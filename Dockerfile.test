@@ -1,0 +1,53 @@
+# Test-runner image for the ministack suite.
+#
+# Kept separate from the runtime Dockerfiles (Dockerfile / Dockerfile.full) so those stay clean for upstream. It installs the full
+# runtime + test dependency set on a Linux base; the ministack source itself is
+# bind-mounted live at run time (see run-tests.sh), so this image only needs a
+# rebuild when the dependency set changes, not on every code edit.
+FROM python:3.12-slim
+
+# apt/pip trust the system CA bundle. An extra CA is appended below only
+# if a bundle is passed as a build secret (run-tests.sh does this when env
+# CA_BUNDLE names a file). It is not COPYd from the build context, so a
+# missing cert never breaks the build.
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
+    PIP_CERT=/etc/ssl/certs/ca-certificates.crt
+
+# curl: apigw "provided runtime" test. nodejs: Node Lambda tests. Plus the full
+# runtime + test dependency set. The optional CA bundle is mounted for this
+# layer only; --trusted-host keeps pip working when no cert is available.
+RUN --mount=type=secret,id=cabundle,target=/tmp/ca-bundle.pem <<'SH'
+set -eux
+if [ -s /tmp/ca-bundle.pem ]; then
+    cat /tmp/ca-bundle.pem >> /etc/ssl/certs/ca-certificates.crt
+fi
+apt-get update
+apt-get install -y --no-install-recommends curl nodejs
+rm -rf /var/lib/apt/lists/*
+pip install --no-cache-dir --trusted-host pypi.org --trusted-host files.pythonhosted.org \
+    hypercorn pyyaml defusedxml boto3 cryptography psycopg2-binary pymysql \
+    asyncssh duckdb docker pytest pytest-xdist cbor2 websockets
+SH
+
+# Resolve *.localhost to loopback for both the in-container server and the
+# pytest client. A minimal Debian container doesn't do this automatically
+# (RFC 6761), so the execute-api virtual-host hostnames
+# (e.g. {api_id}.execute-api.localhost) would otherwise fail to resolve.
+# sitecustomize is auto-imported by Python at startup.
+RUN cat > /usr/local/lib/python3.12/site-packages/sitecustomize.py <<'PY'
+import socket as _socket
+
+_real_getaddrinfo = _socket.getaddrinfo
+
+
+def getaddrinfo(host, *args, **kwargs):
+    if isinstance(host, str) and (host == "localhost" or host.endswith(".localhost")):
+        host = "127.0.0.1"
+    return _real_getaddrinfo(host, *args, **kwargs)
+
+
+_socket.getaddrinfo = getaddrinfo
+PY
+
+WORKDIR /work

@@ -32,6 +32,46 @@ def test_cognito_create_and_describe_user_pool(cognito_idp):
     assert desc["Id"] == pid
     assert desc["Name"] == "TestPool"
 
+def test_cognito_describe_returns_schema_attributes_with_custom_prefix(cognito_idp):
+    """Schema passed to CreateUserPool must come back from DescribeUserPool as
+    SchemaAttributes, with custom attributes prefixed `custom:` (standard ones
+    left as-is). Regression: describe used to omit SchemaAttributes entirely."""
+    pid = cognito_idp.create_user_pool(
+        PoolName="SchemaPool",
+        Schema=[
+            {"Name": "email", "AttributeDataType": "String", "Mutable": True},
+            {"Name": "uuid", "AttributeDataType": "String", "Mutable": True},
+            {"Name": "isMigrated", "AttributeDataType": "String", "Mutable": True},
+        ],
+    )["UserPool"]["Id"]
+
+    desc = cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]
+    names = {a["Name"] for a in desc.get("SchemaAttributes", [])}
+    assert "custom:uuid" in names          # custom → prefixed
+    assert "custom:isMigrated" in names
+    assert "email" in names                # standard → unprefixed
+    assert "custom:email" not in names
+
+
+def test_cognito_add_custom_attributes(cognito_idp):
+    """AddCustomAttributes appends to the pool schema and shows up (prefixed)
+    in DescribeUserPool; re-adding the same name is a no-op, not an error."""
+    pid = cognito_idp.create_user_pool(PoolName="AddAttrPool")["UserPool"]["Id"]
+    cognito_idp.add_custom_attributes(
+        UserPoolId=pid,
+        CustomAttributes=[{"Name": "uuid", "AttributeDataType": "String", "Mutable": True}],
+    )
+    names = {a["Name"] for a in cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]["SchemaAttributes"]}
+    assert "custom:uuid" in names
+    # idempotent re-add (passing the already-prefixed form) doesn't error or dup
+    cognito_idp.add_custom_attributes(
+        UserPoolId=pid,
+        CustomAttributes=[{"Name": "custom:uuid", "AttributeDataType": "String", "Mutable": True}],
+    )
+    attrs = cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]["SchemaAttributes"]
+    assert sum(1 for a in attrs if a["Name"] == "custom:uuid") == 1
+
+
 def test_cognito_list_user_pools(cognito_idp):
     cognito_idp.create_user_pool(PoolName="ListPoolA")
     cognito_idp.create_user_pool(PoolName="ListPoolB")
@@ -3063,3 +3103,223 @@ def test_cognito_email_disabled_env_skips_send(cognito_idp, monkeypatch):
     })
 
     assert len(ses_mod._sent_emails_list()) == before
+
+
+# ===========================================================================
+# CFN provisioner: UserPool LambdaConfig round-trip + in-place update
+# ===========================================================================
+#
+# The CDK pattern `userPool.addTrigger(UserPoolOperation.PRE_SIGN_UP, fn)` ends
+# up in the synthesized CFN template as the UserPool resource's `LambdaConfig`
+# property. Before this fix, the CFN provisioner silently dropped that field on
+# create, AND the engine had no update handler so a stack update would have
+# fallthrough-created a fresh pool with a new id, orphaning every SDK-level
+# write to the existing pool.
+
+def _wait_cfn_stack(cfn, name, timeout=30):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        stacks = cfn.describe_stacks(StackName=name)["Stacks"]
+        status = stacks[0]["StackStatus"]
+        if not status.endswith("_IN_PROGRESS"):
+            return stacks[0]
+        time.sleep(0.5)
+    raise TimeoutError(f"Stack {name} stuck at {status}")
+
+
+def _user_pool_id_from_outputs(cfn, stack_name):
+    desc = cfn.describe_stack_resources(StackName=stack_name)["StackResources"]
+    return next(r["PhysicalResourceId"] for r in desc if r["LogicalResourceId"] == "Pool")
+
+
+def test_cfn_user_pool_provisions_lambda_config(cfn, cognito_idp):
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Pool": {
+                "Type": "AWS::Cognito::UserPool",
+                "Properties": {
+                    "PoolName": "cfn-lambdaconfig-pool",
+                    "LambdaConfig": {
+                        "PreSignUp": "arn:aws:lambda:us-east-1:000000000000:function:pre-signup-fn",
+                        "PostConfirmation": "arn:aws:lambda:us-east-1:000000000000:function:post-confirm-fn",
+                        "UserMigration": "arn:aws:lambda:us-east-1:000000000000:function:user-migration-fn",
+                    },
+                },
+            }
+        },
+    }
+    cfn.create_stack(StackName="cfn-cognito-lc", TemplateBody=json.dumps(template))
+    stack = _wait_cfn_stack(cfn, "cfn-cognito-lc")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    pid = _user_pool_id_from_outputs(cfn, "cfn-cognito-lc")
+    pool = cognito_idp.describe_user_pool(UserPoolId=pid)["UserPool"]
+    lc = pool.get("LambdaConfig", {})
+    assert lc.get("PreSignUp", "").endswith(":pre-signup-fn")
+    assert lc.get("PostConfirmation", "").endswith(":post-confirm-fn")
+    assert lc.get("UserMigration", "").endswith(":user-migration-fn")
+
+
+def test_cfn_user_pool_update_preserves_id_and_applies_lambda_config_change(cfn, cognito_idp):
+    base_template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Pool": {
+                "Type": "AWS::Cognito::UserPool",
+                "Properties": {
+                    "PoolName": "cfn-lambdaconfig-update-pool",
+                    "LambdaConfig": {
+                        "PreSignUp": "arn:aws:lambda:us-east-1:000000000000:function:pre-v1",
+                    },
+                },
+            }
+        },
+    }
+    cfn.create_stack(StackName="cfn-cognito-lc-upd", TemplateBody=json.dumps(base_template))
+    _wait_cfn_stack(cfn, "cfn-cognito-lc-upd")
+    pid_before = _user_pool_id_from_outputs(cfn, "cfn-cognito-lc-upd")
+    assert cognito_idp.describe_user_pool(UserPoolId=pid_before)["UserPool"]["LambdaConfig"].get("PreSignUp", "").endswith(":pre-v1")
+
+    updated = json.loads(json.dumps(base_template))
+    updated["Resources"]["Pool"]["Properties"]["LambdaConfig"] = {
+        "PreSignUp": "arn:aws:lambda:us-east-1:000000000000:function:pre-v2",
+        "PostConfirmation": "arn:aws:lambda:us-east-1:000000000000:function:post-v2",
+        "UserMigration": "arn:aws:lambda:us-east-1:000000000000:function:migrate-v2",
+    }
+    cfn.update_stack(StackName="cfn-cognito-lc-upd", TemplateBody=json.dumps(updated))
+    _wait_cfn_stack(cfn, "cfn-cognito-lc-upd")
+
+    pid_after = _user_pool_id_from_outputs(cfn, "cfn-cognito-lc-upd")
+    assert pid_after == pid_before, "update must NOT mint a new pool id"
+    lc = cognito_idp.describe_user_pool(UserPoolId=pid_after)["UserPool"]["LambdaConfig"]
+    assert lc.get("PreSignUp", "").endswith(":pre-v2")
+    assert lc.get("PostConfirmation", "").endswith(":post-v2")
+    assert lc.get("UserMigration", "").endswith(":migrate-v2")
+
+
+# ===========================================================================
+# Lifecycle triggers (PreSignUp / PostConfirmation) — MiniStack must invoke
+# the configured Lambda at the matching lifecycle moment, the way real Cognito
+# does. Before this work, the slots were stored but never invoked, so chains
+# like `Cognito → PostConfirmation Lambda → EventBridge → StepFunctions` never
+# fired on confirm.
+# ===========================================================================
+
+def _signup_trigger_lambda(lam, name: str, handler_body: str) -> str:
+    lam.create_function(
+        FunctionName=name, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": _make_pretoken_lambda_zip(handler_body)},
+    )
+    return lam.get_function(FunctionName=name)["Configuration"]["FunctionArn"]
+
+
+def test_pre_signup_trigger_auto_confirms_on_sign_up(cognito_idp, lam):
+    """PreSignUp_SignUp may return {response: {autoConfirmUser: true,
+    autoVerifyEmail: true}}; SignUp must honour that, return UserConfirmed=true,
+    and chain PostConfirmation. The latter is exercised via the next test."""
+    pre_arn = _signup_trigger_lambda(lam, "ms-pre-signup-ac",
+        "def handler(event, ctx):\n"
+        "    event['response']['autoConfirmUser'] = True\n"
+        "    event['response']['autoVerifyEmail'] = True\n"
+        "    return event\n"
+    )
+    pid = cognito_idp.create_user_pool(
+        PoolName="pre-signup-ac",
+        LambdaConfig={"PreSignUp": pre_arn},
+        AutoVerifiedAttributes=["email"],
+    )["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="app",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+
+    resp = cognito_idp.sign_up(
+        ClientId=cid, Username="ada@example.com", Password="Aa1!aaaa",
+        UserAttributes=[{"Name": "email", "Value": "ada@example.com"}],
+    )
+    assert resp["UserConfirmed"] is True, "PreSignUp autoConfirmUser was ignored"
+
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="ada@example.com")
+    assert user["UserStatus"] == "CONFIRMED"
+    attrs = {a["Name"]: a["Value"] for a in user.get("UserAttributes", [])}
+    assert attrs.get("email_verified") == "true"
+
+
+def test_post_confirmation_trigger_fires_on_admin_confirm_sign_up(cognito_idp, lam, s3):
+    """AdminConfirmSignUp must invoke the configured PostConfirmation Lambda
+    with triggerSource=PostConfirmation_ConfirmSignUp. The Lambda writes a
+    marker object to S3 so the test can observe the invocation directly."""
+    bucket = "ms-postconfirm-marker"
+    s3.create_bucket(Bucket=bucket)
+    post_body = (
+        "import boto3, json, os\n"
+        "def handler(event, ctx):\n"
+        "    s3 = boto3.client('s3', endpoint_url=os.environ.get('AWS_ENDPOINT_URL'))\n"
+        "    s3.put_object(\n"
+        f"        Bucket='{bucket}', Key=event['userName'],\n"
+        "        Body=json.dumps({\n"
+        "            'triggerSource': event.get('triggerSource'),\n"
+        "            'email': event['request']['userAttributes'].get('email'),\n"
+        "        }).encode(),\n"
+        "    )\n"
+        "    return event\n"
+    )
+    post_arn = _signup_trigger_lambda(lam, "ms-postconfirm-fire", post_body)
+    pid = cognito_idp.create_user_pool(
+        PoolName="postconfirm-fire",
+        LambdaConfig={"PostConfirmation": post_arn},
+    )["UserPool"]["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="lovelace",
+        UserAttributes=[{"Name": "email", "Value": "ada@example.com"}],
+        TemporaryPassword="Temp1234!", MessageAction="SUPPRESS",
+    )
+    # AdminCreateUser leaves user in FORCE_CHANGE_PASSWORD; explicit confirm
+    # is the trigger we're testing.
+    cognito_idp.admin_confirm_sign_up(UserPoolId=pid, Username="lovelace")
+
+    marker = json.loads(s3.get_object(Bucket=bucket, Key="lovelace")["Body"].read())
+    assert marker == {
+        "triggerSource": "PostConfirmation_ConfirmSignUp",
+        "email": "ada@example.com",
+    }
+
+
+def test_admin_create_user_with_pre_signup_auto_confirm_chains_post_confirmation(cognito_idp, lam, s3):
+    """The full PreSignUp_AdminCreateUser → autoConfirm → PostConfirmation
+    chain must run on AdminCreateUser when the PreSignUp Lambda auto-confirms.
+    Mirrors the real-Cognito sequence used by passwordless flows."""
+    bucket = "ms-precon-chain"
+    s3.create_bucket(Bucket=bucket)
+    pre_body = (
+        "def handler(event, ctx):\n"
+        "    event['response']['autoConfirmUser'] = True\n"
+        "    event['response']['autoVerifyEmail'] = True\n"
+        "    return event\n"
+    )
+    post_body = (
+        "import boto3, os\n"
+        "def handler(event, ctx):\n"
+        "    s3 = boto3.client('s3', endpoint_url=os.environ.get('AWS_ENDPOINT_URL'))\n"
+        f"    s3.put_object(Bucket='{bucket}', Key=event['userName'], Body=event['triggerSource'].encode())\n"
+        "    return event\n"
+    )
+    pre_arn = _signup_trigger_lambda(lam, "ms-pre-admin", pre_body)
+    post_arn = _signup_trigger_lambda(lam, "ms-post-admin", post_body)
+    pid = cognito_idp.create_user_pool(
+        PoolName="admin-create-chain",
+        LambdaConfig={"PreSignUp": pre_arn, "PostConfirmation": post_arn},
+    )["UserPool"]["Id"]
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="grace",
+        UserAttributes=[{"Name": "email", "Value": "grace@example.com"}],
+        TemporaryPassword="Temp1234!", MessageAction="SUPPRESS",
+    )
+
+    user = cognito_idp.admin_get_user(UserPoolId=pid, Username="grace")
+    assert user["UserStatus"] == "CONFIRMED", "PreSignUp_AdminCreateUser did not auto-confirm"
+    marker = s3.get_object(Bucket=bucket, Key="grace")["Body"].read().decode()
+    assert marker == "PostConfirmation_ConfirmSignUp"

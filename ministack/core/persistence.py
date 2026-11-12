@@ -1,7 +1,8 @@
 """
 State persistence for MiniStack services.
 When PERSIST_STATE=1, service state is saved to STATE_DIR on shutdown
-and reloaded on startup.
+(and every MINISTACK_PERSIST_INTERVAL seconds when that is set) and
+reloaded on startup.
 """
 
 import ast
@@ -9,6 +10,8 @@ import json
 import logging
 import os
 import tempfile
+import threading
+import time
 
 from ministack.core.responses import AccountScopedDict
 
@@ -69,7 +72,12 @@ def save_state(service: str, data: dict) -> None:
         try:
             with open(tmp, "w") as f:
                 json.dump(data, f, default=_json_default)
+                # Without fsync before the rename, an unclean stop of the Docker VM
+                # shortly after a save leaves the renamed file at 0 bytes.
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp, path)
+            _fsync_dir(STATE_DIR)
         except BaseException:
             # Clean up temp file on any failure to avoid stale partial writes
             try:
@@ -80,6 +88,20 @@ def save_state(service: str, data: dict) -> None:
         logger.info("Persistence: saved %s state to %s", service, path)
     except Exception as e:
         logger.error("Persistence: failed to save %s: %s", service, e)
+
+
+def _fsync_dir(path: str) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _quarantine(path: str) -> str:
+    target = f"{path}.corrupt-{time.strftime('%Y%m%dT%H%M%S')}"
+    os.replace(path, target)
+    return target
 
 
 def load_state(service: str) -> dict | None:
@@ -93,15 +115,30 @@ def load_state(service: str) -> dict | None:
             data = json.load(f, object_hook=_json_object_hook)
         logger.info("Persistence: loaded %s state from %s", service, path)
         return data
-    except (json.JSONDecodeError, OSError) as e:
+    except json.JSONDecodeError as e:
+        # Moved aside so the next save cannot overwrite the only copy.
+        try:
+            target = _quarantine(path)
+        except OSError as qe:
+            logger.error("Persistence: %s state is unreadable (%s) and could not be moved aside: %s",
+                         service, e, qe)
+            return None
+        logger.error("Persistence: %s state is unreadable (%s); moved to %s, starting empty",
+                     service, e, target)
+        return None
+    except OSError as e:
         logger.error("Persistence: failed to load %s: %s", service, e)
         return None
 
 
+_save_lock = threading.Lock()
+
+
 def save_all(services: dict) -> None:
     """Save all service states. services = {name: get_state_fn}"""
-    for name, get_state in services.items():
-        try:
-            save_state(name, get_state())
-        except Exception as e:
-            logger.error("Persistence: error getting state for %s: %s", name, e)
+    with _save_lock:
+        for name, get_state in services.items():
+            try:
+                save_state(name, get_state())
+            except Exception as e:
+                logger.error("Persistence: error getting state for %s: %s", name, e)

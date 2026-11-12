@@ -27,6 +27,17 @@ def _is_custom_resource(resource_type: str) -> bool:
     return resource_type.startswith("Custom::") or resource_type == "AWS::CloudFormation::CustomResource"
 
 
+def _needs_threaded_provisioning(resource_type: str) -> bool:
+    """Resources whose provisioner must run via asyncio.to_thread.
+
+    - Custom resources: provisioner blocks on a Lambda invoke + ResponseURL callback.
+    - AWS::CloudFormation::Stack (nested stacks): provisioner runs a full
+      asyncio.run() of _deploy_stack_async for the child template; cannot share
+      the parent's event loop.
+    """
+    return _is_custom_resource(resource_type) or resource_type == "AWS::CloudFormation::Stack"
+
+
 # ===========================================================================
 # Stack Events helper
 # ===========================================================================
@@ -128,7 +139,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
             if prev_resource:
                 old_pid = prev_resource.get("PhysicalResourceId", logical_id)
                 old_props = prev_resource.get("Properties", {})
-                if _is_custom_resource(resource_type):
+                if _needs_threaded_provisioning(resource_type):
                     physical_id, attrs = await asyncio.to_thread(
                         _update_resource, resource_type, old_pid, old_props,
                         resolved_props, stack_name, logical_id
@@ -138,7 +149,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                         resource_type, old_pid, old_props, resolved_props, stack_name
                     )
             else:
-                if _is_custom_resource(resource_type):
+                if _needs_threaded_provisioning(resource_type):
                     physical_id, attrs = await asyncio.to_thread(
                         _provision_resource, resource_type, logical_id, resolved_props, stack_name
                     )
@@ -178,7 +189,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
             pid = old_res.get("PhysicalResourceId", "")
             old_props = old_res.get("Properties", {})
             try:
-                if _is_custom_resource(rtype):
+                if _needs_threaded_provisioning(rtype):
                     await asyncio.to_thread(
                         _delete_resource, rtype, pid, old_props,
                         stack_name, logical_id
@@ -212,7 +223,7 @@ async def _deploy_stack_async(stack_name: str, stack_id: str, template: dict,
                 pid = res.get("PhysicalResourceId", "")
                 res_props = res.get("Properties", {})
                 try:
-                    if _is_custom_resource(rtype):
+                    if _needs_threaded_provisioning(rtype):
                         await asyncio.to_thread(
                             _delete_resource, rtype, pid, res_props,
                             stack_name, logical_id
@@ -320,7 +331,7 @@ async def _delete_stack_async(stack_name: str, stack_id: str):
         _add_event(stack_id, stack_name, logical_id, rtype,
                    "DELETE_IN_PROGRESS", physical_id=pid)
         try:
-            if _is_custom_resource(rtype):
+            if _needs_threaded_provisioning(rtype):
                 await asyncio.to_thread(
                     _delete_resource, rtype, pid, res_props,
                     stack_name, logical_id

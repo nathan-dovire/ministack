@@ -4463,3 +4463,31 @@ def test_sfn_jsonata_assign_reuses_input(sfn_sync):
         assert json.loads(resp["output"]) == "hello world"
     finally:
         sfn_sync.delete_state_machine(stateMachineArn=sm_arn)
+
+
+def test_jsonpath_supports_quoted_bracket_keys_with_special_chars():
+    """JsonPath like `$.foo['custom:uuid']` must resolve. CDK-generated SFN
+    Pass states use this for Cognito userAttribute lookups; before this fix
+    the colon broke the splitter and the value came back null, which then
+    fed an empty hash key into dynamodb-onetable."""
+    from ministack.services.stepfunctions import _resolve_path
+    data = {"detail": {"request": {"userAttributes": {
+        "custom:uuid": "abc-123",
+        "email": "ada@example.com",
+    }}}}
+    assert _resolve_path(
+        "$.detail.request.userAttributes['custom:uuid']", data
+    ) == "abc-123"
+    assert _resolve_path(
+        '$.detail.request.userAttributes["custom:uuid"]', data
+    ) == "abc-123"
+    # mixed bracket + dot
+    assert _resolve_path(
+        "$.detail.request['userAttributes'].email", data
+    ) == "ada@example.com"
+    # numeric index unchanged
+    assert _resolve_path("$.list[0]", {"list": ["x", "y"]}) == "x"
+    # missing key returns None (not raises)
+    assert _resolve_path(
+        "$.detail.request.userAttributes['nope']", data
+    ) is None

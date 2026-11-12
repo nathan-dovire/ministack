@@ -513,7 +513,18 @@ async def _call_lambda(func_name, event, qualifier=None):
     # Logs emission and Docker log output work for API Gateway invocations.
     # Response shaping (throttle→429, error→502, body→envelope) goes through
     # the shared helper so v1/v2 stay consistent.
-    exec_record = {"config": func_config, "code_zip": func_data.get("code_zip")}
+    # Carry the full code reference, not just code_zip: pipeline-deployed
+    # functions back their code with a local-asset marker (code_local_dir) or an
+    # S3 ref rather than an inline zip. Dropping those here made marker-backed
+    # functions fall back to the no-code mock on API Gateway invokes.
+    exec_record = {
+        "config": func_config,
+        "code_zip": func_data.get("code_zip"),
+        "code_local_dir": func_data.get("code_local_dir"),
+        "code_s3_bucket": func_data.get("code_s3_bucket"),
+        "code_s3_key": func_data.get("code_s3_key"),
+        "code_s3_object_version": func_data.get("code_s3_object_version"),
+    }
     result = await asyncio.to_thread(lambda_svc._execute_function, exec_record, event)
     lambda_response, _ = lambda_svc.lambda_execute_result_to_api_proxy_response(result)
     # On error the helper returns {statusCode: 502, body: <msg>}; preserve
@@ -922,9 +933,20 @@ async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resour
     qs_params = {k: v[0] for k, v in query_params.items()} if query_params else None
     mv_qs_params = {k: list(v) for k, v in query_params.items()} if query_params else None
 
-    # Build single and multi-value header dicts
-    single_headers = {k: v if isinstance(v, str) else v[-1] for k, v in headers.items()}
-    multi_headers = {k: [v] if isinstance(v, str) else list(v) for k, v in headers.items()}
+    # Build the single- and multi-value header dicts. Emit the inbound host as
+    # a single capitalised `Host` and drop the lowercase `host`: a handler that
+    # sets `headers.Host` before forwarding must see one overridable key, not a
+    # capitalised/lowercase pair. Every other header keeps its original
+    # (lowercase) casing, which is how deployed Lambdas read them
+    # (e.g. `headers["x-amz-target"]`).
+    single_headers = {k: (v if isinstance(v, str) else v[-1])
+                      for k, v in headers.items() if k != "host"}
+    multi_headers = {k: ([v] if isinstance(v, str) else list(v))
+                     for k, v in headers.items() if k != "host"}
+    if "host" in headers:
+        _host_val = headers["host"]
+        single_headers["Host"] = _host_val if isinstance(_host_val, str) else _host_val[-1]
+        multi_headers["Host"] = [_host_val] if isinstance(_host_val, str) else list(_host_val)
 
     now_epoch_ms = int(time.time() * 1000)
     request_time = datetime.datetime.utcnow().strftime("%d/%b/%Y:%H:%M:%S +0000")

@@ -185,6 +185,7 @@ process.stdout.write = function(chunk, encoding, callback) {
     "cloudwatch-logs":             "Logs_20140328",
     "logs":                        "Logs_20140328",
     "secretsmanager":              "secretsmanager",
+    "secrets-manager":             "secretsmanager",
     "events":                      "AmazonEventBridge",
     "eventbridge":                 "AmazonEventBridge",
     "kinesis":                     "Kinesis_20131202",
@@ -361,7 +362,35 @@ function patchAwsSdk() {
 
   // Patch https.request for bundled SDK
   const origHttpsReq = https.request;
-  https.request = function(options, callback) {
+  https.request = function(arg1, arg2, arg3) {
+    // Node's https.request supports two signatures:
+    //   https.request(options[, callback])
+    //   https.request(url[, options][, callback])
+    // Earlier this wrapper only handled the first form, so any caller using
+    // the url-first form (e.g. aws-jwt-verify's SimpleJsonFetcher passing
+    // (url, options, callback) into https.request) blew up inside
+    // ClientRequest with "listener argument must be of type function" when
+    // the wrapper handed an options object to the constructor as the
+    // callback. Normalise to (options, callback) before the rest of the
+    // wrapper runs.
+    let options, callback;
+    if (typeof arg1 === "string" || arg1 instanceof url.URL) {
+      const parsed = typeof arg1 === "string" ? url.parse(arg1) : url.parse(arg1.toString());
+      if (typeof arg2 === "function") {
+        options = parsed;
+        callback = arg2;
+      } else if (arg2 && typeof arg2 === "object") {
+        options = Object.assign({}, parsed, arg2);
+        callback = typeof arg3 === "function" ? arg3 : undefined;
+      } else {
+        options = parsed;
+        callback = undefined;
+      }
+    } else {
+      options = arg1;
+      callback = typeof arg2 === "function" ? arg2 : undefined;
+    }
+
     if (typeof options === "string") options = url.parse(options);
     else if (options instanceof url.URL) options = url.parse(options.toString());
     else options = Object.assign({}, options);
@@ -369,6 +398,29 @@ function patchAwsSdk() {
     const host = options.hostname || options.host || "";
     if (host.endsWith(".amazonaws.com") || host.endsWith(".amazonaws.com.cn")) {
       options.protocol = "http:";
+      options.hostname = msHost;
+      options.host = msHost + ":" + msPort;
+      options.port = msPort;
+      options.path = options.path || "/";
+      if (options.agent instanceof https.Agent) {
+        options.agent = new http.Agent({ keepAlive: true });
+      } else if (options.agent === undefined) {
+        options.agent = new http.Agent({ keepAlive: true });
+      }
+      delete options._defaultAgent;
+      return http.request(options, callback);
+    }
+
+    // execute-api hosts ({apiId}.execute-api.<msHost>): route TCP at
+    // msHost:msPort but preserve the apiId-prefixed Host header so
+    // MiniStack's host-based router still finds the api. An app's
+    // PostToConnection call hits this path (apigatewaymanagementapi's
+    // endpoint = `${domainName}/${stage}` where domainName is the
+    // apiId-prefixed name).
+    const cleanHost = host.split(":")[0];
+    if (cleanHost.endsWith(".execute-api." + msHost) || cleanHost.endsWith(".execute-api.localhost")) {
+      options.protocol = "http:";
+      options.headers = Object.assign({}, options.headers || {}, { Host: cleanHost + ":" + msPort });
       options.hostname = msHost;
       options.host = msHost + ":" + msPort;
       options.port = msPort;
@@ -560,10 +612,15 @@ def _worker_script_extension(runtime: str) -> str:
 
 
 class Worker:
-    def __init__(self, func_name: str, config: dict, code_zip: bytes):
+    def __init__(self, func_name: str, config: dict, code_zip: bytes,
+                 code_local_dir: str | None = None):
         self.func_name = func_name
         self.config = config
         self.code_zip = code_zip
+        # MiniStack local-native asset: when set, the function code already
+        # lives unpacked at this on-disk path (bind-mounted cdk.out). We run
+        # from it directly instead of writing + extracting a zip.
+        self.code_local_dir = code_local_dir
         self._proc = None
         self._tmpdir = None
         self._lock = threading.Lock()
@@ -593,12 +650,29 @@ class Worker:
         with open(worker_path, "w") as f:
             f.write(worker_script)
 
-        code_dir = os.path.join(self._tmpdir, "code")
-        os.makedirs(code_dir)
-        with open(os.path.join(self._tmpdir, "code.zip"), "wb") as f:
-            f.write(self.code_zip)
-        with zipfile.ZipFile(os.path.join(self._tmpdir, "code.zip")) as zf:
-            zf.extractall(code_dir)
+        has_layers = bool(self.config.get("Layers"))
+        if self.code_local_dir and os.path.isdir(self.code_local_dir) and not has_layers:
+            # Local-native fast path: run straight from the bind-mounted asset
+            # directory. Zero copy, zero extract. Safe because Lambda code dirs
+            # are read-only at runtime and the worker script + any layer
+            # symlinks are written into self._tmpdir, not into code_dir.
+            # (When layers are present we fall through to a copy so we can
+            # symlink layer node_modules into code_dir without mutating the
+            # shared asset dir.)
+            code_dir = self.code_local_dir
+        elif self.code_local_dir and os.path.isdir(self.code_local_dir):
+            # Layers present: copy the asset dir so layer symlinking doesn't
+            # pollute the shared on-disk asset. Still avoids the zip round-trip.
+            import shutil as _shutil
+            code_dir = os.path.join(self._tmpdir, "code")
+            _shutil.copytree(self.code_local_dir, code_dir)
+        else:
+            code_dir = os.path.join(self._tmpdir, "code")
+            os.makedirs(code_dir)
+            with open(os.path.join(self._tmpdir, "code.zip"), "wb") as f:
+                f.write(self.code_zip)
+            with zipfile.ZipFile(os.path.join(self._tmpdir, "code.zip")) as zf:
+                zf.extractall(code_dir)
 
         # Extract Lambda Layers and build search paths for the worker process.
         # This mirrors the layer handling in lambda_svc._execute_function_local().
@@ -898,7 +972,8 @@ class Worker:
 
 
 def get_or_create_worker(func_name: str, config: dict, code_zip: bytes,
-                         qualifier: str = "$LATEST") -> Worker:
+                         qualifier: str = "$LATEST",
+                         code_local_dir: str | None = None) -> Worker:
     # Include account ID in the key to isolate workers across accounts.
     # Two accounts deploying the same function name must not share a worker.
     account = _account_from_arn(config.get("FunctionArn", ""))
@@ -907,7 +982,7 @@ def get_or_create_worker(func_name: str, config: dict, code_zip: bytes,
         worker = _workers.get(key)
         if worker is not None:
             return worker
-        worker = Worker(func_name, config, code_zip)
+        worker = Worker(func_name, config, code_zip, code_local_dir=code_local_dir)
         _workers[key] = worker
         return worker
 

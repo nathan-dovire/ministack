@@ -259,6 +259,19 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"codebuild\."],
         "credential_scope": "codebuild",
     },
+    "codepipeline": {
+        "target_prefixes": ["CodePipeline_20150709"],
+        "host_patterns": [r"codepipeline\."],
+        "credential_scope": "codepipeline",
+    },
+    "codestar-connections": {
+        "target_prefixes": [
+            "com.amazonaws.codestar.connections.CodeStar_connections_20191201",
+            "CodeStar_connections_20191201",
+        ],
+        "host_patterns": [r"codestar-connections\."],
+        "credential_scope": "codestar-connections",
+    },
     "transfer": {
         "target_prefixes": ["TransferService"],
         "host_patterns": [r"transfer\."],

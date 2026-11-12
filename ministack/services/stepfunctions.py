@@ -284,6 +284,14 @@ async def handle_request(method, path, headers, body, query_params):
         return error_response_json("InvalidAction", f"Unknown action: {action}", 400)
     if action == "GetActivityTask":
         return _finalize_response(await _get_activity_task(data))
+    if action == "StartSyncExecution":
+        # StartSyncExecution runs the whole state machine inline, including
+        # blocking Lambda invokes whose handlers may call back into MiniStack
+        # (e.g. a provisioning Lambda doing a DynamoDB PutItem). Running that on
+        # the event loop blocks it, so those re-entrant calls can't be served
+        # and the Lambda deadlocks until it times out. Offload to the worker
+        # thread pool (as Lambda invokes already do) to keep the loop free.
+        return _finalize_response(await asyncio.to_thread(handler, data))
     return _finalize_response(handler(data))
 
 
@@ -2539,30 +2547,72 @@ def _iter_top_level_chars(text):
 
 
 def _resolve_path(path, data):
+    """Evaluate a Step Functions JsonPath against `data`.
+
+    Supports four cursor moves after the `$` root:
+      .field            dotted identifier (alnum + underscore)
+      [N]               numeric index into a list
+      ['key']           quoted bracket key (single OR double quotes); the key
+                        may contain any character including `:` or `-` —
+                        which the old split-on-`.` parser couldn't reach.
+                        This is the syntax CDK Pipelines uses for Cognito
+                        userAttribute lookups like `['custom:uuid']`.
+      ["key"]           same, double-quoted.
+    Returns the value at the path, or None if any cursor step misses.
+    """
     if path == "$" or not path:
         return data
-    if not path.startswith("$"):
+    if not isinstance(path, str) or not path.startswith("$"):
         return data
 
-    parts = path[2:].split(".") if path.startswith("$.") else []
     cur = data
-    for part in parts:
-        if not part:
-            continue
-        m = re.match(r"(\w+)\[(\d+)]", part)
-        if m:
-            field, idx = m.group(1), int(m.group(2))
-            if isinstance(cur, dict) and field in cur:
-                cur = cur[field]
-                if isinstance(cur, list) and idx < len(cur):
-                    cur = cur[idx]
-                else:
-                    return None
-            else:
+    i = 1  # skip the leading "$"
+    n = len(path)
+    while i < n:
+        ch = path[i]
+        if ch == ".":
+            j = i + 1
+            while j < n and (path[j].isalnum() or path[j] == "_"):
+                j += 1
+            field = path[i + 1: j]
+            if not field:
                 return None
-        elif isinstance(cur, dict) and part in cur:
-            cur = cur[part]
+            if not isinstance(cur, dict) or field not in cur:
+                return None
+            cur = cur[field]
+            i = j
+        elif ch == "[":
+            if i + 1 >= n:
+                return None
+            if path[i + 1] in ("'", '"'):
+                quote = path[i + 1]
+                key_start = i + 2
+                # find the matching closing quote (no escape handling — SFN
+                # paths in practice are CDK-generated, not user-typed)
+                key_end = path.find(quote, key_start)
+                if key_end < 0 or key_end + 1 >= n or path[key_end + 1] != "]":
+                    return None
+                field = path[key_start: key_end]
+                if not isinstance(cur, dict) or field not in cur:
+                    return None
+                cur = cur[field]
+                i = key_end + 2
+            else:
+                end = path.find("]", i + 1)
+                if end < 0:
+                    return None
+                try:
+                    idx = int(path[i + 1: end])
+                except ValueError:
+                    return None
+                if not isinstance(cur, list):
+                    return None
+                if idx < -len(cur) or idx >= len(cur):
+                    return None
+                cur = cur[idx]
+                i = end + 1
         else:
+            # Unexpected character — bail rather than guess.
             return None
     return cur
 

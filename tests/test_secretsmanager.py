@@ -6,8 +6,24 @@ import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
 
+import boto3
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
+
+
+def _sm_for_account(account_id: str):
+    """Boto3 SecretsManager client that pretends to be the given 12-digit
+    account by using the account ID as the access key. MiniStack's
+    set_request_account_id() picks this up to scope state via AccountScopedDict."""
+    return boto3.client(
+        "secretsmanager",
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        region_name="us-east-1",
+        aws_access_key_id=account_id,
+        aws_secret_access_key="test",
+        config=Config(retries={"mode": "standard"}),
+    )
 
 
 def test_secretsmanager_resource_policy(sm):
@@ -414,3 +430,79 @@ def test_secretsmanager_force_delete_removes_resource_policy():
         "_secrets[name] AND _resource_policies[arn]."
     )
     sm.reset()
+
+
+def test_secretsmanager_account_isolation():
+    """Two requests with different 12-digit access keys land in different
+    AccountScopedDict namespaces — secrets created by account A are invisible
+    to account B, and the same logical name can coexist in both accounts."""
+    a = _sm_for_account("111111111111")
+    b = _sm_for_account("222222222222")
+    name = f"isolation-{_uuid_mod.uuid4().hex[:8]}"
+
+    a_arn = a.create_secret(Name=name, SecretString="value-from-A")["ARN"]
+    try:
+        # ARN reflects the caller's account.
+        assert ":111111111111:" in a_arn
+
+        # Account A sees its own secret; account B sees an empty namespace.
+        a_names = {s["Name"] for s in a.list_secrets()["SecretList"]}
+        b_names = {s["Name"] for s in b.list_secrets()["SecretList"]}
+        assert name in a_names
+        assert name not in b_names
+
+        # Account B's get-secret-value misses cleanly.
+        with pytest.raises(ClientError) as exc:
+            b.get_secret_value(SecretId=name)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+        # Account A's get-secret-value returns the right value.
+        assert a.get_secret_value(SecretId=name)["SecretString"] == "value-from-A"
+
+        # Same logical name in account B should not collide with A's secret.
+        b_arn = b.create_secret(Name=name, SecretString="value-from-B")["ARN"]
+        try:
+            assert ":222222222222:" in b_arn
+            assert b.get_secret_value(SecretId=name)["SecretString"] == "value-from-B"
+            # And A's value didn't change.
+            assert a.get_secret_value(SecretId=name)["SecretString"] == "value-from-A"
+        finally:
+            b.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+    finally:
+        a.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+
+
+def test_secretsmanager_resource_policy_isolation():
+    """Resource policies are also account-scoped — the same secret name in two
+    accounts has independent policies, neither visible to the other account."""
+    a = _sm_for_account("111111111111")
+    b = _sm_for_account("222222222222")
+    name = f"pol-iso-{_uuid_mod.uuid4().hex[:8]}"
+
+    a.create_secret(Name=name, SecretString="x")
+    b.create_secret(Name=name, SecretString="x")
+    try:
+        a.put_resource_policy(
+            SecretId=name,
+            ResourcePolicy=json.dumps({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "arn:aws:iam::111111111111:root"},
+                    "Action": "secretsmanager:GetSecretValue",
+                    "Resource": "*",
+                }],
+            }),
+        )
+
+        # Account A sees its policy.
+        a_resp = a.get_resource_policy(SecretId=name)
+        assert "ResourcePolicy" in a_resp
+        assert "111111111111" in a_resp["ResourcePolicy"]
+
+        # Account B has no policy on its own copy of the secret.
+        b_resp = b.get_resource_policy(SecretId=name)
+        assert b_resp.get("ResourcePolicy") in (None, "{}")
+    finally:
+        a.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)
+        b.delete_secret(SecretId=name, ForceDeleteWithoutRecovery=True)

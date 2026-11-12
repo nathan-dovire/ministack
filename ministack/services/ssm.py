@@ -200,6 +200,15 @@ def _get_parameter(data):
     return json_response({"Parameter": _param_out(param, with_decryption)})
 
 
+def _get_parameter_value(name):
+    """Return the stored value for an SSM parameter (or None if missing).
+    Used by the CFN engine to resolve `AWS::SSM::Parameter::Value<*>`
+    template parameters at deploy time. Honours the current request's
+    account context via `_parameters` (AccountScopedDict)."""
+    param = _parameters.get(name)
+    return param.get("Value") if param else None
+
+
 def _get_parameters(data):
     names = data.get("Names", [])
     with_decryption = data.get("WithDecryption", False)

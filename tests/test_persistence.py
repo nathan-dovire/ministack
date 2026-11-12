@@ -464,6 +464,54 @@ def test_sns_platform_endpoints_survive_warm_boot():
     mod.reset()
 
 
+# ── CloudFormation orphaned in-progress reconciliation ────────────────
+
+def test_cfn_orphaned_in_progress_recovered_across_accounts_on_restore():
+    """A stack persisted mid-deploy can never reach a terminal status on its
+    own after a restart: state is saved only on graceful shutdown and the
+    driving _deploy_stack_async task lives only in the previous event loop.
+    restore_state must flip orphaned *_IN_PROGRESS to a terminal status so the
+    next deploy isn't permanently rejected by UpdateStack. Must cover stacks
+    under a NON-default account (deployed stacks never live under 000000000000),
+    which forces restore_state to walk raw _data, not .values()."""
+    cfn = _get_module("cloudformation")
+    cfn.reset()
+
+    stage_acct = "222222222222"
+    # name -> (persisted status, expected status after restore)
+    cases = {
+        "stk-update": ("UPDATE_IN_PROGRESS", "UPDATE_COMPLETE"),
+        "stk-create": ("CREATE_IN_PROGRESS", "CREATE_FAILED"),
+        "stk-rollback": ("ROLLBACK_IN_PROGRESS", "ROLLBACK_COMPLETE"),
+        "stk-uprollback": ("UPDATE_ROLLBACK_IN_PROGRESS", "UPDATE_ROLLBACK_COMPLETE"),
+        "stk-delete": ("DELETE_IN_PROGRESS", "DELETE_COMPLETE"),
+        # Terminal and review states must be left untouched.
+        "stk-complete": ("UPDATE_COMPLETE", "UPDATE_COMPLETE"),
+        "stk-review": ("REVIEW_IN_PROGRESS", "REVIEW_IN_PROGRESS"),
+    }
+    for name, (status, _expected) in cases.items():
+        cfn._stacks._data[(stage_acct, name)] = {
+            "StackName": name,
+            "StackId": f"arn:aws:cloudformation:us-east-1:{stage_acct}:stack/{name}/x",
+            "StackStatus": status,
+            "_template_body": "{}",
+        }
+
+    _round_trip_dict(cfn, "cloudformation")
+
+    for name, (_status, expected) in cases.items():
+        got = cfn._stacks._data[(stage_acct, name)]["StackStatus"]
+        assert got == expected, (
+            f"{name}: expected {expected} after restore, got {got}"
+        )
+
+    # A reconciled stack records an operator-facing breadcrumb in its reason.
+    assert "recovered orphaned" in (
+        cfn._stacks._data[(stage_acct, "stk-update")].get("StackStatusReason", "")
+    ), "reconciled stack must record why its status was changed"
+    cfn.reset()
+
+
 # ── Import-order regression for the ECS NameError trap ───────────────
 
 def test_ecs_module_reload_with_persisted_attributes_does_not_namerror():

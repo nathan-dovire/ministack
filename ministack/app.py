@@ -257,6 +257,8 @@ SERVICE_REGISTRY = {
     "cloudfront": {"module": "cloudfront"},
     "cloudfront-keyvaluestore": {"module": "cloudfront_keyvaluestore"},
     "codebuild": {"module": "codebuild"},
+    "codepipeline": {"module": "codepipeline"},
+    "codestar-connections": {"module": "codestar_connections"},
     "cognito-identity": {"module": "cognito"},
     "cognito-idp": {"module": "cognito"},
     "dynamodb": {"module": "dynamodb"},
@@ -313,6 +315,20 @@ SERVICE_HANDLERS = {
     service_name: _lazy_handler(service_config["module"]) for service_name, service_config in SERVICE_REGISTRY.items()
 }
 
+# Eager-load the CodePipeline runtime so set_executor() runs before the first
+# request. Without this, the first StartPipelineExecution hits the Tier 1
+# auto-succeed path before the orchestrator is registered.
+try:
+    import ministack.services.codepipeline_runtime  # noqa: F401
+    # Also pre-populate _loaded_modules so save_all() at shutdown captures
+    # codepipeline + codestar_connections state — they otherwise only land in
+    # _loaded_modules after the first lazy request, and shutdown may fire first.
+    _get_module("codepipeline")
+    _get_module("codestar_connections")
+    _get_module("cloudformation")
+except Exception:
+    logger.exception("CodePipeline runtime failed to load; falling back to Tier 1 stub")
+
 # Maps the on-disk persistence key to the service module name. `save_all`
 # (lifespan.shutdown) consumes this. Restore happens at module import time
 # in each service via its own `load_state()` call (see e.g. services/sqs.py);
@@ -320,6 +336,13 @@ SERVICE_HANDLERS = {
 # below. Symmetry between save and restore is enforced by
 # tests/test_persistence_symmetry.py.
 _state_map = {
+    # Persist cloudformation / codepipeline / codestar_connections FIRST so
+    # a slow lambda save (the .json can hit hundreds of MB from persisted
+    # code_zip blobs) doesn't cause the container's SIGTERM grace window to
+    # expire before they're flushed.
+    "cloudformation": "cloudformation",
+    "codepipeline": "codepipeline",
+    "codestar_connections": "codestar_connections",
     "apigateway": "apigateway", "apigateway_v1": "apigateway_v1",
     "sqs": "sqs", "sns": "sns", "ssm": "ssm",
     "secretsmanager": "secretsmanager", "iam": "iam",
@@ -333,7 +356,9 @@ _state_map = {
     "stepfunctions": "stepfunctions", "alb": "alb",
     "glue": "glue", "mwaa": "mwaa", "efs": "efs", "waf": "waf",
     "athena": "athena", "emr": "emr", "cloudfront": "cloudfront",
-    "codebuild": "codebuild", "acm": "acm", "firehose": "firehose",
+    "codebuild": "codebuild", "codepipeline": "codepipeline",
+    "codestar_connections": "codestar_connections",
+    "acm": "acm", "firehose": "firehose",
     "ses": "ses", "ses_v2": "ses_v2",
     "servicediscovery": "servicediscovery", "s3files": "s3files",
     "appconfig": "appconfig", "transfer": "transfer",
@@ -700,6 +725,51 @@ async def _handle_ses_messages_request(method: str, path: str, headers: dict, qu
     return 200, {"Content-Type": "application/json"}, json.dumps(response).encode()
 
 
+def _handle_accounts_request(method: str, path: str):
+    """`GET /_ministack/accounts` returns the set of account IDs that have
+    written any state into MiniStack so far.
+
+    Walks every live ``AccountScopedDict`` instance and unions in any
+    AssumeRole'd accounts tracked by STS. The console uses this to
+    populate the account-picker dropdown dynamically.
+    """
+    if path != "/_ministack/accounts" or method != "GET":
+        return None
+
+    try:
+        from ministack.core.responses import AccountScopedDict, _12_DIGIT_RE
+
+        accounts = set(AccountScopedDict.all_known_accounts())
+
+        # STS sessions carry the *target* account for an AssumeRole; surface
+        # those too so a freshly-assumed role doesn't disappear from the
+        # picker before any state has been written under it.
+        try:
+            from ministack.services import sts as _sts
+
+            for entry in getattr(_sts, "_sessions", {}).values():
+                arn = (entry or {}).get("Arn", "")
+                parts = arn.split(":")
+                if len(parts) >= 5 and _12_DIGIT_RE.match(parts[4]):
+                    accounts.add(parts[4])
+        except Exception:
+            # STS module unavailable — that's fine, fall back to ASD scan only.
+            pass
+
+        return (
+            200,
+            {"Content-Type": "application/json"},
+            json.dumps({"accounts": sorted(accounts)}).encode(),
+        )
+    except Exception as e:
+        logger.exception("Error listing accounts: %s", e)
+        return (
+            500,
+            {"Content-Type": "application/json"},
+            json.dumps({"message": str(e)}).encode(),
+        )
+
+
 async def _handle_pre_body_request(method: str, path: str, headers: dict, query_params: dict, request_id: str):
     """Handle fast-path routes that do not require request body parsing."""
     # OPTIONS on an execute-api host / path MUST flow through apigateway.handle_execute
@@ -726,6 +796,10 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
         return _with_data_plane_headers(response, request_id)
 
     response = await _handle_ses_messages_request(method, path, headers, query_params)
+    if response is not None:
+        return response
+
+    response = _handle_accounts_request(method, path)
     if response is not None:
         return response
 
@@ -1072,6 +1146,33 @@ def _parse_execute_api_url(host: str, path: str) -> tuple[str, str, str] | None:
     return None
 
 
+def _lookup_apigw_stages_cross_account(api_id: str) -> dict:
+    """Return the stages map for *api_id*, searching every account's store.
+
+    execute-api ids are globally unique, but an unsigned request resolves under
+    the default account while the api may be stored under another, so the
+    account-scoped view can miss it. Walk the raw `_data` of `_rest_apis` (v1)
+    and `_apis` (v2) and return the matching stages map.
+    """
+    apigw_v1 = _get_module("apigateway_v1")
+    apigw_v2 = _get_module("apigateway")
+    # v1 storage: keys are (account_id, api_id). Match by api_id only.
+    for (_acct, key), _ in apigw_v1._rest_apis._data.items():
+        if key == api_id:
+            for (sk_acct, sk_api_id), stages in apigw_v1._stages_v1._data.items():
+                if sk_api_id == api_id and sk_acct == _acct:
+                    return stages
+            return {}
+    # v2 fallback.
+    for (_acct, key), _ in apigw_v2._apis._data.items():
+        if key == api_id:
+            for (sk_acct, sk_api_id), stages in apigw_v2._stages._data.items():
+                if sk_api_id == api_id and sk_acct == _acct:
+                    return stages
+            return {}
+    return {}
+
+
 def _resolve_stage_and_path(api_id: str, tentative_stage: str, execute_path: str) -> tuple[str, str]:
     """Pick (stage, execute_path) based on the API's configured stages.
 
@@ -1087,11 +1188,7 @@ def _resolve_stage_and_path(api_id: str, tentative_stage: str, execute_path: str
         whole original path (including ``tentative_stage``) as ``execute_path``.
       - Else fall through (``handle_execute`` will return "Stage not found").
     """
-    apigw_v1 = _get_module("apigateway_v1")
-    if api_id in apigw_v1._rest_apis:
-        stages_map = apigw_v1._stages_v1.get(api_id, {})
-    else:
-        stages_map = _get_module("apigateway")._stages.get(api_id, {})
+    stages_map = _lookup_apigw_stages_cross_account(api_id)
 
     if tentative_stage in stages_map:
         return tentative_stage, execute_path
@@ -1121,17 +1218,47 @@ async def _handle_execute_api_request(
             return await _get_module("apigateway").handle_connections_api(
                 method, api_id, tentative_stage, connection_id, body, headers
             )
-        stage, execute_path = _resolve_stage_and_path(api_id, tentative_stage, execute_path)
-        if api_id in _get_module("apigateway_v1")._rest_apis:
-            return await _get_module("apigateway_v1").handle_execute(
-                api_id, stage, method, execute_path, headers, body, query_params
+
+        # Switch into the api's owning account for the dispatch. An unsigned
+        # execute-api request resolves under the default account, not the
+        # api's owner; setting the account contextvar here means downstream
+        # lookups (`_rest_apis.get`, `_stages_v1.get`, Lambda invocation) all
+        # resolve against the right account. Reset in `finally`.
+        owner_acct = _find_apigw_owner_account(api_id)
+        from ministack.core.responses import _request_account_id
+        ctx_token = None
+        if owner_acct:
+            ctx_token = _request_account_id.set(owner_acct)
+        try:
+            stage, execute_path = _resolve_stage_and_path(api_id, tentative_stage, execute_path)
+            if api_id in _get_module("apigateway_v1")._rest_apis:
+                return await _get_module("apigateway_v1").handle_execute(
+                    api_id, stage, method, execute_path, headers, body, query_params
+                )
+            return await _get_module("apigateway").handle_execute(
+                api_id, stage, execute_path, method, headers, body, query_params
             )
-        return await _get_module("apigateway").handle_execute(
-            api_id, stage, execute_path, method, headers, body, query_params
-        )
+        finally:
+            if ctx_token is not None:
+                _request_account_id.reset(ctx_token)
     except Exception as e:
         logger.exception("Error in execute-api dispatch: %s", e)
         return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
+
+
+def _find_apigw_owner_account(api_id: str) -> str | None:
+    """Return the account that owns *api_id* across the v1 and v2 stores, or
+    None if no api matches. Matching by id alone is valid: execute-api ids are
+    globally unique."""
+    apigw_v1 = _get_module("apigateway_v1")
+    for (acct, key), _ in apigw_v1._rest_apis._data.items():
+        if key == api_id:
+            return acct
+    apigw_v2 = _get_module("apigateway")
+    for (acct, key), _ in apigw_v2._apis._data.items():
+        if key == api_id:
+            return acct
+    return None
 
 
 def _is_potential_alb_request(host: str, path: str) -> bool:
@@ -1531,6 +1658,7 @@ async def app(scope, receive, send):
                 ws_headers[name.decode("latin-1").lower()] = value.decode("latin-1")
         ws_host = ws_headers.get("host", "")
         ws_path = scope.get("path", "")
+
         parsed = _parse_execute_api_url(ws_host, ws_path)
         appsync_rt_m = _APPSYNC_REALTIME_RE.match(ws_host)
         iot_ws_m = _IOT_DATA_WS_RE.search(ws_host) and _ws_has_mqtt_subprotocol(ws_headers)
@@ -1623,6 +1751,7 @@ async def app(scope, receive, send):
 
 async def _handle_lifespan(scope, receive, send):
     """Handle ASGI lifespan events."""
+    global _periodic_save_task
     while True:
         message = await receive()
         if message["type"] == "lifespan.startup":
@@ -1653,6 +1782,16 @@ async def _handle_lifespan(scope, receive, send):
             _stop_docker_containers()
             if PERSIST_STATE:
                 _load_persisted_state()
+            # Pre-bootstrap CDK accounts from MINISTACK_BOOTSTRAP_ACCOUNTS so
+            # `cdk deploy` against MiniStack doesn't need a per-project
+            # bootstrap script. Runs AFTER _load_persisted_state so a restart
+            # doesn't clobber values restored from disk. No-op when the env
+            # is unset.
+            try:
+                from ministack.core.bootstrap import bootstrap_cdk_accounts
+                bootstrap_cdk_accounts()
+            except Exception as e:
+                logger.warning("CDK bootstrap startup hook failed: %s", e)
             # Start the Transfer Family SFTP listener after persistence is
             # loaded (so any restored Transfer servers/users are visible to
             # the SSH auth callback). When the user opts out via
@@ -1686,15 +1825,17 @@ async def _handle_lifespan(scope, receive, send):
             for svc in SERVICE_HANDLERS:
                 logger.debug("%s init completed.", svc.capitalize())
             asyncio.create_task(_run_ready_scripts())
+            interval = _persist_interval()
+            if PERSIST_STATE and interval > 0:
+                _periodic_save_task = asyncio.create_task(_periodic_save(interval))
+                logger.info("Persistence: periodic save every %ds", interval)
         elif message["type"] == "lifespan.shutdown":
             logger.info("MiniStack shutting down...")
+            if _periodic_save_task is not None:
+                _periodic_save_task.cancel()
             if PERSIST_STATE:
-                # Only save state for modules that were actually loaded
-                save_dict = {}
-                for key, mod_name in _state_map.items():
-                    if mod_name in _loaded_modules:
-                        save_dict[key] = _loaded_modules[mod_name].get_state
-                save_all(save_dict)
+                # save_all holds a lock, so this waits for an in-flight periodic save.
+                save_all(_build_save_dict("shutdown"))
             try:
                 from ministack.services import transfer
 
@@ -1736,6 +1877,49 @@ def _stop_docker_containers():
                     pass
         except Exception:
             pass
+
+
+_periodic_save_task = None
+
+
+def _persist_interval() -> int:
+    try:
+        return int(os.environ.get("MINISTACK_PERSIST_INTERVAL", "0"))
+    except ValueError:
+        logger.warning("MINISTACK_PERSIST_INTERVAL is not an integer; periodic save is off")
+        return 0
+
+
+def _build_save_dict(context: str) -> dict:
+    # Persist EVERY service in the state map, not just the ones touched this
+    # session. Force-load any module that wasn't loaded so its
+    # (restored-at-import) state round-trips back to disk. Without this, a
+    # service that was populated in a prior session but untouched in this one
+    # would silently lose its state file, causing drift between
+    # CloudFormation's stack records and the underlying resource services
+    # (e.g. a CDKToolkit stack surviving while its SSM bootstrap param
+    # vanishes).
+    save_dict = {}
+    for key, mod_name in _state_map.items():
+        try:
+            mod = _get_module(mod_name)
+            if hasattr(mod, "get_state"):
+                save_dict[key] = mod.get_state
+        except Exception:
+            logger.exception("%s: could not load %s for save", context, mod_name)
+    return save_dict
+
+
+async def _periodic_save(interval: int) -> None:
+    # Off the event loop: the Lambda state alone can take seconds to encode. A
+    # module mutated mid-encode fails that one file, which keeps its previous
+    # copy and is retried next round.
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await asyncio.to_thread(save_all, _build_save_dict("periodic save"))
+        except Exception:
+            logger.exception("Persistence: periodic save failed")
 
 
 def _load_persisted_state():
@@ -1914,14 +2098,23 @@ def _reset_all_state():
 
     module_names = {cfg["module"] for cfg in SERVICE_REGISTRY.values()}
     module_names.update(_extra_reset_modules)
+    # cloudformation isn't in SERVICE_REGISTRY's module set under that exact
+    # name in all paths; ensure it's reset too.
+    module_names.add("cloudformation")
 
     for mod_name in module_names:
-        if mod_name in _loaded_modules:
-            mod = _loaded_modules[mod_name]
-            try:
+        # Force-load the module before resetting. Persistence restores a
+        # module's in-memory state at import time (provisioners import
+        # codebuild/codepipeline/etc. at startup), so a module can hold state
+        # WITHOUT being in the app's lazy-load cache. Resetting only
+        # _loaded_modules would leave that restored state intact — e.g. a
+        # CodeBuild project surviving reset and colliding on the next deploy.
+        try:
+            mod = _get_module(mod_name)
+            if hasattr(mod, "reset"):
                 mod.reset()
-            except Exception as e:
-                logger.warning("reset() failed for %s: %s", mod_name, e)
+        except Exception as e:
+            logger.warning("reset() failed for %s: %s", mod_name, e)
 
     S3_DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")
     S3_PERSIST = os.environ.get("S3_PERSIST", "0") == "1"

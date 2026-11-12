@@ -564,7 +564,7 @@ def _put_item(data):
         if not _evaluate_expected(old_item or {}, expected, data.get("ConditionalOperator", "AND")):
             return _conditional_check_failed(data, old_item)
 
-    table["items"][pk_val][sk_val] = item
+    table["items"].setdefault(pk_val, {})[sk_val] = item
     _update_counts(table)
 
     event_name = "MODIFY" if old_item else "INSERT"
@@ -674,7 +674,7 @@ def _update_item(data):
         except _AttributeUpdatesValidationError as exc:
             return error_response_json("ValidationException", str(exc), 400)
 
-    table["items"][pk_val][sk_val] = item
+    table["items"].setdefault(pk_val, {})[sk_val] = item
     _update_counts(table)
 
     event_name = "MODIFY" if old_item else "INSERT"
@@ -924,7 +924,7 @@ def _partiql_insert(table, parsed):
     if pk_val in table["items"] and sk_val in table["items"][pk_val]:
         return error_response_json("ConditionalCheckFailedException",
                                    "Duplicate primary key exists in table", 400)
-    table["items"][pk_val][sk_val] = item
+    table["items"].setdefault(pk_val, {})[sk_val] = item
     return json_response({})
 
 
@@ -1231,7 +1231,7 @@ def _batch_write_item(data):
                 if key_err:
                     return key_err
                 old_item = table["items"].get(pk_val, {}).get(sk_val)
-                table["items"][pk_val][sk_val] = item
+                table["items"].setdefault(pk_val, {})[sk_val] = item
                 _emit_stream_event(table_name, "MODIFY" if old_item else "INSERT", old_item, item)
             elif "DeleteRequest" in req:
                 key = req["DeleteRequest"]["Key"]
@@ -1330,7 +1330,7 @@ def _transact_write_items(data):
             pk_val = _extract_key_val(item.get(tbl["pk_name"]))
             sk_val = _extract_key_val(item.get(tbl["sk_name"])) if tbl["sk_name"] else "__no_sort__"
             old_item = tbl["items"].get(pk_val, {}).get(sk_val)
-            tbl["items"][pk_val][sk_val] = item
+            tbl["items"].setdefault(pk_val, {})[sk_val] = item
             _emit_stream_event(table_name, "MODIFY" if old_item else "INSERT", old_item, item)
         elif op_type == "Delete":
             key = op["Key"]
@@ -1349,7 +1349,7 @@ def _transact_write_items(data):
             ue = op.get("UpdateExpression", "")
             if ue:
                 item = _apply_update_expression(item, ue, op.get("ExpressionAttributeValues", {}), op.get("ExpressionAttributeNames", {}))
-            tbl["items"][pk_val][sk_val] = item
+            tbl["items"].setdefault(pk_val, {})[sk_val] = item
             _emit_stream_event(table_name, "MODIFY" if old_item else "INSERT", old_item, item)
         _update_counts(tbl)
 

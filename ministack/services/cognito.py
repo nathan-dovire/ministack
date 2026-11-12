@@ -607,6 +607,14 @@ def _user_from_token(token: str, pool: dict):
 
 def _resolve_pool(pool_id: str):
     pool = _user_pools.get(pool_id)
+    if pool is None:
+        # Look the pool up across all accounts. Pool IDs are globally unique,
+        # but unsigned callers resolve under the default account while the pool
+        # may be stored under another, so the account-scoped get can miss it.
+        for (_acct, pid), candidate in _user_pools._data.items():
+            if pid == pool_id:
+                pool = candidate
+                break
     if not pool:
         return None, error_response_json(
             "ResourceNotFoundException",
@@ -817,7 +825,23 @@ def _qp(query_params: dict, key: str, default: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 async def handle_request(method, path, headers, body, query_params):
-    """Unified entry point — dispatches to IDP or Identity based on target prefix."""
+    """Unified entry point — dispatches to IDP or Identity based on target prefix.
+
+    Runs the synchronous Cognito handlers on a worker thread so lifecycle
+    triggers can fire Lambdas that issue SDK callbacks (SecretsManager,
+    EventBridge, …) back to this same MiniStack instance. The Lambda
+    invocation is itself synchronous, so without `asyncio.to_thread` the
+    ASGI event loop is blocked for the full Lambda duration and the
+    callbacks deadlock until the trigger times out at 60 s. APIGW v1/v2
+    and direct `lambda invoke` already use the same pattern (see
+    `lambda_svc.py:1642`, `apigateway_v1.py:528`, `apigateway.py:1002`)."""
+    import asyncio as _asyncio
+    return await _asyncio.to_thread(
+        _handle_request_sync, method, path, headers, body, query_params
+    )
+
+
+def _handle_request_sync(method, path, headers, body, query_params):
     target = headers.get("x-amz-target", "")
 
     # Path-based endpoints (form-encoded or no body — must run before JSON parse)
@@ -858,6 +882,7 @@ def _dispatch_idp(action: str, data: dict):
         "DescribeUserPool": _describe_user_pool,
         "ListUserPools": _list_user_pools,
         "UpdateUserPool": _update_user_pool,
+        "AddCustomAttributes": _add_custom_attributes,
         # User Pool Client CRUD
         "CreateUserPoolClient": _create_user_pool_client,
         "DeleteUserPoolClient": _delete_user_pool_client,
@@ -1048,6 +1073,28 @@ def _describe_user_pool(data):
     return json_response({"UserPool": _pool_out(pool)})
 
 
+def _add_custom_attributes(data):
+    """Append custom attributes to an existing pool's schema. Idempotent-ish:
+    re-adding an existing attribute name is a no-op rather than an error."""
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return err
+    schema = pool.setdefault("Schema", [])
+    existing = {a.get("Name") for a in schema}
+    for attr in data.get("CustomAttributes", []):
+        name = attr.get("Name")
+        # Tolerate both "uuid" and an already-"custom:uuid" form.
+        bare = name[len("custom:"):] if isinstance(name, str) and name.startswith("custom:") else name
+        if bare and bare not in existing and f"custom:{bare}" not in existing:
+            entry = dict(attr)
+            entry["Name"] = bare
+            schema.append(entry)
+            existing.add(bare)
+    pool["LastModifiedDate"] = _now_epoch()
+    return json_response({})
+
+
 def _list_user_pools(data):
     max_results = min(data.get("MaxResults", 60), 60)
     next_token = data.get("NextToken")
@@ -1086,8 +1133,38 @@ def _update_user_pool(data):
     return json_response({})
 
 
+# Cognito's reserved standard attributes. Anything else declared in a pool's
+# schema is a custom attribute and is surfaced (by DescribeUserPool) with a
+# "custom:" prefix on its Name.
+_STANDARD_POOL_ATTRS = frozenset({
+    "address", "birthdate", "email", "email_verified", "family_name", "gender",
+    "given_name", "locale", "middle_name", "name", "nickname", "phone_number",
+    "phone_number_verified", "picture", "preferred_username", "profile", "sub",
+    "updated_at", "website", "zoneinfo",
+})
+
+
+def _schema_attributes_out(schema):
+    """Render a pool's stored `Schema` (CreateUserPool input) as the
+    `SchemaAttributes` shape DescribeUserPool returns — custom attributes get
+    the `custom:` prefix on Name (unless already prefixed)."""
+    out = []
+    for attr in schema or []:
+        a = dict(attr)
+        name = a.get("Name", "")
+        if name and ":" not in name and name not in _STANDARD_POOL_ATTRS:
+            a["Name"] = "custom:" + name
+        out.append(a)
+    return out
+
+
 def _pool_out(pool: dict) -> dict:
-    return {k: v for k, v in pool.items() if not k.startswith("_")}
+    out = {k: v for k, v in pool.items() if not k.startswith("_")}
+    # The AWS API key is SchemaAttributes (output), not Schema (input).
+    schema = out.pop("Schema", None)
+    if schema is not None:
+        out["SchemaAttributes"] = _schema_attributes_out(schema)
+    return out
 
 
 # ===========================================================================
@@ -1455,12 +1532,29 @@ def _admin_create_user(data):
         "_groups": [],
         "_tokens": [],
     }
+    # PreSignUp_AdminCreateUser runs synchronously and may auto-confirm /
+    # auto-verify attributes; PostConfirmation then fires if the user is now
+    # CONFIRMED. Matches real-Cognito ordering for the admin path.
+    # Real Cognito forwards the AdminCreateUser ClientMetadata (and
+    # ValidationData) to the PreSignUp trigger; mirror that so triggers can
+    # branch on it (e.g. a flag suppressing async workflows).
+    presu_resp = _fire_lifecycle_trigger(
+        pool, pid, "PreSignUp", "PreSignUp_AdminCreateUser", user,
+        extra_request={
+            "clientMetadata": data.get("ClientMetadata", {}),
+            "validationData": _attr_list_to_dict(data.get("ValidationData", [])),
+        })
+    _apply_pre_signup_response(user, presu_resp)
     pool["_users"][username] = user
     pool["EstimatedNumberOfUsers"] = len(pool["_users"])
     logger.info("Cognito: AdminCreateUser %s in pool %s", username, pid)
 
     if message_action != "SUPPRESS" and _wants_email_delivery(data):
         _send_invitation_email(pool, username, temp_password, attr_dict)
+
+    if user["UserStatus"] == "CONFIRMED":
+        _fire_lifecycle_trigger(
+            pool, pid, "PostConfirmation", "PostConfirmation_ConfirmSignUp", user)
 
     return json_response({"User": _user_out(user)})
 
@@ -1575,6 +1669,8 @@ def _admin_confirm_sign_up(data):
         return err
     user["UserStatus"] = "CONFIRMED"
     user["UserLastModifiedDate"] = _now_epoch()
+    _fire_lifecycle_trigger(
+        pool, pid, "PostConfirmation", "PostConfirmation_ConfirmSignUp", user)
     return json_response({})
 
 
@@ -1628,11 +1724,8 @@ def _resend_confirmation_code(data):
     cid = data.get("ClientId")
     username = data.get("Username")
 
-    pool = None
-    for p in _user_pools.values():
-        if cid in p["_clients"]:
-            pool = p
-            break
+    # Cross-account client-id resolution (see _find_pool_by_client_id).
+    _pid, pool, _ = _find_pool_by_client_id(cid)
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
 
@@ -1775,6 +1868,374 @@ def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = ""
     }
 
 
+# ===========================================================================
+# CUSTOM_AUTH challenge orchestration
+# ===========================================================================
+#
+# Real Cognito drives the CUSTOM_AUTH flow through three Lambda triggers
+# configured on the pool's LambdaConfig: DefineAuthChallenge,
+# CreateAuthChallenge, and VerifyAuthChallengeResponse. We invoke them the
+# same way _apply_pretoken_trigger above invokes PreTokenGeneration.
+#
+# Session state across the InitiateAuth → RespondToAuthChallenge round-trip
+# is held in _custom_auth_sessions, keyed by an opaque Session token that
+# we issue to the client and require back on the response.
+
+_custom_auth_sessions: dict[str, dict] = {}
+
+
+def _invoke_cognito_trigger(pool: dict, trigger_name: str, event: dict) -> dict:
+    """Invoke a Cognito Lambda trigger configured on the user pool and return
+    the parsed ``response`` block from the Lambda's payload.
+
+    Unlike PreTokenGeneration (where a Lambda failure is silently ignored and
+    the unmodified token is still issued), CUSTOM_AUTH triggers are load-bearing
+    — a missing or broken Lambda means the flow is unimplemented. Raises on
+    failure so callers can return a clean InvalidLambdaResponseException.
+    """
+    cfg = pool.get("LambdaConfig") or {}
+    arn = cfg.get(trigger_name)
+    if not arn:
+        raise RuntimeError(f"User pool has no {trigger_name} Lambda configured.")
+
+    from ministack.services import lambda_svc
+    from ministack.core.responses import _request_account_id
+    name, qualifier = lambda_svc._resolve_name_and_qualifier(arn)
+    # Trigger ARNs carry the Lambda's owning account (e.g. 222222222222).
+    # The current request may be unsigned (e.g. a SignUp/ConfirmSignUp
+    # forwarded by a proxy Lambda) and would otherwise look the function up
+    # under account `000000000000` and miss.
+    # Switch into the ARN's account just for the Lambda lookup + execute.
+    ctx_token = None
+    if isinstance(arn, str) and arn.startswith("arn:aws:lambda:"):
+        try:
+            _arn_acct = arn.split(":", 5)[4]
+            if _arn_acct.isdigit() and len(_arn_acct) == 12:
+                ctx_token = _request_account_id.set(_arn_acct)
+        except (IndexError, AttributeError):
+            pass
+    try:
+        record, _alias = lambda_svc._get_func_record_for_qualifier(name, qualifier)
+        if record is None:
+            raise RuntimeError(f"{trigger_name} Lambda not found: {arn}")
+        result = lambda_svc._execute_function(record, event)
+    finally:
+        if ctx_token is not None:
+            _request_account_id.reset(ctx_token)
+    if isinstance(result, dict) and result.get("error"):
+        raise RuntimeError(f"{trigger_name} returned error: {result.get('body')}")
+
+    payload = result.get("body") if isinstance(result, dict) else result
+    if isinstance(payload, (bytes, bytearray)):
+        payload = payload.decode("utf-8", errors="replace")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"{trigger_name} returned non-JSON body: {exc}")
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"{trigger_name} returned unexpected payload type {type(payload).__name__}"
+        )
+
+    return payload.get("response") if isinstance(payload.get("response"), dict) else payload
+
+
+def _custom_auth_event_base(pool_id: str, client_id: str, user: dict) -> dict:
+    """Common envelope shared by all three CUSTOM_AUTH trigger payloads."""
+    return {
+        "version": "1",
+        "region": get_region(),
+        "userPoolId": pool_id,
+        "userName": user.get("Username", ""),
+        "callerContext": {"awsSdkVersion": "ministack", "clientId": client_id or ""},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle triggers (PreSignUp / PostConfirmation / UserMigration / …)
+#
+# Real Cognito invokes the Lambda configured at each `LambdaConfig.<slot>` at
+# the matching point in the user lifecycle, with a `triggerSource` like
+# `PreSignUp_SignUp` or `PostConfirmation_ConfirmSignUp`. The CUSTOM_AUTH
+# triggers above already use `_invoke_cognito_trigger`; these helpers extend
+# the same mechanism to the rest of the lifecycle so chains like
+# Cognito → PostConfirmation Lambda → EventBridge → StepFunctions actually
+# fire on MiniStack.
+# ---------------------------------------------------------------------------
+
+def _lifecycle_event_base(pool_id: str, user: dict, *, client_id: str = "") -> dict:
+    attrs = user.get("Attributes", [])
+    attr_dict = _attr_list_to_dict(attrs) if isinstance(attrs, list) else dict(attrs or {})
+    return {
+        "version": "1",
+        "region": get_region(),
+        "userPoolId": pool_id,
+        "userName": user.get("Username", ""),
+        "callerContext": {"awsSdkVersion": "ministack", "clientId": client_id or ""},
+        "request": {
+            "userAttributes": attr_dict,
+            "clientMetadata": {},
+        },
+        "response": {},
+    }
+
+
+def _fire_lifecycle_trigger(pool: dict, pool_id: str, trigger_name: str,
+                              trigger_source: str, user: dict, *,
+                              client_id: str = "", extra_request: dict = None,
+                              raise_on_error: bool = False) -> dict:
+    """Invoke a lifecycle trigger Lambda (PreSignUp / PostConfirmation /
+    UserMigration / Pre/PostAuthentication / …) if one is configured on the
+    pool, returning its `response` block. Lifecycle triggers are fire-and-log:
+    a missing or broken Lambda must not break the API call (the others are
+    best-effort). The exception is PreSignUp, where real Cognito surfaces a
+    UserLambdaValidationException to the caller — pass raise_on_error=True so
+    the SignUp path can translate the failure into that error."""
+    cfg = pool.get("LambdaConfig") or {}
+    arn = cfg.get(trigger_name)
+    if not arn:
+        return {}
+    logger.info("Cognito: firing %s (%s) on pool %s -> %s",
+                trigger_name, trigger_source, pool_id, arn)
+    event = _lifecycle_event_base(pool_id, user, client_id=client_id)
+    event["triggerSource"] = trigger_source
+    if extra_request:
+        event["request"].update(extra_request)
+    try:
+        return _invoke_cognito_trigger(pool, trigger_name, event) or {}
+    except Exception as exc:
+        logger.warning("Cognito %s (%s) trigger failed: %s",
+                       trigger_name, trigger_source, exc)
+        if raise_on_error:
+            raise
+        return {}
+
+
+def _apply_pre_signup_response(user: dict, response: dict) -> None:
+    """A PreSignUp Lambda may auto-confirm the user or auto-verify
+    email/phone. Mirror the real-AWS semantics so the rest of the flow
+    (e.g. PostConfirmation chaining) lands on the right state."""
+    if not response:
+        return
+    if response.get("autoConfirmUser"):
+        user["UserStatus"] = "CONFIRMED"
+    attr_dict = _attr_list_to_dict(user.get("Attributes", []))
+    dirty = False
+    if response.get("autoVerifyEmail") and "email" in attr_dict:
+        attr_dict["email_verified"] = "true"; dirty = True
+    if response.get("autoVerifyPhone") and "phone_number" in attr_dict:
+        attr_dict["phone_number_verified"] = "true"; dirty = True
+    if dirty:
+        user["Attributes"] = _dict_to_attr_list(attr_dict)
+
+
+def _try_user_migration(pool: dict, pool_id: str, client_id: str, username: str,
+                        password: str,
+                        trigger_source: str = "UserMigration_Authentication"):
+    """Real Cognito invokes the pool's UserMigration Lambda when auth references
+    a user that doesn't exist in the pool. If the Lambda returns userAttributes,
+    Cognito creates (migrates) that user and lets the original flow proceed.
+
+    Returns the newly-created user dict on success, or None when no trigger is
+    configured or the Lambda declines/errors (caller then returns the original
+    UserNotFound/NotAuthorized error)."""
+    cfg = pool.get("LambdaConfig") or {}
+    if not cfg.get("UserMigration"):
+        return None
+    event = {
+        "version": "1",
+        "region": get_region(),
+        "userPoolId": pool_id,
+        "userName": username,
+        "callerContext": {"awsSdkVersion": "ministack", "clientId": client_id or ""},
+        "triggerSource": trigger_source,
+        "request": {
+            "password": password or "",
+            "validationData": {},
+            "clientMetadata": {},
+        },
+        "response": {},
+    }
+    try:
+        resp = _invoke_cognito_trigger(pool, "UserMigration", event) or {}
+    except Exception as exc:
+        logger.warning("Cognito UserMigration (%s) trigger failed: %s",
+                       trigger_source, exc)
+        return None
+    user_attrs = resp.get("userAttributes")
+    if not user_attrs:
+        return None
+    # The Lambda may send booleans (e.g. email_verified) — Cognito attrs are strings.
+    attr_dict = {k: ("true" if v is True else "false" if v is False else str(v))
+                 for k, v in dict(user_attrs).items()}
+    if "sub" not in attr_dict:
+        attr_dict["sub"] = new_uuid()
+    now = _now_epoch()
+    user = {
+        "Username": username,
+        "Attributes": _dict_to_attr_list(attr_dict),
+        "UserCreateDate": now,
+        "UserLastModifiedDate": now,
+        "Enabled": True,
+        "UserStatus": resp.get("finalUserStatus") or "CONFIRMED",
+        "MFAOptions": [],
+        "_password": password or "",
+        "_groups": [],
+        "_tokens": [],
+    }
+    pool["_users"][username] = user
+    pool["EstimatedNumberOfUsers"] = len(pool["_users"])
+    logger.info("Cognito: migrated user %s into pool %s via UserMigration",
+                username, pool_id)
+    return user
+
+
+def _build_define_auth_event(pool_id: str, client_id: str, user: dict,
+                              session_history: list[dict]) -> dict:
+    event = _custom_auth_event_base(pool_id, client_id, user)
+    event["triggerSource"] = "DefineAuthChallenge_Authentication"
+    event["request"] = {
+        "userAttributes": _attr_list_to_dict(user.get("Attributes", [])),
+        "session": session_history,
+        "clientMetadata": {},
+        "userNotFound": False,
+    }
+    event["response"] = {
+        "challengeName": None,
+        "issueTokens": False,
+        "failAuthentication": False,
+    }
+    return event
+
+
+def _build_create_auth_event(pool_id: str, client_id: str, user: dict,
+                              session_history: list[dict], challenge_name: str) -> dict:
+    event = _custom_auth_event_base(pool_id, client_id, user)
+    event["triggerSource"] = "CreateAuthChallenge_Authentication"
+    event["request"] = {
+        "userAttributes": _attr_list_to_dict(user.get("Attributes", [])),
+        "challengeName": challenge_name,
+        "session": session_history,
+        "clientMetadata": {},
+        "userNotFound": False,
+    }
+    event["response"] = {
+        "publicChallengeParameters": {},
+        "privateChallengeParameters": {},
+        "challengeMetadata": "",
+    }
+    return event
+
+
+def _build_verify_auth_event(pool_id: str, client_id: str, user: dict,
+                              private_params: dict, answer: str) -> dict:
+    event = _custom_auth_event_base(pool_id, client_id, user)
+    event["triggerSource"] = "VerifyAuthChallengeResponse_Authentication"
+    event["request"] = {
+        "userAttributes": _attr_list_to_dict(user.get("Attributes", [])),
+        "privateChallengeParameters": private_params or {},
+        "challengeAnswer": answer or "",
+        "clientMetadata": {},
+        "userNotFound": False,
+    }
+    event["response"] = {"answerCorrect": False}
+    return event
+
+
+def _start_custom_auth(pool: dict, pool_id: str, client_id: str, user: dict):
+    """First Define→Create round; returns the response shape for InitiateAuth."""
+    define = _invoke_cognito_trigger(
+        pool, "DefineAuthChallenge",
+        _build_define_auth_event(pool_id, client_id, user, []),
+    )
+    if define.get("failAuthentication"):
+        return error_response_json("NotAuthorizedException", "Authentication failed.", 400)
+    if define.get("issueTokens"):
+        # Spec allows a Lambda to short-circuit and issue tokens immediately. Rare but supported.
+        return json_response({"AuthenticationResult": _build_auth_result(pool_id, client_id, user)})
+    challenge_name = define.get("challengeName") or "CUSTOM_CHALLENGE"
+
+    create = _invoke_cognito_trigger(
+        pool, "CreateAuthChallenge",
+        _build_create_auth_event(pool_id, client_id, user, [], challenge_name),
+    )
+    public_params = create.get("publicChallengeParameters") or {}
+    private_params = create.get("privateChallengeParameters") or {}
+    metadata = create.get("challengeMetadata") or ""
+
+    session = base64.b64encode(secrets.token_bytes(32)).decode()
+    _custom_auth_sessions[session] = {
+        "pool_id": pool_id,
+        "client_id": client_id,
+        "username": user.get("Username"),
+        "history": [],
+        "challenge_name": challenge_name,
+        "private_params": private_params,
+        "metadata": metadata,
+    }
+    return json_response({
+        "ChallengeName": challenge_name,
+        "Session": session,
+        "ChallengeParameters": {k: str(v) for k, v in public_params.items()},
+    })
+
+
+def _respond_custom_auth(pool: dict, session_token: str, answer: str):
+    """Verify→Define (→optional Create) round for RespondToAuthChallenge."""
+    state = _custom_auth_sessions.get(session_token)
+    if not state:
+        return error_response_json("NotAuthorizedException", "Invalid session.", 400)
+
+    pool_id = state["pool_id"]
+    client_id = state["client_id"]
+    user, _err = _resolve_user(pool, state["username"])
+    if _err:
+        return _err
+
+    verify = _invoke_cognito_trigger(
+        pool, "VerifyAuthChallengeResponse",
+        _build_verify_auth_event(pool_id, client_id, user, state["private_params"], answer),
+    )
+    answer_correct = bool(verify.get("answerCorrect"))
+
+    state["history"].append({
+        "challengeName": state["challenge_name"],
+        "challengeResult": answer_correct,
+        "challengeMetadata": state["metadata"],
+    })
+
+    define = _invoke_cognito_trigger(
+        pool, "DefineAuthChallenge",
+        _build_define_auth_event(pool_id, client_id, user, state["history"]),
+    )
+
+    if define.get("failAuthentication"):
+        _custom_auth_sessions.pop(session_token, None)
+        return error_response_json("NotAuthorizedException", "Authentication failed.", 400)
+
+    if define.get("issueTokens"):
+        _custom_auth_sessions.pop(session_token, None)
+        return json_response({"AuthenticationResult": _build_auth_result(pool_id, client_id, user)})
+
+    # Another challenge — issue the next one.
+    next_challenge = define.get("challengeName") or "CUSTOM_CHALLENGE"
+    create = _invoke_cognito_trigger(
+        pool, "CreateAuthChallenge",
+        _build_create_auth_event(pool_id, client_id, user, state["history"], next_challenge),
+    )
+    public_params = create.get("publicChallengeParameters") or {}
+    state["challenge_name"] = next_challenge
+    state["private_params"] = create.get("privateChallengeParameters") or {}
+    state["metadata"] = create.get("challengeMetadata") or ""
+
+    return json_response({
+        "ChallengeName": next_challenge,
+        "Session": session_token,  # state mutated in place; reuse the same token
+        "ChallengeParameters": {k: str(v) for k, v in public_params.items()},
+    })
+
+
 def _admin_initiate_auth(data):
     pid = data.get("UserPoolId")
     cid = data.get("ClientId")
@@ -1787,12 +2248,26 @@ def _admin_initiate_auth(data):
     auth_flow = data.get("AuthFlow", "")
     auth_params = data.get("AuthParameters", {})
 
+    if auth_flow == "CUSTOM_AUTH":
+        username = auth_params.get("USERNAME")
+        user, _err = _resolve_user(pool, username)
+        if _err:
+            return _err
+        if not user.get("Enabled", True):
+            return error_response_json("NotAuthorizedException", "User is disabled.", 400)
+        try:
+            return _start_custom_auth(pool, pid, cid, user)
+        except RuntimeError as exc:
+            return error_response_json("InvalidLambdaResponseException", str(exc), 400)
+
     if auth_flow in ("ADMIN_USER_PASSWORD_AUTH", "ADMIN_NO_SRP_AUTH"):
         username = auth_params.get("USERNAME")
         password = auth_params.get("PASSWORD")
         user, _err = _resolve_user(pool, username)
         if _err:
-            return _err
+            user = _try_user_migration(pool, pid, cid, username, password)
+            if not user:
+                return _err
         if not user.get("Enabled", True):
             return error_response_json("NotAuthorizedException", "User is disabled.", 400)
         if user.get("_password") and user["_password"] != password:
@@ -1842,6 +2317,14 @@ def _admin_respond_to_auth_challenge(data):
     challenge_name = data.get("ChallengeName", "")
     responses = data.get("ChallengeResponses", {})
 
+    if challenge_name == "CUSTOM_CHALLENGE":
+        session_token = data.get("Session", "")
+        answer = responses.get("ANSWER", "")
+        try:
+            return _respond_custom_auth(pool, session_token, answer)
+        except RuntimeError as exc:
+            return error_response_json("InvalidLambdaResponseException", str(exc), 400)
+
     if challenge_name == "NEW_PASSWORD_REQUIRED":
         username = responses.get("USERNAME")
         new_password = responses.get("NEW_PASSWORD")
@@ -1887,22 +2370,36 @@ def _initiate_auth(data):
     auth_params = data.get("AuthParameters", {})
 
     # Find pool by client id
-    pool = None
-    pid = None
-    for p_id, p in _user_pools.items():
-        if cid in p["_clients"]:
-            pool = p
-            pid = p_id
-            break
+    # Resolve cross-account by client id: in AWS a ClientId globally
+    # identifies its pool, and the SDK call carries no account. Account-scoped
+    # iteration (_user_pools.items()) would miss a pool whose owning account
+    # differs from the request's resolved credential account (common when CDK
+    # deploys the pool under one account and the test/proxy calls from
+    # another). _find_pool_by_client_id searches every account.
+    pid, pool, _ = _find_pool_by_client_id(cid)
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
+
+    if auth_flow == "CUSTOM_AUTH":
+        username = auth_params.get("USERNAME")
+        user, _err = _resolve_user(pool, username)
+        if _err:
+            return _err
+        if not user.get("Enabled", True):
+            return error_response_json("NotAuthorizedException", "User is disabled.", 400)
+        try:
+            return _start_custom_auth(pool, pid, cid, user)
+        except RuntimeError as exc:
+            return error_response_json("InvalidLambdaResponseException", str(exc), 400)
 
     if auth_flow in ("USER_PASSWORD_AUTH",):
         username = auth_params.get("USERNAME")
         password = auth_params.get("PASSWORD")
         user, _err = _resolve_user(pool, username)
         if _err:
-            return _err
+            user = _try_user_migration(pool, pid, cid, username, password)
+            if not user:
+                return _err
         if not user.get("Enabled", True):
             return error_response_json("NotAuthorizedException", "User is disabled.", 400)
         if user.get("_password") and user["_password"] != password:
@@ -1960,15 +2457,23 @@ def _respond_to_auth_challenge(data):
     challenge_name = data.get("ChallengeName", "")
     responses = data.get("ChallengeResponses", {})
 
-    pool = None
-    pid = None
-    for p_id, p in _user_pools.items():
-        if cid in p["_clients"]:
-            pool = p
-            pid = p_id
-            break
+    # Resolve cross-account by client id: in AWS a ClientId globally
+    # identifies its pool, and the SDK call carries no account. Account-scoped
+    # iteration (_user_pools.items()) would miss a pool whose owning account
+    # differs from the request's resolved credential account (common when CDK
+    # deploys the pool under one account and the test/proxy calls from
+    # another). _find_pool_by_client_id searches every account.
+    pid, pool, _ = _find_pool_by_client_id(cid)
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
+
+    if challenge_name == "CUSTOM_CHALLENGE":
+        session_token = data.get("Session", "")
+        answer = responses.get("ANSWER", "")
+        try:
+            return _respond_custom_auth(pool, session_token, answer)
+        except RuntimeError as exc:
+            return error_response_json("InvalidLambdaResponseException", str(exc), 400)
 
     if challenge_name in ("NEW_PASSWORD_REQUIRED", "PASSWORD_VERIFIER"):
         username = responses.get("USERNAME")
@@ -2011,13 +2516,13 @@ def _sign_up(data):
     username = data.get("Username")
     password = data.get("Password", "")
 
-    pool = None
-    pid = None
-    for p_id, p in _user_pools.items():
-        if cid in p["_clients"]:
-            pool = p
-            pid = p_id
-            break
+    # Resolve cross-account by client id: in AWS a ClientId globally
+    # identifies its pool, and the SDK call carries no account. Account-scoped
+    # iteration (_user_pools.items()) would miss a pool whose owning account
+    # differs from the request's resolved credential account (common when CDK
+    # deploys the pool under one account and the test/proxy calls from
+    # another). _find_pool_by_client_id searches every account.
+    pid, pool, _ = _find_pool_by_client_id(cid)
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
     if username in pool["_users"]:
@@ -2030,36 +2535,59 @@ def _sign_up(data):
     now = _now_epoch()
     attrs = data.get("UserAttributes", [])
     attr_dict = _attr_list_to_dict(attrs)
+    # Real Cognito infers the `email` attribute from the username for pools that
+    # use email as the sign-in alias, so a sign-up still triggers verification
+    # delivery even when the client passes no explicit email attribute (a client signUp
+    # may send only `locale`). Mirror that so the verification email is sent.
+    if "email" not in attr_dict and "@" in username:
+        attr_dict["email"] = username
     if "sub" not in attr_dict:
         attr_dict["sub"] = new_uuid()
     attrs = _dict_to_attr_list(attr_dict)
 
-    # SignUp always creates UNCONFIRMED — ConfirmSignUp (or AdminConfirmSignUp) confirms the account.
-    # AutoVerifiedAttributes only auto-verifies those attributes (e.g. email), not the account itself.
-    # Auto-confirming accounts requires a pre-signup Lambda trigger, which we don't emulate.
-    status = "UNCONFIRMED"
-
+    # SignUp creates UNCONFIRMED by default; a PreSignUp Lambda may return
+    # `autoConfirmUser=true` (and `autoVerifyEmail/Phone`) to skip the
+    # confirmation step entirely — see _apply_pre_signup_response. When the
+    # Lambda auto-confirms, PostConfirmation_ConfirmSignUp fires right after.
     user = {
         "Username": username,
         "Attributes": attrs,
         "UserCreateDate": now,
         "UserLastModifiedDate": now,
         "Enabled": True,
-        "UserStatus": status,
+        "UserStatus": "UNCONFIRMED",
         "MFAOptions": [],
         "_password": password,
         "_groups": [],
         "_tokens": [],
         "_confirmation_code": "123456",
     }
+    # PreSignUp is the one trigger real Cognito surfaces to the caller: a Lambda
+    # error (e.g. the trigger rejecting a sign-up that clashes with an existing
+    # user) becomes a UserLambdaValidationException rather than a silent success.
+    try:
+        presu_resp = _fire_lifecycle_trigger(
+            pool, pid, "PreSignUp", "PreSignUp_SignUp", user, client_id=cid,
+            raise_on_error=True)
+    except Exception as exc:
+        return error_response_json(
+            "UserLambdaValidationException",
+            f"PreSignUp failed with error {exc}.", 400)
+    _apply_pre_signup_response(user, presu_resp)
     pool["_users"][username] = user
     pool["EstimatedNumberOfUsers"] = len(pool["_users"])
 
+    confirmed = user["UserStatus"] == "CONFIRMED"
+    if confirmed:
+        _fire_lifecycle_trigger(
+            pool, pid, "PostConfirmation", "PostConfirmation_ConfirmSignUp",
+            user, client_id=cid)
+
     resp = {
-        "UserConfirmed": status == "CONFIRMED",
+        "UserConfirmed": confirmed,
         "UserSub": attr_dict["sub"],
     }
-    if "email" in attr_dict:
+    if "email" in attr_dict and not confirmed:
         resp["CodeDeliveryDetails"] = {
             "Destination": attr_dict["email"],
             "DeliveryMedium": "EMAIL",
@@ -2074,11 +2602,8 @@ def _confirm_sign_up(data):
     username = data.get("Username")
     code = data.get("ConfirmationCode", "")
 
-    pool = None
-    for p in _user_pools.values():
-        if cid in p["_clients"]:
-            pool = p
-            break
+    # Cross-account client-id resolution (see _find_pool_by_client_id).
+    _pid, pool, _ = _find_pool_by_client_id(cid)
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
 
@@ -2089,6 +2614,9 @@ def _confirm_sign_up(data):
     # Accept any code in emulation
     user["UserStatus"] = "CONFIRMED"
     user["UserLastModifiedDate"] = _now_epoch()
+    _fire_lifecycle_trigger(
+        pool, _pid, "PostConfirmation", "PostConfirmation_ConfirmSignUp",
+        user, client_id=cid)
     return json_response({})
 
 
@@ -2096,17 +2624,20 @@ def _forgot_password(data):
     cid = data.get("ClientId")
     username = data.get("Username")
 
-    pool = None
-    for p in _user_pools.values():
-        if cid in p["_clients"]:
-            pool = p
-            break
+    # Cross-account client-id resolution (see _find_pool_by_client_id).
+    _pid, pool, _ = _find_pool_by_client_id(cid)
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
 
     user, _err = _resolve_user(pool, username)
     if _err:
-        return _err
+        # Real Cognito also fires UserMigration on ForgotPassword for an unknown
+        # user, so a legacy user can be migrated and then reset their password.
+        user = _try_user_migration(
+            pool, _pid, cid, username, "",
+            trigger_source="UserMigration_ForgotPassword")
+        if not user:
+            return _err
 
     code = "654321"
     user["_reset_code"] = code
@@ -2126,11 +2657,8 @@ def _confirm_forgot_password(data):
     username = data.get("Username")
     new_password = data.get("Password", "")
 
-    pool = None
-    for p in _user_pools.values():
-        if cid in p["_clients"]:
-            pool = p
-            break
+    # Cross-account client-id resolution (see _find_pool_by_client_id).
+    _pid, pool, _ = _find_pool_by_client_id(cid)
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
 
@@ -2154,7 +2682,7 @@ def _change_password(data):
         return error_response_json("NotAuthorizedException", "Access token is missing.", 400)
     proposed = data.get("ProposedPassword", "")
     # Decode token to find user and update password
-    for pool in _user_pools.values():
+    for _pid, pool in _all_pools():
         user = _user_from_token(access_token, pool)
         if user:
             pw_err = _validate_password(pool, proposed)
@@ -2170,7 +2698,7 @@ def _get_user(data):
     access_token = data.get("AccessToken", "")
     if not access_token:
         return error_response_json("NotAuthorizedException", "Access token is missing.", 400)
-    for pool in _user_pools.values():
+    for _pid, pool in _all_pools():
         user = _user_from_token(access_token, pool)
         if user:
             out = _user_out(user)
@@ -2186,7 +2714,7 @@ def _update_user_attributes(data):
     access_token = data.get("AccessToken", "")
     if not access_token:
         return error_response_json("NotAuthorizedException", "Access token is missing.", 400)
-    for pool in _user_pools.values():
+    for _pid, pool in _all_pools():
         user = _user_from_token(access_token, pool)
         if user:
             user["Attributes"] = _merge_attributes(
@@ -2202,7 +2730,7 @@ def _delete_user(data):
     access_token = data.get("AccessToken", "")
     if not access_token:
         return error_response_json("NotAuthorizedException", "Access token is missing.", 400)
-    for pool in _user_pools.values():
+    for _pid, pool in _all_pools():
         user = _user_from_token(access_token, pool)
         if user:
             username = user["Username"]
@@ -2546,7 +3074,7 @@ def _set_user_mfa_preference(data):
     access_token = data.get("AccessToken")
     if not access_token:
         return error_response_json("NotAuthorizedException", "Missing access token.", 400)
-    for pool in _user_pools.values():
+    for _pid, pool in _all_pools():
         user = _user_from_token(access_token, pool)
         if user:
             _apply_mfa_preference(user, data)
@@ -2615,7 +3143,7 @@ def _verify_software_token(data):
 
     if access_token:
         # Find the user by token across all pools
-        for pool in _user_pools.values():
+        for _pid, pool in _all_pools():
             user = _user_from_token(access_token, pool)
             if user:
                 user.setdefault("_mfa_enabled", [])
@@ -2635,7 +3163,7 @@ def _idp_tag_resource(data):
     arn = data.get("ResourceArn", "")
     tags = data.get("Tags", {})
     # Find pool by ARN
-    for pool in _user_pools.values():
+    for _pid, pool in _all_pools():
         if pool["Arn"] == arn:
             pool["UserPoolTags"].update(tags)
             return json_response({})
@@ -2645,7 +3173,7 @@ def _idp_tag_resource(data):
 def _idp_untag_resource(data):
     arn = data.get("ResourceArn", "")
     tag_keys = data.get("TagKeys", [])
-    for pool in _user_pools.values():
+    for _pid, pool in _all_pools():
         if pool["Arn"] == arn:
             for k in tag_keys:
                 pool["UserPoolTags"].pop(k, None)
@@ -2655,7 +3183,7 @@ def _idp_untag_resource(data):
 
 def _idp_list_tags_for_resource(data):
     arn = data.get("ResourceArn", "")
-    for pool in _user_pools.values():
+    for _pid, pool in _all_pools():
         if pool["Arn"] == arn:
             return json_response({"Tags": pool.get("UserPoolTags", {})})
     return error_response_json("ResourceNotFoundException", f"Resource {arn} not found.", 400)

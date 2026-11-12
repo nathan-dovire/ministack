@@ -10,6 +10,7 @@ import json
 import os
 import re
 import uuid
+import weakref
 from datetime import datetime, timezone
 from xml.etree.ElementTree import Element, SubElement, tostring
 
@@ -21,18 +22,56 @@ _request_account_id: contextvars.ContextVar[str] = contextvars.ContextVar(
 )
 
 _12_DIGIT_RE = re.compile(r"^\d{12}$")
+_SESSION_KEY_PREFIXES = ("ASIA", "AKIA")
 
 
 def set_request_account_id(access_key_id: str) -> None:
     """Set the account ID for the current request from the access key.
-    If the access key is a 12-digit number, use it as the account ID.
-    Otherwise fall back to the MINISTACK_ACCOUNT_ID env var or 000000000000."""
+
+    Resolution order:
+      1. 12-digit access key (common LocalStack convention) → use as account ID.
+      2. Session access key (ASIA…/AKIA…) issued by STS AssumeRole → look up in
+         the STS session table, extract account from the assumed-role ARN,
+         use that. This is what makes cross-account `boto3` flows work after
+         AssumeRole — without it, an assumed session would silently fall back
+         to MINISTACK_ACCOUNT_ID and write to the wrong namespace.
+      3. Otherwise fall back to the MINISTACK_ACCOUNT_ID env var or
+         000000000000.
+    """
     if access_key_id and _12_DIGIT_RE.match(access_key_id):
         _request_account_id.set(access_key_id)
-    else:
-        _request_account_id.set(
-            os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
-        )
+        return
+
+    if access_key_id and access_key_id.startswith(_SESSION_KEY_PREFIXES):
+        account = _account_from_sts_session(access_key_id)
+        if account:
+            _request_account_id.set(account)
+            return
+
+    _request_account_id.set(
+        os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
+    )
+
+
+def _account_from_sts_session(access_key_id: str) -> str | None:
+    """Look up a session access key in the STS session table and return the
+    account ID embedded in the assumed-role ARN
+    (e.g. ``arn:aws:sts::123456789012:assumed-role/Role/Session``)."""
+    # Lazy import to avoid module-load circular dependency
+    # (services.sts → core.iam → core.responses).
+    try:
+        from ministack.services import sts as _sts
+    except Exception:
+        return None
+    entry = _sts._sessions.get(access_key_id)
+    if not entry:
+        return None
+    arn = entry.get("Arn", "")
+    # arn:aws:sts::<account>:assumed-role/...
+    parts = arn.split(":")
+    if len(parts) >= 5 and _12_DIGIT_RE.match(parts[4]):
+        return parts[4]
+    return None
 
 
 def get_account_id() -> str:
@@ -75,10 +114,38 @@ class AccountScopedDict:
     e.g. ``_roles = AccountScopedDict()`` instead of ``_roles: dict = {}``.
     """
 
-    __slots__ = ("_data",)
+    __slots__ = ("_data", "__weakref__")
+
+    # Every instance registers itself here so that GET /_ministack/accounts
+    # can union the set of accounts seen across all service modules without
+    # having to know each one by name. Dead refs are pruned lazily.
+    _instances: "list[weakref.ReferenceType]" = []
 
     def __init__(self):
         self._data: dict = {}
+        AccountScopedDict._instances.append(weakref.ref(self))
+
+    @classmethod
+    def all_known_accounts(cls) -> "set[str]":
+        """Return the set of account IDs that appear in any live
+        AccountScopedDict instance. Walks every registered instance and
+        prunes dead weakrefs along the way."""
+        alive: list = []
+        accounts: set = set()
+        for ref in cls._instances:
+            inst = ref()
+            if inst is None:
+                continue
+            alive.append(ref)
+            for key in inst._data.keys():
+                # Each key is (account_id, original_key); be defensive
+                # in case a service ever stores something else.
+                if isinstance(key, tuple) and len(key) >= 1:
+                    acct = key[0]
+                    if isinstance(acct, str) and _12_DIGIT_RE.match(acct):
+                        accounts.add(acct)
+        cls._instances = alive
+        return accounts
 
     # -- internal helpers --------------------------------------------------
 

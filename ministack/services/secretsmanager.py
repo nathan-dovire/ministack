@@ -96,6 +96,12 @@ def _resolve(secret_id):
         for key, s in _secrets.items():
             if s["ARN"].startswith(secret_id):
                 return key, s
+        # Resolve a full ARN across all accounts. An ARN names its own account,
+        # so a full-ARN lookup may target a secret outside the caller's account,
+        # which the account-scoped views above can't see.
+        for (_acct, name), s in _secrets._data.items():
+            if s["ARN"] == secret_id or s["ARN"].startswith(secret_id):
+                return name, s
     return None, None
 
 

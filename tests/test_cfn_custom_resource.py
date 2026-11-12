@@ -60,6 +60,23 @@ def _cfn_template(func_name, resource_type="Custom::Tester", extra_props=None, o
     return json.dumps(tpl)
 
 
+# ── default service timeout (regression guard) ──────────────────────────────
+
+def test_custom_resource_default_timeout_is_short():
+    """The default ServiceTimeout must stay short. Real CFN defaults to 1h, but
+    locally a custom-resource Lambda that never calls back would park the stack
+    in *_IN_PROGRESS for that whole hour; a restart in that window persists a
+    dangling status that permanently wedges the stack. Keep it low so a hang
+    fails fast to a recoverable terminal status."""
+    from ministack.services.cloudformation import custom_resource
+
+    assert custom_resource._DEFAULT_SERVICE_TIMEOUT <= 300, (
+        f"_DEFAULT_SERVICE_TIMEOUT regressed to "
+        f"{custom_resource._DEFAULT_SERVICE_TIMEOUT}s — a long default re-opens "
+        "the restart-mid-deploy wedge window."
+    )
+
+
 # ── token registry smoke test ──────────────────────────────────────────────
 
 def test_cfn_response_endpoint_accepts_put(cfn):

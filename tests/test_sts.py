@@ -259,3 +259,90 @@ def test_get_caller_identity_different_roles_return_different_arns(sts_as_role):
     assert "RoleA" in arn_a
     assert "RoleB" in arn_b
     assert arn_a != arn_b
+
+
+def test_assume_role_into_different_account_flips_account_scope(sts):
+    """AssumeRole into a role in a different account must rebind the request
+    account to the target account, so that subsequent SDK calls made with the
+    session credentials land in the target account's AccountScopedDict
+    namespace (mirrors how cross-account access works in real AWS)."""
+    import boto3
+    from botocore.config import Config
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    region = "us-east-1"
+
+    target_account = "555555555555"
+
+    # Default sts client (caller = 000000000000) assumes a role in 555…555.
+    creds = sts.assume_role(
+        RoleArn=f"arn:aws:iam::{target_account}:role/CrossAcctReadRole",
+        RoleSessionName="xacct-test",
+    )["Credentials"]
+
+    # The session creds (ASIA*) MUST scope to the target account, not the
+    # caller's account. Verify two ways.
+
+    # 1. GetCallerIdentity with the session creds reports the target account.
+    session_sts = boto3.client(
+        "sts",
+        endpoint_url=endpoint,
+        region_name=region,
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretAccessKey"],
+        aws_session_token=creds["SessionToken"],
+        config=Config(retries={"mode": "standard"}),
+    )
+    identity = session_sts.get_caller_identity()
+    assert identity["Account"] == target_account, (
+        f"AssumeRole into {target_account} should flip the request scope, "
+        f"but GetCallerIdentity reported {identity['Account']}"
+    )
+    assert f":{target_account}:assumed-role/CrossAcctReadRole/xacct-test" in identity["Arn"]
+
+    # 2. A non-STS service call with the same creds writes to the target
+    # account's namespace, not the caller's. Use SecretsManager to verify.
+    session_sm = boto3.client(
+        "secretsmanager",
+        endpoint_url=endpoint,
+        region_name=region,
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretAccessKey"],
+        aws_session_token=creds["SessionToken"],
+        config=Config(retries={"mode": "standard"}),
+    )
+    secret_name = f"xacct-{_uuid_mod.uuid4().hex[:8]}"
+    arn = session_sm.create_secret(Name=secret_name, SecretString="from-assumed-role")["ARN"]
+    try:
+        assert f":{target_account}:" in arn, (
+            f"Secret created via assumed-role creds should be ARN-scoped to "
+            f"target account {target_account}, got {arn}"
+        )
+
+        # Direct access from the target account (via 12-digit access key)
+        # MUST see the same secret.
+        target_sm = boto3.client(
+            "secretsmanager",
+            endpoint_url=endpoint,
+            region_name=region,
+            aws_access_key_id=target_account,
+            aws_secret_access_key="test",
+            config=Config(retries={"mode": "standard"}),
+        )
+        target_secret = target_sm.get_secret_value(SecretId=secret_name)
+        assert target_secret["SecretString"] == "from-assumed-role"
+
+        # Caller's original account (000…000) must NOT see it.
+        caller_sm = boto3.client(
+            "secretsmanager",
+            endpoint_url=endpoint,
+            region_name=region,
+            aws_access_key_id="000000000000",
+            aws_secret_access_key="test",
+            config=Config(retries={"mode": "standard"}),
+        )
+        with pytest.raises(ClientError) as exc:
+            caller_sm.get_secret_value(SecretId=secret_name)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        session_sm.delete_secret(SecretId=secret_name, ForceDeleteWithoutRecovery=True)

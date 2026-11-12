@@ -460,6 +460,16 @@ def codebuild():
 
 
 @pytest.fixture(scope="session")
+def codepipeline():
+    return make_client("codepipeline")
+
+
+@pytest.fixture(scope="session")
+def codestar_connections():
+    return make_client("codestar-connections")
+
+
+@pytest.fixture(scope="session")
 def autoscaling():
     return make_client("autoscaling")
 

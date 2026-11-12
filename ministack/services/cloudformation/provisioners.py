@@ -25,6 +25,8 @@ import ministack.services.cloudfront as _cf
 import ministack.services.cloudwatch as _cw
 import ministack.services.cloudwatch_logs as _cw_logs
 import ministack.services.codebuild as _codebuild
+import ministack.services.codepipeline as _codepipeline
+import ministack.services.codestar_connections as _codestar_conn
 import ministack.services.cognito as _cognito
 import ministack.services.dynamodb as _dynamodb
 import ministack.services.ec2 as _ec2
@@ -74,10 +76,17 @@ def _physical_name(stack_name: str, logical_id: str, *,
 # Resource Provisioner Framework
 # ===========================================================================
 
+def _resource_handler(resource_type: str):
+    noop_types = os.environ.get("MINISTACK_CFN_NOOP_CUSTOM_RESOURCES", "")
+    if resource_type in {t.strip() for t in noop_types.split(",") if t.strip()}:
+        return _CUSTOM_NOOP_HANDLER
+    return _RESOURCE_HANDLERS.get(resource_type)
+
+
 def _provision_resource(resource_type: str, logical_id: str, props: dict,
                         stack_name: str) -> tuple:
     """Provision a resource. Returns (physical_id, attributes)."""
-    handler = _RESOURCE_HANDLERS.get(resource_type)
+    handler = _resource_handler(resource_type)
     if handler and "create" in handler:
         return handler["create"](logical_id, props, stack_name)
     # Custom resource types (Custom::* handled here; AWS::CloudFormation::CustomResource goes through handler)
@@ -94,7 +103,7 @@ def _provision_resource(resource_type: str, logical_id: str, props: dict,
 def _delete_resource(resource_type: str, physical_id: str, props: dict,
                      stack_name: str | None = None, logical_id: str | None = None):
     """Delete a provisioned resource."""
-    handler = _RESOURCE_HANDLERS.get(resource_type)
+    handler = _resource_handler(resource_type)
     if handler and "delete" in handler:
         handler["delete"](physical_id, props)
         return
@@ -118,11 +127,19 @@ def _update_resource(resource_type: str, physical_id: str, old_props: dict,
     implement idempotently) when no explicit update handler is registered.
     Returns (physical_id, attributes).
     """
-    handler = _RESOURCE_HANDLERS.get(resource_type)
+    handler = _resource_handler(resource_type)
     if handler and "update" in handler:
         return handler["update"](physical_id, old_props, new_props, stack_name)
-    # Custom resource types
-    if resource_type.startswith("Custom::") or resource_type == "AWS::CloudFormation::CustomResource":
+    # Custom resource types WITHOUT a registered provisioner go through the
+    # generic Lambda-backed update. But a Custom:: type that DOES have a
+    # registered handler (e.g. a type listed in
+    # MINISTACK_CFN_NOOP_CUSTOM_RESOURCES, mapped to a no-op create) must use that handler on update too — otherwise
+    # we'd invoke a real custom-resource Lambda that isn't there and fail with
+    # "Region is missing". So only take the generic path when unregistered.
+    if not handler and (
+        resource_type.startswith("Custom::")
+        or resource_type == "AWS::CloudFormation::CustomResource"
+    ):
         return _custom_resource_update(
             physical_id, old_props, new_props, stack_name,
             logical_id=logical_id,
@@ -130,7 +147,23 @@ def _update_resource(resource_type: str, physical_id: str, old_props: dict,
         )
     # No update handler — fall through to create. Most resource types make
     # their create idempotent; CFN never sees a fresh physical id this way.
-    return _provision_resource(resource_type, physical_id, new_props, stack_name)
+    # But some create handlers raise "already exists" for a resource that's
+    # unchanged across a stack UPDATE (EventBus, etc.). On a re-applied
+    # template that's the expected state, so swallow the duplicate error and
+    # keep the existing physical id — this is what an update of an unchanged
+    # resource should do. Genuine errors (bad props) still surface because
+    # they don't match the duplicate-exists signature.
+    try:
+        return _provision_resource(resource_type, physical_id, new_props, stack_name)
+    except Exception as e:
+        msg = str(e)
+        if "already exists" in msg or "AlreadyExists" in msg:
+            logger.info(
+                "Update of %s (%s): resource already exists, treating as no-op",
+                resource_type, physical_id or logical_id,
+            )
+            return physical_id, {}
+        raise
 
 
 # ===========================================================================
@@ -516,12 +549,22 @@ def _lambda_create(logical_id, props, stack_name):
     #    end-to-end (matching real CFN). Falls back to inline if S3
     #    fetch fails.
     code_zip = _zip_inline(code.get("ZipFile"), handler, runtime)
+    code_local_dir = None
     if code_zip is None and code.get("S3Bucket") and code.get("S3Key"):
-        code_zip = _lambda_svc._fetch_code_from_s3(
+        fetched = _lambda_svc._fetch_code_from_s3(
             code["S3Bucket"],
             code["S3Key"],
             version_id=code.get("S3ObjectVersion"),
         )
+        # Local-native asset: the S3 object may be a marker pointing at the
+        # on-disk asset dir (see codepipeline_runtime asset publisher) instead
+        # of a real zip. Run the function straight from disk — no download,
+        # no extract.
+        marker_path = _lambda_svc.parse_local_asset_marker(fetched)
+        if marker_path:
+            code_local_dir = marker_path
+        else:
+            code_zip = fetched
 
     code_size = len(code_zip) if code_zip else 0
     code_sha = (
@@ -554,6 +597,7 @@ def _lambda_create(logical_id, props, stack_name):
             "RevisionId": new_uuid(),
         },
         "code_zip": code_zip,
+        "code_local_dir": code_local_dir,
         "code_s3_bucket": code.get("S3Bucket"),
         "code_s3_key": code.get("S3Key"),
         "code_s3_object_version": code.get("S3ObjectVersion"),
@@ -567,6 +611,25 @@ def _lambda_create(logical_id, props, stack_name):
     }
     _lambda_svc._functions[name] = func
     return name, {"Arn": arn}
+
+
+def _lambda_update(physical_id, old_props, new_props, stack_name):
+    """Update a Lambda in place, preserving its physical name + ARN.
+
+    Real CloudFormation keeps the function name and ARN when only mutable
+    properties change; replacement (a changed explicit FunctionName) is not
+    modeled here. Reusing physical_id stops the stack name being re-prepended
+    on every update (which truncated to 64 chars and collided distinct
+    functions onto one name, breaking custom-resource ServiceToken wiring)."""
+    props = dict(new_props)
+    if not props.get("FunctionName"):
+        props["FunctionName"] = physical_id
+    name, attrs = _lambda_create(physical_id, props, stack_name)
+    # Bounce any warm worker so the next invoke picks up the rebuilt record
+    # (new code/env/memory) instead of serving the pre-update one, matching
+    # what the Lambda UpdateFunctionCode/Configuration APIs do.
+    _lambda_svc.invalidate_worker(name, qualifier="$LATEST")
+    return name, attrs
 
 
 def _lambda_delete(physical_id, props):
@@ -1439,6 +1502,256 @@ def _sns_topic_policy_delete(physical_id, props):
             topic["attributes"].pop("Policy", None)
 
 
+# --- CodeDeploy (Application + DeploymentGroup + DeploymentConfig, stub) ---
+#
+# Real CodeDeploy orchestrates blue/green Lambda alias shifts via the
+# CodeDeploy data plane. Locally there's no traffic to shift and no alias
+# updates to gate, so the CFN resources are created as inert markers — the
+# logical grouping exists, but the deployment actions never fire.
+# Sufficient for `cdk deploy` to succeed on stacks that include
+# `aws_codedeploy.LambdaApplication` / `LambdaDeploymentGroup` constructs.
+
+def _codedeploy_application_create(logical_id, props, stack_name):
+    name = props.get("ApplicationName") or _physical_name(stack_name, logical_id)
+    return name, {}
+
+
+def _codedeploy_application_delete(physical_id, props):
+    pass
+
+
+def _codedeploy_deployment_group_create(logical_id, props, stack_name):
+    name = props.get("DeploymentGroupName") or _physical_name(stack_name, logical_id)
+    return name, {}
+
+
+def _codedeploy_deployment_group_delete(physical_id, props):
+    pass
+
+
+def _codedeploy_deployment_config_create(logical_id, props, stack_name):
+    name = props.get("DeploymentConfigName") or _physical_name(stack_name, logical_id)
+    return name, {}
+
+
+def _codedeploy_deployment_config_delete(physical_id, props):
+    pass
+
+
+# --- Lambda async-invocation tuning (stub) ---
+#
+# AWS::Lambda::EventInvokeConfig sets retry-attempts / DLQ / max-event-age
+# on async lambda invocations. Real CodeDeploy + LambdaBuilder constructs
+# emit one per (Function, Qualifier). MiniStack doesn't execute async
+# lambdas the same way, so we record the resource for stack lifecycle but
+# don't apply any of the tuning.
+
+def _lambda_event_invoke_config_create(logical_id, props, stack_name):
+    fn_name = props.get("FunctionName", logical_id)
+    qualifier = props.get("Qualifier", "")
+    name = f"{fn_name}:{qualifier}" if qualifier else fn_name
+    return name, {}
+
+
+def _lambda_event_invoke_config_delete(physical_id, props):
+    pass
+
+
+# --- CDK custom-resource stubs (Custom::*) ---
+#
+# Several CDK-bundled custom resources fail in local environments because
+# their bundled handler code targets specific AWS SDK versions / runtime
+# features MiniStack's Lambda host doesn't replicate (e.g.
+# Custom::LogRetention does `new aws-sdk.CloudWatchLogsClient()` which is
+# v3 syntax; the bundled handler resolves to v2 and crashes).
+#
+# Locally these resources do nothing meaningful — log retention, S3 auto-
+# delete, etc. are all dev-irrelevant. Types listed (comma separated) in
+# MINISTACK_CFN_NOOP_CUSTOM_RESOURCES, e.g.
+# Custom::LogRetention,Custom::S3AutoDeleteObjects, get a no-op instead of the
+# lambda invocation so the deploy proceeds. Default: empty, every Custom::*
+# type goes through the Lambda-backed path.
+
+def _custom_noop_create(logical_id, props, stack_name):
+    return f"{stack_name}-{logical_id}-stub-{new_uuid()[:8]}", {}
+
+
+def _custom_noop_delete(physical_id, props):
+    pass
+
+
+_CUSTOM_NOOP_HANDLER = {"create": _custom_noop_create, "delete": _custom_noop_delete}
+
+
+# --- CloudFormation Stack (nested stacks) ---
+#
+# CDK uses nested stacks (AWS::CloudFormation::Stack) heavily — both
+# implicitly (when a stack exceeds CFN's 500-resource limit) and explicitly
+# (when an L3 construct extends `NestedStack`).
+#
+# Implementation strategy: when a parent stack provisions an
+# AWS::CloudFormation::Stack resource we
+#   1. resolve the child template (TemplateURL points at the CDK staging
+#      bucket; _resolve_template fetches it and returns the body),
+#   2. create a child stack record in _stacks with a synthetic name
+#      ${parent}-${logicalId}-XXXX,
+#   3. run a full `asyncio.run(_deploy_stack_async(...))` for the child
+#      synchronously inside this thread (the parent dispatched us via
+#      asyncio.to_thread, so we own this thread),
+#   4. flatten the child's Outputs into the returned attrs dict as
+#      `Outputs.<OutputKey>` so the parent's
+#      `Fn::GetAtt NestedStack.Outputs.X` resolves through the standard
+#      Attributes lookup path.
+
+def _nested_stack_create(logical_id, props, stack_name):
+    import asyncio as _asyncio
+    import copy as _copy
+
+    from ministack.services.cloudformation import _stacks, _stack_events
+    from ministack.services.cloudformation.helpers import _resolve_template
+    from ministack.services.cloudformation.engine import (
+        _parse_template, _evaluate_conditions,
+    )
+    from ministack.services.cloudformation.stacks import (
+        _deploy_stack_async, _add_event,
+    )
+
+    # 1. Resolve template (TemplateURL → S3 fetch, or inline TemplateBody)
+    template_body, err = _resolve_template({
+        "TemplateBody": props.get("TemplateBody"),
+        "TemplateURL": props.get("TemplateURL"),
+    })
+    if err is not None or not template_body:
+        raise ValueError(
+            f"nested stack {logical_id}: could not resolve template "
+            f"(TemplateURL={props.get('TemplateURL')!r})"
+        )
+    try:
+        template = _parse_template(template_body)
+    except Exception as exc:
+        raise ValueError(f"nested stack {logical_id}: template parse error: {exc}")
+
+    # 2. Build the child stack record with the same shape as _create_stack.
+    child_name = f"{stack_name}-{logical_id}-{new_uuid()[:8]}"
+    child_id = (
+        f"arn:aws:cloudformation:{get_region()}:{get_account_id()}:"
+        f"stack/{child_name}/{new_uuid()}"
+    )
+
+    # Nested-stack parameters: CDK passes them as a dict in `Parameters`.
+    # _deploy_stack_async expects resolved param values, not template-level
+    # parameter defs. Wrap them in the same shape _resolve_parameters emits.
+    nested_param_values = {}
+    for k, v in (props.get("Parameters") or {}).items():
+        nested_param_values[k] = {"Value": str(v), "NoEcho": False}
+
+    child_stack = {
+        "StackName": child_name,
+        "StackId": child_id,
+        "StackStatus": "CREATE_IN_PROGRESS",
+        "StackStatusReason": "",
+        "CreationTime": now_iso(),
+        "LastUpdatedTime": now_iso(),
+        "Description": template.get("Description", ""),
+        "Parameters": [
+            {"ParameterKey": k, "ParameterValue": v["Value"], "NoEcho": False}
+            for k, v in nested_param_values.items()
+        ],
+        "Tags": [],
+        "Outputs": [],
+        "DisableRollback": True,  # nested stacks roll back via the parent
+        "ParentId": stack_name,
+        "RootId": stack_name,
+        "_resources": {},
+        "_template": template,
+        "_template_body": template_body,
+        "_resolved_params": nested_param_values,
+        "_conditions": _evaluate_conditions(template, nested_param_values),
+    }
+    _stacks[child_name] = child_stack
+    _stack_events[child_id] = []
+
+    _add_event(child_id, child_name, child_name,
+               "AWS::CloudFormation::Stack", "CREATE_IN_PROGRESS",
+               physical_id=child_id)
+
+    # 3. Deploy synchronously inside our worker thread.
+    try:
+        _asyncio.run(_deploy_stack_async(
+            child_name, child_id, template, nested_param_values,
+            disable_rollback=False, tags=[], is_update=False,
+            previous_stack=None,
+        ))
+    except Exception as exc:
+        raise RuntimeError(f"nested stack {child_name} deploy failed: {exc}")
+
+    final = _stacks.get(child_name) or {}
+    status = final.get("StackStatus", "")
+    if status != "CREATE_COMPLETE":
+        raise RuntimeError(
+            f"nested stack {child_name} ended in {status}: "
+            f"{final.get('StackStatusReason', '(no reason)')}"
+        )
+
+    # 4. Flatten Outputs into attrs so Fn::GetAtt resolves.
+    attrs = {}
+    for out in final.get("Outputs", []) or []:
+        key = out.get("OutputKey")
+        val = out.get("OutputValue")
+        if key is not None:
+            attrs[f"Outputs.{key}"] = val
+    return child_id, attrs
+
+
+def _nested_stack_delete(physical_id, props):
+    import asyncio as _asyncio
+
+    from ministack.services.cloudformation import _stacks
+    from ministack.services.cloudformation.stacks import _delete_stack_async
+
+    # physical_id is the child stack ARN we returned from create.
+    # Find the matching stack record by ARN.
+    child = None
+    child_name = None
+    for name, stk in list(_stacks.items()):
+        if stk.get("StackId") == physical_id:
+            child = stk
+            child_name = name
+            break
+    if not child or not child_name:
+        return  # already gone (e.g. rollback cleaned it up)
+
+    try:
+        _asyncio.run(_delete_stack_async(child_name, physical_id))
+    except Exception as exc:
+        logger.warning("Nested stack %s delete failed: %s", child_name, exc)
+
+
+# --- SecretsManager ResourcePolicy ---
+#
+# CFN-side counterpart to the existing PutResourcePolicy SDK handler in
+# services/secretsmanager.py. CDK emits this resource whenever a stack does
+# `secret.grantRead(principal)` / `secret.addToResourcePolicy(...)`.
+
+def _sm_resource_policy_create(logical_id, props, stack_name):
+    secret_id = props.get("SecretId", "")
+    policy = props.get("ResourcePolicy")
+    _, secret = _sm._resolve(secret_id)
+    if secret and policy is not None:
+        _sm._resource_policies[secret["ARN"]] = (
+            json.dumps(policy) if isinstance(policy, dict) else policy
+        )
+        return f"{secret['ARN']}-policy", {}
+    return f"{stack_name}-{logical_id}-{new_uuid()[:8]}", {}
+
+
+def _sm_resource_policy_delete(physical_id, props):
+    secret_id = props.get("SecretId", "")
+    _, secret = _sm._resolve(secret_id)
+    if secret:
+        _sm._resource_policies.pop(secret["ARN"], None)
+
+
 # --- AppSync resource provisioners ---
 
 def _appsync_api_create(logical_id, props, stack_name):
@@ -1624,22 +1937,85 @@ def _cognito_user_pool_create(logical_id, props, stack_name):
         "AutoVerifiedAttributes": props.get("AutoVerifiedAttributes", []),
         "AliasAttributes": props.get("AliasAttributes", []),
         "UsernameAttributes": props.get("UsernameAttributes", []),
+        "SmsVerificationMessage": props.get("SmsVerificationMessage", ""),
+        "EmailVerificationMessage": props.get("EmailVerificationMessage", ""),
+        "EmailVerificationSubject": props.get("EmailVerificationSubject", ""),
+        "SmsAuthenticationMessage": props.get("SmsAuthenticationMessage", ""),
         "MfaConfiguration": props.get("MfaConfiguration", "OFF"),
         "EstimatedNumberOfUsers": 0,
+        "EmailConfiguration": props.get("EmailConfiguration", {}),
+        "SmsConfiguration": props.get("SmsConfiguration", {}),
         "UserPoolTags": props.get("UserPoolTags", {}),
         "AdminCreateUserConfig": props.get("AdminCreateUserConfig", {
             "AllowAdminCreateUserOnly": False,
             "UnusedAccountValidityDays": 7,
         }),
+        "AccountRecoverySetting": props.get("AccountRecoverySetting", {}),
+        "DeletionProtection": props.get("DeletionProtection", "INACTIVE"),
+        # CDK `userPool.addTrigger(...)` ends up in the synthesized template as
+        # the UserPool's `LambdaConfig` property. Without this line the live
+        # pool silently has no PreSignUp/PostConfirmation/UserMigration wiring
+        # even though the CFN template ships it.
+        "LambdaConfig": props.get("LambdaConfig", {}),
         "Domain": None,
         "_clients": {},
         "_users": {},
         "_groups": {},
     }
+    if props.get("DeviceConfiguration"):
+        pool["DeviceConfiguration"] = props["DeviceConfiguration"]
+    if props.get("UsernameConfiguration"):
+        pool["UsernameConfiguration"] = props["UsernameConfiguration"]
+    if props.get("UserPoolAddOns"):
+        pool["UserPoolAddOns"] = props["UserPoolAddOns"]
+    if props.get("VerificationMessageTemplate"):
+        pool["VerificationMessageTemplate"] = props["VerificationMessageTemplate"]
     _cognito._user_pools[pid] = pool
     arn = _cognito._pool_arn(pid)
     provider_name = f"cognito-idp.{get_region()}.amazonaws.com/{pid}"
     return pid, {"Arn": arn, "ProviderName": provider_name}
+
+
+# Properties the Cognito API supports updating in-place on an existing pool,
+# mirroring real-AWS UpdateUserPool. Without an explicit update handler the
+# engine's fallthrough-to-create would mint a new pool id and orphan all the
+# API-level state on the existing pool (clients, users, custom-auth wiring
+# written by `provision-cognito.sh`).
+_USER_POOL_UPDATABLE_PROPS = (
+    "Policies",
+    "LambdaConfig",
+    "AutoVerifiedAttributes",
+    "SmsVerificationMessage",
+    "EmailVerificationMessage",
+    "EmailVerificationSubject",
+    "SmsAuthenticationMessage",
+    "MfaConfiguration",
+    "EmailConfiguration",
+    "SmsConfiguration",
+    "UserPoolTags",
+    "AdminCreateUserConfig",
+    "AccountRecoverySetting",
+    "DeletionProtection",
+    "DeviceConfiguration",
+    "VerificationMessageTemplate",
+    "UserPoolAddOns",
+)
+
+
+def _cognito_user_pool_update(physical_id, old_props, new_props, stack_name):
+    pool = _cognito._user_pools.get(physical_id)
+    if pool is None:
+        # Pool was deleted out-of-band — recreate so the stack stays consistent.
+        return _cognito_user_pool_create(physical_id, new_props, stack_name)
+    for k in _USER_POOL_UPDATABLE_PROPS:
+        if k in new_props:
+            pool[k] = new_props[k]
+    if "PoolName" in new_props:
+        pool["Name"] = new_props["PoolName"]
+    pool["LastModifiedDate"] = _cognito._now_epoch()
+    arn = pool["Arn"]
+    provider_name = f"cognito-idp.{get_region()}.amazonaws.com/{physical_id}"
+    return physical_id, {"Arn": arn, "ProviderName": provider_name}
 
 
 def _cognito_user_pool_delete(physical_id, props):
@@ -1760,15 +2136,8 @@ def _ecr_repo_delete(physical_id, props):
 
 # --- CodeBuild Project provisioner ---
 
-def _codebuild_project_create(logical_id, props, stack_name):
-    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=255)
-    
-    # Pre-check for duplicates to raise exception (not just return error response)
-    if name in _codebuild._projects:
-        raise ValueError(f"CodeBuild project already exists: {name}")
-    
-    data = {
-        "name": name,
+def _codebuild_project_props_to_data(props):
+    return {
         "description": props.get("Description", ""),
         "source": props.get("Source", {"type": "NO_SOURCE"}),
         "sourceVersion": props.get("SourceVersion", ""),
@@ -1778,18 +2147,191 @@ def _codebuild_project_create(logical_id, props, stack_name):
             "image": "aws/codebuild/standard:7.0",
             "computeType": "BUILD_GENERAL1_SMALL",
         }),
-        "serviceRole": props.get("ServiceRole", f"arn:aws:iam::{get_account_id()}:role/codebuild-role"),
+        "serviceRole": props.get("ServiceRole",
+                                 f"arn:aws:iam::{get_account_id()}:role/codebuild-role"),
         "timeoutInMinutes": int(props.get("TimeoutInMinutes", 60)),
         "tags": [{"key": t["Key"], "value": t["Value"]} for t in props.get("Tags", [])],
-        "encryptionKey": props.get("EncryptionKey", f"arn:aws:kms:{get_region()}:{get_account_id()}:alias/aws/codebuild"),
+        "encryptionKey": props.get("EncryptionKey",
+                                    f"arn:aws:kms:{get_region()}:{get_account_id()}:alias/aws/codebuild"),
     }
+
+
+def _codebuild_project_create(logical_id, props, stack_name):
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=255)
+
+    # CFN CreateStack semantics: matches the real AWS CFN behavior of
+    # raising on a duplicate physical name. The UPDATE path uses the
+    # dedicated _codebuild_project_update handler instead.
+    if name in _codebuild._projects:
+        raise ValueError(f"CodeBuild project already exists: {name}")
+
+    data = {"name": name, **_codebuild_project_props_to_data(props)}
     _codebuild._create_project(data)
+    arn = _codebuild._project_arn(name)
+    return name, {"Arn": arn}
+
+
+def _codebuild_project_update(physical_id, old_props, new_props, stack_name):
+    """CFN UpdateStack handler — idempotent. Used by SelfMutate and any
+    other update flow where the same template is re-applied."""
+    name = physical_id or new_props.get("Name") or _physical_name(
+        stack_name, "", max_len=255
+    )
+    data = _codebuild_project_props_to_data(new_props)
+    if name in _codebuild._projects:
+        existing = _codebuild._projects[name]
+        existing.update(data)
+        existing["lastModified"] = now_iso()
+    else:
+        _codebuild._create_project({"name": name, **data})
     arn = _codebuild._project_arn(name)
     return name, {"Arn": arn}
 
 
 def _codebuild_project_delete(physical_id, props):
     _codebuild._projects.pop(physical_id, None)
+
+
+# --- CodeBuild ReportGroup provisioner (stub) ---
+
+def _codebuild_report_group_create(logical_id, props, stack_name):
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=128)
+    arn = f"arn:aws:codebuild:{get_region()}:{get_account_id()}:report-group/{name}"
+    return name, {"Arn": arn}
+
+
+def _codebuild_report_group_delete(physical_id, props):
+    pass
+
+
+# --- CodePipeline Pipeline provisioner ---
+
+_PASCAL_PRESERVE_KEYS = {"Configuration", "configuration"}
+
+
+def _pascal_to_camel_keys(value, parent_key=None):
+    """Recursively lowercase first char of dict keys (CFN PascalCase -> JSON RPC camelCase).
+
+    Action.Configuration uses service-specific PascalCase keys in both CFN
+    and the JSON RPC CodePipeline API, so it's preserved.
+    """
+    if parent_key in _PASCAL_PRESERVE_KEYS:
+        return value
+    if isinstance(value, dict):
+        return {
+            (k[:1].lower() + k[1:] if k else k): _pascal_to_camel_keys(v, parent_key=k)
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_pascal_to_camel_keys(v, parent_key=parent_key) for v in value]
+    return value
+
+
+def _codepipeline_pipeline_def_from_props(name, props):
+    return {
+        "name": name,
+        "roleArn": props.get("RoleArn", f"arn:aws:iam::{get_account_id()}:role/codepipeline-role"),
+        "stages": _pascal_to_camel_keys(props.get("Stages", [])),
+        "artifactStore": _pascal_to_camel_keys(props.get("ArtifactStore", {})),
+        "artifactStores": _pascal_to_camel_keys(props.get("ArtifactStores", {})),
+        "pipelineType": props.get("PipelineType", "V1"),
+        "executionMode": props.get("ExecutionMode", "SUPERSEDED"),
+        "restartExecutionOnUpdate": bool(props.get("RestartExecutionOnUpdate", False)),
+        "disableInboundStageTransitions": _pascal_to_camel_keys(props.get("DisableInboundStageTransitions", [])),
+        "triggers": _pascal_to_camel_keys(props.get("Triggers", [])),
+        "variables": _pascal_to_camel_keys(props.get("Variables", [])),
+        "version": 1,
+    }
+
+
+def _codepipeline_pipeline_create(logical_id, props, stack_name):
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=100)
+    if name in _codepipeline._pipelines:
+        raise ValueError(f"CodePipeline pipeline already exists: {name}")
+    pipeline_def = _codepipeline_pipeline_def_from_props(name, props)
+    tag_list = [{"key": t["Key"], "value": t["Value"]} for t in props.get("Tags", [])]
+    _codepipeline._create_pipeline({"pipeline": pipeline_def, "tags": tag_list})
+    arn = _codepipeline._pipeline_arn(name)
+    return name, {"Version": "1", "Arn": arn}
+
+
+def _codepipeline_pipeline_update(physical_id, old_props, new_props, stack_name):
+    """CFN UpdateStack handler — idempotent. SelfMutate re-applies the same
+    template; we bump version + replace the definition without erroring."""
+    name = physical_id or new_props.get("Name") or _physical_name(
+        stack_name, "", max_len=100
+    )
+    pipeline_def = _codepipeline_pipeline_def_from_props(name, new_props)
+    if name in _codepipeline._pipelines:
+        existing = _codepipeline._pipelines[name]
+        pipeline_def["version"] = existing.get("version", 1) + 1
+        pipeline_def["created"] = existing.get("created", _codepipeline._now_iso())
+        pipeline_def["updated"] = _codepipeline._now_iso()
+        _codepipeline._pipelines[name] = pipeline_def
+    else:
+        tag_list = [{"key": t["Key"], "value": t["Value"]} for t in new_props.get("Tags", [])]
+        _codepipeline._create_pipeline({"pipeline": pipeline_def, "tags": tag_list})
+    arn = _codepipeline._pipeline_arn(name)
+    return name, {"Version": str(pipeline_def["version"]), "Arn": arn}
+
+
+def _codepipeline_pipeline_delete(physical_id, props):
+    _codepipeline._pipelines.pop(physical_id, None)
+    for eid in [e for e, x in _codepipeline._executions.items()
+                if x.get("pipelineName") == physical_id]:
+        _codepipeline._executions.pop(eid, None)
+
+
+# --- CodePipeline Webhook provisioner ---
+
+def _codepipeline_webhook_create(logical_id, props, stack_name):
+    name = props.get("Name") or _physical_name(stack_name, logical_id, max_len=100)
+    webhook_def = {
+        "name": name,
+        "targetPipeline": props.get("TargetPipeline", ""),
+        "targetAction": props.get("TargetAction", ""),
+        "filters": props.get("Filters", []),
+        "authentication": props.get("Authentication", "UNAUTHENTICATED"),
+        "authenticationConfiguration": props.get("AuthenticationConfiguration", {}),
+    }
+    _codepipeline._webhooks[name] = webhook_def
+    arn = f"arn:aws:codepipeline:{get_region()}:{get_account_id()}:webhook:{name}"
+    return name, {"Url": f"http://localhost:4566/_ministack/codepipeline/webhook/{name}",
+                  "Arn": arn}
+
+
+def _codepipeline_webhook_delete(physical_id, props):
+    _codepipeline._webhooks.pop(physical_id, None)
+
+
+# --- CodeStar Connections Connection provisioner ---
+
+def _codestar_connection_create(logical_id, props, stack_name):
+    name = props.get("ConnectionName") or _physical_name(stack_name, logical_id, max_len=32)
+    provider = props.get("ProviderType")
+    host_arn = props.get("HostArn", "")
+    response = _codestar_conn._create_connection({
+        "ConnectionName": name,
+        "ProviderType": provider,
+        "HostArn": host_arn,
+        "Tags": props.get("Tags", []),
+    })
+    # response is a json_response tuple; parse it to grab the ARN.
+    import json as _json
+    body = response[2] if isinstance(response, tuple) and len(response) >= 3 else b"{}"
+    if isinstance(response, tuple) and response[0] != 200:
+        raise ValueError(body.decode() if isinstance(body, (bytes, bytearray)) else str(body))
+    body_str = body.decode() if isinstance(body, (bytes, bytearray)) else str(body)
+    parsed = _json.loads(body_str) if body_str else {}
+    arn = parsed.get("ConnectionArn", "")
+    return arn, {"ConnectionArn": arn, "ConnectionStatus": "AVAILABLE",
+                 "OwnerAccountId": get_account_id()}
+
+
+def _codestar_connection_delete(physical_id, props):
+    if physical_id and "connection/" in physical_id:
+        conn_id = physical_id.rsplit("/", 1)[-1]
+        _codestar_conn._connections.pop(conn_id, None)
 
 
 # --- IAM ManagedPolicy provisioner ---
@@ -2852,20 +3394,32 @@ def _r53_record_set_delete(physical_id, props):
 
 
 def _cw_metric_alarm_create(logical_id, props, stack_name):
-    if props.get("Metrics"):
-        raise ValueError(
-            "AWS::CloudWatch::Alarm Properties.Metrics (metric math) is not supported; "
-            "use MetricName and Namespace."
-        )
     name = props.get("AlarmName") or _physical_name(stack_name, logical_id, max_len=255)
-    metric_name = props.get("MetricName")
-    namespace = props.get("Namespace")
-    if not metric_name or not namespace:
-        raise ValueError("MetricName and Namespace are required for AWS::CloudWatch::Alarm")
-    comparison = props.get("ComparisonOperator")
-    if not comparison:
-        raise ValueError("ComparisonOperator is required for AWS::CloudWatch::Alarm")
-    if props.get("Threshold") is None:
+    metrics = props.get("Metrics")
+    if metrics:
+        # Metric-math alarms (multi-metric expressions) — we accept these as
+        # opaque records so CFN deploys complete, but no evaluation engine
+        # actually runs. Pick the first metric stat as a representative for
+        # MetricName/Namespace so downstream describe-alarms responses look sane.
+        metric_name = "(metric-math)"
+        namespace = "(metric-math)"
+        comparison = props.get("ComparisonOperator", "GreaterThanOrEqualToThreshold")
+        for m in metrics:
+            stat = (m or {}).get("MetricStat") or {}
+            inner = stat.get("Metric") or {}
+            if inner.get("MetricName") and inner.get("Namespace"):
+                metric_name = inner["MetricName"]
+                namespace = inner["Namespace"]
+                break
+    else:
+        metric_name = props.get("MetricName")
+        namespace = props.get("Namespace")
+        if not metric_name or not namespace:
+            raise ValueError("MetricName and Namespace are required for AWS::CloudWatch::Alarm")
+        comparison = props.get("ComparisonOperator")
+        if not comparison:
+            raise ValueError("ComparisonOperator is required for AWS::CloudWatch::Alarm")
+    if props.get("Threshold") is None and not metrics:
         raise ValueError("Threshold is required for AWS::CloudWatch::Alarm")
 
     period = int(props.get("Period", 60))
@@ -3576,7 +4130,7 @@ _RESOURCE_HANDLERS = {
     # ignored locally), so it gets a dedicated provisioner that translates
     # before delegating to the Table engine.
     "AWS::DynamoDB::GlobalTable": {"create": _ddb_global_table_create, "delete": _ddb_global_table_delete},
-    "AWS::Lambda::Function": {"create": _lambda_create, "delete": _lambda_delete},
+    "AWS::Lambda::Function": {"create": _lambda_create, "update": _lambda_update, "delete": _lambda_delete},
     "AWS::IAM::Role": {"create": _iam_role_create, "delete": _iam_role_delete},
     "AWS::IAM::Policy": {"create": _iam_policy_create, "delete": _iam_policy_delete},
     "AWS::IAM::InstanceProfile": {"create": _iam_ip_create, "delete": _iam_ip_delete},
@@ -3612,7 +4166,13 @@ _RESOURCE_HANDLERS = {
     "AWS::AppSync::GraphQLSchema": {"create": _appsync_schema_create},
     "AWS::AppSync::ApiKey": {"create": _appsync_apikey_create, "delete": _appsync_apikey_delete},
     "AWS::SecretsManager::Secret": {"create": _sm_secret_create, "delete": _sm_secret_delete},
-    "AWS::Cognito::UserPool": {"create": _cognito_user_pool_create, "delete": _cognito_user_pool_delete},
+    "AWS::SecretsManager::ResourcePolicy": {"create": _sm_resource_policy_create, "delete": _sm_resource_policy_delete},
+    "AWS::CloudFormation::Stack": {"create": _nested_stack_create, "delete": _nested_stack_delete},
+    "AWS::CodeDeploy::Application": {"create": _codedeploy_application_create, "delete": _codedeploy_application_delete},
+    "AWS::CodeDeploy::DeploymentGroup": {"create": _codedeploy_deployment_group_create, "delete": _codedeploy_deployment_group_delete},
+    "AWS::CodeDeploy::DeploymentConfig": {"create": _codedeploy_deployment_config_create, "delete": _codedeploy_deployment_config_delete},
+    "AWS::Lambda::EventInvokeConfig": {"create": _lambda_event_invoke_config_create, "delete": _lambda_event_invoke_config_delete},
+    "AWS::Cognito::UserPool": {"create": _cognito_user_pool_create, "update": _cognito_user_pool_update, "delete": _cognito_user_pool_delete},
     "AWS::Cognito::UserPoolClient": {"create": _cognito_user_pool_client_create, "delete": _cognito_user_pool_client_delete},
     "AWS::Cognito::IdentityPool": {"create": _cognito_identity_pool_create, "delete": _cognito_identity_pool_delete},
     "AWS::Cognito::UserPoolDomain": {"create": _cognito_user_pool_domain_create, "delete": _cognito_user_pool_domain_delete},
@@ -3620,7 +4180,11 @@ _RESOURCE_HANDLERS = {
     "AWS::CertificateManager::Certificate": {"create": _acm_certificate_create, "delete": _acm_certificate_delete},
     "AWS::ElasticLoadBalancingV2::TargetGroup": {"create": _elbv2_target_group_create, "delete": _elbv2_target_group_delete},
     "AWS::ElasticLoadBalancingV2::ListenerRule": {"create": _elbv2_listener_rule_create, "delete": _elbv2_listener_rule_delete},
-    "AWS::CodeBuild::Project": {"create": _codebuild_project_create, "delete": _codebuild_project_delete},
+    "AWS::CodeBuild::Project": {"create": _codebuild_project_create, "update": _codebuild_project_update, "delete": _codebuild_project_delete},
+    "AWS::CodeBuild::ReportGroup": {"create": _codebuild_report_group_create, "delete": _codebuild_report_group_delete},
+    "AWS::CodePipeline::Pipeline": {"create": _codepipeline_pipeline_create, "update": _codepipeline_pipeline_update, "delete": _codepipeline_pipeline_delete},
+    "AWS::CodePipeline::Webhook": {"create": _codepipeline_webhook_create, "delete": _codepipeline_webhook_delete},
+    "AWS::CodeStarConnections::Connection": {"create": _codestar_connection_create, "delete": _codestar_connection_delete},
     "AWS::IAM::ManagedPolicy": {"create": _iam_managed_policy_create, "delete": _iam_managed_policy_delete},
     "AWS::KMS::Key": {"create": _kms_key_create, "delete": _kms_key_delete},
     "AWS::KMS::Alias": {"create": _kms_alias_create, "delete": _kms_alias_delete},

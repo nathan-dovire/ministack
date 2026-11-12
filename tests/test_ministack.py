@@ -105,6 +105,46 @@ def test_localstack_health_still_returns_200():
     assert "edition" in data
 
 
+def test_ministack_accounts_endpoint_lists_accounts_with_state():
+    """GET /_ministack/accounts returns every account that has any state
+    in any AccountScopedDict. We seed two distinct accounts via SecretsManager
+    and then assert both appear."""
+    import urllib.request
+    import boto3
+    from botocore.config import Config
+
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+    def _sm(account_id: str):
+        return boto3.client(
+            "secretsmanager",
+            endpoint_url=endpoint,
+            region_name="us-east-1",
+            aws_access_key_id=account_id,
+            aws_secret_access_key="test",
+            config=Config(retries={"mode": "standard"}),
+        )
+
+    acct_a = "777777777777"
+    acct_b = "888888888888"
+    name_a = f"accounts-endpoint-test-a-{_uuid_mod.uuid4().hex[:8]}"
+    name_b = f"accounts-endpoint-test-b-{_uuid_mod.uuid4().hex[:8]}"
+    _sm(acct_a).create_secret(Name=name_a, SecretString="v")
+    _sm(acct_b).create_secret(Name=name_b, SecretString="v")
+
+    resp = urllib.request.urlopen(f"{endpoint}/_ministack/accounts", timeout=5)
+    assert resp.status == 200
+    data = json.loads(resp.read())
+    assert "accounts" in data
+    accounts = data["accounts"]
+    assert isinstance(accounts, list)
+    assert acct_a in accounts, f"expected {acct_a} in {accounts}"
+    assert acct_b in accounts, f"expected {acct_b} in {accounts}"
+    # IDs are 12-digit strings and the list is sorted.
+    assert all(isinstance(a, str) and len(a) == 12 and a.isdigit() for a in accounts)
+    assert accounts == sorted(accounts)
+
+
 @_requires_package
 def test_ministack_package_core_importable():
     """ministack.core modules must all be importable."""

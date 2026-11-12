@@ -106,6 +106,74 @@ def _account_from_arn(arn: str) -> str:
 
 
 REGION = os.environ.get("MINISTACK_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+
+
+def _custom_resource_synthetic_success() -> bool:
+    return os.environ.get("MINISTACK_CUSTOM_RESOURCE_SYNTHETIC_SUCCESS", "0").lower() in ("1", "true", "yes")
+
+
+def _custom_resource_mock_data() -> dict:
+    raw = os.environ.get("MINISTACK_CUSTOM_RESOURCE_MOCK_DATA", "")
+    try:
+        data = json.loads(raw) if raw else {}
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _mock_no_code_response(event):
+    """Mock-Lambda response used when a function has no deployed code.
+
+    With MINISTACK_CUSTOM_RESOURCE_SYNTHETIC_SUCCESS=1 and a CFN Custom
+    Resource event (has a ResponseURL), also POST a synthetic SUCCESS payload
+    to that URL so the custom resource doesn't hang waiting for the Lambda to
+    call back. The Data field is populated with all top-level keys from the
+    resource's properties, plus MINISTACK_CUSTOM_RESOURCE_MOCK_DATA, so
+    Fn::GetAtt lookups against the custom resource resolve to *some* value.
+    """
+    body = {"statusCode": 200, "body": "Mock response - no code deployed"}
+    try:
+        response_url = event.get("ResponseURL") if isinstance(event, dict) else None
+        if response_url and _custom_resource_synthetic_success():
+            import json as _json
+            import urllib.request as _urlreq
+
+            props = event.get("ResourceProperties") or {}
+            data = {k: v for k, v in props.items()
+                    if isinstance(v, (str, int, float, bool)) and k != "ServiceToken"}
+            for key, value in _custom_resource_mock_data().items():
+                data.setdefault(key, value)
+            payload = {
+                "Status": "SUCCESS",
+                "Reason": "ministack mock: no code deployed",
+                "PhysicalResourceId": event.get("PhysicalResourceId")
+                    or (props.get("PhysicalResourceId") or {}).get("id")
+                    or event.get("RequestId", "mock"),
+                "StackId": event.get("StackId", ""),
+                "RequestId": event.get("RequestId", ""),
+                "LogicalResourceId": event.get("LogicalResourceId", ""),
+                "NoEcho": False,
+                "Data": data,
+            }
+            req = _urlreq.Request(
+                response_url,
+                data=_json.dumps(payload).encode("utf-8"),
+                method="PUT",
+                headers={"Content-Type": ""},
+            )
+            try:
+                _urlreq.urlopen(req, timeout=5).close()
+            except Exception as exc:
+                import logging as _logging
+                _logging.getLogger("lambda").warning(
+                    "Mock CFN ResponseURL POST failed: %s", exc
+                )
+    except Exception:
+        # Never let mock-response delivery break the lambda invoke contract
+        import logging as _logging
+        _logging.getLogger("lambda").exception("Mock response handler raised")
+    return {"body": body}
+
 LAMBDA_EXECUTOR = os.environ.get("LAMBDA_EXECUTOR", "local").lower()
 LAMBDA_DOCKER_VOLUME_MOUNT = os.environ.get("LAMBDA_REMOTE_DOCKER_VOLUME_MOUNT", "")
 LAMBDA_DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "") or os.environ.get("LAMBDA_DOCKER_NETWORK", "")
@@ -506,6 +574,79 @@ def _fetch_code_from_s3(bucket: str, key: str, version_id: str | None = None) ->
     return None
 
 
+# ---------------------------------------------------------------------------
+# Local-asset markers
+#
+# A CodePipeline-published Lambda asset can be represented by a small JSON
+# marker stored in place of the code zip; the marker holds the path to the
+# unpacked asset directory in the bind-mounted cdk.out. A function whose code
+# is a marker runs directly from that directory instead of from a zip. See
+# codepipeline_runtime._publish_assets_from_disk.
+# ---------------------------------------------------------------------------
+
+_LOCAL_ASSET_MARKER_KEY = "__ministack_local_asset__"
+
+
+def make_local_asset_marker(path: str) -> bytes:
+    import json as _json
+    return _json.dumps({_LOCAL_ASSET_MARKER_KEY: path}).encode("utf-8")
+
+
+def parse_local_asset_marker(data: bytes | None) -> str | None:
+    """Return the local dir path if `data` is a marker, else None."""
+    if not data or len(data) > 4096 or data[:1] != b"{":
+        return None
+    if _LOCAL_ASSET_MARKER_KEY.encode() not in data:
+        return None
+    try:
+        import json as _json
+        obj = _json.loads(data)
+        p = obj.get(_LOCAL_ASSET_MARKER_KEY)
+        return p if isinstance(p, str) and p else None
+    except (ValueError, TypeError):
+        return None
+
+
+def ensure_runtime_code(func: dict) -> tuple:
+    """Return ``(code_zip, code_local_dir)`` for *func*, resolving from its S3
+    code reference if neither is set yet.
+
+    A pipeline-deployed function's code may be a local-asset marker (a JSON
+    pointer at the on-disk cdk.out asset dir; see
+    ``codepipeline_runtime._publish_assets_from_disk``). When the marker isn't
+    already resolved on the record, fetch it from S3, point the function at the
+    asset directory, and cache the result. Falls back to the existing
+    zip/local-dir when there's no usable marker.
+    """
+    code_zip = func.get("code_zip")
+    code_local_dir = func.get("code_local_dir")
+    if code_zip or (code_local_dir and os.path.isdir(code_local_dir)):
+        return code_zip, code_local_dir
+
+    bucket = func.get("code_s3_bucket")
+    key = func.get("code_s3_key")
+    if not bucket or not key:
+        return code_zip, code_local_dir
+
+    fetched = _fetch_code_from_s3(bucket, key, version_id=func.get("code_s3_object_version"))
+    if not fetched:
+        return code_zip, code_local_dir
+
+    marker_path = parse_local_asset_marker(fetched)
+    if marker_path:
+        if os.path.isdir(marker_path):
+            func["code_local_dir"] = marker_path
+            logger.info("Resolved local-asset code for %s -> %s",
+                        func.get("config", {}).get("FunctionName", "?"), marker_path)
+            return code_zip, marker_path
+        logger.warning("Local-asset marker for %s points at missing dir %s",
+                       func.get("config", {}).get("FunctionName", "?"), marker_path)
+        return code_zip, code_local_dir
+
+    func["code_zip"] = fetched
+    return fetched, code_local_dir
+
+
 _UNZIPPED_LIMIT_BYTES = 262144000  # 250 MiB — AWS hard limit
 
 
@@ -629,6 +770,12 @@ def _get_func_record_for_qualifier(name: str, qualifier: str | None) -> tuple[di
     For $LATEST or None, returns the primary record/config.
     For a version number, returns the versioned snapshot.
     For an alias, resolves to the alias target version.
+
+    Versions / aliases inherit their code references (code_zip, code_local_dir)
+    from the parent function lazily: CDK Pipelines publishes a version *before*
+    the asset bundle gets attached to the function, so without this fallback
+    every alias-invoke (e.g. Cognito triggers wired with `:live`) hits the
+    "no code deployed" mock even though $LATEST runs fine.
     """
     func = _functions.get(name)
     if func is None:
@@ -643,14 +790,43 @@ def _get_func_record_for_qualifier(name: str, qualifier: str | None) -> tuple[di
             return func, func["config"]
         ver = func["versions"].get(target_ver)
         if ver:
+            _inherit_code_from_parent(ver, func)
             return ver, ver["config"]
         return func, func["config"]
 
     ver = func["versions"].get(qualifier)
     if ver:
+        _inherit_code_from_parent(ver, func)
         return ver, ver["config"]
 
     return func, func["config"]
+
+
+def _inherit_code_from_parent(ver: dict, parent: dict) -> None:
+    """If the version snapshot has no code attached but the parent function
+    does, copy the parent's code references onto the version so subsequent
+    invocations execute the real handler instead of the mock. Covers the
+    resolved code (`code_zip` / `code_local_dir`) AND the unresolved S3
+    references (`code_s3_*`) that `ensure_runtime_code` resolves on demand —
+    CDK Pipelines may publish the version before the asset is uploaded.
+    Safe to call repeatedly: each branch is a no-op once the version has
+    its own attachment."""
+    for key in (
+        "code_zip", "code_local_dir",
+        "code_s3_bucket", "code_s3_key", "code_s3_object_version",
+    ):
+        if not ver.get(key) and parent.get(key):
+            ver[key] = parent.get(key)
+    # Propagate a raised $LATEST timeout onto the published version (and so the
+    # `:live` alias), so `update-function-configuration --timeout` against
+    # $LATEST takes effect locally even though versions are immutable in real
+    # AWS. Only widen, never shrink.
+    parent_cfg = parent.get("config") or {}
+    ver_cfg = ver.get("config") or {}
+    parent_timeout = parent_cfg.get("Timeout")
+    if isinstance(parent_timeout, (int, float)) and parent_timeout > (ver_cfg.get("Timeout") or 0):
+        ver_cfg["Timeout"] = parent_timeout
+        ver["config"] = ver_cfg
 
 
 # ---------------------------------------------------------------------------
@@ -914,18 +1090,27 @@ def _create_function(data: dict):
         )
 
     code_zip = None
+    code_local_dir = None
     image_uri = None
+    code_s3_bucket = code_s3_key = code_s3_version = None
     code_data = data.get("Code", {})
     if "ImageUri" in code_data:
         image_uri = code_data["ImageUri"]
     elif "ZipFile" in code_data:
         code_zip = base64.b64decode(code_data["ZipFile"])
     elif "S3Bucket" in code_data and "S3Key" in code_data:
-        code_zip = _fetch_code_from_s3(
-            code_data["S3Bucket"],
-            code_data["S3Key"],
-            version_id=code_data.get("S3ObjectVersion"),
-        )
+        code_s3_bucket = code_data["S3Bucket"]
+        code_s3_key = code_data["S3Key"]
+        code_s3_version = code_data.get("S3ObjectVersion")
+        fetched = _fetch_code_from_s3(code_s3_bucket, code_s3_key, version_id=code_s3_version)
+        # Local-native asset: the S3 object may be a marker pointing at the
+        # on-disk asset dir (see codepipeline_runtime asset publisher) rather
+        # than a real zip — run straight from disk in that case.
+        marker_path = parse_local_asset_marker(fetched)
+        if marker_path:
+            code_local_dir = marker_path
+        else:
+            code_zip = fetched
 
     err = _validate_unzipped_size(code_zip)
     if err is not None:
@@ -952,6 +1137,10 @@ def _create_function(data: dict):
     _functions[name] = {
         "config": config,
         "code_zip": code_zip,
+        "code_local_dir": code_local_dir,
+        "code_s3_bucket": code_s3_bucket,
+        "code_s3_key": code_s3_key,
+        "code_s3_object_version": code_s3_version,
         "versions": {},
         "next_version": 1,
         "tags": data.get("Tags", {}),
@@ -1279,28 +1468,45 @@ def _update_code(name: str, data: dict):
         )
     func = _functions[name]
     code_zip = None
+    code_local_dir = None
     if "ImageUri" in data:
         func["config"]["ImageUri"] = data["ImageUri"]
         func["config"]["PackageType"] = "Image"
     elif "ZipFile" in data:
         code_zip = base64.b64decode(data["ZipFile"])
     elif "S3Bucket" in data and "S3Key" in data:
-        code_zip = _fetch_code_from_s3(
+        fetched = _fetch_code_from_s3(
             data["S3Bucket"],
             data["S3Key"],
             version_id=data.get("S3ObjectVersion"),
         )
-        if code_zip is None:
+        if fetched is None:
             return error_response_json(
                 "InvalidParameterValueException",
                 f"Failed to fetch code from s3://{data['S3Bucket']}/{data['S3Key']}",
                 400,
             )
+        # Local-native asset marker -> run from disk; else a real zip.
+        marker_path = parse_local_asset_marker(fetched)
+        if marker_path:
+            code_local_dir = marker_path
+        else:
+            code_zip = fetched
+        func["code_s3_bucket"] = data["S3Bucket"]
+        func["code_s3_key"] = data["S3Key"]
+        func["code_s3_object_version"] = data.get("S3ObjectVersion")
     err = _validate_unzipped_size(code_zip)
     if err is not None:
         return err
-    if code_zip:
+    if code_local_dir:
+        # Switch the function to local-dir execution; clear any stale zip.
+        func["code_zip"] = None
+        func["code_local_dir"] = code_local_dir
+        func["config"]["CodeSize"] = 0
+        func["config"]["CodeSha256"] = "cfn-deployed"
+    elif code_zip:
         func["code_zip"] = code_zip
+        func["code_local_dir"] = None
         func["config"]["CodeSize"] = len(code_zip)
         func["config"]["CodeSha256"] = base64.b64encode(
             hashlib.sha256(code_zip).digest(),
@@ -1385,6 +1591,11 @@ def _update_config(name: str, data: dict):
     config["StateReason"] = "The function is being updated."
     config["StateReasonCode"] = "Updating"
     config["RevisionId"] = new_uuid()
+    # AWS-match: changing env vars / handler / timeout etc. requires the next
+    # invocation to run a fresh init. _update_code already does this on code
+    # change; do the same on config change so callers don't have to bounce the
+    # warm worker out of band (e.g. `docker exec ministack pkill -f <fn>`).
+    invalidate_worker(name, qualifier="$LATEST")
     _schedule_state_transition(name, _LAMBDA_STATE_TRANSITION_DELAY)
     return json_response(config)
 
@@ -2403,7 +2614,7 @@ def _execute_function_docker(func: dict, event: dict) -> dict:
     # Zip needs code (Image brings it in the image)
     code_zip = func.get("code_zip")
     if package_type == "Zip" and not code_zip:
-        return {"body": {"statusCode": 200, "body": "Mock response - no code deployed"}}
+        return _mock_no_code_response(event)
 
     # Early validation of runtime → image mapping to return a clean mock
     if package_type != "Image" and _docker_image_for_runtime(runtime) is None:
@@ -2633,6 +2844,24 @@ def _execute_function(func: dict, event: dict) -> dict:
         bool(result.get("error")) if isinstance(result, dict) else False,
         duration_ms,
     )
+
+    # With MINISTACK_CUSTOM_RESOURCE_SYNTHETIC_SUCCESS=1: if the invocation
+    # errored AND the event has a CFN ResponseURL, fall back to the
+    # synthetic-success path used for no-code-deployed Lambdas.
+    # Real Lambda code can fail in MiniStack because:
+    #  - CDK's AwsCustomResource Lambda is bundled with --external:aws-sdk
+    #    expecting the AWS runtime to provide it (it doesn't, locally).
+    #  - The function imports modules MiniStack's subprocess executor can't
+    #    resolve (no Lambda layers, no native bindings).
+    # The synthetic success unblocks CFN custom resource provisioning;
+    # downstream "real" Lambda invocations from the app keep their real error.
+    if (
+        _custom_resource_synthetic_success()
+        and isinstance(result, dict) and result.get("error")
+        and isinstance(event, dict) and event.get("ResponseURL")
+    ):
+        return _mock_no_code_response(event)
+
     return result
 
 
@@ -2753,14 +2982,21 @@ def _execute_function_proxy(func: dict, event: dict, url: str, request_id: str) 
 def _execute_function_warm(func: dict, event: dict) -> dict:
     """Execute a Lambda function using the warm worker pool (Python + Node.js)."""
     config = func.get("config") or func
-    code_zip = func.get("code_zip")
-    if not code_zip:
-        return {"body": {"statusCode": 200, "body": "Mock response - no code deployed"}}
+    # Local-native asset: code lives on disk (bind-mounted cdk.out) rather than
+    # in a zip. Resolve lazily from the S3 marker if the function was created
+    # before its asset was published. Only mock when there's still neither a
+    # zip nor a valid local dir.
+    code_zip, code_local_dir = ensure_runtime_code(func)
+    if not code_zip and not (code_local_dir and os.path.isdir(code_local_dir)):
+        return _mock_no_code_response(event)
 
     func_name = config.get("FunctionName", "unknown")
     qualifier = config.get("Version", "$LATEST")
     try:
-        worker = get_or_create_worker(func_name, config, code_zip, qualifier=qualifier)
+        worker = get_or_create_worker(
+            func_name, config, code_zip, qualifier=qualifier,
+            code_local_dir=code_local_dir,
+        )
         result = worker.invoke(event, new_uuid())
         if result.get("status") == "ok":
             return {"body": result.get("result"), "log": result.get("log", "")}
@@ -2792,7 +3028,7 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
     config = func.get("config") or func
     code_zip = func.get("code_zip")
     if not code_zip:
-        return {"body": {"statusCode": 200, "body": "Mock response - no code deployed"}}
+        return _mock_no_code_response(event)
 
     timeout = config.get("Timeout", 30)
     env_vars = config.get("Environment", {}).get("Variables", {})
@@ -2974,9 +3210,9 @@ def _execute_function_provided(func: dict, event: dict) -> dict:
 def _execute_function_local(func: dict, event: dict) -> dict:
     """Execute a Lambda function in a one-shot subprocess (fallback for unsupported runtimes)."""
     config = func.get("config") or func
-    code_zip = func.get("code_zip")
+    code_zip, _ = ensure_runtime_code(func)
     if not code_zip:
-        return {"body": {"statusCode": 200, "body": "Mock response - no code deployed"}}
+        return _mock_no_code_response(event)
 
     handler = config["Handler"]
     runtime = config["Runtime"]
@@ -3185,9 +3421,14 @@ def _publish_version(name: str, data: dict):
     if data.get("Description"):
         ver_config["Description"] = data["Description"]
 
+    # A versioned snapshot carries both the inline `code_zip` and the
+    # `code_local_dir` (the on-disk asset path used for local-bundle dispatch),
+    # mirroring how real-AWS Publish copies the code. Include the local-dir, or
+    # alias->version invocations fall through to the no-code path.
     func["versions"][str(ver_num)] = {
         "config": ver_config,
         "code_zip": func.get("code_zip"),
+        "code_local_dir": func.get("code_local_dir"),
     }
     return json_response(ver_config, 201)
 

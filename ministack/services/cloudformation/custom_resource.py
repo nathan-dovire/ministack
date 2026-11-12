@@ -1,6 +1,7 @@
 """
 CloudFormation Custom Resource — ResponseURL intercept and Lambda invocation.
 """
+import json
 import logging
 import os
 import threading
@@ -9,6 +10,30 @@ logger = logging.getLogger("cloudformation")
 
 _HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _PORT = os.environ.get("GATEWAY_PORT", "4566")
+
+# A custom-resource Lambda that never PUTs back to its ResponseURL holds the
+# whole stack in *_IN_PROGRESS for this long. Real CFN defaults to 1h; locally
+# that just widens the window for a restart to persist a dangling IN_PROGRESS
+# and permanently wedge the stack (see cloudformation.restore_state). Fail fast
+# instead: a terminal *_FAILED/rollback is recoverable, a persisted
+# IN_PROGRESS is not. 300s keeps headroom for a legitimately slow resource
+# while staying 12x below the old 1h. Override with
+# MINISTACK_CUSTOM_RESOURCE_TIMEOUT or a per-resource ServiceTimeout property.
+_DEFAULT_SERVICE_TIMEOUT = int(os.environ.get("MINISTACK_CUSTOM_RESOURCE_TIMEOUT", "300"))
+
+
+def _synthetic_success() -> bool:
+    return os.environ.get("MINISTACK_CUSTOM_RESOURCE_SYNTHETIC_SUCCESS", "0").lower() in ("1", "true", "yes")
+
+
+def _mock_data() -> dict:
+    raw = os.environ.get("MINISTACK_CUSTOM_RESOURCE_MOCK_DATA", "")
+    try:
+        data = json.loads(raw) if raw else {}
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
 
 _lock = threading.Lock()
 # token → {"event": threading.Event, "result": dict | None}
@@ -22,12 +47,46 @@ def register_token(token: str) -> threading.Event:
     return evt
 
 
+_SDK_NOT_FOUND_PATTERNS = (
+    "No client constructor found",
+    "Cannot find module",
+    "is not a constructor",
+    "Cannot find package",
+    "MODULE_NOT_FOUND",
+)
+
+
 def deliver_response(token: str, response: dict) -> bool:
-    """Called by the HTTP handler when ResponseURL is PUT to. Returns False if token unknown."""
+    """Called by the HTTP handler when ResponseURL is PUT to. Returns False if token unknown.
+
+    MiniStack-specific fixup, only with MINISTACK_CUSTOM_RESOURCE_SYNTHETIC_SUCCESS=1:
+    when a CDK AwsCustomResource framework Lambda
+    reports FAILED because Node's bundled handler can't find the AWS SDK
+    package it needs at runtime (CDK bundles with --external:aws-sdk,
+    expecting the real Lambda runtime to provide it), we rewrite the response
+    to SUCCESS. The Lambda would have returned data the dependent resources
+    need; with no real implementation we synthesize a minimal Data dict from
+    the original event's ResourceProperties to keep Fn::GetAtt lookups
+    populated. Real downstream behavior may be wrong, but CFN provisioning
+    completes instead of hanging the whole stack.
+    """
     with _lock:
         entry = _pending.get(token)
         if entry is None:
             return False
+        if response.get("Status") == "FAILED" and _synthetic_success():
+            reason = response.get("Reason", "")
+            if any(pat in reason for pat in _SDK_NOT_FOUND_PATTERNS):
+                logger.warning(
+                    "Custom resource failure rewritten to SUCCESS (token=%s): %s",
+                    token, reason,
+                )
+                response = {
+                    **response,
+                    "Status": "SUCCESS",
+                    "Reason": f"ministack: {reason} — rewritten to SUCCESS",
+                    "Data": response.get("Data") or _mock_data(),
+                }
         entry["result"] = response
         entry["event"].set()
     return True
@@ -86,9 +145,9 @@ def invoke_custom_resource(
 
     func_record = _lambda_svc._functions[func_name]
     try:
-        service_timeout = int(props.get("ServiceTimeout", 3600))
+        service_timeout = int(props.get("ServiceTimeout", _DEFAULT_SERVICE_TIMEOUT))
     except (ValueError, TypeError):
-        service_timeout = 3600
+        service_timeout = _DEFAULT_SERVICE_TIMEOUT
 
     token = new_uuid()
     request_id = new_uuid()

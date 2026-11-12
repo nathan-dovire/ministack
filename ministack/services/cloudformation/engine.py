@@ -167,7 +167,31 @@ def _resolve_parameters(template: dict, provided_params: list[dict]) -> dict:
         elif ptype == "CommaDelimitedList":
             # Keep as string; Fn::Select will split
             pass
-        # AWS-specific types treated as String -- no extra validation
+        elif ptype.startswith("AWS::SSM::Parameter::Value"):
+            # Special CFN parameter type: the supplied value is the *name* of
+            # an SSM parameter, and CFN must look it up and substitute the
+            # parameter's actual value before the template is processed. Used
+            # heavily for cross-stack/cross-pipeline references (e.g. a
+            # stack pulling a table ARN written by another stack via SSM). Without this lookup,
+            # downstream Fn::Split/Select on the value falls apart and Lambda
+            # env vars derived from it end up empty.
+            try:
+                from ministack.services import ssm as _ssm
+                resolved_value = _ssm._get_parameter_value(value)
+                if resolved_value is not None:
+                    if ptype.startswith("AWS::SSM::Parameter::Value<List<"):
+                        # CFN keeps lists as comma-delimited strings so
+                        # Fn::Split can still operate on them.
+                        if isinstance(resolved_value, list):
+                            value = ",".join(str(v) for v in resolved_value)
+                        else:
+                            value = str(resolved_value)
+                    else:
+                        value = str(resolved_value)
+            except Exception:
+                # Best-effort: if SSM doesn't have it, keep the literal name
+                # so existing fail-paths surface a clear error downstream.
+                pass
 
         resolved[name] = {"Value": value, "NoEcho": no_echo}
 

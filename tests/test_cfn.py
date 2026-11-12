@@ -1024,6 +1024,308 @@ def test_cfn_secretsmanager_generate_secret_string(cfn, sm):
     assert "password" in secret
     assert len(secret["password"]) >= 20
 
+def test_cfn_secretsmanager_resource_policy_create(cfn, sm):
+    """AWS::SecretsManager::ResourcePolicy in a CFN stack attaches the policy
+    to the named secret, retrievable via GetResourcePolicy."""
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "MySecret": {
+                "Type": "AWS::SecretsManager::Secret",
+                "Properties": {
+                    "Name": "intg-cfn-rp-secret",
+                    "SecretString": "shh",
+                },
+            },
+            "MySecretPolicy": {
+                "Type": "AWS::SecretsManager::ResourcePolicy",
+                "Properties": {
+                    "SecretId": {"Ref": "MySecret"},
+                    "ResourcePolicy": {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {
+                                "Effect": "Allow",
+                                "Principal": {"AWS": "arn:aws:iam::222222222222:root"},
+                                "Action": "secretsmanager:GetSecretValue",
+                                "Resource": "*",
+                            }
+                        ],
+                    },
+                },
+            },
+        },
+    }
+    cfn.create_stack(
+        StackName="intg-cfn-rp-stack",
+        TemplateBody=json.dumps(template),
+    )
+    stack = _wait_stack(cfn, "intg-cfn-rp-stack")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    resp = sm.get_resource_policy(SecretId="intg-cfn-rp-secret")
+    assert "ResourcePolicy" in resp
+    policy = json.loads(resp["ResourcePolicy"])
+    assert policy["Statement"][0]["Principal"]["AWS"] == "arn:aws:iam::222222222222:root"
+    assert policy["Statement"][0]["Action"] == "secretsmanager:GetSecretValue"
+
+
+def test_cfn_secretsmanager_resource_policy_delete(cfn, sm):
+    """Deleting the stack removes the resource policy without removing the secret
+    if the secret was created in a separate stack."""
+    sm.create_secret(Name="intg-cfn-rp-detach-secret", SecretString="shh")
+
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Policy": {
+                "Type": "AWS::SecretsManager::ResourcePolicy",
+                "Properties": {
+                    "SecretId": "intg-cfn-rp-detach-secret",
+                    "ResourcePolicy": {
+                        "Version": "2012-10-17",
+                        "Statement": [
+                            {
+                                "Effect": "Allow",
+                                "Principal": {"AWS": "arn:aws:iam::333333333333:root"},
+                                "Action": "secretsmanager:GetSecretValue",
+                                "Resource": "*",
+                            }
+                        ],
+                    },
+                },
+            }
+        },
+    }
+    cfn.create_stack(
+        StackName="intg-cfn-rp-detach-stack",
+        TemplateBody=json.dumps(template),
+    )
+    stack = _wait_stack(cfn, "intg-cfn-rp-detach-stack")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    # Policy attached
+    resp = sm.get_resource_policy(SecretId="intg-cfn-rp-detach-secret")
+    assert "ResourcePolicy" in resp
+
+    # Stack delete removes the policy but not the secret
+    cfn.delete_stack(StackName="intg-cfn-rp-detach-stack")
+    _wait_stack(cfn, "intg-cfn-rp-detach-stack")  # waits for DELETE_COMPLETE
+
+    resp_after = sm.get_resource_policy(SecretId="intg-cfn-rp-detach-secret")
+    assert "ResourcePolicy" not in resp_after  # policy gone
+    sm.describe_secret(SecretId="intg-cfn-rp-detach-secret")  # secret still there
+
+
+# ============================================================
+# Nested stacks (AWS::CloudFormation::Stack)
+# ============================================================
+#
+# CDK emits a nested stack any time you extend cdk.NestedStack, hit the
+# 500-resource CFN limit, or use certain L3 patterns. The provisioner
+# fetches the child template from S3 via TemplateURL, runs the full deploy
+# loop for it, and exposes the child's Outputs through the parent's
+# Fn::GetAtt resolution.
+
+def _nested_uid():
+    return _uuid_mod.uuid4().hex[:8]
+
+
+def _upload_nested_template(s3_client, bucket: str, key: str, template: dict) -> str:
+    """Upload a child stack template to S3 and return its TemplateURL."""
+    try:
+        s3_client.create_bucket(Bucket=bucket)
+    except ClientError:
+        pass  # already exists
+    s3_client.put_object(Bucket=bucket, Key=key, Body=json.dumps(template).encode())
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    return f"{endpoint}/{bucket}/{key}"
+
+
+def test_cfn_nested_stack_simple(cfn, s3, sns):
+    """Parent with a single nested stack child. Both stacks complete and the
+    child's resources (an SNS topic) are actually created."""
+    bucket = f"nested-tmpl-{_nested_uid()}"
+    child_topic_name = f"nested-child-topic-{_nested_uid()}"
+    child_template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "ChildTopic": {
+                "Type": "AWS::SNS::Topic",
+                "Properties": {"TopicName": child_topic_name},
+            }
+        },
+    }
+    template_url = _upload_nested_template(s3, bucket, "child.json", child_template)
+
+    parent_template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Nested": {
+                "Type": "AWS::CloudFormation::Stack",
+                "Properties": {"TemplateURL": template_url},
+            }
+        },
+    }
+    parent_name = f"nested-parent-{_nested_uid()}"
+    cfn.create_stack(StackName=parent_name, TemplateBody=json.dumps(parent_template))
+    stack = _wait_stack(cfn, parent_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    arns = [t["TopicArn"] for t in sns.list_topics().get("Topics", [])]
+    assert any(arn.endswith(f":{child_topic_name}") for arn in arns), (
+        f"Child topic {child_topic_name} not found in SNS after nested-stack deploy"
+    )
+
+
+def test_cfn_nested_stack_outputs_resolved_in_parent(cfn, s3, sqs):
+    """Parent uses Fn::GetAtt Nested.Outputs.X to flow a value into the
+    parent's own Outputs. The child's Outputs must be visible to the
+    parent's intrinsic resolution path."""
+    bucket = f"nested-out-{_nested_uid()}"
+    queue_name = f"nested-out-queue-{_nested_uid()}"
+
+    child_template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Queue": {
+                "Type": "AWS::SQS::Queue",
+                "Properties": {"QueueName": queue_name},
+            }
+        },
+        "Outputs": {
+            "QueueArn": {"Value": {"Fn::GetAtt": ["Queue", "Arn"]}},
+        },
+    }
+    template_url = _upload_nested_template(s3, bucket, "child.json", child_template)
+
+    parent_template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Nested": {
+                "Type": "AWS::CloudFormation::Stack",
+                "Properties": {"TemplateURL": template_url},
+            }
+        },
+        "Outputs": {
+            "QueueArnFromChild": {
+                "Value": {"Fn::GetAtt": ["Nested", "Outputs.QueueArn"]}
+            }
+        },
+    }
+    parent_name = f"nested-parent-out-{_nested_uid()}"
+    cfn.create_stack(StackName=parent_name, TemplateBody=json.dumps(parent_template))
+    stack = _wait_stack(cfn, parent_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    assert "QueueArnFromChild" in outputs
+    assert outputs["QueueArnFromChild"].endswith(f":{queue_name}"), (
+        f"Expected parent output to flow through child's Outputs.QueueArn; "
+        f"got {outputs['QueueArnFromChild']!r}"
+    )
+
+
+def test_cfn_nested_stack_deleted_with_parent(cfn, s3, sns):
+    """Deleting the parent must recursively delete the child stack and its
+    resources."""
+    bucket = f"nested-del-{_nested_uid()}"
+    child_topic_name = f"nested-del-topic-{_nested_uid()}"
+    child_template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "ChildTopic": {
+                "Type": "AWS::SNS::Topic",
+                "Properties": {"TopicName": child_topic_name},
+            }
+        },
+    }
+    template_url = _upload_nested_template(s3, bucket, "child.json", child_template)
+
+    parent_template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Nested": {
+                "Type": "AWS::CloudFormation::Stack",
+                "Properties": {"TemplateURL": template_url},
+            }
+        },
+    }
+    parent_name = f"nested-parent-del-{_nested_uid()}"
+    cfn.create_stack(StackName=parent_name, TemplateBody=json.dumps(parent_template))
+    assert _wait_stack(cfn, parent_name)["StackStatus"] == "CREATE_COMPLETE"
+
+    arns_before = [t["TopicArn"] for t in sns.list_topics().get("Topics", [])]
+    assert any(arn.endswith(f":{child_topic_name}") for arn in arns_before)
+
+    cfn.delete_stack(StackName=parent_name)
+    _wait_stack(cfn, parent_name)
+
+    arns_after = [t["TopicArn"] for t in sns.list_topics().get("Topics", [])]
+    assert not any(arn.endswith(f":{child_topic_name}") for arn in arns_after), (
+        "Child topic survived parent stack delete — nested-stack cleanup is broken"
+    )
+
+
+def test_cfn_nested_stack_two_levels_deep(cfn, s3, sns):
+    """Nested-in-nested: grandparent → middle → leaf. Outputs propagate up
+    through both levels."""
+    bucket = f"nested-2lvl-{_nested_uid()}"
+    leaf_topic_name = f"nested-leaf-topic-{_nested_uid()}"
+
+    leaf_template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "LeafTopic": {
+                "Type": "AWS::SNS::Topic",
+                "Properties": {"TopicName": leaf_topic_name},
+            }
+        },
+        "Outputs": {
+            "LeafTopicArn": {"Value": {"Ref": "LeafTopic"}}
+        },
+    }
+    leaf_url = _upload_nested_template(s3, bucket, "leaf.json", leaf_template)
+
+    middle_template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Inner": {
+                "Type": "AWS::CloudFormation::Stack",
+                "Properties": {"TemplateURL": leaf_url},
+            }
+        },
+        "Outputs": {
+            "InnerLeafArn": {
+                "Value": {"Fn::GetAtt": ["Inner", "Outputs.LeafTopicArn"]}
+            }
+        },
+    }
+    middle_url = _upload_nested_template(s3, bucket, "middle.json", middle_template)
+
+    parent_template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Resources": {
+            "Middle": {
+                "Type": "AWS::CloudFormation::Stack",
+                "Properties": {"TemplateURL": middle_url},
+            }
+        },
+        "Outputs": {
+            "FinalArn": {
+                "Value": {"Fn::GetAtt": ["Middle", "Outputs.InnerLeafArn"]}
+            }
+        },
+    }
+    parent_name = f"nested-grandparent-{_nested_uid()}"
+    cfn.create_stack(StackName=parent_name, TemplateBody=json.dumps(parent_template))
+    stack = _wait_stack(cfn, parent_name)
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    outputs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    assert outputs["FinalArn"].endswith(f":{leaf_topic_name}")
+
+
 def test_cfn_stack_with_s3_lambda_dynamodb(cfn, s3, lam, ddb):
     """CloudFormation stack provisions S3 bucket, Lambda function, and DynamoDB table together."""
     stack_name = "intg-cfn-full-stack"
@@ -3085,3 +3387,65 @@ def test_cfn_apigateway_account_provisions(cfn, apigw_v1):
 
     cfn.delete_stack(StackName=stack_name)
     _wait_stack(cfn, stack_name)
+
+
+def test_cfn_ssm_parameter_value_type_resolves_at_deploy(cfn, ssm):
+    """CFN template parameter of type AWS::SSM::Parameter::Value<String>
+    must be resolved by looking up the SSM parameter NAME and substituting
+    its VALUE before the rest of the template is processed. Cross-pipeline
+    CDK references (e.g. one stack importing a table ARN that
+    another stack wrote into SSM) rely on this; without it the
+    name leaks through and downstream Fn::Split/Select silently produce
+    empty strings."""
+    ssm.put_parameter(
+        Name="/cfn-test/table-arn",
+        Type="String",
+        Value="arn:aws:dynamodb:us-east-1:000000000000:table/MyTable",
+        Overwrite=True,
+    )
+    template = {
+        "AWSTemplateFormatVersion": "2010-09-09",
+        "Parameters": {
+            "TableArn": {
+                "Type": "AWS::SSM::Parameter::Value<String>",
+                "Default": "/cfn-test/table-arn",
+            }
+        },
+        "Resources": {
+            "TopicNamed": {
+                "Type": "AWS::SNS::Topic",
+                "Properties": {
+                    # Pull the table name out of the ARN — same intrinsic
+                    # chain CDK emits for the Migration->shared reference.
+                    "TopicName": {
+                        "Fn::Select": [
+                            1,
+                            {"Fn::Split": [
+                                "/",
+                                {"Fn::Select": [
+                                    5,
+                                    {"Fn::Split": [
+                                        ":",
+                                        {"Ref": "TableArn"},
+                                    ]},
+                                ]},
+                            ]},
+                        ]
+                    }
+                },
+            }
+        },
+        "Outputs": {
+            "TopicName": {"Value": {"Fn::GetAtt": ["TopicNamed", "TopicName"]}},
+        },
+    }
+    cfn.create_stack(StackName="cfn-ssm-param", TemplateBody=json.dumps(template))
+    stack = _wait_stack(cfn, "cfn-ssm-param")
+    assert stack["StackStatus"] == "CREATE_COMPLETE"
+
+    outs = {o["OutputKey"]: o["OutputValue"] for o in stack.get("Outputs", [])}
+    assert outs.get("TopicName") == "MyTable", (
+        "AWS::SSM::Parameter::Value<String> must resolve to the SSM value, "
+        "not leak the parameter name through"
+    )
+

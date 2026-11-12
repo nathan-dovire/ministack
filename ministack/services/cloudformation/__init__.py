@@ -78,6 +78,107 @@ def reset():
     _cr.reset()
 
 
+def get_state():
+    """Snapshot CFN bookkeeping for persistence.
+
+    Stack dicts carry callables and compiled regexes in some edge cases; we
+    drop the parsed template (re-parsed on demand from _template_body) and
+    the resolved-conditions cache (re-evaluated). Everything else is JSON-
+    serialisable: template body strings, parameter dicts, physical-id maps.
+    """
+    import copy
+
+    def _clean_stack(s):
+        c = {k: v for k, v in s.items() if k not in ("_template", "_conditions")}
+        return copy.deepcopy(c)
+
+    stacks_clean = AccountScopedDict()
+    for k, v in _stacks._data.items():
+        stacks_clean._data[k] = _clean_stack(v) if isinstance(v, dict) else v
+
+    return {
+        "stacks": stacks_clean,
+        "stack_events": copy.deepcopy(_stack_events),
+        "exports": copy.deepcopy(_exports),
+        "change_sets": copy.deepcopy(_change_sets),
+    }
+
+
+# Non-terminal statuses cannot recover on their own after a restart: state is
+# persisted only on graceful shutdown (app.py lifespan.shutdown), and the
+# background _deploy_stack_async task that flips the status to terminal lives
+# only in the previous process's event loop. Any *_IN_PROGRESS we reload is
+# therefore orphaned. Map each to the nearest terminal status so the next deploy
+# isn't permanently rejected by UpdateStack (handlers._update_stack). Resources
+# are provisioned incrementally and may be left partially applied if the process
+# died mid-loop, but UPDATE_IN_PROGRESS still resolves optimistically to
+# UPDATE_COMPLETE: a recoverable (if possibly drifted) stack beats a permanently
+# wedged one, and the next UpdateStack reconciles any drift. REVIEW_IN_PROGRESS
+# is excluded: it is already recoverable via a fresh CreateChangeSet.
+_ORPHANED_STATUS_RECOVERY = {
+    "CREATE_IN_PROGRESS": "CREATE_FAILED",
+    "UPDATE_IN_PROGRESS": "UPDATE_COMPLETE",
+    "UPDATE_ROLLBACK_IN_PROGRESS": "UPDATE_ROLLBACK_COMPLETE",
+    "ROLLBACK_IN_PROGRESS": "ROLLBACK_COMPLETE",
+    "DELETE_IN_PROGRESS": "DELETE_COMPLETE",
+}
+
+
+def restore_state(data):
+    if not data:
+        return
+    if isinstance(data.get("stacks"), AccountScopedDict):
+        _stacks._data.update(data["stacks"]._data)
+    if isinstance(data.get("stack_events"), AccountScopedDict):
+        _stack_events._data.update(data["stack_events"]._data)
+    if isinstance(data.get("exports"), AccountScopedDict):
+        _exports._data.update(data["exports"]._data)
+    if isinstance(data.get("change_sets"), AccountScopedDict):
+        _change_sets._data.update(data["change_sets"]._data)
+
+    # Single pass over the raw _data so EVERY account is covered: at import time
+    # the account context is the default 000000000000, but deployed stacks live
+    # under other accounts, and .values()/.items() would skip them entirely.
+    for stack in _stacks._data.values():
+        if not isinstance(stack, dict):
+            continue
+
+        # Re-parse templates so downstream describe/update/delete calls work.
+        if stack.get("_template_body") and not stack.get("_template"):
+            try:
+                stack["_template"] = _parse_template(stack["_template_body"])
+                stack["_conditions"] = _evaluate_conditions(
+                    stack["_template"], stack.get("_resolved_params", {})
+                )
+            except Exception:
+                logger.exception("Failed to re-parse template for %s on restore", stack.get("StackName"))
+
+        # Reconcile an orphaned in-progress status left by a restart mid-deploy:
+        # the driving _deploy_stack_async task did not survive the restart, so
+        # the status would otherwise dangle forever.
+        current = stack.get("StackStatus", "")
+        recovered = _ORPHANED_STATUS_RECOVERY.get(current)
+        if recovered:
+            stack["StackStatus"] = recovered
+            stack["StackStatusReason"] = (
+                f"ministack: recovered orphaned {current} on restart "
+                "(deploy task did not survive process restart)"
+            )
+            logger.warning("Reconciled orphaned CFN stack %s: %s -> %s",
+                           stack.get("StackName", "?"), current, recovered)
+
+
+# Auto-load persisted state at module import time, matching the pattern used
+# by other persistent services (sqs, kms, etc).
+try:
+    from ministack.core.persistence import load_state as _load_state
+    _restored = _load_state("cloudformation")
+    if _restored:
+        restore_state(_restored)
+except Exception:
+    logger.exception("Failed to restore persisted cloudformation state")
+
+
 # Must be last — handlers imports from this module
 from ministack.core.responses import AccountScopedDict, get_account_id
 
