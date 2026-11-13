@@ -1,53 +1,155 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 Glue Service Emulator.
 JSON-based API via X-Amz-Target (AWSGlue).
 Supports full Data Catalog: Databases, Tables, Partitions, Connections, Crawlers, Jobs, JobRuns.
 Also: SecurityConfigurations, Classifiers, PartitionIndexes, CrawlerMetrics, Tags,
       Triggers, Workflows.
-Job execution runs Python scripts via subprocess in background threads.
+Job execution: when Docker is available and the job command is ``glueetl`` or
+``gluestreaming``, runs the script inside an ``amazon/aws-glue-libs`` container
+with Spark + awsglue.  Falls back to plain ``python3`` subprocess for non-Spark
+scripts or when Docker is unavailable.
 Crawlers transition through RUNNING state with a configurable timer.
 """
 
+import base64
+import contextvars
 import copy
+import datetime
 import fnmatch
 import json
 import logging
 import os
+import re
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+from decimal import Decimal
+from urllib.parse import unquote
 
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core import container_reaper
+from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import run_reentrant
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
     get_region,
-    json_response,
     new_uuid,
+    to_output_shape,
+)
+from ministack.core.responses import (
+    json_response as _core_json_response,
 )
 
 logger = logging.getLogger("glue")
 
-REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
-CRAWLER_RUN_SECONDS = int(os.environ.get("GLUE_CRAWLER_RUN_SECONDS", "5"))
-S3_DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")
+# Cap any single Docker daemon call. docker-py defaults to 60s, which turns a
+# slow or wedged daemon into a minutes-long stall on a request path.
+_DOCKER_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
 
-_databases = AccountScopedDict()
-_tables = AccountScopedDict()       # "db_name/table_name" -> table dict
-_partitions = AccountScopedDict()   # "db_name/table_name" -> [partition, ...]
-_partition_indexes = AccountScopedDict()  # "db_name/table_name" -> [index, ...]
-_connections = AccountScopedDict()
-_crawlers = AccountScopedDict()
-_jobs = AccountScopedDict()
-_job_runs = AccountScopedDict()     # job_name -> [run, ...]
-_tags = AccountScopedDict()         # arn -> {key: value, ...}
-_security_configs = AccountScopedDict()
-_classifiers = AccountScopedDict()
-_triggers = AccountScopedDict()     # trigger_name -> trigger dict
-_workflows = AccountScopedDict()    # workflow_name -> workflow dict
-_workflow_runs = AccountScopedDict() # workflow_name -> [run, ...]
+
+REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
+CRAWLER_RUN_SECONDS = 5
+S3_DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")
+DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
+
+# Glue Docker image — maps GlueVersion to the amazon/aws-glue-libs tag.
+# Users can override via GLUE_DOCKER_IMAGE env var.
+_GLUE_VERSION_IMAGES = {
+    "5.0": "amazon/aws-glue-libs:5",
+    "4.0": "amazon/aws-glue-libs:glue_libs_4.0.0_image_01",
+    "3.0": "amazon/aws-glue-libs:glue_libs_3.0.0_image_01",
+}
+GLUE_DOCKER_IMAGE_OVERRIDE = os.environ.get("GLUE_DOCKER_IMAGE", "")
+
+_docker = None
+_ministack_network = None
+
+
+_DOCUMENT_MEMBERS = frozenset(('Type', 'InitialDefault', 'WriteDefault', 'Records'))
+
+
+def _drop_none(value):
+    """AWS omits unset members; it never sends null. Document members pass through as given."""
+    if isinstance(value, dict):
+        return {k: v if k in _DOCUMENT_MEMBERS else _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
+def json_response(data, status=200, **kwargs):
+    return _core_json_response(_drop_none(data), status, **kwargs)
+
+
+def _get_docker():
+    global _docker
+    if _docker is None:
+        try:
+            import docker
+
+            _docker = docker.from_env(timeout=_DOCKER_TIMEOUT)
+        except Exception:
+            pass
+    return _docker
+
+
+def _get_ministack_network(docker_client):
+    """Detect the Docker network MiniStack is running on (if containerised)."""
+    global _ministack_network
+    if _ministack_network is not None:
+        return _ministack_network or None
+    if DOCKER_NETWORK:
+        _ministack_network = DOCKER_NETWORK
+        return DOCKER_NETWORK
+    try:
+        self_container = docker_client.containers.get(os.environ.get("HOSTNAME", ""))
+        nets = list(self_container.attrs["NetworkSettings"]["Networks"].keys())
+        if nets:
+            _ministack_network = nets[0]
+            return nets[0]
+    except Exception:
+        pass
+    _ministack_network = ""
+    return None
+
+
+def _glue_image_for_version(glue_version):
+    """Return the Docker image for a given GlueVersion."""
+    if GLUE_DOCKER_IMAGE_OVERRIDE:
+        return GLUE_DOCKER_IMAGE_OVERRIDE
+    return _GLUE_VERSION_IMAGES.get(glue_version, _GLUE_VERSION_IMAGES.get("4.0"))
+
+
+def _is_spark_job(job):
+    """True if the job uses glueetl/gluestreaming (Spark-based)."""
+    cmd_name = job.get("Command", {}).get("Name", "")
+    return cmd_name in ("glueetl", "gluestreaming")
+
+
+_databases = AccountRegionScopedDict()
+_tables = AccountRegionScopedDict()  # "db_name/table_name" -> table dict
+_partitions = AccountRegionScopedDict()  # "db_name/table_name" -> [partition, ...]
+_partition_indexes = AccountRegionScopedDict()  # "db_name/table_name" -> [index, ...]
+_connections = AccountRegionScopedDict()
+_crawlers = AccountRegionScopedDict()
+_jobs = AccountRegionScopedDict()
+_job_runs = AccountRegionScopedDict()  # job_name -> [run, ...]
+_tags = AccountScopedDict()  # arn -> {key: value, ...}
+_security_configs = AccountRegionScopedDict()
+_classifiers = AccountRegionScopedDict()
+_triggers = AccountRegionScopedDict()  # trigger_name -> trigger dict
+_workflows = AccountRegionScopedDict()  # workflow_name -> workflow dict
+_workflow_runs = AccountRegionScopedDict()  # workflow_name -> [run, ...]
+_user_defined_functions = AccountRegionScopedDict()  # "db_name/function_name" -> udf dict
+_table_column_statistics = AccountRegionScopedDict()  # "db/table" -> {column_name: stats}
+_partition_column_statistics = AccountRegionScopedDict()  # "db/table" -> [{"Values": [...], "Stats": {col: stats}}]
+_table_optimizers = AccountRegionScopedDict()  # "db/table" -> {optimizer type: TableOptimizer}
 
 _ALL_STATE = {
     "databases": _databases,
@@ -64,6 +166,10 @@ _ALL_STATE = {
     "triggers": _triggers,
     "workflows": _workflows,
     "workflow_runs": _workflow_runs,
+    "user_defined_functions": _user_defined_functions,
+    "table_column_statistics": _table_column_statistics,
+    "table_optimizers": _table_optimizers,
+    "partition_column_statistics": _partition_column_statistics,
 }
 
 
@@ -71,28 +177,125 @@ def get_state():
     return copy.deepcopy(_ALL_STATE)
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     for key, store in _ALL_STATE.items():
         store.clear()
-        store.update(data.get(key, {}))
+        restored = data.get(key, {})
+        if key == "tags":
+            store.update(restored)
+        else:
+            _restore_regional_store(store, restored)
 
 
-try:
-    _restored = load_state("glue")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
+def _restore_regional_store(store, restored):
+    """Map legacy Glue state to the boot region without mining nested ARNs."""
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return
+    if isinstance(restored, AccountScopedDict):
+        region = get_region()
+        for (account_id, key), value in restored._data.items():
+            store.set_scoped(account_id, region, key, value)
+        return
+    for key, value in restored.items():
+        store[key] = value
+
+
 
 
 def _arn(resource_type, name):
     return f"arn:aws:glue:{get_region()}:{get_account_id()}:{resource_type}/{name}"
 
 
-async def handle_request(method, path, headers, body, query_params):
+_GLUE_PARTITION_RE = re.compile(r"^aws(?:-(?:cn|us-gov|iso(?:-[bef])?))?$")
+_GLUE_SIMPLE_TAGGABLE_RESOURCE_PREFIXES = (
+    "blueprint/",
+    "crawler/",
+    "connection/",
+    "customEntityType/",
+    "dataQualityRuleset/",
+    "devEndpoint/",
+    "job/",
+    "mlTransform/",
+    "registry/",
+    "security-configuration/",
+    "securityConfiguration/",
+    "session/",
+    "trigger/",
+    "usageProfile/",
+    "workflow/",
+)
+_GLUE_COLON_TAGGABLE_RESOURCE_PREFIXES = (
+    "connectionType:",
+    "integration:",
+)
+_GLUE_PATH_TAGGABLE_RESOURCE_MIN_PARTS = {
+    "catalog/": 1,
+    "database/": 1,
+    "integrationresourceproperty/": 2,
+    "integrationResourceProperty/": 2,
+    "schema/": 2,
+    "table/": 2,
+    "userDefinedFunction/": 2,
+}
+
+
+def _validate_tag_resource_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return _invalid_resource_arn(arn)
+
+    if (
+        not _GLUE_PARTITION_RE.match(spec.partition)
+        or spec.service != "glue"
+        or spec.account_id != get_account_id()
+        or spec.region != get_region()
+    ):
+        return _invalid_resource_arn(arn)
+    if not _is_taggable_glue_resource(spec.resource):
+        return _invalid_resource_arn(arn)
+    return None
+
+
+def _is_taggable_glue_resource(resource):
+    if resource == "catalog":
+        return True
+    return (
+        any(resource.startswith(prefix) and resource != prefix for prefix in _GLUE_SIMPLE_TAGGABLE_RESOURCE_PREFIXES)
+        or any(resource.startswith(prefix) and resource != prefix for prefix in _GLUE_COLON_TAGGABLE_RESOURCE_PREFIXES)
+        or any(
+            _has_min_path_parts(resource, prefix, min_parts)
+            for prefix, min_parts in _GLUE_PATH_TAGGABLE_RESOURCE_MIN_PARTS.items()
+        )
+    )
+
+
+def _has_min_path_parts(resource, prefix, min_parts):
+    if not resource.startswith(prefix):
+        return False
+    parts = resource[len(prefix) :].split("/")
+    return len(parts) >= min_parts and all(parts)
+
+
+def _invalid_resource_arn(arn):
+    return error_response_json("InvalidInputException", f"Invalid Glue resource ARN: {arn}", 400)
+
+
+def _handle_request_sync(method, path, headers, body, query_params):
+    # Glue's Iceberg REST catalog data plane. On real AWS this is
+    # `glue.<region>.amazonaws.com/iceberg` — same service, same SigV4
+    # signing name (`glue`), different protocol (Iceberg REST OpenAPI
+    # instead of X-Amz-Target JSON RPC). The router's credential-scope
+    # dispatch already lands `glue`-signed requests here, so a plain
+    # path check is all that's needed to tell the two protocols apart.
+    if path.startswith("/iceberg"):
+        return _handle_iceberg_rest(method, path, query_params, body=body)
+
     target = headers.get("x-amz-target", "")
     action = target.split(".")[-1] if "." in target else ""
 
@@ -115,16 +318,32 @@ async def handle_request(method, path, headers, body, query_params):
         "GetTables": _get_tables,
         "UpdateTable": _update_table,
         "BatchDeleteTable": _batch_delete_table,
+        # Table optimizers
+        "CreateTableOptimizer": _create_table_optimizer,
+        "GetTableOptimizer": _get_table_optimizer,
+        "UpdateTableOptimizer": _update_table_optimizer,
+        "DeleteTableOptimizer": _delete_table_optimizer,
+        "BatchGetTableOptimizer": _batch_get_table_optimizer,
+        "ListTableOptimizerRuns": _list_table_optimizer_runs,
         # Partitions
         "CreatePartition": _create_partition,
         "DeletePartition": _delete_partition,
         "GetPartition": _get_partition,
         "GetPartitions": _get_partitions,
         "BatchCreatePartition": _batch_create_partition,
+        "BatchDeletePartition": _batch_delete_partition,
         "BatchGetPartition": _batch_get_partition,
+        "BatchUpdatePartition": _batch_update_partition,
         # Partition Indexes
         "CreatePartitionIndex": _create_partition_index,
         "GetPartitionIndexes": _get_partition_indexes,
+        # Column Statistics
+        "UpdateColumnStatisticsForTable": _update_column_statistics_for_table,
+        "GetColumnStatisticsForTable": _get_column_statistics_for_table,
+        "DeleteColumnStatisticsForTable": _delete_column_statistics_for_table,
+        "UpdateColumnStatisticsForPartition": _update_column_statistics_for_partition,
+        "GetColumnStatisticsForPartition": _get_column_statistics_for_partition,
+        "DeleteColumnStatisticsForPartition": _delete_column_statistics_for_partition,
         # Connections
         "CreateConnection": _create_connection,
         "DeleteConnection": _delete_connection,
@@ -175,6 +394,12 @@ async def handle_request(method, path, headers, body, query_params):
         "DeleteWorkflow": _delete_workflow,
         "UpdateWorkflow": _update_workflow,
         "StartWorkflowRun": _start_workflow_run,
+        # User Defined Functions
+        "CreateUserDefinedFunction": _create_user_defined_function,
+        "UpdateUserDefinedFunction": _update_user_defined_function,
+        "DeleteUserDefinedFunction": _delete_user_defined_function,
+        "GetUserDefinedFunction": _get_user_defined_function,
+        "GetUserDefinedFunctions": _get_user_defined_functions,
         # Tags
         "TagResource": _tag_resource,
         "UntagResource": _untag_resource,
@@ -187,7 +412,504 @@ async def handle_request(method, path, headers, body, query_params):
     return handler(data)
 
 
+# ---- Iceberg REST catalog (Glue data plane) ----
+#
+# Read-path subset of the Apache Iceberg REST Catalog OpenAPI spec, mirroring
+# AWS Glue's `glue.<region>.amazonaws.com/iceberg` endpoint so that clients
+# like DuckDB's `iceberg` extension can ATTACH:
+#
+#     ATTACH '000000000000' AS glue_catalog (
+#         TYPE iceberg,
+#         ENDPOINT 'localhost:4566/iceberg',
+#         AUTHORIZATION_TYPE 'sigv4'
+#     );
+#
+# Glue's prefix shape is `/v1/catalogs/{catalog}/...` (returned to the client
+# as `defaults.prefix` from /v1/config). This is distinct from the S3 Tables
+# Iceberg REST endpoint served by `services/s3tables.py`, whose prefix is a
+# URL-encoded table-bucket ARN — on AWS those are two separate services told
+# apart by SigV4 signing name, and MiniStack routes them the same way.
+#
+# A table participates in this surface iff its `Parameters["metadata_location"]`
+# points at an Iceberg metadata.json on MiniStack's S3 (written there by an
+# external engine such as Trino/Spark, then registered in Glue). The
+# metadata.json is passed through verbatim — format versions change and we
+# don't want to be in the parsing business. Write paths return 501.
+#
+# Responses use plain `application/json` and the spec's
+# `{"error": {"message", "type", "code"}}` envelope — NOT the AWS
+# x-amz-json-1.0 flavor the rest of this module speaks.
+
+_iceberg_tls_hint_logged = False
+
+
+def _iceberg_json(data, status=200):
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    return status, {"Content-Type": "application/json"}, body
+
+
+def _iceberg_error(message, error_type, status):
+    return _iceberg_json(
+        {"error": {"message": message, "type": error_type, "code": status}},
+        status=status,
+    )
+
+
+def _iceberg_s3_overrides():
+    """S3 client config handed to Iceberg REST clients.
+
+    Real AWS Glue returns no overrides (clients use ambient AWS creds);
+    MiniStack must return them or the client tries real S3 for the data
+    files referenced by the catalog and fails.
+
+    The access key names the caller's account (same as the s3tables Iceberg
+    surface) — MiniStack's S3 doesn't verify signatures, and echoing ambient
+    AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY into an HTTP response would leak
+    real credentials from the host environment."""
+    from ministack.services.s3tables import _vended_access_key
+
+    host = os.environ.get("MINISTACK_HOST", "localhost")
+    port = os.environ.get("GATEWAY_PORT", "4566")
+    return {
+        "s3.endpoint": f"http://{host}:{port}",
+        "s3.access-key-id": _vended_access_key(),
+        "s3.secret-access-key": "test",
+        "s3.path-style-access": "true",
+        "s3.region": os.environ.get("MINISTACK_REGION", "us-east-1"),
+    }
+
+
+def _iceberg_fetch_metadata(metadata_location):
+    """Read the metadata.json at an ``s3://bucket/key`` URI from MiniStack's
+    S3 and return it parsed, or None if the URI is malformed, the object is
+    missing, or the body isn't valid JSON."""
+    # Spark's S3FileIO writes `s3a://` locations; DuckDB and our REST catalog
+    # write `s3://`. Both point at the same MiniStack S3 object, so accept either.
+    scheme = next((s for s in ("s3://", "s3a://") if metadata_location and metadata_location.startswith(s)), None)
+    if scheme is None:
+        return None
+    rest = metadata_location[len(scheme) :]
+    if "/" not in rest:
+        return None
+    bucket, key = rest.split("/", 1)
+    if not bucket or not key:
+        return None
+    from ministack.services import s3 as _s3
+
+    data = _s3._get_object_data(bucket, key)
+    if data is None:
+        return None
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        logger.warning("Iceberg metadata.json at %s did not parse: %s", metadata_location, exc)
+        return None
+
+
+def _iceberg_table_entry(db_name, table_name):
+    """Return the Glue table dict if it exists AND is an Iceberg table
+    (has a `metadata_location` parameter), else None."""
+    table = _tables.get(f"{db_name}/{table_name}")
+    if table is None:
+        return None
+    if not (table.get("Parameters") or {}).get("metadata_location"):
+        return None
+    return table
+
+
+def _iceberg_latest_metadata_location(metadata_location):
+    """A writer (DuckDB, Spark) commits by writing the next ``vN.metadata.json``
+    to S3, and does not always drive it through the REST commit endpoint, so the
+    table's stored pointer can lag. Scan the metadata directory for the newest
+    ``.metadata.json`` and return it, falling back to the stored pointer."""
+    scheme = next((s for s in ("s3://", "s3a://") if metadata_location and metadata_location.startswith(s)), None)
+    if scheme is None:
+        return metadata_location
+    try:
+        from ministack.services import s3 as _s3
+
+        rest = metadata_location[len(scheme) :]
+        bucket, key = rest.split("/", 1)
+        meta_dir = "/".join(key.split("/")[:-1]) + "/"
+        bucket_data = _s3._ensure_bucket(bucket)
+        if not bucket_data:
+            return metadata_location
+        meta_files = sorted(
+            k for k in bucket_data.get("objects", {}) if k.startswith(meta_dir) and k.endswith(".metadata.json")
+        )
+        if meta_files:
+            # Order by version number, not lexically: v10 must sort after v2.
+            meta_files.sort(key=lambda k: _metadata_version_from_location(k))
+            return f"{scheme}{bucket}/{meta_files[-1]}"
+    except Exception:
+        pass
+    return metadata_location
+
+
+def _iceberg_load_table(db_name, table_name):
+    table = _iceberg_table_entry(db_name, table_name)
+    if table is None:
+        return _iceberg_error(f"Table does not exist: {db_name}.{table_name}", "NoSuchTableException", 404)
+    metadata_location = _iceberg_latest_metadata_location(table["Parameters"]["metadata_location"])
+    # Missing/unparseable metadata.json is a 404, not a 200 with empty
+    # metadata — DuckDB would treat the latter as a real-but-empty table
+    # and silently return wrong query results.
+    metadata = _iceberg_fetch_metadata(metadata_location)
+    if metadata is None:
+        return _iceberg_error(
+            f"Table metadata not readable: {db_name}.{table_name} " f"(metadata_location={metadata_location})",
+            "NoSuchTableException",
+            404,
+        )
+    return _iceberg_json(
+        {
+            "metadata-location": metadata_location,
+            "metadata": metadata,
+            "config": _iceberg_s3_overrides(),
+        }
+    )
+
+
+def _iceberg_maybe_log_tls_hint():
+    """Warn once if USE_SSL isn't on — DuckDB hardcodes https:// on the
+    Iceberg endpoint and fails at connect time with no useful message."""
+    global _iceberg_tls_hint_logged
+    if _iceberg_tls_hint_logged:
+        return
+    _iceberg_tls_hint_logged = True
+    if os.environ.get("USE_SSL", "").strip().lower() not in ("1", "true", "yes"):
+        logger.warning(
+            "Glue Iceberg REST endpoint hit while USE_SSL is not enabled. "
+            "DuckDB's iceberg extension hardcodes https:// and will fail to "
+            "connect. Set USE_SSL=1 and trust MiniStack's self-signed cert "
+            "(SSL_CERT_FILE / DuckDB ca_cert_file) for ATTACH to work."
+        )
+
+
+# The default warehouse for Glue Data Catalog Iceberg tables. Spark's
+# GlueCatalog writes here (see the injected `warehouse=s3a://...` conf), and
+# the REST catalog writes here too so a table Firehose commits and a table a
+# Glue job commits land in the same place.
+_GLUE_WAREHOUSE_BUCKET = "ministack-glue-warehouse"
+
+
+def _metadata_version_from_location(metadata_location):
+    """Extract the integer N from a ``.../vN.metadata.json`` location, or -1 if
+    it doesn't match, so a commit can allocate the next version."""
+    if not metadata_location:
+        return -1
+    tail = metadata_location.rsplit("/", 1)[-1]
+    if tail.startswith("v") and tail.endswith(".metadata.json"):
+        try:
+            return int(tail[1:-len(".metadata.json")])
+        except ValueError:
+            return -1
+    return -1
+
+
+def _iceberg_write_metadata(namespace, table_name, version, metadata):
+    """Write ``metadata`` as ``vN.metadata.json`` under the Glue warehouse and
+    return its ``s3://`` location. Clients (DuckDB, Spark) read by location."""
+    from ministack.services import s3 as _s3
+
+    if _s3._ensure_bucket(_GLUE_WAREHOUSE_BUCKET) is None:
+        _s3._create_bucket(_GLUE_WAREHOUSE_BUCKET, b"", {})
+    key = f"{namespace}/{table_name}/metadata/v{version}.metadata.json"
+    _s3._put_object(
+        _GLUE_WAREHOUSE_BUCKET, key, json.dumps(metadata).encode("utf-8"),
+        {"content-type": "application/json"},
+    )
+    return f"s3://{_GLUE_WAREHOUSE_BUCKET}/{key}"
+
+
+def _iceberg_rest_create_namespace(body):
+    """POST namespaces -- create a Glue database to back an Iceberg namespace."""
+    ns_field = body.get("namespace", [])
+    ns = ns_field[0] if isinstance(ns_field, list) and ns_field else (ns_field or "")
+    if not ns:
+        return _iceberg_error("Missing namespace", "BadRequestException", 400)
+    if ns not in _databases:
+        _databases[ns] = {
+            "Name": ns,
+            "Description": "",
+            "LocationUri": None,
+            "Parameters": body.get("properties", {}) or {},
+            "CreateTime": int(time.time()),
+            "CatalogId": get_account_id(),
+        }
+    return _iceberg_json({"namespace": [ns], "properties": _databases[ns].get("Parameters", {})})
+
+
+def _iceberg_rest_create_table(namespace, body):
+    """POST namespaces/{ns}/tables -- register a Glue Iceberg table and write
+    its initial metadata.json to the warehouse."""
+    from ministack.services import s3tables as _s3t
+
+    if namespace not in _databases:
+        return _iceberg_error(f"Namespace does not exist: {namespace}", "NoSuchNamespaceException", 404)
+    table_name = body.get("name", "")
+    key = f"{namespace}/{table_name}"
+    # createTable is not idempotent -- a resent create must not wipe snapshots.
+    if key in _tables:
+        return _iceberg_error(f"Table already exists: {namespace}.{table_name}", "AlreadyExistsException", 409)
+
+    schema = body.get("schema", {})
+    schema_fields = [
+        {
+            "name": f.get("name", ""),
+            "type": f.get("type", "string") if isinstance(f.get("type"), str) else "string",
+            "required": f.get("required", False),
+        }
+        for f in schema.get("fields", [])
+    ]
+    location = body.get("location") or f"s3://{_GLUE_WAREHOUSE_BUCKET}/{namespace}/{table_name}"
+    metadata = _s3t._initial_iceberg_metadata(table_name, schema_fields, location)
+    # ``format-version`` is a reserved table property: a client creating with
+    # it (Spark's .tableProperty("format-version", "3")) expects it lifted
+    # into the top-level metadata field, not kept in the properties map.
+    props = dict(body.get("properties") or {})
+    fmt_ver = props.pop("format-version", None) or body.get("format-version")
+    if fmt_ver is not None:
+        try:
+            requested = int(str(fmt_ver))
+        except (TypeError, ValueError):
+            return _iceberg_error(f"Invalid format-version: {fmt_ver!r}", "BadRequestException", 400)
+        if requested > 3:
+            return _iceberg_error(
+                f"Cannot create table with unsupported format version: v{requested} (supported: v3)",
+                "BadRequestException", 400)
+        metadata["format-version"] = requested
+    if props:
+        metadata["properties"] = props
+    if schema:
+        metadata["schemas"] = [schema]
+    partition_spec = body.get("partition-spec")
+    if partition_spec:
+        metadata["partition-specs"] = [partition_spec]
+        metadata["default-spec-id"] = partition_spec.get("spec-id", 0)
+    metadata_location = _iceberg_write_metadata(namespace, table_name, 0, metadata)
+
+    _tables[key] = {
+        "Name": table_name,
+        "DatabaseName": namespace,
+        "Description": "",
+        "Owner": "",
+        "CreateTime": int(time.time()),
+        "UpdateTime": int(time.time()),
+        "LastAccessTime": int(time.time()),
+        "StorageDescriptor": {
+            "Location": location,
+            "Columns": [{"Name": f["name"], "Type": f["type"]} for f in schema_fields],
+        },
+        "PartitionKeys": [],
+        "TableType": "EXTERNAL_TABLE",
+        # `table_type=ICEBERG` is how Iceberg's GlueCatalog recognises the table,
+        # and `metadata_location` is the pointer both it and this REST catalog
+        # follow. Writing them here means a Firehose-created table is a normal
+        # Glue table that a Spark job's GlueCatalog can load.
+        "Parameters": {"table_type": "ICEBERG", "metadata_location": metadata_location},
+        "CatalogId": get_account_id(),
+        "VersionId": "1",
+    }
+    return _iceberg_json({"metadata-location": metadata_location, "metadata": metadata})
+
+
+def _iceberg_rest_commit_table(namespace, table_name, body):
+    """POST namespaces/{ns}/tables/{tbl} -- apply an Iceberg commit against a
+    Glue table: read current metadata, apply the updates, write the next
+    metadata.json, and advance the table's metadata_location."""
+    from ministack.services import s3tables as _s3t
+
+    table = _iceberg_table_entry(namespace, table_name)
+    if table is None:
+        return _iceberg_error(f"Table does not exist: {namespace}.{table_name}", "NoSuchTableException", 404)
+    meta_loc = table["Parameters"]["metadata_location"]
+    metadata = _iceberg_fetch_metadata(meta_loc) or {}
+    try:
+        _s3t._check_iceberg_requirements(metadata, body.get("requirements", []))
+        _s3t._apply_iceberg_updates(metadata, body.get("updates", []))
+    except _s3t.IcebergCommitFailed as exc:
+        return _iceberg_error(str(exc), "CommitFailedException", 409)
+    except ValueError as exc:
+        # A refused update (an illegal format-version change) commits
+        # nothing: the stored metadata_location is only advanced below.
+        return _iceberg_error(str(exc), "BadRequestException", 400)
+    version = _metadata_version_from_location(meta_loc) + 1
+    new_loc = _iceberg_write_metadata(namespace, table_name, version, metadata)
+    table["Parameters"]["metadata_location"] = new_loc
+    table["UpdateTime"] = int(time.time())
+    return _iceberg_json({"metadata-location": new_loc, "metadata": metadata})
+
+
+def _iceberg_rest_commit_transaction(body):
+    """POST transactions/commit -- DuckDB's atomic multi-table commit."""
+    for change in body.get("table-changes", []):
+        ns, tbl = _iceberg_rest_change_identifier(change)
+        result = _iceberg_rest_commit_table(ns, tbl, change)
+        if result and result[0] not in (200, 204):
+            return result
+    return _iceberg_json({})
+
+
+# Iceberg REST calls below namespaces/ -> the glue action they need and how many of catalog, database, table it names.
+_ICEBERG_IAM_ACTIONS = {
+    (0, "GET"): ("GetDatabases", 1),
+    (0, "POST"): ("CreateDatabase", 2),
+    (1, "GET"): ("GetDatabase", 2),
+    (1, "HEAD"): ("GetDatabase", 2),
+    (1, "DELETE"): ("DeleteDatabase", 2),
+    (2, "GET"): ("GetTables", 2),
+    (2, "POST"): ("CreateTable", 3),
+    (3, "GET"): ("GetTable", 3),
+    (3, "HEAD"): ("GetTable", 3),
+    (3, "POST"): ("UpdateTable", 3),
+    (3, "DELETE"): ("DeleteTable", 3),
+}
+
+
+def iceberg_iam_checks(method, path, body, query_params):
+    """The glue actions an Iceberg REST call on the Glue catalog needs, with resources, in order; else None."""
+    parts = _iceberg_rest_parts(path)[2:]
+    catalog = f"arn:aws:glue:{get_region()}:{get_account_id()}:catalog"
+    if parts == ["config"] and method == "GET":
+        return [("glue:GetCatalog", catalog)]
+    # Every {catalog} is served from the account's default catalog, so it is authorized as that one.
+    if parts[:1] == ["catalogs"] and parts[2:3] == ["transactions"] and method == "POST":
+        # Each table change is an updateTable; a body whose changes cannot be read needs it on every resource.
+        try:
+            tables = [_iceberg_rest_change_identifier(change)
+                      for change in json.loads(body or b"{}").get("table-changes", [])]
+        except (ValueError, TypeError, AttributeError):
+            tables = []
+        if not tables:
+            return [("glue:UpdateTable", "*")]
+        return [("glue:UpdateTable", arn) for namespace, table in tables
+                for arn in (catalog, _arn("database", namespace), _arn("table", f"{namespace}/{table}"))]
+    if parts[:1] != ["catalogs"] or parts[2:3] != ["namespaces"]:
+        return None
+    rest = parts[3:]
+    if rest[1:] == ["properties"] and method == "POST":
+        resources = [catalog, _arn("database", rest[0])]
+        return [(f"glue:{action}", arn) for action in ("GetDatabase", "UpdateDatabase") for arn in resources]
+    entry = _ICEBERG_IAM_ACTIONS.get((len(rest), method))
+    if not entry or rest[1:2] not in ([], ["tables"]):
+        return None
+    action, depth = entry
+    namespace, _, table = rest + [""] * (3 - len(rest))
+    if method == "POST" and len(rest) in (0, 2):
+        named = _iceberg_body_name(body, "namespace" if not rest else "name")
+        namespace, table = (named, table) if not rest else (namespace, named)
+    resources = [catalog, _arn("database", namespace), _arn("table", f"{namespace}/{table}")]
+    return [(f"glue:{action}", arn) for arn in resources[:depth]]
+
+
+def _iceberg_rest_parts(path):
+    """The segments of an Iceberg REST path as the Glue router reads them, each decoded on its own."""
+    return [unquote(p) for p in path.strip("/").split("/") if p]
+
+
+def _iceberg_rest_change_identifier(change):
+    """The namespace and table name a transactions/commit table change names, read as the commit reads them."""
+    ident = change.get("identifier", {})
+    ns_field = ident.get("namespace", [""])
+    return (ns_field[0] if isinstance(ns_field, list) and ns_field else (ns_field or "")), ident.get("name", "")
+
+
+def _iceberg_body_name(body, field):
+    """The namespace or table name an Iceberg REST request body names, read as the handlers read it, or ''."""
+    try:
+        name = json.loads(body or b"{}").get(field, "")
+    except (ValueError, TypeError, AttributeError):
+        return ""
+    if field == "namespace":
+        name = name[0] if isinstance(name, list) and name else (name or "")
+    return str(name)
+
+
+def _handle_iceberg_rest(method, path, query_params, body=None):
+    _iceberg_maybe_log_tls_hint()
+    parts = _iceberg_rest_parts(path)
+    if len(parts) < 3 or parts[0] != "iceberg" or parts[1] != "v1":
+        return _iceberg_error(f"Unknown Iceberg REST path: {path}", "NotFoundException", 404)
+
+    # Parse JSON body for write operations
+    if body is None:
+        body = {}
+    elif isinstance(body, bytes):
+        try:
+            body = json.loads(body) if body else {}
+        except (json.JSONDecodeError, TypeError):
+            body = {}
+
+    # GET /iceberg/v1/config
+    if parts[2] == "config" and len(parts) == 3 and method == "GET":
+        warehouse = query_params.get("warehouse", "")
+        if isinstance(warehouse, list):
+            warehouse = warehouse[0] if warehouse else ""
+        defaults = {"prefix": f"catalogs/{warehouse}"} if warehouse else {}
+        return _iceberg_json({"defaults": defaults, "overrides": _iceberg_s3_overrides()})
+
+    # /v1/catalogs/{catalog}/namespaces[/{ns}[/tables[/{tbl}]]]
+    if len(parts) < 5 or parts[2] != "catalogs":
+        return _iceberg_error(f"Operation not supported: {method} {path}", "UnsupportedOperationException", 501)
+
+    # POST /v1/catalogs/{catalog}/transactions/commit -- DuckDB's atomic commit
+    if parts[4] == "transactions" and method == "POST":
+        return _iceberg_rest_commit_transaction(body)
+
+    if parts[4] != "namespaces":
+        return _iceberg_error(f"Operation not supported: {method} {path}", "UnsupportedOperationException", 501)
+
+    # -- Namespace operations --
+
+    if len(parts) == 5 and method == "GET":
+        return _iceberg_json({"namespaces": [[name] for name in sorted(_databases.keys())]})
+
+    if len(parts) == 5 and method == "POST":
+        return _iceberg_rest_create_namespace(body)
+
+    if len(parts) == 6:
+        ns = parts[5]
+        if method == "GET":
+            if ns not in _databases:
+                return _iceberg_error(f"Namespace does not exist: {ns}", "NoSuchNamespaceException", 404)
+            return _iceberg_json({"namespace": [ns], "properties": _databases[ns].get("Parameters", {})})
+        if method == "HEAD":
+            return (200 if ns in _databases else 404), {}, b""
+
+    # -- Table operations --
+
+    if len(parts) >= 7 and parts[6] == "tables":
+        ns = parts[5]
+        if len(parts) == 7:
+            if method == "GET":
+                if ns not in _databases:
+                    return _iceberg_error(f"Namespace does not exist: {ns}", "NoSuchNamespaceException", 404)
+                prefix = f"{ns}/"
+                names = sorted(
+                    t["Name"]
+                    for k, t in _tables.items()
+                    if k.startswith(prefix) and (t.get("Parameters") or {}).get("metadata_location")
+                )
+                return _iceberg_json({"identifiers": [{"namespace": [ns], "name": n} for n in names]})
+            if method == "POST":
+                return _iceberg_rest_create_table(ns, body)
+
+        if len(parts) == 8:
+            tbl = parts[7]
+            if method == "GET":
+                return _iceberg_load_table(ns, tbl)
+            if method == "POST":
+                return _iceberg_rest_commit_table(ns, tbl, body)
+            if method == "HEAD":
+                exists = _iceberg_table_entry(ns, tbl) is not None
+                return (200 if exists else 404), {}, b""
+
+    return _iceberg_error(f"Operation not supported: {method} {path}", "UnsupportedOperationException", 501)
+
+
 # ---- Databases ----
+
 
 def _create_database(data):
     db_input = data.get("DatabaseInput", {})
@@ -204,6 +926,11 @@ def _create_database(data):
         "CreateTime": int(time.time()),
         "CatalogId": get_account_id(),
     }
+    for k in ("CreateTableDefaultPermissions", "TargetDatabase", "FederatedDatabase"):
+        if db_input.get(k) is not None:
+            _databases[name][k] = db_input[k]
+    if data.get("Tags"):
+        _tags[_arn("database", name)] = dict(data["Tags"])
     return json_response({})
 
 
@@ -212,11 +939,15 @@ def _delete_database(data):
     if name not in _databases:
         return error_response_json("EntityNotFoundException", f"Database {name} not found", 400)
     del _databases[name]
+    _tags.pop(_arn("database", name), None)
     keys_to_del = [k for k in _tables if k.startswith(f"{name}/")]
     for k in keys_to_del:
         del _tables[k]
         _partitions.pop(k, None)
         _partition_indexes.pop(k, None)
+        _table_column_statistics.pop(k, None)
+        _partition_column_statistics.pop(k, None)
+        _table_optimizers.pop(k, None)
     return json_response({})
 
 
@@ -237,7 +968,8 @@ def _update_database(data):
     db_input = data.get("DatabaseInput", {})
     if name not in _databases:
         return error_response_json("EntityNotFoundException", f"Database {name} not found", 400)
-    safe_keys = {"Description", "LocationUri", "Parameters"}
+    safe_keys = {"Description", "LocationUri", "Parameters", "CreateTableDefaultPermissions", "TargetDatabase",
+                 "FederatedDatabase"}
     for k in safe_keys:
         if k in db_input:
             _databases[name][k] = db_input[k]
@@ -245,6 +977,7 @@ def _update_database(data):
 
 
 # ---- Tables ----
+
 
 def _create_table(data):
     db_name = data.get("DatabaseName")
@@ -262,14 +995,25 @@ def _create_table(data):
         "Owner": table_input.get("Owner", ""),
         "CreateTime": int(time.time()),
         "UpdateTime": int(time.time()),
-        "LastAccessTime": int(time.time()),
+        "LastAccessTime": table_input.get("LastAccessTime", int(time.time())),
         "StorageDescriptor": table_input.get("StorageDescriptor", {}),
         "PartitionKeys": table_input.get("PartitionKeys", []),
         "TableType": table_input.get("TableType", "EXTERNAL_TABLE"),
         "Parameters": table_input.get("Parameters", {}),
+        "ViewOriginalText": table_input.get("ViewOriginalText"),
+        "ViewExpandedText": table_input.get("ViewExpandedText"),
+        "ViewDefinition": table_input.get("ViewDefinition"),
+        "IsMultiDialectView": table_input.get("IsMultiDialectView"),
         "IsRegisteredWithLakeFormation": False,
         "CatalogId": get_account_id(),
+        # AWS Glue exposes a monotonically-increasing VersionId per table for
+        # optimistic concurrency on UpdateTable. Stored as a string per the
+        # botocore Table output shape.
+        "VersionId": "1",
     }
+    for k in ("LastAnalyzedTime", "Retention", "TargetTable", "FederatedTable"):
+        if table_input.get(k) is not None:
+            _tables[key][k] = table_input[k]
     return json_response({})
 
 
@@ -282,6 +1026,9 @@ def _delete_table(data):
     _tables.pop(key, None)
     _partitions.pop(key, None)
     _partition_indexes.pop(key, None)
+    _table_column_statistics.pop(key, None)
+    _partition_column_statistics.pop(key, None)
+    _table_optimizers.pop(key, None)
     return json_response({})
 
 
@@ -311,12 +1058,42 @@ def _update_table(data):
     key = f"{db_name}/{name}"
     if key not in _tables:
         return error_response_json("EntityNotFoundException", f"Table {name} not found", 400)
-    safe_keys = {"Description", "Owner", "StorageDescriptor", "PartitionKeys",
-                 "TableType", "Parameters", "ViewOriginalText", "ViewExpandedText"}
+    # Optimistic-concurrency check: if the caller passes VersionId, it must
+    # match the table's current VersionId. Real AWS Glue rejects stale writes
+    # with ConcurrentModificationException. Issue #1183.
+    requested_version = data.get("VersionId")
+    current_version = _tables[key].get("VersionId", "1")
+    if requested_version is not None and str(requested_version) != current_version:
+        return error_response_json(
+            "ConcurrentModificationException",
+            f"Table {name} was modified by another process. Expected VersionId={current_version}, got {requested_version}.",
+            400,
+        )
+    safe_keys = {
+        "Description",
+        "Owner",
+        "StorageDescriptor",
+        "PartitionKeys",
+        "TableType",
+        "Parameters",
+        "ViewOriginalText",
+        "ViewExpandedText",
+        "ViewDefinition",
+        "IsMultiDialectView",
+        "LastAccessTime",
+        "LastAnalyzedTime",
+        "Retention",
+        "TargetTable",
+        "FederatedTable",
+    }
     for k in safe_keys:
         if k in table_input:
             _tables[key][k] = table_input[k]
     _tables[key]["UpdateTime"] = int(time.time())
+    try:
+        _tables[key]["VersionId"] = str(int(current_version) + 1)
+    except (TypeError, ValueError):
+        _tables[key]["VersionId"] = "1"
     return json_response({})
 
 
@@ -327,16 +1104,222 @@ def _batch_delete_table(data):
     for name in names:
         key = f"{db_name}/{name}"
         if key not in _tables:
-            errors.append({"TableName": name, "ErrorDetail": {
-                "ErrorCode": "EntityNotFoundException", "ErrorMessage": "Table not found"}})
+            errors.append(
+                {
+                    "TableName": name,
+                    "ErrorDetail": {"ErrorCode": "EntityNotFoundException", "ErrorMessage": "Table not found"},
+                }
+            )
         else:
             del _tables[key]
             _partitions.pop(key, None)
             _partition_indexes.pop(key, None)
+            _table_column_statistics.pop(key, None)
+            _partition_column_statistics.pop(key, None)
+            _table_optimizers.pop(key, None)
     return json_response({"Errors": errors})
 
 
+# ---- Table optimizers (control plane only: optimizers never run) ----
+# Shapes, defaults and messages from a real-AWS capture (eu-west-2, 2026-11-01).
+
+
+def _optimizer_config(optimizer_type, config):
+    """The stored configuration: what the call sent, with the defaults AWS fills in for its type."""
+    config = copy.deepcopy(config or {})
+    if optimizer_type == "compaction":
+        block = config.setdefault("compactionConfiguration", {}).setdefault("icebergConfiguration", {})
+        block.setdefault("strategy", "binpack")
+    elif optimizer_type == "retention":
+        block = config.setdefault("retentionConfiguration", {}).setdefault("icebergConfiguration", {})
+        block.setdefault("cleanExpiredFiles", True)
+        block.setdefault("runRateInHours", 24)
+    elif optimizer_type == "orphan_file_deletion":
+        block = config.setdefault("orphanFileDeletionConfiguration", {}).setdefault("icebergConfiguration", {})
+        block.setdefault("runRateInHours", 24)
+    return config
+
+
+def _optimizer_table(data):
+    """(key, table, optimizers) for the call's table, or an error response when the table doesn't exist."""
+    key = f"{data.get('DatabaseName')}/{data.get('TableName')}"
+    table = _tables.get(key)
+    if table is None:
+        return None, _optimizer_error("EntityNotFoundException", _entity_not_found_message(), 404)
+    return (key, table, _table_optimizers.get(key) or {}), None
+
+
+def _optimizer_error(code, message, glue_status):
+    """AWS ends every table optimizer error with Glue's service suffix (real AWS capture)."""
+    return error_response_json(code, f"{message} (Service: glue; Status Code: {glue_status}; Error Code: {code}; "
+                                     f"Request ID: {new_uuid()}; Proxy: null)", 400)
+
+
+def _entity_not_found_message():
+    return (f"Entity Not Found (Service: AmazonDataCatalog; Status Code: 400; Error Code: EntityNotFoundException; "
+            f"Request ID: {new_uuid()}; Proxy: null)")
+
+
+def _run_rate_error(config):
+    """Retention and orphan file deletion run every 3 to 168 hours."""
+    for block in ("retentionConfiguration", "orphanFileDeletionConfiguration"):
+        rate = (((config or {}).get(block) or {}).get("icebergConfiguration") or {}).get("runRateInHours")
+        if rate is not None and not 3 <= rate <= 168:
+            return _optimizer_error("InvalidInputException", "Request Validation Failed with error: "
+                                    "Run rate for ICEBERG tables must be between 3 and 168 hours", 400)
+    return None
+
+
+def _optimizer_response(optimizer_type, config):
+    return {"type": optimizer_type, "configuration": config, "configurationSource": "table"}
+
+
+def _no_optimizer(optimizer_type, table_name):
+    return _optimizer_error("EntityNotFoundException",
+                            f"No optimizer of type {optimizer_type} found for the table: {table_name}", 404)
+
+
+def _role_refusal(table, role_arn):
+    """Under AUTH=true, the optimizer role must be able to read the table and reach its S3 location."""
+    from ministack.app import AUTH
+    if not AUTH:
+        return None
+    from ministack.core.iam_evaluator import EvalContext, _gather_role_policies, evaluate
+
+    account = role_arn.split(":")[4] if role_arn.count(":") >= 5 else get_account_id()
+    policies = _gather_role_policies(role_arn.rsplit("/", 1)[-1], account)
+
+    def allowed(action, resource):
+        ctx = EvalContext(principal_arn=role_arn, principal_type="AssumedRole", principal_account=account,
+                          action=action, resource_arn=resource, region=get_region())
+        return evaluate(ctx, policies).decision == "Allow"
+
+    table_arn = f"arn:aws:glue:{get_region()}:{get_account_id()}:table/{table['DatabaseName']}/{table['Name']}"
+    if not allowed("glue:GetTable", table_arn):
+        return _optimizer_error("AccessDeniedException", f"The provided IAM Role: {role_arn} does not have the "
+                                "proper IAM permissions to call Glue APIs. Please update the role's IAM "
+                                "permissions to allow access to the table", 403)
+    location = (table.get("StorageDescriptor") or {}).get("Location", "")
+    bucket = location.split("://", 1)[-1].split("/", 1)[0]
+    if not (allowed("s3:ListBucket", f"arn:aws:s3:::{bucket}")
+            or any(allowed(f"s3:{a}", f"arn:aws:s3:::{bucket}/*") for a in ("GetObject", "PutObject", "DeleteObject"))):
+        return _optimizer_error("AccessDeniedException", "Access denied", 403)
+    return None
+
+
+def _sort_order_missing(table):
+    metadata = _iceberg_fetch_metadata((table.get("Parameters") or {}).get("metadata_location")) or {}
+    default_id = metadata.get("default-sort-order-id", 0)
+    order = next((o for o in metadata.get("sort-orders", []) if o.get("order-id") == default_id), {})
+    return not order.get("fields")
+
+
+def _create_table_optimizer(data):
+    found, err = _optimizer_table(data)
+    if err:
+        return err
+    key, table, optimizers = found
+    optimizer_type, name = data.get("Type"), data.get("TableName")
+    config = data.get("TableOptimizerConfiguration") or {}
+    # Order as captured on AWS: the table's location, the run rate, an existing optimizer, the role, the sort order.
+    if not (table.get("StorageDescriptor") or {}).get("Location"):
+        return _optimizer_error("InvalidInputException", "Glue table storage warehouse location is null", 400)
+    if not (table.get("Parameters") or {}).get("metadata_location"):
+        return _optimizer_error("InvalidInputException", "Glue table metadata filepath is null", 400)
+    rate_error = _run_rate_error(config)
+    if rate_error:
+        return rate_error
+    if optimizer_type in optimizers:
+        return _optimizer_error("AlreadyExistsException",
+                                f"An optimizer of type {optimizer_type} already exists on table with name: {name}", 400)
+    role_error = _role_refusal(table, config.get("roleArn") or "")
+    if role_error:
+        return role_error
+    strategy = ((config.get("compactionConfiguration") or {}).get("icebergConfiguration") or {}).get("strategy")
+    if optimizer_type == "compaction" and strategy == "sort" and _sort_order_missing(table):
+        return _optimizer_error("InvalidInputException", "Sort order is not present in metadata", 400)
+    _table_optimizers[key] = {**optimizers, optimizer_type: _optimizer_config(
+        optimizer_type, data.get("TableOptimizerConfiguration"))}
+    return json_response({})
+
+
+def _get_table_optimizer(data):
+    found, err = _optimizer_table(data)
+    if err:
+        return err
+    _key, _table, optimizers = found
+    optimizer_type = data.get("Type")
+    if optimizer_type not in optimizers:
+        return _no_optimizer(optimizer_type, data.get("TableName"))
+    return json_response({"CatalogId": data.get("CatalogId") or get_account_id(),
+                          "DatabaseName": data.get("DatabaseName"), "TableName": data.get("TableName"),
+                          "TableOptimizer": _optimizer_response(optimizer_type, optimizers[optimizer_type])})
+
+
+def _update_table_optimizer(data):
+    found, err = _optimizer_table(data)
+    if err:
+        return err
+    key, table, optimizers = found
+    optimizer_type = data.get("Type")
+    if optimizer_type not in optimizers:
+        return _no_optimizer(optimizer_type, data.get("TableName"))
+    config = _optimizer_config(optimizer_type, data.get("TableOptimizerConfiguration"))
+    strategy = ((config.get("compactionConfiguration") or {}).get("icebergConfiguration") or {}).get("strategy")
+    if optimizer_type == "compaction" and strategy == "sort" and _sort_order_missing(table):
+        return _optimizer_error("InvalidInputException", "Sort order is not present in metadata", 400)
+    _table_optimizers[key] = {**optimizers, optimizer_type: config}  # replaces it: fields left out are dropped
+    return json_response({})
+
+
+def _delete_table_optimizer(data):
+    found, err = _optimizer_table(data)
+    if err:
+        return err
+    key, _table, optimizers = found
+    optimizer_type = data.get("Type")
+    if optimizer_type not in optimizers:
+        return _optimizer_error("EntityNotFoundException",
+                                f"An optimizer of type {optimizer_type} does not exist on table {data.get('TableName')}",
+                                404)
+    _table_optimizers[key] = {t: c for t, c in optimizers.items() if t != optimizer_type}
+    return json_response({})
+
+
+def _batch_get_table_optimizer(data):
+    found, failures = [], []
+    for entry in data.get("Entries") or []:
+        catalog_id = entry.get("catalogId") or get_account_id()
+        db_name, name, optimizer_type = entry.get("databaseName"), entry.get("tableName"), entry.get("type")
+        table = _tables.get(f"{db_name}/{name}")
+        optimizers = _table_optimizers.get(f"{db_name}/{name}") or {}
+        ids = {"catalogId": catalog_id, "databaseName": db_name, "tableName": name}
+        if table is None:
+            error = ("EntityNotFoundException", _entity_not_found_message())
+        elif not (table.get("Parameters") or {}).get("metadata_location"):
+            error = ("InvalidInputException", "Request Validation Failed: Unsupported Table type")
+        elif optimizer_type not in optimizers:
+            error = ("EntityNotFoundException", f"No optimizer of type {optimizer_type} found for the table: {name}")
+        else:
+            found.append({**ids, "tableOptimizer": _optimizer_response(optimizer_type, optimizers[optimizer_type])})
+            continue
+        failures.append({"error": {"ErrorCode": error[0], "ErrorMessage": error[1]}, **ids, "type": optimizer_type})
+    return json_response({"TableOptimizers": found, "Failures": failures})
+
+
+def _list_table_optimizer_runs(data):
+    found, err = _optimizer_table(data)
+    if err:
+        return err
+    if data.get("Type") not in found[2]:
+        return _no_optimizer(data.get("Type"), data.get("TableName"))
+    return json_response({"CatalogId": data.get("CatalogId") or get_account_id(),
+                          "DatabaseName": data.get("DatabaseName"), "TableName": data.get("TableName"),
+                          "TableOptimizerRuns": []})
+
+
 # ---- Partitions ----
+
 
 def _create_partition(data):
     db_name = data.get("DatabaseName")
@@ -349,17 +1332,18 @@ def _create_partition(data):
     values = partition_input.get("Values", [])
     for existing in _partitions[key]:
         if existing.get("Values") == values:
-            return error_response_json("AlreadyExistsException",
-                f"Partition with values {values} already exists", 400)
+            return error_response_json("AlreadyExistsException", f"Partition with values {values} already exists", 400)
 
-    _partitions[key].append({
-        **partition_input,
-        "DatabaseName": db_name,
-        "TableName": table_name,
-        "CreationTime": int(time.time()),
-        "LastAccessTime": int(time.time()),
-        "CatalogId": get_account_id(),
-    })
+    _partitions[key].append(
+        {
+            **partition_input,
+            "DatabaseName": db_name,
+            "TableName": table_name,
+            "CreationTime": int(time.time()),
+            "LastAccessTime": partition_input.get("LastAccessTime", int(time.time())),
+            "CatalogId": get_account_id(),
+        }
+    )
     return json_response({})
 
 
@@ -368,8 +1352,14 @@ def _delete_partition(data):
     table_name = data.get("TableName")
     values = data.get("PartitionValues", [])
     key = f"{db_name}/{table_name}"
-    if key in _partitions:
-        _partitions[key] = [p for p in _partitions[key] if p.get("Values") != values]
+    err = _partition_table_error(db_name, table_name)
+    if err:
+        return err
+    if not any(p.get("Values") == values for p in _partitions.get(key, [])):
+        return error_response_json("EntityNotFoundException", "Partition not found", 400)
+    _partitions[key] = [p for p in _partitions[key] if p.get("Values") != values]
+    if key in _partition_column_statistics:
+        _partition_column_statistics[key] = [e for e in _partition_column_statistics[key] if e.get("Values") != values]
     return json_response({})
 
 
@@ -384,11 +1374,400 @@ def _get_partition(data):
     return error_response_json("EntityNotFoundException", "Partition not found", 400)
 
 
+class _PartitionFilterError(Exception):
+    def __init__(self, message="Invalid partition expression!"):
+        super().__init__(message)
+
+
+# Any partition key outside these types makes Glue reject every Expression on the table.
+_FILTERABLE_KEY_TYPES = {"string", "char", "varchar", "date", "timestamp", "tinyint", "smallint", "int", "bigint",
+                         "long", "decimal"}
+_INTEGER_KEY_TYPES = {"tinyint", "smallint", "int", "bigint", "long"}
+_STRING_KEY_TYPES = {"string", "char", "varchar"}
+_DEFAULT_PARTITION_PAGE_SIZE = 500
+_FILTER_TOKEN = re.compile(
+    r"\s*(?:(?P<str>'(?:[^']|'')*')|(?P<num>\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)"
+    r"|(?P<op><>|!=|<=|>=|\|\||[=<>(),+\-*/])|(?P<word>[A-Za-z_][A-Za-z0-9_]*|`[^`]+`)|(?P<other>\S))"
+)
+_FILTER_OPS = {
+    "=": lambda a, b: a == b,
+    "<>": lambda a, b: a != b,
+    "!=": lambda a, b: a != b,
+    "<": lambda a, b: a < b,
+    "<=": lambda a, b: a <= b,
+    ">": lambda a, b: a > b,
+    ">=": lambda a, b: a >= b,
+}
+
+
+def _parse_big_integer(raw):
+    """Parse like java.math.BigInteger(String); Glue puts its error text into the response."""
+    def fail(reason):
+        raise _PartitionFilterError(
+            f"com.amazonaws.daylight.core.exceptions.InvalidPartitionValueException: {reason} is not an integer.")
+
+    if not raw:
+        fail("Zero length BigInteger")
+    minus, plus = raw.rfind("-"), raw.rfind("+")
+    if (minus >= 0 and (minus != 0 or plus >= 0)) or plus > 0:
+        fail("Illegal embedded sign character")
+    body = raw[1:] if raw[0] in "+-" else raw
+    if not body:
+        fail("Zero length BigInteger")
+    digits = body.lstrip("0")
+    first = len(digits) % 9 or 9
+    for group in [digits[:first]] + [digits[i:i + 9] for i in range(first, len(digits), 9)] if digits else []:
+        if not (group.isascii() and group.isdigit()):
+            fail(f'For input string: "{group}"')
+    return int(raw)
+
+
+def _parse_partition_value(raw, col_type):
+    """Turn a partition value or literal into a comparable value for its key type, as Glue does."""
+    prefix = "com.amazonaws.daylight.core.exceptions.InvalidPartitionValueException: "
+    if col_type in _INTEGER_KEY_TYPES:
+        return _parse_big_integer(raw)
+    if col_type == "decimal":
+        if not re.fullmatch(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?", raw):
+            raise _PartitionFilterError(f"{prefix}{raw} is not a decimal.")
+        return Decimal(raw)
+    if col_type == "date":
+        m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", raw)
+        if not m or not 1 <= int(m[2]) <= 12 or not 1 <= int(m[3]) <= 31:
+            raise _PartitionFilterError(f"{prefix}{raw} is not a date.")
+        # java.sql.Date is lenient: 2024-02-31 rolls over into March.
+        return datetime.date(int(m[1]), int(m[2]), 1) + datetime.timedelta(days=int(m[3]) - 1)
+    if col_type == "timestamp":
+        try:
+            return _java_timestamp(raw)
+        except _JavaNumberFormatError as e:
+            raise _PartitionFilterError(f"{prefix}{e} {raw} is not a timestamp.")
+        except (ValueError, OverflowError):
+            raise _PartitionFilterError(
+                f"{prefix}Timestamp format must be yyyy-mm-dd hh:mm:ss[.fffffffff] {raw} is not a timestamp.")
+    return raw
+
+
+class _JavaNumberFormatError(Exception):
+    pass
+
+
+def _java_parse_int(s, begin, end):
+    """Integer.parseInt(s, begin, end, 10), raising its NumberFormatException message."""
+    def fail(i):
+        return _JavaNumberFormatError(f'Error at index {i - begin} in: "{s[begin:end]}"')
+    if begin == end:
+        raise _JavaNumberFormatError("")
+    i, negative = begin, False
+    if s[i] < "0":
+        if s[i] not in "+-":
+            raise fail(i)
+        negative = s[i] == "-"
+        i += 1
+        if i == end:
+            raise fail(i)
+    limit, result = 2**31 if negative else 2**31 - 1, 0
+    while i < end:
+        if not "0" <= s[i] <= "9":
+            raise fail(i)
+        result = result * 10 + int(s[i])
+        if result > limit:
+            raise fail(i)
+        i += 1
+    return -result if negative else result
+
+
+def _java_timestamp(raw):
+    """java.sql.Timestamp.valueOf, which Glue applies to timestamp keys; ValueError means its format error."""
+    s = raw.strip("".join(map(chr, range(33))))
+    space = s.find(" ")
+    dash1 = s.find("-")
+    dash2 = s.find("-", dash1 + 1)
+    colon1 = s.find(":", space + 1)
+    colon2 = s.find(":", colon1 + 1)
+    period = s.find(".", colon2 + 1)
+    if space < 0 or not (dash1 == 4 and 1 < dash2 - dash1 <= 3 and 1 < space - dash2 <= 3):
+        raise ValueError
+    year, month, day = _java_parse_int(s, 0, dash1), _java_parse_int(s, dash1 + 1, dash2), _java_parse_int(s, dash2 + 1, space)
+    if not (1 <= month <= 12 and 1 <= day <= 31) or not (colon1 > 0 and colon2 > 0 and colon2 < len(s) - 1):
+        raise ValueError
+    hour, minute, nanos = _java_parse_int(s, space + 1, colon1), _java_parse_int(s, colon1 + 1, colon2), 0
+    if 0 < period < len(s) - 1:
+        second = _java_parse_int(s, colon2 + 1, period)
+        digits = len(s) - period - 1
+        if digits > 9 or not "0" <= s[period + 1] <= "9":
+            raise ValueError
+        nanos = _java_parse_int(s, period + 1, len(s)) * 10 ** (9 - digits)
+    elif period > 0:
+        raise ValueError
+    else:
+        second = _java_parse_int(s, colon2 + 1, len(s))
+    # Lenient like java.sql.Timestamp: 2024-01-14 25:02:03 rolls over into the 15th.
+    start = datetime.datetime(year, month, 1)
+    return start + datetime.timedelta(days=day - 1, hours=hour, minutes=minute, seconds=second), nanos
+
+
+def _tokenize_partition_filter(expr):
+    tokens, pos, expr = [], 0, expr.rstrip()
+    while pos < len(expr):
+        m = _FILTER_TOKEN.match(expr, pos)
+        pos = m.end()
+        kind = m.lastgroup
+        text = m.group(kind)
+        if kind == "str":
+            text = text[1:-1].replace("''", "'")
+        tokens.append((kind, text))
+    # Glue accepts redundant parentheses around a single column or literal: ((k)) = (('1')).
+    i = 0
+    while i + 2 < len(tokens):
+        in_list = i > 0 and tokens[i - 1][0] == "word" and tokens[i - 1][1].upper() == "IN"
+        if (tokens[i] == ("op", "(") and tokens[i + 2] == ("op", ")") and tokens[i + 1][0] in ("word", "str", "num")
+                and not in_list):
+            del tokens[i + 2], tokens[i]
+            i = max(i - 1, 0)
+        else:
+            i += 1
+    return tokens
+
+
+def _compile_partition_filter(expr, partition_keys):
+    """Compile a Glue GetPartitions Expression into a predicate over a partition's Values list."""
+    columns = {}
+    for i, k in enumerate(partition_keys):
+        col_type = (k.get("Type") or "string").lower().split("(")[0].strip()
+        if col_type not in _FILTERABLE_KEY_TYPES:
+            raise _PartitionFilterError()
+        columns[k["Name"].lower()] = (i, col_type)
+    tokens = _tokenize_partition_filter(expr)
+    pos = 0
+
+    def peek(offset=0):
+        return tokens[pos + offset] if pos + offset < len(tokens) else (None, None)
+
+    def take(kind=None, value=None):
+        nonlocal pos
+        k, v = peek()
+        if k is None or (kind and k != kind) or (value and (v.upper() if k == "word" else v) != value):
+            raise _PartitionFilterError()
+        pos += 1
+        return v
+
+    def is_kw(word):
+        k, v = peek()
+        return k == "word" and v.upper() == word
+
+    def disjunction():
+        left = conjunction()
+        while is_kw("OR"):
+            take()
+            left = (lambda l, r: lambda row: l(row) or r(row))(left, conjunction())
+        return left
+
+    def conjunction():
+        left = negation()
+        while is_kw("AND"):
+            take()
+            left = (lambda l, r: lambda row: l(row) and r(row))(left, negation())
+        return left
+
+    def negation():
+        if is_kw("NOT"):
+            take()
+            if is_kw("NOT"):
+                raise _PartitionFilterError()
+            inner = negation()
+            return lambda row: not inner(row)
+        if peek() == ("op", "("):
+            take()
+            inner = disjunction()
+            take("op", ")")
+            return inner
+        return predicate()
+
+    def predicate():
+        name = take("word").strip("`")
+        if name.lower() not in columns:
+            raise _PartitionFilterError()
+        idx, col_type = columns[name.lower()]
+
+        def literal():
+            sign = ""
+            if peek()[0] == "op" and peek()[1] in "+-" and peek(1)[0] == "num":
+                sign = "-" if take() == "-" else ""
+            kind = peek()[0]
+            if kind not in ("str", "num"):
+                raise _PartitionFilterError()
+            raw = take()
+            # A literal followed by an arithmetic or concatenation operator is no longer a plain value.
+            if peek()[0] == "op" and peek()[1] in ("||", "+", "-", "*", "/"):
+                raise _PartitionFilterError()
+            if kind == "num" and raw.isdigit() and int(raw) > 2**63 - 1:
+                raise _PartitionFilterError()
+            return _parse_partition_value(sign + raw, col_type)
+
+        if is_kw("IS"):
+            take()
+            not_null = is_kw("NOT")
+            if not_null:
+                take()
+            take("word", "NULL")
+            # Partition values are never null in Glue: IS NULL matches nothing, IS NOT NULL everything.
+            return lambda row: not_null
+
+        negate = False
+        if is_kw("NOT"):
+            take()
+            negate = True
+        if is_kw("IN"):
+            take()
+            take("op", "(")
+            values = [literal()]
+            while peek() == ("op", ","):
+                take()
+                values.append(literal())
+            take("op", ")")
+            test = values.__contains__
+        elif is_kw("BETWEEN"):
+            take()
+            low = literal()
+            take("word", "AND")
+            high = literal()
+
+            def test(v):
+                return low <= v <= high
+        elif is_kw("LIKE") and not negate and col_type in _STRING_KEY_TYPES:
+            take()
+            if peek()[0] != "str":
+                raise _PartitionFilterError()
+            pattern = "".join(".*" if c == "%" else "." if c == "_" else re.escape(c) for c in take())
+            if peek()[0] == "op" and peek()[1] == "||":
+                raise _PartitionFilterError()
+            regex = re.compile(pattern, re.DOTALL | re.IGNORECASE)
+            return lambda row: idx < len(row) and bool(regex.fullmatch(row[idx]))
+        elif not negate and peek()[0] == "op" and peek()[1] in _FILTER_OPS:
+            op = _FILTER_OPS[take()]
+            value = literal()
+
+            def test(v):
+                return op(v, value)
+        else:
+            raise _PartitionFilterError()
+
+        def evaluate(row):
+            try:
+                value = _parse_partition_value(row[idx], col_type)
+            except (_PartitionFilterError, IndexError):
+                return False
+            return negate != test(value)
+
+        return evaluate
+
+    # Glue ignores whatever follows a complete expression.
+    return disjunction()
+
+
+def _paren_run(expr):
+    """The longest run of "(" separated only by whitespace, outside quoted text."""
+    longest = run = i = 0
+    while i < len(expr):
+        c = expr[i]
+        if c in "'`":
+            j = i + 1
+            while j < len(expr) and not (expr[j] == c and not (c == "'" and expr[j + 1:j + 2] == "'")):
+                j += 2 if c == "'" and expr[j:j + 2] == "''" else 1
+            i, run = j + 1, 0
+            continue
+        if c == "(":
+            run += 1
+            longest = max(longest, run)
+        elif not c.isspace():
+            run = 0
+        i += 1
+    return longest
+
+
+def _partition_table_error(db_name, table_name):
+    if db_name not in _databases:
+        return error_response_json("EntityNotFoundException", f"Database {db_name} not found.", 400)
+    if f"{db_name}/{table_name}" not in _tables:
+        return error_response_json("EntityNotFoundException", f"Table {table_name} not found.", 400)
+    return None
+
+
+def _partition_token(key, offset):
+    return base64.b64encode(json.dumps({"table": key, "offset": offset}).encode()).decode()
+
+
+def _partition_token_offset(token, key):
+    if not token:
+        return 0
+    try:
+        decoded = json.loads(base64.b64decode(token, validate=True))
+        table, offset = decoded["table"], int(decoded["offset"])
+    except (ValueError, KeyError, TypeError):
+        raise _PartitionFilterError("Invalid token value")
+    if table != key:
+        raise _PartitionFilterError("NextToken key is not valid")
+    return offset
+
+
 def _get_partitions(data):
     db_name = data.get("DatabaseName")
     table_name = data.get("TableName")
     key = f"{db_name}/{table_name}"
-    return json_response({"Partitions": _partitions.get(key, [])})
+    max_results = data.get("MaxResults")
+    if max_results and max_results > 1000:
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{max_results}' at 'maxResults' failed to satisfy constraint: "
+            "Member must have value less than or equal to 1000",
+            400,
+        )
+    if max_results is not None and max_results <= 0:
+        return error_response_json("InvalidInputException", "MaxItems has to be a positive number", 400)
+    segment = data.get("Segment") or {}
+    number, total = segment.get("SegmentNumber", 0), segment.get("TotalSegments", 1)
+    if total > 10:
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{total}' at 'segment.totalSegments' failed to satisfy constraint: "
+            "Member must have value less than or equal to 10",
+            400,
+        )
+    if number < 0:
+        return error_response_json("InvalidInputException", "Segment number should be a non-negative integer.", 400)
+    if number >= total:
+        return error_response_json("InvalidInputException", "Segment number should be less than total segments.", 400)
+    err = _partition_table_error(db_name, table_name)
+    if err:
+        return err
+
+    expression = data.get("Expression")
+    # Glue's parser times out past 148 directly nested parentheses; NOT ( nesting and flat groups don't count.
+    if expression and _paren_run(expression) > 148:
+        return error_response_json("OperationTimeoutException", "Operation timed out", 400)
+    # The recursive-descent parser needs ~2,100 frames for a 2,048-character expression.
+    if sys.getrecursionlimit() < 10000:
+        sys.setrecursionlimit(10000)
+    parts = _partitions.get(key, [])
+    parts = parts[number * len(parts) // total:(number + 1) * len(parts) // total]
+    try:
+        matches = _compile_partition_filter(expression, _tables[key].get("PartitionKeys") or []) if expression else None
+        start = _partition_token_offset(data.get("NextToken"), key)
+        # MaxResults bounds the partitions scanned, not the matches: filtered pages can be short or empty.
+        window = parts[start:start + (max_results or _DEFAULT_PARTITION_PAGE_SIZE)]
+        page = [p for p in window if matches is None or matches(p.get("Values") or [])]
+    except _PartitionFilterError as e:
+        return error_response_json("InvalidInputException", str(e), 400)
+    except RecursionError:
+        return error_response_json("OperationTimeoutException", "Operation timed out", 400)
+    if data.get("ExcludeColumnSchema"):
+        page = [{**p, "StorageDescriptor": {**p["StorageDescriptor"], "Columns": []}} if "StorageDescriptor" in p else p
+                for p in page]
+    resp = {"Partitions": page}
+    if window:
+        resp["NextToken"] = _partition_token(key, start + len(window))
+    return json_response(resp)
 
 
 def _batch_create_partition(data):
@@ -402,17 +1781,58 @@ def _batch_create_partition(data):
         values = pi.get("Values", [])
         dupe = any(p.get("Values") == values for p in _partitions[key])
         if dupe:
-            errors.append({"PartitionValues": values, "ErrorDetail": {
-                "ErrorCode": "AlreadyExistsException",
-                "ErrorMessage": "Partition already exists"}})
+            errors.append(
+                {
+                    "PartitionValues": values,
+                    "ErrorDetail": {"ErrorCode": "AlreadyExistsException", "ErrorMessage": "Partition already exists"},
+                }
+            )
         else:
-            _partitions[key].append({
-                **pi,
-                "DatabaseName": db_name,
-                "TableName": table_name,
-                "CreationTime": int(time.time()),
-                "CatalogId": get_account_id(),
+            _partitions[key].append(
+                {
+                    **pi,
+                    "DatabaseName": db_name,
+                    "TableName": table_name,
+                    "CreationTime": int(time.time()),
+                    "CatalogId": get_account_id(),
+                }
+            )
+    return json_response({"Errors": errors})
+
+
+def _batch_delete_partition(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    key = f"{db_name}/{table_name}"
+    to_delete = data.get("PartitionsToDelete") or []
+    if len(to_delete) > 25:
+        listed = ", ".join(f"PartitionValueList(values=[{', '.join(e.get('Values') or [])}])" for e in to_delete)
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '[{listed}]' at 'partitionsToDelete' failed to satisfy constraint: "
+            "Member must have length less than or equal to 25",
+            400,
+        )
+    err = _partition_table_error(db_name, table_name)
+    if err:
+        return err
+    existing = {tuple(p.get("Values") or []) for p in _partitions.get(key, [])}
+    errors, deleted = [], set()
+    for entry in to_delete:
+        values = tuple(entry.get("Values") or [])
+        if values in existing and values not in deleted:
+            deleted.add(values)
+        else:
+            errors.append({
+                "PartitionValues": list(values),
+                "ErrorDetail": {"ErrorCode": "EntityNotFoundException", "ErrorMessage": "Partition not found"},
             })
+    if deleted:
+        _partitions[key] = [p for p in _partitions[key] if tuple(p.get("Values") or []) not in deleted]
+        if key in _partition_column_statistics:
+            _partition_column_statistics[key] = [
+                e for e in _partition_column_statistics[key] if tuple(e.get("Values") or []) not in deleted
+            ]
     return json_response({"Errors": errors})
 
 
@@ -438,7 +1858,47 @@ def _batch_get_partition(data):
     return json_response({"Partitions": partitions, "UnprocessedKeys": unprocessed})
 
 
+def _batch_update_partition(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    key = f"{db_name}/{table_name}"
+    if key not in _tables:
+        return error_response_json("EntityNotFoundException", f"Table {table_name} not found in {db_name}", 400)
+    parts = _partitions.get(key, [])
+    errors = []
+    for entry in data.get("Entries", []):
+        values = entry.get("PartitionValueList", [])
+        partition_input = entry.get("PartitionInput", {})
+        target = None
+        for p in parts:
+            if p.get("Values") == values:
+                target = p
+                break
+        if target is None:
+            errors.append(
+                {
+                    "PartitionValueList": values,
+                    "ErrorDetail": {"ErrorCode": "EntityNotFoundException", "ErrorMessage": "Partition not found"},
+                }
+            )
+            continue
+        creation_time = target.get("CreationTime")
+        target.clear()
+        target.update(
+            {
+                **partition_input,
+                "DatabaseName": db_name,
+                "TableName": table_name,
+                "CreationTime": creation_time,
+                "LastAccessTime": partition_input.get("LastAccessTime", int(time.time())),
+                "CatalogId": get_account_id(),
+            }
+        )
+    return json_response({"Errors": errors})
+
+
 # ---- Partition Indexes ----
+
 
 def _create_partition_index(data):
     db_name = data.get("DatabaseName")
@@ -449,11 +1909,13 @@ def _create_partition_index(data):
         _partition_indexes[key] = []
     raw_keys = index_input.get("Keys", [])
     key_schema = [{"Name": k} if isinstance(k, str) else k for k in raw_keys]
-    _partition_indexes[key].append({
-        "IndexName": index_input.get("IndexName", ""),
-        "Keys": key_schema,
-        "IndexStatus": "ACTIVE",
-    })
+    _partition_indexes[key].append(
+        {
+            "IndexName": index_input.get("IndexName", ""),
+            "Keys": key_schema,
+            "IndexStatus": "ACTIVE",
+        }
+    )
     return json_response({})
 
 
@@ -464,7 +1926,154 @@ def _get_partition_indexes(data):
     return json_response({"PartitionIndexDescriptorList": _partition_indexes.get(key, [])})
 
 
+# ---- Column Statistics ----
+
+
+def _partition_stats_entry(key, values):
+    for entry in _partition_column_statistics.get(key, []):
+        if entry.get("Values") == values:
+            return entry
+    return None
+
+
+def _update_column_statistics_for_table(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    key = f"{db_name}/{table_name}"
+    if key not in _tables:
+        return error_response_json("EntityNotFoundException", f"Table {table_name} not found in {db_name}", 400)
+    stats_list = data.get("ColumnStatisticsList", [])
+    bucket = _table_column_statistics.setdefault(key, {})
+    errors = []
+    for cs in stats_list:
+        col = cs.get("ColumnName")
+        if not col:
+            errors.append(
+                {
+                    "ColumnStatistics": cs,
+                    "Error": {"ErrorCode": "InvalidInputException", "ErrorMessage": "ColumnName is required"},
+                }
+            )
+            continue
+        bucket[col] = cs
+    return json_response({"Errors": errors})
+
+
+def _get_column_statistics_for_table(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    key = f"{db_name}/{table_name}"
+    if key not in _tables:
+        return error_response_json("EntityNotFoundException", f"Table {table_name} not found in {db_name}", 400)
+    bucket = _table_column_statistics.get(key, {})
+    stats_list = []
+    errors = []
+    for col in data.get("ColumnNames", []):
+        if col in bucket:
+            stats_list.append(_column_statistics_out(bucket[col]))
+        else:
+            errors.append(
+                {
+                    "ColumnName": col,
+                    "Error": {
+                        "ErrorCode": "EntityNotFoundException",
+                        "ErrorMessage": f"Column statistics for {col} not found",
+                    },
+                }
+            )
+    return json_response({"ColumnStatisticsList": stats_list, "Errors": errors})
+
+
+def _column_statistics_out(cs):
+    if isinstance(cs.get("AnalyzedTime"), float):
+        return {**cs, "AnalyzedTime": int(cs["AnalyzedTime"])}
+    return cs
+
+
+def _delete_column_statistics_for_table(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    column_name = data.get("ColumnName")
+    key = f"{db_name}/{table_name}"
+    if key not in _tables:
+        return error_response_json("EntityNotFoundException", f"Table {table_name} not found in {db_name}", 400)
+    # Real Glue's Delete* operations are idempotent — deleting stats for a
+    # column that never had any returns 200 with an empty body.
+    _table_column_statistics.get(key, {}).pop(column_name, None)
+    return json_response({})
+
+
+def _update_column_statistics_for_partition(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    values = data.get("PartitionValues", [])
+    key = f"{db_name}/{table_name}"
+    if not any(p.get("Values") == values for p in _partitions.get(key, [])):
+        return error_response_json("EntityNotFoundException", f"Partition with values {values} not found", 400)
+    entry = _partition_stats_entry(key, values)
+    if entry is None:
+        entry = {"Values": values, "Stats": {}}
+        _partition_column_statistics.setdefault(key, []).append(entry)
+    errors = []
+    for cs in data.get("ColumnStatisticsList", []):
+        col = cs.get("ColumnName")
+        if not col:
+            errors.append(
+                {
+                    "ColumnStatistics": cs,
+                    "Error": {"ErrorCode": "InvalidInputException", "ErrorMessage": "ColumnName is required"},
+                }
+            )
+            continue
+        entry["Stats"][col] = cs
+    return json_response({"Errors": errors})
+
+
+def _get_column_statistics_for_partition(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    values = data.get("PartitionValues", [])
+    key = f"{db_name}/{table_name}"
+    if key not in _tables:
+        return error_response_json("EntityNotFoundException", f"Table {table_name} not found in {db_name}", 400)
+    if not any(p.get("Values") == values for p in _partitions.get(key, [])):
+        return error_response_json("EntityNotFoundException", f"Partition with values {values} not found", 400)
+    entry = _partition_stats_entry(key, values)
+    bucket = entry["Stats"] if entry else {}
+    stats_list = []
+    errors = []
+    for col in data.get("ColumnNames", []):
+        if col in bucket:
+            stats_list.append(_column_statistics_out(bucket[col]))
+        else:
+            errors.append(
+                {
+                    "ColumnName": col,
+                    "Error": {
+                        "ErrorCode": "EntityNotFoundException",
+                        "ErrorMessage": "Statistics do not exist for this column",
+                    },
+                }
+            )
+    return json_response({"ColumnStatisticsList": stats_list, "Errors": errors})
+
+
+def _delete_column_statistics_for_partition(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    values = data.get("PartitionValues", [])
+    column_name = data.get("ColumnName")
+    key = f"{db_name}/{table_name}"
+    if not any(p.get("Values") == values for p in _partitions.get(key, [])):
+        return error_response_json("EntityNotFoundException", f"Partition with values {values} not found", 400)
+    entry = _partition_stats_entry(key, values)
+    if entry is not None:
+        entry.get("Stats", {}).pop(column_name, None)
+    return json_response({})
+
+
 # ---- Connections ----
+
 
 def _create_connection(data):
     conn_input = data.get("ConnectionInput", {})
@@ -495,15 +2104,24 @@ def _get_connections(data):
 
 # ---- Crawlers ----
 
+
 def _create_crawler(data):
     name = data.get("Name")
     if name in _crawlers:
         return error_response_json("AlreadyExistsException", f"Crawler {name} already exists", 400)
+    _glue_role = data.get("Role", "")
+    if _glue_role:
+        from ministack.core.iam_evaluator import validate_role_arn
+
+        _glue_role_err = validate_role_arn(_glue_role)
+        if _glue_role_err:
+            return error_response_json("InvalidInputException", _glue_role_err, 400)
+
     schedule = data.get("Schedule", "")
     schedule_struct = {"ScheduleExpression": schedule} if schedule else {}
     _crawlers[name] = {
         "Name": name,
-        "Role": data.get("Role", ""),
+        "Role": _glue_role,
         "DatabaseName": data.get("DatabaseName", ""),
         "Description": data.get("Description", ""),
         "Targets": data.get("Targets", {}),
@@ -522,6 +2140,8 @@ def _create_crawler(data):
         "Configuration": data.get("Configuration", ""),
         "CrawlerSecurityConfiguration": data.get("CrawlerSecurityConfiguration", ""),
     }
+    if data.get("LakeFormationConfiguration") is not None:
+        _crawlers[name]["LakeFormationConfiguration"] = data["LakeFormationConfiguration"]
     return json_response({})
 
 
@@ -550,9 +2170,21 @@ def _update_crawler(data):
     if name not in _crawlers:
         return error_response_json("EntityNotFoundException", f"Crawler {name} not found", 400)
     crawler = _crawlers[name]
-    updatable = {"Role", "DatabaseName", "Description", "Targets", "Schedule",
-                 "Classifiers", "TablePrefix", "SchemaChangePolicy", "RecrawlPolicy",
-                 "LineageConfiguration", "Configuration", "CrawlerSecurityConfiguration"}
+    updatable = {
+        "Role",
+        "DatabaseName",
+        "Description",
+        "Targets",
+        "Schedule",
+        "Classifiers",
+        "TablePrefix",
+        "SchemaChangePolicy",
+        "RecrawlPolicy",
+        "LineageConfiguration",
+        "LakeFormationConfiguration",
+        "Configuration",
+        "CrawlerSecurityConfiguration",
+    }
     for k in updatable:
         if k in data:
             if k == "Schedule":
@@ -571,8 +2203,7 @@ def _start_crawler(data):
         return error_response_json("EntityNotFoundException", f"Crawler {name} not found", 400)
     crawler = _crawlers[name]
     if crawler["State"] == "RUNNING":
-        return error_response_json("CrawlerRunningException",
-            f"Crawler {name} is already running", 400)
+        return error_response_json("CrawlerRunningException", f"Crawler {name} is already running", 400)
 
     crawler["State"] = "RUNNING"
     crawler["CrawlElapsedTime"] = 0
@@ -592,7 +2223,12 @@ def _start_crawler(data):
             }
             logger.info("Glue: Crawler %s finished after %ss", name, CRAWLER_RUN_SECONDS)
 
-    timer = threading.Timer(CRAWLER_RUN_SECONDS, _finish_crawl)
+    # threading.Timer (like threading.Thread) does NOT copy contextvars, so
+    # without this snapshot _finish_crawl runs under the default account and the
+    # account-scoped _crawlers guard never matches — the crawler would hang in
+    # RUNNING forever for non-default accounts. See issue #639 / stepfunctions.
+    ctx = contextvars.copy_context()
+    timer = threading.Timer(CRAWLER_RUN_SECONDS, lambda: ctx.run(_finish_crawl))
     timer.daemon = True
     timer.start()
 
@@ -605,8 +2241,7 @@ def _stop_crawler(data):
     if name not in _crawlers:
         return error_response_json("EntityNotFoundException", f"Crawler {name} not found", 400)
     if _crawlers[name]["State"] != "RUNNING":
-        return error_response_json("CrawlerNotRunningException",
-            f"Crawler {name} is not running", 400)
+        return error_response_json("CrawlerNotRunningException", f"Crawler {name} is not running", 400)
     _crawlers[name]["State"] = "STOPPING"
     _crawlers[name]["State"] = "READY"
     return json_response({})
@@ -618,20 +2253,38 @@ def _get_crawler_metrics(data):
     for name in crawler_names:
         crawler = _crawlers.get(name)
         if crawler:
-            metrics.append({
-                "CrawlerName": name,
-                "TimeLeftSeconds": 0.0,
-                "StillEstimating": False,
-                "LastRuntimeSeconds": crawler.get("CrawlElapsedTime", 0) / 1000.0,
-                "MedianRuntimeSeconds": crawler.get("CrawlElapsedTime", 0) / 1000.0,
-                "TablesCreated": 0,
-                "TablesUpdated": 0,
-                "TablesDeleted": 0,
-            })
+            metrics.append(
+                {
+                    "CrawlerName": name,
+                    "TimeLeftSeconds": 0.0,
+                    "StillEstimating": False,
+                    "LastRuntimeSeconds": crawler.get("CrawlElapsedTime", 0) / 1000.0,
+                    "MedianRuntimeSeconds": crawler.get("CrawlElapsedTime", 0) / 1000.0,
+                    "TablesCreated": 0,
+                    "TablesUpdated": 0,
+                    "TablesDeleted": 0,
+                }
+            )
     return json_response({"CrawlerMetricsList": metrics})
 
 
 # ---- Jobs ----
+
+
+_JOB_OPTIONAL_FIELDS = (
+    "JobRunQueuingEnabled", "LogUri", "AllocatedCapacity", "MaxCapacity", "WorkerType", "NumberOfWorkers",
+    "NotificationProperty", "CodeGenConfigurationNodes", "ExecutionClass", "SourceControlDetails",
+    "MaintenanceWindow",
+)
+
+
+def _default_job_timeout(glue_version):
+    """2,880 minutes for Glue 4.0 and earlier, 480 for 5.0 and later (botocore CreateJob Timeout)."""
+    try:
+        return 480 if float(glue_version) >= 5.0 else 2880
+    except (TypeError, ValueError):
+        return 2880
+
 
 def _create_job(data):
     name = data.get("Name")
@@ -648,16 +2301,21 @@ def _create_job(data):
         "NonOverridableArguments": data.get("NonOverridableArguments", {}),
         "Connections": data.get("Connections", {}),
         "MaxRetries": data.get("MaxRetries", 0),
-        "Timeout": data.get("Timeout", 2880),
-        "GlueVersion": data.get("GlueVersion", "3.0"),
-        "NumberOfWorkers": data.get("NumberOfWorkers", 2),
-        "WorkerType": data.get("WorkerType", "G.1X"),
-        "MaxCapacity": data.get("MaxCapacity"),
+        "GlueVersion": data.get("GlueVersion", "5.1"),
+        "JobMode": data.get("JobMode", "SCRIPT"),
+        "ExecutionProperty": data.get("ExecutionProperty") or {"MaxConcurrentRuns": 1},
         "SecurityConfiguration": data.get("SecurityConfiguration", ""),
         "Tags": data.get("Tags", {}),
         "CreatedOn": int(time.time()),
         "LastModifiedOn": int(time.time()),
     }
+    _jobs[name]["Timeout"] = data.get("Timeout", _default_job_timeout(_jobs[name]["GlueVersion"]))
+    for k in _JOB_OPTIONAL_FIELDS:
+        if data.get(k) is not None:
+            _jobs[name][k] = data[k]
+    if ("MaxCapacity" not in _jobs[name] and "WorkerType" not in _jobs[name]
+            and _jobs[name]["Command"].get("Name") == "pythonshell"):
+        _jobs[name]["MaxCapacity"] = 0.0625
     _job_runs[name] = []
     return json_response({"Name": name})
 
@@ -674,11 +2332,11 @@ def _get_job(data):
     job = _jobs.get(name)
     if not job:
         return error_response_json("EntityNotFoundException", f"Job {name} not found", 400)
-    return json_response({"Job": job})
+    return json_response(to_output_shape("glue", "GetJobResponse", {"Job": job}))
 
 
 def _get_jobs(data):
-    return json_response({"Jobs": list(_jobs.values())})
+    return json_response(to_output_shape("glue", "GetJobsResponse", {"Jobs": list(_jobs.values())}))
 
 
 def _update_job(data):
@@ -686,10 +2344,31 @@ def _update_job(data):
     job_update = data.get("JobUpdate", {})
     if name not in _jobs:
         return error_response_json("EntityNotFoundException", f"Job {name} not found", 400)
-    updatable = {"Description", "Role", "Command", "DefaultArguments",
-                 "NonOverridableArguments", "Connections", "MaxRetries", "Timeout",
-                 "GlueVersion", "NumberOfWorkers", "WorkerType", "MaxCapacity",
-                 "SecurityConfiguration"}
+    updatable = {
+        "Description",
+        "Role",
+        "Command",
+        "DefaultArguments",
+        "NonOverridableArguments",
+        "Connections",
+        "MaxRetries",
+        "Timeout",
+        "GlueVersion",
+        "NumberOfWorkers",
+        "WorkerType",
+        "MaxCapacity",
+        "SecurityConfiguration",
+        "JobMode",
+        "JobRunQueuingEnabled",
+        "LogUri",
+        "ExecutionProperty",
+        "AllocatedCapacity",
+        "NotificationProperty",
+        "CodeGenConfigurationNodes",
+        "ExecutionClass",
+        "SourceControlDetails",
+        "MaintenanceWindow",
+    }
     for k in updatable:
         if k in job_update:
             _jobs[name][k] = job_update[k]
@@ -698,7 +2377,11 @@ def _update_job(data):
 
 
 def _resolve_script(script_location):
-    """Resolve a script location to a local path. Supports local paths and s3:// URIs."""
+    """Resolve a script location to a local path. Supports local paths and s3:// URIs.
+
+    For S3 URIs, first checks the on-disk S3_DATA_DIR (file-backed S3).
+    If not found, fetches from MiniStack's in-memory S3 service to a temp file.
+    """
     if not script_location:
         return None
     if os.path.exists(script_location):
@@ -708,10 +2391,42 @@ def _resolve_script(script_location):
         parts = stripped.split("/", 1)
         bucket = parts[0]
         key = parts[1] if len(parts) > 1 else ""
-        local_path = os.path.join(S3_DATA_DIR, bucket, key)
+        # Check on-disk first. Objects are persisted account-scoped at
+        # DATA_DIR/<account>/<bucket>/<key> (see s3._object_disk_path), so the
+        # account id MUST be part of the lookup path or it never matches.
+        local_path = os.path.join(S3_DATA_DIR, get_account_id(), bucket, key)
         if os.path.exists(local_path):
             return local_path
+        # Fetch from in-memory S3
+        try:
+            import ministack.services.s3 as _s3_svc
+
+            s3_bucket = _s3_svc._buckets.get(bucket)
+            if s3_bucket:
+                obj = s3_bucket.get("objects", {}).get(key)
+                if obj and obj.get("body"):
+                    tmp_dir = os.path.join(tempfile.gettempdir(), "ministack-glue-scripts")
+                    os.makedirs(tmp_dir, exist_ok=True)
+                    tmp_path = os.path.join(tmp_dir, os.path.basename(key))
+                    data = obj["body"]
+                    if isinstance(data, memoryview):
+                        data = bytes(data)
+                    with open(tmp_path, "wb") as f:
+                        f.write(data)
+                    logger.info("Glue: resolved script from S3: s3://%s/%s -> %s", bucket, key, tmp_path)
+                    return tmp_path
+        except Exception as e:
+            logger.debug("Glue: failed to fetch script from S3: %s", e)
     return None
+
+
+def _script_args(job, job_name, run_id, run_arguments):
+    """Return the arguments that the job script gets."""
+    default_arguments = job.get("DefaultArguments", {})
+    if not _is_spark_job(job):
+        return {**default_arguments, **run_arguments}
+    # Glue gives a Spark script its job name and run ID. They replace DefaultArguments, and the run's Arguments replace them.
+    return {**default_arguments, "--JOB_NAME": job_name, "--JOB_RUN_ID": run_id, **run_arguments}
 
 
 def _start_job_run(data):
@@ -733,20 +2448,25 @@ def _start_job_run(data):
         "Arguments": args,
         "ErrorMessage": "",
         "PredecessorRuns": [],
-        "AllocatedCapacity": job.get("MaxCapacity") or job.get("NumberOfWorkers", 2),
         "ExecutionTime": 0,
-        "Timeout": job.get("Timeout", 2880),
-        "MaxCapacity": job.get("MaxCapacity"),
-        "WorkerType": job.get("WorkerType", "G.1X"),
-        "NumberOfWorkers": job.get("NumberOfWorkers", 2),
-        "SecurityConfiguration": job.get("SecurityConfiguration", ""),
-        "GlueVersion": job.get("GlueVersion", "3.0"),
+        "Timeout": data.get("Timeout") or job.get("Timeout", 2880),
+        "SecurityConfiguration": data.get("SecurityConfiguration") or job.get("SecurityConfiguration", ""),
+        "GlueVersion": job.get("GlueVersion", "5.1"),
         "Attempt": 0,
     }
+    if job.get("JobMode"):
+        run["JobMode"] = job["JobMode"]
+    for k in ("JobRunQueuingEnabled", "AllocatedCapacity", "MaxCapacity", "WorkerType", "NumberOfWorkers",
+              "NotificationProperty", "ExecutionClass", "MaintenanceWindow", "ExecutionRoleSessionPolicy"):
+        value = data.get(k) if data.get(k) is not None else job.get(k)
+        if value is not None:
+            run[k] = value
 
     if job_name not in _job_runs:
         _job_runs[job_name] = []
     _job_runs[job_name].append(run)
+
+    script_args = _script_args(job, job_name, run_id, data.get("Arguments", {}))
 
     def _execute():
         run["JobRunState"] = "RUNNING"
@@ -754,30 +2474,24 @@ def _start_job_run(data):
 
         script_location = job.get("Command", {}).get("ScriptLocation", "")
         resolved = _resolve_script(script_location)
-        if resolved and resolved.endswith(".py"):
+
+        docker_client = _get_docker()
+        use_docker = False
+        if _is_spark_job(job) and docker_client and resolved:
+            image = _glue_image_for_version(job.get("GlueVersion", "4.0"))
             try:
-                env = dict(os.environ)
-                for k, v in args.items():
-                    env_key = k.lstrip("-")
-                    if env_key:
-                        env[env_key] = str(v)
-                proc = subprocess.run(
-                    ["python3", resolved],
-                    capture_output=True, text=True,
-                    timeout=min(job.get("Timeout", 300), 600),
-                    env=env,
-                )
-                if proc.returncode == 0:
-                    run["JobRunState"] = "SUCCEEDED"
-                else:
-                    run["JobRunState"] = "FAILED"
-                    run["ErrorMessage"] = proc.stderr[:2000] if proc.stderr else f"Exit code {proc.returncode}"
-            except subprocess.TimeoutExpired:
-                run["JobRunState"] = "TIMEOUT"
-                run["ErrorMessage"] = "Job execution timed out"
-            except Exception as e:
-                run["JobRunState"] = "FAILED"
-                run["ErrorMessage"] = str(e)[:2000]
+                docker_client.images.get(image)
+                use_docker = True
+            except Exception:
+                logger.info("Glue: image %s not available — stubbing job %s", image, job_name)
+
+        run_job = {**job, "Timeout": run["Timeout"]}
+        if use_docker:
+            _execute_spark_docker(run, run_job, job_name, script_args, resolved, docker_client)
+        elif _is_spark_job(job):
+            run["JobRunState"] = "SUCCEEDED"
+        elif resolved and resolved.endswith(".py"):
+            _execute_subprocess(run, run_job, script_args, resolved)
         else:
             run["JobRunState"] = "SUCCEEDED"
 
@@ -785,10 +2499,476 @@ def _start_job_run(data):
         run["ExecutionTime"] = int(run["CompletedOn"] - run["StartedOn"])
         run["LastModifiedOn"] = int(time.time())
 
-    thread = threading.Thread(target=_execute, daemon=True)
+    # threading.Thread does NOT copy contextvars, so without this snapshot the
+    # worker would run under the default account and fail to resolve the
+    # account-scoped on-disk script (and AccountScopedDict lookups). Carry the
+    # request's account/region into the thread. See issue #639 / stepfunctions.
+    ctx = contextvars.copy_context()
+    thread = threading.Thread(target=ctx.run, args=(_execute,), daemon=True)
     thread.start()
 
     return json_response({"JobRunId": run_id})
+
+
+def _execute_subprocess(run, job, args, resolved):
+    """Run a Glue script as a plain Python subprocess (non-Spark fallback)."""
+    try:
+        env = dict(os.environ)
+        for k, v in args.items():
+            env_key = k.lstrip("-")
+            if env_key:
+                env[env_key] = str(v)
+        proc = subprocess.run(
+            ["python3", resolved],
+            capture_output=True,
+            text=True,
+            timeout=min(job.get("Timeout", 300), 600),
+            env=env,
+        )
+        if proc.returncode == 0:
+            run["JobRunState"] = "SUCCEEDED"
+        else:
+            run["JobRunState"] = "FAILED"
+            run["ErrorMessage"] = proc.stderr[:2000] if proc.stderr else f"Exit code {proc.returncode}"
+    except subprocess.TimeoutExpired:
+        run["JobRunState"] = "TIMEOUT"
+        run["ErrorMessage"] = "Job execution timed out"
+    except Exception as e:
+        run["JobRunState"] = "FAILED"
+        run["ErrorMessage"] = str(e)[:2000]
+
+
+# Driver-side bootstrap submitted in place of the user script. The Glue 4.0
+# image ships botocore 1.27, which predates AWS_ENDPOINT_URL (botocore
+# 1.31.57), so the env var alone is silently ignored and a bare
+# boto3.client("s3") in the script escapes to real AWS — which answers
+# InvalidAccessKeyId for the emulator's credentials. Patching
+# Session.create_client covers every botocore vintage; the user script then
+# runs unmodified as __main__ with its own argv, so getResolvedOptions and
+# __name__ checks behave identically.
+# The patch is applied when the script first imports botocore.session, not
+# before. A deps zip on --py-files can hold its own botocore, and an early
+# import would load botocore from that zip, where it cannot read its data files.
+_GLUE_BOOT_SCRIPT = """\
+import os
+import runpy
+import sys
+
+_endpoint = os.environ.get("AWS_ENDPOINT_URL")
+
+
+class _PatchedSessionLoader:
+    def __init__(self, loader):
+        self._loader = loader
+
+    def __getattr__(self, name):
+        return getattr(self._loader, name)
+
+    def exec_module(self, module):
+        self._loader.exec_module(module)
+        _orig_create_client = module.Session.create_client
+
+        def _create_client(self, *args, **kwargs):
+            if not kwargs.get("endpoint_url"):
+                kwargs["endpoint_url"] = _endpoint
+            return _orig_create_client(self, *args, **kwargs)
+
+        module.Session.create_client = _create_client
+
+
+def _with_patch(spec):
+    if hasattr(spec.loader, "exec_module"):
+        spec.loader = _PatchedSessionLoader(spec.loader)
+    return spec
+
+
+class _BotocoreSessionFinder:
+    # Stays on sys.meta_path, so each load of botocore.session is patched, also after a find_spec probe or a reload.
+    def find_spec(self, name, path=None, target=None):
+        if name != "botocore.session":
+            return None
+        # The other finders resolve it from the sys.path of this import.
+        for finder in sys.meta_path:
+            if finder is self or not hasattr(finder, "find_spec"):
+                continue
+            spec = finder.find_spec(name, path, target)
+            if spec is not None:
+                return _with_patch(spec)
+        return None
+
+
+if _endpoint:
+    sys.meta_path.insert(0, _BotocoreSessionFinder())
+
+_script = {script!r}
+sys.argv = [_script] + sys.argv[1:]
+runpy.run_path(_script, run_name="__main__")
+"""
+
+
+def _extract_python_error(logs: str) -> str:
+    """Pull the Python traceback out of Spark's mixed output.
+
+    Spark routes everything through stdout, so a Python traceback is buried
+    under hundreds of Java INFO lines. Look for the last ``Traceback`` block
+    and return everything from there to the end of the error.
+    """
+    marker = "Traceback (most recent call last):"
+    idx = logs.rfind(marker)
+    if idx == -1:
+        return ""
+    return logs[idx:].strip()
+
+
+_LOOPBACK_HOSTS = ("localhost", "127.0.0.1", "host.docker.internal")
+
+
+def _translate_loopback_conf(value: str, ministack_host: str, ministack_port: str) -> str:
+    """Rewrite loopback references to MiniStack in a user Spark conf value.
+
+    A ``--conf`` value carrying ``localhost:4566`` (or ``127.0.0.1`` /
+    ``host.docker.internal``) was written from the submitting host's point of
+    view; inside the job container those names do not reach MiniStack, so the
+    Iceberg REST client falls back to a dead endpoint. From inside the
+    container they can only have meant "MiniStack as the submitter saw it", so
+    the host part is rewritten to the resolved gateway address. Only the
+    gateway port qualifies — any other host or port passes through untouched,
+    so a conf pointing at an external REST catalog keeps working.
+    """
+    for h in _LOOPBACK_HOSTS:
+        value = re.sub(
+            rf"(?<![\w.-]){re.escape(h)}:{ministack_port}(?!\d)",
+            f"{ministack_host}:{ministack_port}",
+            value,
+        )
+    return value
+
+
+def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
+    """Run a Glue Spark job inside an amazon/aws-glue-libs Docker container."""
+    glue_version = job.get("GlueVersion", "4.0")
+    image = _glue_image_for_version(glue_version)
+    container_name = f"ministack-glue-{job_name}-{run['Id'][:8]}"
+
+    # Ensure the default Iceberg warehouse bucket exists so CREATE TABLE
+    # ... USING iceberg works without the user pre-creating it.
+    try:
+        from ministack.services import s3 as _s3
+
+        if _s3._ensure_bucket("ministack-glue-warehouse") is None:
+            _s3._create_bucket("ministack-glue-warehouse", b"", {})
+    except Exception:
+        pass
+
+    # Remove stale container with same name
+    try:
+        existing = docker_client.containers.get(container_name)
+        existing.remove(force=True, v=True)
+    except Exception:
+        pass
+
+    ms_network = _get_ministack_network(docker_client)
+
+    # Determine MiniStack's S3 endpoint from inside the container.
+    # If on a Docker network, use the ministack container's IP; otherwise localhost.
+    ministack_host = os.environ.get("MINISTACK_HOST", "")
+    ministack_port = (os.environ.get("GATEWAY_PORT")
+                      or os.environ.get("EDGE_PORT") or "4566")
+    if ms_network and not ministack_host:
+        # Try to resolve from HOSTNAME
+        try:
+            ms_container = docker_client.containers.get(os.environ.get("HOSTNAME", ""))
+            ms_container.reload()
+            nets = ms_container.attrs.get("NetworkSettings", {}).get("Networks", {})
+            ip = nets.get(ms_network, {}).get("IPAddress", "")
+            if ip:
+                ministack_host = ip
+        except Exception:
+            pass
+    if not ministack_host:
+        # HOSTNAME lookup failed. Try to find our own container by name on the
+        # network — the compose service name or the container name both work.
+        for name in ("ministack", os.environ.get("HOSTNAME", "")):
+            if not name:
+                continue
+            try:
+                c = docker_client.containers.get(name)
+                c.reload()
+                nets = c.attrs.get("NetworkSettings", {}).get("Networks", {})
+                for net_name, net_info in nets.items():
+                    ip = net_info.get("IPAddress", "")
+                    if ip:
+                        ministack_host = ip
+                        if not ms_network:
+                            ms_network = net_name
+                        break
+                if ministack_host:
+                    break
+            except Exception:
+                pass
+    if not ministack_host:
+        # Last resort: resolve the gateway address, which is how
+        # host.docker.internal resolves on Docker Desktop. On Linux the
+        # extra_hosts entry maps it to host-gateway, so this is what the
+        # Spark container would see — use it directly rather than relying
+        # on the name, which the Java SDK may resolve to 127.0.0.1.
+        try:
+            import socket
+            ministack_host = socket.gethostbyname("host.docker.internal")
+        except Exception:
+            ministack_host = "host.docker.internal"
+
+    s3_endpoint = f"http://{ministack_host}:{ministack_port}"
+
+    # Build Spark submit arguments from Glue job arguments.
+    # Glue args use --key value; spark-submit uses --conf key=value for Spark conf.
+    spark_args = []
+    for k, v in args.items():
+        spark_args.extend([k, str(v)])
+
+    # Extra py files (Glue --extra-py-files)
+    extra_py = args.get("--extra-py-files", "")
+
+    # Build environment for the container.
+    # Both Python (boto3) and Java (AWS SDK v2) credential chains read these.
+    # Hardcoded to "test" so the Glue container always authenticates against
+    # MiniStack regardless of what the host env carries.
+    container_env = {
+        "AWS_ACCESS_KEY_ID": "test",
+        "AWS_SECRET_ACCESS_KEY": "test",
+        "AWS_DEFAULT_REGION": get_region(),
+        "AWS_REGION": get_region(),
+        "AWS_ENDPOINT_URL": s3_endpoint,
+        # Java AWS SDK v2 reads AWS_ENDPOINT_URL only from 2.21 (late 2023);
+        # the Glue images ship older SDKs, and Iceberg's S3FileIO does the
+        # actual S3 PutObject through them — so set the service-specific var
+        # (and the system property below) explicitly.
+        "AWS_ENDPOINT_URL_S3": s3_endpoint,
+        "DISABLE_SSL": "true",
+    }
+
+    # Build the spark-submit command.
+    ak = container_env["AWS_ACCESS_KEY_ID"]
+    sk = container_env["AWS_SECRET_ACCESS_KEY"]
+    cmd = [
+        "spark-submit",
+        "--master",
+        "local[*]",
+        # Java SDK v2 system property: Iceberg's S3FileIO reads this for
+        # the S3 endpoint when the env var is not picked up.
+        "--conf",
+        f"spark.driver.extraJavaOptions=-Daws.endpointUrlS3={s3_endpoint}",
+        "--conf",
+        f"spark.executor.extraJavaOptions=-Daws.endpointUrlS3={s3_endpoint}",
+        # S3A (Hadoop filesystem for s3a:// paths)
+        "--conf",
+        f"spark.hadoop.fs.s3a.endpoint={s3_endpoint}",
+        "--conf",
+        "spark.hadoop.fs.s3a.path.style.access=true",
+        "--conf",
+        f"spark.hadoop.fs.s3a.access.key={ak}",
+        "--conf",
+        f"spark.hadoop.fs.s3a.secret.key={sk}",
+        "--conf",
+        "spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem",
+        "--conf",
+        "spark.hadoop.fs.s3a.connection.ssl.enabled=false",
+        # Glue 5's magicv2 committer completes only the uploads it tracks in memory. Without this, a write
+        # to the bucket that spark-submit fetched s3:// --py-files from is never completed.
+        "--conf",
+        "spark.hadoop.fs.s3a.committer.magic.track.commits.in.memory.enabled=true",
+    ]
+
+    # Iceberg GlueCatalog conf -- add when the user's job or --conf references
+    # iceberg, or when --datalake-formats includes it. Glue 5 has Iceberg on
+    # the classpath by default; Glue 4 only when --datalake-formats is set.
+    conf_arg = args.get("--conf", "")
+    datalake_formats = args.get("--datalake-formats", "")
+    uses_iceberg = (
+        "iceberg" in conf_arg.lower() or "iceberg" in datalake_formats.lower() or glue_version.startswith("5")
+    )
+    if uses_iceberg:
+        cmd.extend(
+            [
+                "--conf",
+                "spark.sql.catalog.spark_catalog=org.apache.iceberg.spark.SparkSessionCatalog",
+                "--conf",
+                "spark.sql.catalog.spark_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog",
+                "--conf",
+                f"spark.sql.catalog.spark_catalog.glue.endpoint={s3_endpoint}",
+                "--conf",
+                # `s3://`, not `s3a://`: Iceberg's S3FileIO (io-impl above) and
+                # DuckDB both address objects with the `s3://` scheme via the AWS
+                # SDK. An `s3a://` warehouse stamps `s3a://` into table metadata,
+                # which DuckDB's httpfs cannot write to — so a Firehose commit to
+                # a Spark-created table silently no-ops. Keeping both engines on
+                # `s3://` is what lets them share one table.
+                "spark.sql.catalog.spark_catalog.warehouse=s3://ministack-glue-warehouse/",
+                "--conf",
+                "spark.sql.catalog.spark_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO",
+                "--conf",
+                f"spark.sql.catalog.spark_catalog.s3.endpoint={s3_endpoint}",
+                "--conf",
+                "spark.sql.catalog.spark_catalog.s3.path-style-access=true",
+                "--conf",
+                f"spark.sql.catalog.spark_catalog.s3.access-key-id={ak}",
+                "--conf",
+                f"spark.sql.catalog.spark_catalog.s3.secret-access-key={sk}",
+            ]
+        )
+
+    # Add extra-py-files if present
+    if extra_py:
+        cmd.extend(["--py-files", extra_py])
+
+    # Add Spark/Iceberg conf from job arguments
+    conf_arg = args.get("--conf", "")
+    user_confs = []
+    if conf_arg:
+        for conf in conf_arg.split(" --conf "):
+            conf = conf.strip()
+            if conf:
+                translated = _translate_loopback_conf(conf, ministack_host, ministack_port)
+                cmd.extend(["--conf", translated])
+                user_confs.append(translated)
+
+    # Iceberg's S3FileIO creates its own S3 client per catalog. If the user
+    # defined a catalog (spark.sql.catalog.<name>=...) but did not set its
+    # s3.endpoint, the write path resolves to localhost. Inject the MiniStack
+    # endpoint for every user catalog that doesn't already have one.
+    if uses_iceberg:
+        user_conf_str = " ".join(user_confs)
+        catalog_names = set()
+        for uc in user_confs:
+            m = re.match(r"spark\.sql\.catalog\.(\w+)=", uc)
+            # spark_catalog gets the full GlueCatalog block above; every
+            # other user-defined catalog (including one named "default")
+            # gets its S3FileIO endpoint injected here.
+            if m and m.group(1) != "spark_catalog":
+                catalog_names.add(m.group(1))
+        for cat in sorted(catalog_names):
+            prefix = f"spark.sql.catalog.{cat}"
+            if f"{prefix}.s3.endpoint=" not in user_conf_str:
+                cmd.extend(["--conf", f"{prefix}.s3.endpoint={s3_endpoint}"])
+            if f"{prefix}.s3.path-style-access=" not in user_conf_str:
+                cmd.extend(["--conf", f"{prefix}.s3.path-style-access=true"])
+            if f"{prefix}.s3.access-key-id=" not in user_conf_str:
+                cmd.extend(["--conf", f"{prefix}.s3.access-key-id={ak}"])
+            if f"{prefix}.s3.secret-access-key=" not in user_conf_str:
+                cmd.extend(["--conf", f"{prefix}.s3.secret-access-key={sk}"])
+
+    # The script path inside the container; spark-submit is handed the
+    # bootstrap, which re-runs the real script as __main__ (see
+    # _GLUE_BOOT_SCRIPT).
+    container_script = f"/tmp/{os.path.basename(script_path)}"
+    cmd.append("/tmp/_ministack_boot.py")
+
+    # Append Glue job arguments (--key value pairs) after the script
+    cmd.extend(spark_args)
+
+    # --additional-python-modules: pip install before spark-submit,
+    # matching real Glue which installs packages before the script runs.
+    # The Glue 5 image has entrypoint ["bash", "-l"], so we must override
+    # the entrypoint to avoid double-bash invocation.
+    extra_modules = args.get("--additional-python-modules", "")
+    _entrypoint_override = None
+    if extra_modules:
+        pkgs = [p.strip() for p in extra_modules.split(",") if p.strip()]
+        if pkgs:
+            pip_cmd = "pip install --quiet --no-warn-script-location " + " ".join(f"'{p}'" for p in pkgs)
+            spark_cmd = " ".join(f"'{c}'" for c in cmd)
+            cmd = [f"{pip_cmd} && exec {spark_cmd}"]
+            _entrypoint_override = ["bash", "-lc"]
+            logger.info("Glue: will install additional modules for %s: %s", job_name, pkgs)
+
+    container_kwargs = {
+        "image": image,
+        "name": container_name,
+        "command": cmd,
+        "environment": container_env,
+        "detach": True,
+        "labels": container_reaper.own_labels("glue", job_name=job_name),
+        # host.docker.internal resolves natively on Docker Desktop but not on
+        # a Linux engine; map it so a user conf pointing at the host resolves
+        # there too.
+        "extra_hosts": {"host.docker.internal": "host-gateway"},
+    }
+    if _entrypoint_override:
+        container_kwargs["entrypoint"] = _entrypoint_override
+
+    if ms_network:
+        container_kwargs["network"] = ms_network
+
+    logger.info(
+        "Glue: starting Spark container for %s (image=%s, network=%s)",
+        job_name,
+        image,
+        ms_network or "host",
+    )
+
+    try:
+        container = docker_client.containers.create(**container_kwargs)
+        _live_job_containers.add(getattr(container, "id", None))
+        # Copy script into container (avoids Docker-in-Docker volume mount issues)
+        import io
+        import tarfile
+
+        script_data = open(script_path, "rb").read()
+        boot_data = _GLUE_BOOT_SCRIPT.format(script=container_script).encode()
+        tar_buf = io.BytesIO()
+        with tarfile.open(fileobj=tar_buf, mode="w") as tar:
+            for name, data in ((os.path.basename(script_path), script_data), ("_ministack_boot.py", boot_data)):
+                info = tarfile.TarInfo(name=name)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+        tar_buf.seek(0)
+        container.put_archive("/tmp", tar_buf)
+        container.start()
+    except Exception as e:
+        logger.warning("Glue: failed to start Spark container for %s: %s", job_name, e)
+        run["JobRunState"] = "FAILED"
+        run["ErrorMessage"] = f"Docker container start failed: {e}"[:2000]
+        try:
+            container.remove(force=True, v=True)
+            _live_job_containers.discard(getattr(container, "id", None))
+        except Exception:
+            pass
+        return
+
+    # Wait for container to finish
+    try:
+        result = container.wait(timeout=min(job.get("Timeout", 2880) * 60, 3600))
+        exit_code = result.get("StatusCode", -1)
+        # Capture the full output. Spark routes Python tracebacks through
+        # stdout (not stderr), so tail=200 loses them under Java INFO lines.
+        all_logs = container.logs().decode("utf-8", errors="replace")
+        if all_logs:
+            logger.info("Glue: %s output:\n%s", job_name, all_logs[-16000:])
+
+        if exit_code == 0:
+            run["JobRunState"] = "SUCCEEDED"
+            logger.info("Glue: Spark job %s completed successfully", job_name)
+        else:
+            run["JobRunState"] = "FAILED"
+            # Extract the Python traceback if present, otherwise full logs
+            error_output = _extract_python_error(all_logs) or all_logs or f"Exit code {exit_code}"
+            run["ErrorMessage"] = error_output[-8000:]
+            logger.warning("Glue: Spark job %s failed (exit %d)", job_name, exit_code)
+    except Exception as e:
+        run["JobRunState"] = "FAILED"
+        run["ErrorMessage"] = f"Container execution error: {e}"[:4000]
+        logger.warning("Glue: Spark container for %s error: %s", job_name, e)
+    finally:
+        _live_job_containers.discard(getattr(container, "id", None))
+        try:
+            container.remove(force=True, v=True)
+        except Exception:
+            pass
+
+
+# Job runs still in progress; any other stopped glue container is the reaper's.
+_live_job_containers: set = set()
+container_reaper.register_live_ids("glue", lambda: set(_live_job_containers) - {None})
 
 
 def _get_job_run(data):
@@ -820,27 +3000,38 @@ def _batch_stop_job_run(data):
                     run["LastModifiedOn"] = int(time.time())
                     successful.append({"JobName": job_name, "JobRunId": run_id})
                 else:
-                    errors.append({"JobName": job_name, "JobRunId": run_id,
-                        "ErrorDetail": {"ErrorCode": "InvalidInputException",
-                            "ErrorMessage": f"Run {run_id} is in state {run['JobRunState']}"}})
+                    errors.append(
+                        {
+                            "JobName": job_name,
+                            "JobRunId": run_id,
+                            "ErrorDetail": {
+                                "ErrorCode": "InvalidInputException",
+                                "ErrorMessage": f"Run {run_id} is in state {run['JobRunState']}",
+                            },
+                        }
+                    )
                 found = True
                 break
         if not found:
-            errors.append({"JobName": job_name, "JobRunId": run_id,
-                "ErrorDetail": {"ErrorCode": "EntityNotFoundException",
-                    "ErrorMessage": "Run not found"}})
+            errors.append(
+                {
+                    "JobName": job_name,
+                    "JobRunId": run_id,
+                    "ErrorDetail": {"ErrorCode": "EntityNotFoundException", "ErrorMessage": "Run not found"},
+                }
+            )
     return json_response({"SuccessfulSubmissions": successful, "Errors": errors})
 
 
 # ---- Security Configurations ----
+
 
 def _create_security_configuration(data):
     name = data.get("Name")
     if not name:
         return error_response_json("InvalidInputException", "Name is required", 400)
     if name in _security_configs:
-        return error_response_json("AlreadyExistsException",
-            f"Security configuration {name} already exists", 400)
+        return error_response_json("AlreadyExistsException", f"Security configuration {name} already exists", 400)
     _security_configs[name] = {
         "Name": name,
         "CreatedTimeStamp": int(time.time()),
@@ -852,8 +3043,7 @@ def _create_security_configuration(data):
 def _delete_security_configuration(data):
     name = data.get("Name")
     if name not in _security_configs:
-        return error_response_json("EntityNotFoundException",
-            f"Security configuration {name} not found", 400)
+        return error_response_json("EntityNotFoundException", f"Security configuration {name} not found", 400)
     del _security_configs[name]
     return json_response({})
 
@@ -862,8 +3052,7 @@ def _get_security_configuration(data):
     name = data.get("Name")
     config = _security_configs.get(name)
     if not config:
-        return error_response_json("EntityNotFoundException",
-            f"Security configuration {name} not found", 400)
+        return error_response_json("EntityNotFoundException", f"Security configuration {name} not found", 400)
     return json_response({"SecurityConfiguration": config})
 
 
@@ -873,6 +3062,7 @@ def _get_security_configurations(data):
 
 # ---- Classifiers ----
 
+
 def _create_classifier(data):
     grok = data.get("GrokClassifier")
     xml_cls = data.get("XMLClassifier")
@@ -881,17 +3071,21 @@ def _create_classifier(data):
 
     classifier = grok or xml_cls or json_cls or csv_cls
     if not classifier:
-        return error_response_json("InvalidInputException",
-            "Must provide one of GrokClassifier, XMLClassifier, JsonClassifier, CsvClassifier", 400)
+        return error_response_json(
+            "InvalidInputException",
+            "Must provide one of GrokClassifier, XMLClassifier, JsonClassifier, CsvClassifier",
+            400,
+        )
 
     name = classifier.get("Name")
     if not name:
         return error_response_json("InvalidInputException", "Classifier name is required", 400)
     if name in _classifiers:
-        return error_response_json("AlreadyExistsException",
-            f"Classifier {name} already exists", 400)
+        return error_response_json("AlreadyExistsException", f"Classifier {name} already exists", 400)
 
-    cls_type = "GrokClassifier" if grok else "XMLClassifier" if xml_cls else "JsonClassifier" if json_cls else "CsvClassifier"
+    cls_type = (
+        "GrokClassifier" if grok else "XMLClassifier" if xml_cls else "JsonClassifier" if json_cls else "CsvClassifier"
+    )
     _classifiers[name] = {
         cls_type: {**classifier, "CreationTime": int(time.time()), "LastUpdated": int(time.time()), "Version": 1},
     }
@@ -920,6 +3114,7 @@ def _delete_classifier(data):
 
 # ---- Triggers ----
 
+
 def _create_trigger(data):
     name = data.get("Name")
     if not name:
@@ -941,6 +3136,8 @@ def _create_trigger(data):
         "CreatedOn": int(time.time()),
         "LastModifiedOn": int(time.time()),
     }
+    if data.get("EventBatchingCondition") is not None:
+        _triggers[name]["EventBatchingCondition"] = data["EventBatchingCondition"]
     if data.get("StartOnCreation", False):
         _triggers[name]["State"] = "ACTIVATED"
     if data.get("Tags"):
@@ -954,7 +3151,7 @@ def _get_trigger(data):
     trigger = _triggers.get(name)
     if not trigger:
         return error_response_json("EntityNotFoundException", f"Trigger {name} not found", 400)
-    return json_response({"Trigger": trigger})
+    return json_response(to_output_shape("glue", "GetTriggerResponse", {"Trigger": trigger}))
 
 
 def _delete_trigger(data):
@@ -971,12 +3168,12 @@ def _update_trigger(data):
     if name not in _triggers:
         return error_response_json("EntityNotFoundException", f"Trigger {name} not found", 400)
     trigger_update = data.get("TriggerUpdate", {})
-    updatable = {"Schedule", "Predicate", "Actions", "Description"}
+    updatable = {"Schedule", "Predicate", "Actions", "Description", "EventBatchingCondition"}
     for k in updatable:
         if k in trigger_update:
             _triggers[name][k] = trigger_update[k]
     _triggers[name]["LastModifiedOn"] = int(time.time())
-    return json_response({"Trigger": _triggers[name]})
+    return json_response(to_output_shape("glue", "UpdateTriggerResponse", {"Trigger": _triggers[name]}))
 
 
 def _start_trigger(data):
@@ -1013,7 +3210,8 @@ def _batch_get_triggers(data):
     requested = data.get("TriggerNames", [])
     found = [_triggers[n] for n in requested if n in _triggers]
     not_found = [n for n in requested if n not in _triggers]
-    return json_response({"Triggers": found, "TriggersNotFound": not_found})
+    return json_response(to_output_shape("glue", "BatchGetTriggersResponse",
+                                         {"Triggers": found, "TriggersNotFound": not_found}))
 
 
 def _get_triggers(data):
@@ -1025,10 +3223,11 @@ def _get_triggers(data):
             if not any(a.get("JobName") == dependent_job for a in actions):
                 continue
         triggers.append(trigger)
-    return json_response({"Triggers": triggers})
+    return json_response(to_output_shape("glue", "GetTriggersResponse", {"Triggers": triggers}))
 
 
 # ---- Workflows ----
+
 
 def _create_workflow(data):
     name = data.get("Name")
@@ -1095,25 +3294,181 @@ def _start_workflow_run(data):
         "StartedOn": int(time.time()),
         "CompletedOn": None,
         "Statistics": {
-            "TotalActions": 0, "RunningActions": 0, "StoppedActions": 0,
-            "SucceededActions": 0, "FailedActions": 0, "TimeoutActions": 0,
+            "TotalActions": 0,
+            "RunningActions": 0,
+            "StoppedActions": 0,
+            "SucceededActions": 0,
+            "FailedActions": 0,
+            "TimeoutActions": 0,
         },
-        "WorkflowRunProperties": dict(_workflows[name].get("DefaultRunProperties", {})),
+        "WorkflowRunProperties": {**_workflows[name].get("DefaultRunProperties", {}), **(data.get("RunProperties") or {})},
     }
     _workflow_runs.setdefault(name, []).append(run)
     return json_response({"RunId": run_id})
 
 
+# ---- User Defined Functions ----
+
+
+def _udf_key(db_name: str, func_name: str) -> str:
+    return f"{db_name}/{func_name}"
+
+
+def _udf_record(db_name: str, fn_input: dict) -> dict:
+    """Build a UserDefinedFunction record matching the botocore output shape:
+    UserDefinedFunction { FunctionName, DatabaseName, ClassName, OwnerName,
+    FunctionType, OwnerType, CreateTime, ResourceUris, CatalogId }."""
+    return {
+        "FunctionName": fn_input.get("FunctionName"),
+        "DatabaseName": db_name,
+        "ClassName": fn_input.get("ClassName"),
+        "OwnerName": fn_input.get("OwnerName"),
+        "OwnerType": fn_input.get("OwnerType"),
+        **({"FunctionType": fn_input["FunctionType"]} if fn_input.get("FunctionType") else {}),
+        "CreateTime": int(time.time()),
+        "ResourceUris": fn_input.get("ResourceUris", []),
+        "CatalogId": get_account_id(),
+    }
+
+
+def _create_user_defined_function(data):
+    db_name = data.get("DatabaseName")
+    if db_name not in _databases:
+        return error_response_json("EntityNotFoundException", f"Database {db_name} not found.", 400)
+    fn_input = data.get("FunctionInput") or {}
+    func_name = fn_input.get("FunctionName")
+    if not func_name:
+        return error_response_json("InvalidInputException", "FunctionInput.FunctionName is required", 400)
+    if not fn_input.get("ClassName"):
+        return error_response_json("InvalidInputException", "FunctionInput.ClassName is required", 400)
+    key = _udf_key(db_name, func_name)
+    if key in _user_defined_functions:
+        return error_response_json("AlreadyExistsException", f"User-defined function {func_name} already exists", 400)
+    _user_defined_functions[key] = _udf_record(db_name, fn_input)
+    return json_response({})
+
+
+def _update_user_defined_function(data):
+    db_name = data.get("DatabaseName")
+    func_name = data.get("FunctionName")
+    key = _udf_key(db_name, func_name)
+    if key not in _user_defined_functions:
+        return error_response_json(
+            "EntityNotFoundException", f"User-defined function {func_name} not found in {db_name}", 400
+        )
+    fn_input = data.get("FunctionInput") or {}
+    existing = _user_defined_functions[key]
+    for field in ("ClassName", "OwnerName", "OwnerType", "FunctionType", "ResourceUris"):
+        if field in fn_input:
+            existing[field] = fn_input[field]
+    # AWS allows renaming the function via FunctionInput.FunctionName.
+    new_name = fn_input.get("FunctionName")
+    if new_name and new_name != func_name:
+        existing["FunctionName"] = new_name
+        _user_defined_functions[_udf_key(db_name, new_name)] = existing
+        del _user_defined_functions[key]
+    return json_response({})
+
+
+def _delete_user_defined_function(data):
+    db_name = data.get("DatabaseName")
+    func_name = data.get("FunctionName")
+    key = _udf_key(db_name, func_name)
+    if key not in _user_defined_functions:
+        return error_response_json(
+            "EntityNotFoundException", f"User-defined function {func_name} not found in {db_name}", 400
+        )
+    del _user_defined_functions[key]
+    return json_response({})
+
+
+def _get_user_defined_function(data):
+    db_name = data.get("DatabaseName")
+    func_name = data.get("FunctionName")
+    key = _udf_key(db_name, func_name)
+    udf = _user_defined_functions.get(key)
+    if not udf:
+        return error_response_json(
+            "EntityNotFoundException", f"User-defined function {func_name} not found in {db_name}", 400
+        )
+    return json_response({"UserDefinedFunction": udf})
+
+
+def _translate_java_regex_quote(pattern):
+    r"""Translate java.util.regex `\Q...\E` literal-quote spans into their
+    RE2/Python-`re` equivalent.
+
+    Real AWS Glue compiles `Pattern` with java.util.regex, which supports `\Q`
+    (begin literal quote) and `\E` (end literal quote): everything between them
+    is matched literally regardless of regex metacharacters. Trino's Hive/Glue
+    connector relies on this — it resolves a UDF with a pattern like
+    `trino__\Qdw_clean_text\E__.*`. Python's `re` (like Go's RE2) does not
+    understand `\Q...\E` and raises `bad escape \Q`, so we rewrite each span by
+    `re.escape()`-ing the literal between `\Q` and `\E` before compiling. Per
+    Java semantics a trailing `\Q` with no closing `\E` quotes to end-of-string.
+    """
+    out = []
+    i = 0
+    while True:
+        start = pattern.find(r"\Q", i)
+        if start == -1:
+            out.append(pattern[i:])
+            break
+        out.append(pattern[i:start])
+        end = pattern.find(r"\E", start + 2)
+        if end == -1:
+            out.append(re.escape(pattern[start + 2 :]))
+            break
+        out.append(re.escape(pattern[start + 2 : end]))
+        i = end + 2
+    return "".join(out)
+
+
+def _get_user_defined_functions(data):
+    db_name = data.get("DatabaseName")
+    pattern = data.get("Pattern") or ""
+    # Real AWS accepts DatabaseName="*" or omitted to span all databases in the
+    # catalog. Botocore marks DatabaseName as optional.
+    if db_name and db_name != "*":
+        items = [u for k, u in _user_defined_functions.items() if k.startswith(f"{db_name}/")]
+    else:
+        items = list(_user_defined_functions.values())
+    if pattern:
+        # Real AWS Glue treats Pattern as a regular expression matched against the
+        # function name (not a glob). e.g. Trino's Glue connector resolves a UDF
+        # with a regex like `trino__<name>__.*`. Glue compiles it with
+        # java.util.regex, so translate `\Q...\E` literal-quote spans (which RE2
+        # / Python `re` reject) before compiling. An invalid regex (e.g. a bare
+        # `*`) raises InvalidInputException, mirroring Glue's RE2 parse error.
+        try:
+            compiled = re.compile(_translate_java_regex_quote(pattern))
+        except re.error as exc:
+            return error_response_json(
+                "InvalidInputException",
+                f"Invalid pattern syntax: error parsing regexp: {exc}",
+                400,
+            )
+        items = [u for u in items if compiled.search(u.get("FunctionName", ""))]
+    return json_response({"UserDefinedFunctions": items})
+
+
 # ---- Tags ----
+
 
 def _tag_resource(data):
     arn = data.get("ResourceArn", "")
+    validation_error = _validate_tag_resource_arn(arn)
+    if validation_error:
+        return validation_error
     _tags[arn] = {**_tags.get(arn, {}), **data.get("TagsToAdd", {})}
     return json_response({})
 
 
 def _untag_resource(data):
     arn = data.get("ResourceArn", "")
+    validation_error = _validate_tag_resource_arn(arn)
+    if validation_error:
+        return validation_error
     for key in data.get("TagsToRemove", []):
         _tags.get(arn, {}).pop(key, None)
     return json_response({})
@@ -1121,10 +3476,14 @@ def _untag_resource(data):
 
 def _get_tags(data):
     arn = data.get("ResourceArn", "")
+    validation_error = _validate_tag_resource_arn(arn)
+    if validation_error:
+        return validation_error
     return json_response({"Tags": _tags.get(arn, {})})
 
 
 # ---- Helpers ----
+
 
 def _simple_glob_match(pattern, name):
     """Very simple glob matching: * matches anything."""
@@ -1146,3 +3505,25 @@ def reset():
     _triggers.clear()
     _workflows.clear()
     _workflow_runs.clear()
+    _user_defined_functions.clear()
+    _table_column_statistics.clear()
+    _partition_column_statistics.clear()
+    _table_optimizers.clear()
+
+
+async def handle_request(method, path, headers, body, query_params):
+    """Dispatch off the event loop.
+
+    Request paths here reach the Docker daemon (container create/start/stop/
+    inspect), which blocks for as long as the daemon takes. Measured on ECS: a
+    cached-image container start held the loop for 7.3s, during which the health
+    endpoint — the cheapest request in the process — could not be served.
+
+    Uses run_reentrant, not the shared pool: containers started here are handed
+    an endpoint pointing back at MiniStack, so one calls in while this
+    dispatch is still running. A bounded pool would queue that nested request
+    behind the call waiting on it.
+    """
+    return await run_reentrant(
+        _handle_request_sync, method, path, headers, body, query_params, thread_name="ministack-glue-dispatch"
+    )

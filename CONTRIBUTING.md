@@ -18,15 +18,36 @@ ministack/
 │       └── cognito.py      # example of a two-client service file
 ├── tests/
 │   ├── conftest.py         # pytest fixtures (boto3 clients)
-│   └── test_services.py    # all integration tests
+│   └── test_<service>.py   # integration tests by service
 ├── Dockerfile
 ├── pyproject.toml
 └── CHANGELOG.md
 ```
+-----
+## For infrastructure changes (Dockerfiles, CI/CD, pyproject, dependencies), open an issue first. PRs containing such changes without a prior issue will be rejected. 
+
+## FOR NEW SERVICES — Open an Issue First
+
+
+
+> **This section applies only when you are adding a brand-new AWS service** (a new file under `ministack/services/`).
+
+**Before writing any code for a new service, open a GitHub issue.** Use the `enhancement` label and describe:
+
+1. **Which AWS service** (full name + the API namespace, e.g. `inspector2`, `appconfig`, `qbusiness`).
+2. **Which operations** you actually need — not the full API surface. MiniStack favors the operations real users hit (CRUD + the handful of list/get calls SDKs and Terraform providers rely on) over wire-format completeness for every action.
+3. **A real use case** — what tool, framework, or workflow drove the need (Terraform module, CDK construct, app code, integration test, etc.). "I want full parity" is not a use case.
+4. **Scope boundaries** — what's explicitly out of scope for the first PR (e.g. "no async job lifecycle, no findings persistence, no scheduled scans" for Inspector v2). It's fine to ship a partial service; it's not fine to ship a 50-operation stub where 45 return empty lists.
+
+A maintainer will confirm the scope, flag overlap with existing work, and point you at the right protocol (JSON vs XML/Query vs REST) before you write code. This saves you from large PRs that get rejected for scope drift, AWS-parity gaps, or duplicating in-flight work.
+
+**PRs that add a new service without a corresponding scoped issue will be closed and the contributor asked to open one.** This rule is specific to new services — it's the only way we keep MiniStack's AWS parity bar high while staying a one-file-per-service codebase.
+
+---
 
 ## Adding a New Service
 
-Every service follows the same 4-step pattern:
+For a new service, follow these steps:
 
 ### 1. Create `ministack/services/myservice.py`
 
@@ -37,16 +58,14 @@ JSON-based API via X-Amz-Target.
 Supports: OperationOne, OperationTwo, ...
 """
 
+import copy
 import json
 import logging
-from ministack.core.responses import json_response, error_response_json, new_uuid
+from ministack.core.responses import AccountRegionScopedDict, json_response, error_response_json
 
 logger = logging.getLogger("myservice")
 
-ACCOUNT_ID = "000000000000"
-REGION = "us-east-1"
-
-_state: dict = {}  # in-memory storage
+_state = AccountRegionScopedDict()  # for account- and region-scoped resources
 
 
 async def handle_request(method, path, headers, body, query_params):
@@ -77,15 +96,32 @@ def _operation_two(data):
     return json_response({})
 
 
+def get_state():
+    return {"state": copy.deepcopy(_state)}
+
+
+def load_persisted_state(data):
+    if data:
+        _state.update(data.get("state", {}))
+
+
 def reset():
     _state.clear()
 ```
 
-**Protocol guide:**
+**Protocol guide:** Check the botocore service model and an existing handler
+before choosing how to dispatch an operation.
 
-- JSON services (DynamoDB, SecretsManager, Glue, Athena, Cognito, etc.) — use `json_response` / `error_response_json`, route via `X-Amz-Target`
-- XML/Query services (S3, SQS, SNS, IAM, STS, RDS, ElastiCache, EC2) — build XML responses, route via `Action` query param; use `_xml(status, root_tag, inner)` pattern; verify field names against botocore shapes via `Loader().load_service_model()`
-- REST services (Lambda, ECS, Route53) — route via URL path
+- **JSON:** Commonly uses `X-Amz-Target` and the shared `json_response` /
+  `error_response_json` helpers.
+- **Query:** Uses `Action` in the URL or a form-encoded POST body and returns
+  XML; verify response shapes against botocore with
+  `Loader().load_service_model()`.
+- **S3:** Uses a REST-style API with XML responses and dispatches by method,
+  path, and subresource.
+
+Some services support more than one protocol, so follow the operation's actual
+wire format.
 
 ### 2. Register in `ministack/app.py`
 
@@ -122,7 +158,7 @@ def mysvc():
     return make_client("myservice")
 ```
 
-### 5. Add tests to `tests/test_services.py`
+### 5. Add tests to `tests/test_myservice.py`
 
 ```python
 def test_myservice_operation_one(mysvc):
@@ -143,11 +179,18 @@ docker compose up -d
 # Install test dependencies
 pip install boto3 pytest pytest-xdist duckdb docker cbor2 
 
-# Parallel-safe phase: run tests that are safe to run concurrently
-pytest tests/ -v -n 4 --dist=loadfile -m "not serial"
+# Full suite (the default local verification command)
+pytest tests/ -v
 
-# Serial/global-state phase: run tests that mutate runtime state or require isolation
-pytest tests/ -v -m serial
+# Control-plane parallel lane: excludes serial and live-container tests
+pytest tests/ -v -n 4 --dist=loadfile -m "not serial and not data_plane and not auth_contract"
+
+# Control-plane serial/global-state lane
+pytest tests/ -v -m "serial and not data_plane and not auth_contract"
+
+# Docker-backed data-plane lane (requires a Docker daemon and network)
+DOCKER_NETWORK=ministack-data-local LAMBDA_EXECUTOR=docker \
+pytest tests/ -v -m "data_plane and not auth_contract"
 
 # Run a specific service
 pytest tests/ -v -k "cognito"
@@ -155,16 +198,56 @@ pytest tests/ -v -k "cognito"
 
 ---
 
+## Testing Permission Behavior
+
+Test whether an operation is allowed or denied with an SDK/HTTP test in
+`tests/test_<service>.py` marked `auth_contract`. CI runs these against servers
+with `AUTH=false` and `AUTH=true`; the other jobs exclude them. `iam_user`
+creates a user with no permissions (pass `policy={...}` for an inline policy)
+and cleans up after the test; `auth_enabled` is the server's mode, checked
+against the `AUTH` the tests run with.
+
+```python
+@pytest.mark.auth_contract
+def test_list_buckets_without_permission(auth_enabled, iam_user):
+    client = iam_user().client("s3")
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            client.list_buckets()
+        assert exc.value.response["Error"]["Code"] == "AccessDenied"
+    else:
+        assert "Buckets" in client.list_buckets()
+```
+
+Run them locally with the server and pytest in the same mode, then repeat with
+`AUTH=true`:
+
+```bash
+AUTH=false IOT_MTLS_ENABLED=0 python -m hypercorn ministack.app:app --bind 127.0.0.1:4566
+AUTH=false pytest tests/ -m auth_contract -v
+```
+
+---
+
 ## Code Conventions
 
-- **One file per service** — keep everything for a service in `ministack/services/myservice.py`
 - **Imports** — always `from ministack.core.responses import ...`, never `from core.responses import ...`
-- **In-memory state** — use module-level dicts (`_things: dict = {}`)
-- **reset()** — every service must expose a `reset()` that clears all module-level state; it's called by `/_ministack/reset`
+- **In-memory state** — scope resources by account and region where AWS does; follow the existing `AccountRegionScopedDict` pattern
+- **State contract** — every registered service module defines `get_state()`, `load_persisted_state(data)`, and `reset()`; `tests/test_persistence.py` checks this, and `/_ministack/reset` calls `reset()`
 - **No external AWS deps** — no `boto3`, `botocore`, or `aws-sdk` in service code
 - **Minimal dependencies** — `duckdb` and `docker` are optional; guard with `try/except ImportError`
 - **Error responses** — match real AWS error codes and HTTP status codes as closely as possible
 - **Logging** — `logger = logging.getLogger("servicename")`; DEBUG for request details, INFO for significant events
+
+---
+
+## Pull Request Rules
+
+- **Brand-new GitHub accounts can only open issues**, not PRs.
+- **At most 5 open PRs per contributor.** If the work was agreed beforehand in an issue, we may lift the limit temporarily.
+- **Real AWS evidence.** Every behavior change should be backed by a response captured from a real AWS account. PRs based on documentation, botocore model reading, LocalStack or other third-party recordings, or inference that turn out to differ from AWS will be closed.
+- **PRs that are not in line with AWS are closed**, and we implement the behavior ourselves.
+- **No AWS account?** Open an issue describing the behavior and your workflow instead of a PR, and we'll take it from there.
 
 ---
 
@@ -175,6 +258,7 @@ pytest tests/ -v -k "cognito"
 - [ ] Detection patterns added to `ministack/core/router.py`
 - [ ] Fixture added to `tests/conftest.py`
 - [ ] Tests added and passing (`pytest tests/ -v`)
+- [ ] Registered modules expose `get_state()`, `load_persisted_state(data)`, and `reset()`
 - [ ] Linting passes (`ruff check ministack/`)
 - [ ] Service added to the table in `README.md`
 - [ ] Entry added to `CHANGELOG.md`
@@ -183,13 +267,7 @@ pytest tests/ -v -k "cognito"
 
 ## What We're Looking For
 
-High-value contributions right now:
-
-- **CloudFront** — distribution CRUD, invalidations, origin configuration
-- **CodeBuild / CodePipeline** — CI/CD pipeline stubs
-- **AppSync** — GraphQL API CRUD
-- **SQS FIFO** — message group / deduplication support
-- **More Cognito flows** — hosted UI, federated identity providers, custom auth triggers
+ONLY REAL AWS USERS WHO BUMP INTO REAL LIFE ISSUES.
 
 ---
 

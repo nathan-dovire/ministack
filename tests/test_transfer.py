@@ -25,12 +25,24 @@ def test_transfer_describe_server_not_found(transfer):
     with pytest.raises(ClientError) as exc:
         transfer.describe_server(ServerId="s-doesnotexist00000")
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
 
 
 def test_transfer_list_servers(transfer):
     resp = transfer.list_servers()
     assert "Servers" in resp
     assert len(resp["Servers"]) >= 1
+    raw = {}
+
+    def grab(http_response, **_):
+        raw["body"] = http_response.content
+
+    transfer.meta.events.register("after-call.transfer.ListServers", grab)
+    try:
+        transfer.list_servers()
+    finally:
+        transfer.meta.events.unregister("after-call.transfer.ListServers", grab)
+    assert b'"Protocols"' not in raw["body"]
 
 
 def test_transfer_create_server_with_options(transfer):
@@ -323,7 +335,6 @@ def test_transfer_workos_sftp_workflow(transfer):
 import asyncio
 import os
 import socket
-import time
 import urllib.request
 import uuid
 
@@ -430,6 +441,20 @@ def _provision(transfer, s3, *, bucket=None, home_prefix="", logical_mappings=No
         "bucket": bucket,
         "describe": transfer.describe_server(ServerId=server_id)["Server"],
     }
+
+
+def _regional_transfer_client(region):
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client(
+        "transfer",
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region,
+        config=Config(region_name=region, retries={"mode": "standard"}),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -680,11 +705,9 @@ def test_sftp_concurrent_uploads_two_users(transfer, s3):
     transfer.delete_server(ServerId=b["server_id"])
 
 
-def test_sftp_key_disambiguates_overlapping_usernames(transfer, s3):
-    """Two servers, same UserName, different keys: each user's key routes
-    to the correct server's bucket. This is the AWS-faithful single-port
-    behavior — username alone isn't enough, the SSH key is the
-    disambiguator."""
+def test_sftp_key_disambiguates_overlapping_usernames(s3):
+    """Same UserName in two regions with distinct keys routes each login to
+    the matching regional user, server, and home-directory bucket."""
     suffix = uuid.uuid4().hex[:8]
     user_name = f"shared-{suffix}"
     bucket_a = f"sftp-share-a-{suffix}"
@@ -692,17 +715,19 @@ def test_sftp_key_disambiguates_overlapping_usernames(transfer, s3):
     s3.create_bucket(Bucket=bucket_a)
     s3.create_bucket(Bucket=bucket_b)
 
-    sid_a = transfer.create_server()["ServerId"]
-    sid_b = transfer.create_server()["ServerId"]
+    east = _regional_transfer_client("us-east-1")
+    west = _regional_transfer_client("us-west-2")
+    sid_a = east.create_server()["ServerId"]
+    sid_b = west.create_server()["ServerId"]
     priv_a, pub_a = _gen_keypair()
     priv_b, pub_b = _gen_keypair()
-    transfer.create_user(
+    east.create_user(
         ServerId=sid_a, UserName=user_name,
         Role="arn:aws:iam::000000000000:role/r",
         HomeDirectoryType="PATH", HomeDirectory=f"/{bucket_a}",
         SshPublicKeyBody=pub_a,
     )
-    transfer.create_user(
+    west.create_user(
         ServerId=sid_b, UserName=user_name,
         Role="arn:aws:iam::000000000000:role/r",
         HomeDirectoryType="PATH", HomeDirectory=f"/{bucket_b}",
@@ -720,8 +745,90 @@ def test_sftp_key_disambiguates_overlapping_usernames(transfer, s3):
 
     assert s3.get_object(Bucket=bucket_a, Key="marker")["Body"].read() == b"from-a"
     assert s3.get_object(Bucket=bucket_b, Key="marker")["Body"].read() == b"from-b"
-    transfer.delete_server(ServerId=sid_a)
-    transfer.delete_server(ServerId=sid_b)
+    east.delete_server(ServerId=sid_a)
+    west.delete_server(ServerId=sid_b)
+
+
+def test_sftp_auth_uses_server_region_and_stashes_connection_metadata():
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import transfer as service
+
+    class _FakeConnection:
+        def __init__(self):
+            self.extra_info = {}
+
+        def set_extra_info(self, **kwargs):
+            self.extra_info.update(kwargs)
+
+    account_id = "111111111111"
+    east_region = "us-east-1"
+    west_region = "us-west-2"
+    server_id = "s-sharedregional01"
+    user_name = "shared-regional-user"
+    user_key = f"{server_id}/{user_name}"
+    original_account = get_account_id()
+    original_region = get_region()
+    _priv_east, pub_east = _gen_keypair()
+    _priv_west, pub_west = _gen_keypair()
+    east_user = {
+        "ServerId": server_id,
+        "UserName": user_name,
+        "SshPublicKeys": [{"SshPublicKeyBody": pub_east}],
+    }
+    west_user = {
+        "ServerId": server_id,
+        "UserName": user_name,
+        "SshPublicKeys": [{"SshPublicKeyBody": pub_west}],
+    }
+
+    service.reset()
+    try:
+        set_request_account_id(account_id)
+        service._servers.set_scoped(
+            account_id, east_region, server_id, {"State": "ONLINE"}
+        )
+        service._servers.set_scoped(
+            account_id, west_region, server_id, {"State": "OFFLINE"}
+        )
+        service._users.set_scoped(account_id, east_region, user_key, east_user)
+        service._users.set_scoped(account_id, west_region, user_key, west_user)
+
+        assert service._sftp_server_state(account_id, east_region, server_id) == "ONLINE"
+        assert service._sftp_server_state(account_id, west_region, server_id) == "OFFLINE"
+
+        connection = _FakeConnection()
+        # `_MiniStackSSHServer` is built by `_ensure_sftp_runtime()`, not at
+        # import — reaching for the class directly is only safe once that has
+        # run. Previously this test passed only when some earlier test in the
+        # same process happened to trigger it.
+        service._ensure_sftp_runtime()
+        auth_server = service._MiniStackSSHServer()
+        auth_server.connection_made(connection)
+        assert auth_server.validate_public_key(
+            user_name, asyncssh.import_public_key(pub_east)
+        )
+        assert auth_server._resolved == (
+            account_id, east_region, server_id, east_user
+        )
+        assert connection.extra_info["ministack_account_id"] == account_id
+        assert connection.extra_info["ministack_region"] == east_region
+        assert connection.extra_info["ministack_server_id"] == server_id
+        assert connection.extra_info["ministack_user"] == east_user
+
+        denied_server = service._MiniStackSSHServer()
+        denied_server.connection_made(_FakeConnection())
+        assert not denied_server.validate_public_key(
+            user_name, asyncssh.import_public_key(pub_west)
+        )
+    finally:
+        service.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
 
 
 # ---------------------------------------------------------------------------
@@ -765,3 +872,126 @@ def test_sftp_port_per_server_mode(transfer, s3):
     obj = s3.get_object(Bucket=ctx["bucket"], Key="per-server-marker")
     assert obj["Body"].read() == b"ok"
     transfer.delete_server(ServerId=ctx["server_id"])
+
+
+def test_transfer_servers_and_users_are_region_scoped():
+    import os
+
+    import boto3
+    from botocore.config import Config
+
+    def _client(region):
+        return boto3.client(
+            "transfer",
+            endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+            aws_access_key_id="test",
+            aws_secret_access_key="test",
+            region_name=region,
+            config=Config(region_name=region, retries={"mode": "standard"}),
+        )
+
+    east = _client("us-east-1")
+    west = _client("us-west-2")
+    east_server = east.create_server()["ServerId"]
+    west_server = west.create_server()["ServerId"]
+    user_name = "same-name-regional-user"
+
+    try:
+        east.create_user(
+            ServerId=east_server,
+            UserName=user_name,
+            Role="arn:aws:iam::000000000000:role/transfer-role",
+        )
+        west.create_user(
+            ServerId=west_server,
+            UserName=user_name,
+            Role="arn:aws:iam::000000000000:role/transfer-role",
+        )
+
+        east_ids = {server["ServerId"] for server in east.list_servers()["Servers"]}
+        west_ids = {server["ServerId"] for server in west.list_servers()["Servers"]}
+        assert east_server in east_ids
+        assert east_server not in west_ids
+        assert west_server in west_ids
+        assert west_server not in east_ids
+        assert east.list_users(ServerId=east_server)["Users"][0]["UserName"] == user_name
+        assert west.list_users(ServerId=west_server)["Users"][0]["UserName"] == user_name
+        with pytest.raises(ClientError) as exc:
+            west.describe_server(ServerId=east_server)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+    finally:
+        east.delete_server(ServerId=east_server)
+        west.delete_server(ServerId=west_server)
+
+
+def test_transfer_legacy_state_restores_resources_to_arn_region():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import transfer as service
+
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    resource_region = "us-west-2"
+    server_id = "s-legacyregional01"
+    user_name = "legacy-user"
+    user_key = f"{server_id}/{user_name}"
+    original_account = get_account_id()
+    original_region = get_region()
+    servers = AccountScopedDict()
+    users = AccountScopedDict()
+
+    set_request_account_id(account_id)
+    set_request_region(boot_region)
+    servers[server_id] = {
+        "ServerId": server_id,
+        "Arn": f"arn:aws:transfer:{resource_region}:{account_id}:server/{server_id}",
+        "State": "ONLINE",
+    }
+    users[user_key] = {
+        "ServerId": server_id,
+        "UserName": user_name,
+        "Arn": (
+            f"arn:aws:transfer:{resource_region}:{account_id}:"
+            f"user/{server_id}/{user_name}"
+        ),
+    }
+
+    service.reset()
+    try:
+        service.load_persisted_state({"servers": servers, "users": users})
+        assert service._servers.get_scoped(
+            account_id, resource_region, server_id
+        )["ServerId"] == server_id
+        assert service._users.get_scoped(
+            account_id, resource_region, user_key
+        )["UserName"] == user_name
+        assert service._servers.get_scoped(account_id, boot_region, server_id) is None
+        assert service._users.get_scoped(account_id, boot_region, user_key) is None
+    finally:
+        service.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_transfer_reset_clears_state_across_regions():
+    from ministack.core.responses import get_region, set_request_region
+    from ministack.services import transfer as service
+
+    original_region = get_region()
+    service.reset()
+    try:
+        for region in ("us-east-1", "us-west-2"):
+            set_request_region(region)
+            service._servers[f"server-{region}"] = {"State": "ONLINE"}
+            service._users[f"server-{region}/user"] = {"UserName": "user"}
+        service.reset()
+        assert not service._servers.has_any()
+        assert not service._users.has_any()
+    finally:
+        service.reset()
+        set_request_region(original_region)

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 RDS Data API Service Emulator.
 REST-style JSON API (POST /Execute, /BeginTransaction, etc.)
@@ -6,16 +8,14 @@ Routes SQL to real database containers managed by the RDS service emulator.
 
 import json
 import logging
-import os
 import re
 import threading
 import uuid
 
-from ministack.core.responses import AccountScopedDict, error_response_json, get_account_id, get_region, json_response
+from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.responses import AccountRegionScopedDict, error_response_json, get_account_id, json_response
 
 logger = logging.getLogger("rds-data")
-
-REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 # Active transactions: txn_id -> {conn, engine, resourceArn, database}
 _transactions: dict = {}
@@ -23,13 +23,42 @@ _lock = threading.Lock()
 
 # In-memory tracking for stub mode: remember databases/users created via SQL.
 # Keyed by cluster identifier.
-_stub_databases = AccountScopedDict()   # cluster_id -> set of database names
-_stub_users = AccountScopedDict()       # cluster_id -> set of usernames
-_stub_grants = AccountScopedDict()      # cluster_id -> {username -> list of grant strings}
+_stub_databases = AccountRegionScopedDict()   # cluster_id -> set of database names
+_stub_users = AccountRegionScopedDict()       # cluster_id -> set of usernames
+_stub_grants = AccountRegionScopedDict()      # cluster_id -> {username -> list of grant strings}
 
 
 def _error(code, message, status=400):
     return error_response_json(code, message, status)
+
+
+def _transient_database_error(message):
+    return _error("DatabaseUnavailableException", message, 504)
+
+
+def _has_real_endpoint(instance):
+    """Return true when RDS assigned an endpoint backed by a real container."""
+    endpoint = instance.get("Endpoint", {})
+    return (
+        isinstance(endpoint, dict)
+        and bool(endpoint.get("Port"))
+        and bool(instance.get("_docker_container_id"))
+    )
+
+
+def _is_connection_error(exc):
+    err_str = str(exc)
+    return any(
+        marker in err_str
+        for marker in (
+            "Can't connect",
+            "Connection refused",
+            "Connection reset",
+            "timed out",
+            "Name or service not known",
+            "Temporary failure in name resolution",
+        )
+    )
 
 
 def _stub_success():
@@ -41,11 +70,21 @@ def _stub_success():
     })
 
 
+def _stub_unsupported_sql_error(sql):
+    return _error(
+        "BadRequestException",
+        f"Unsupported SQL in RDS Data API stub mode: {sql}",
+    )
+
+
 def _cluster_id_from_arn(resource_arn):
-    """Extract cluster identifier from an ARN."""
-    parts = resource_arn.split(":")
-    if len(parts) >= 7:
-        return parts[6]
+    """Return a stable, region-qualified key for per-cluster stub state."""
+    try:
+        spec = parse_arn(resource_arn)
+    except ArnParseError:
+        return resource_arn
+    if spec.service == "rds":
+        return f"{spec.account_id}:{spec.region}:{spec.resource}"
     return resource_arn
 
 
@@ -188,41 +227,150 @@ def _stub_execute(resource_arn, sql):
             "records": records,
         })
 
-    # Default stub
-    return _stub_success()
+    return _stub_unsupported_sql_error(sql)
+
+
+def _resolve_target(resource_arn):
+    """Find RDS cluster metadata and a SQL target from a resourceArn.
+
+    Standalone DB instance ARNs remain a deliberate local-development
+    divergence from AWS's cluster-only Data API; they have no cluster
+    metadata to return or endpoint setting to enforce.
+    """
+    from ministack.services import rds
+
+    parsed = rds._parse_rds_arn(resource_arn)
+    if not parsed:
+        return None, None, None
+
+    spec, resource_type, resource_id = parsed
+    if resource_type == "db":
+        if spec.account_id != get_account_id():
+            return None, None, None
+        instance = rds._instances.get_scoped(spec.account_id, spec.region, resource_id)
+        if instance:
+            cluster = None
+            cluster_id = instance.get("DBClusterIdentifier")
+            if cluster_id:
+                cluster = rds._clusters.get_scoped(
+                    spec.account_id,
+                    spec.region,
+                    cluster_id,
+                )
+            return instance, instance.get("Engine", "postgres"), cluster
+        return None, None, None
+
+    if resource_type != "cluster":
+        return None, None, None
+
+    cluster = rds._resolve_cluster(resource_arn)
+    if not cluster:
+        return None, None, None
+
+    engine = cluster.get("Engine", "postgres")
+    cluster_id = cluster["DBClusterIdentifier"]
+
+    # Aurora Serverless has no customer-managed DB instances and retains its
+    # intentional in-memory Data API stub. Provisioned clusters, however, must
+    # have an available member before SQL can run.
+    if cluster.get("EngineMode") == "serverless":
+        return cluster, engine, cluster
+
+    member_ids = {
+        member.get("DBInstanceIdentifier")
+        for member in cluster.get("DBClusterMembers", [])
+        if member.get("DBInstanceIdentifier")
+    }
+    if not member_ids or not cluster.get("_shared_container_ready", True):
+        return None, engine, cluster
+
+    # Find an instance belonging to this cluster
+    for inst in rds._instances.values_scoped(spec.account_id, spec.region):
+        if (
+            inst.get("DBClusterIdentifier") == cluster_id
+            and inst.get("DBInstanceIdentifier") in member_ids
+            and inst.get("DBInstanceStatus") == "available"
+        ):
+            # Aurora members intentionally share one backing container. During
+            # creation, recover its endpoint from the cluster if this member's
+            # control-plane record has not been stamped yet.
+            if not inst.get("Endpoint") and cluster.get("_shared_endpoint"):
+                inst["Endpoint"] = dict(cluster["_shared_endpoint"])
+                inst["_docker_container_id"] = cluster.get("_shared_container_id")
+                inst["_internal_address"] = cluster.get("_shared_internal_address")
+                inst["_internal_port"] = cluster.get("_shared_internal_port")
+            return inst, engine, cluster
+
+    # The cluster exists, but it has no available compute to accept SQL.
+    return None, engine, cluster
 
 
 def _resolve_cluster(resource_arn):
     """Find RDS cluster and a member instance from a resourceArn."""
-    from ministack.services import rds
+    instance, engine, _cluster = _resolve_target(resource_arn)
+    return instance, engine
 
-    # Parse ARN: arn:aws:rds:REGION:ACCOUNT:cluster:IDENTIFIER
-    parts = resource_arn.split(":")
-    if len(parts) >= 7 and parts[5] == "cluster":
-        cluster_id = parts[6]
-    elif len(parts) >= 7 and parts[5] == "db":
-        # Instance ARN: arn:aws:rds:REGION:ACCOUNT:db:IDENTIFIER
-        instance_id = parts[6]
-        instance = rds._instances.get(instance_id)
-        if instance:
-            return instance, instance.get("Engine", "postgres")
-        return None, None
-    else:
-        return None, None
 
-    cluster = rds._clusters.get(cluster_id)
-    if not cluster:
-        return None, None
+def _cluster_resolution_error(resource_arn, engine):
+    if engine:
+        return _transient_database_error(
+            f"Database cluster has no available DB instances: {resource_arn}",
+        )
+    return _error(
+        "BadRequestException",
+        f"Database cluster not found for ARN: {resource_arn}",
+    )
 
-    engine = cluster.get("Engine", "postgres")
 
-    # Find an instance belonging to this cluster
-    for inst in rds._instances.values():
-        if inst.get("DBClusterIdentifier") == cluster_id:
-            return inst, engine
+def _http_endpoint_not_enabled_error(resource_arn):
+    return _error(
+        "HttpEndpointNotEnabledException",
+        f"HTTP endpoint is not enabled for cluster ARN: {resource_arn}",
+    )
 
-    # No instance found — return cluster info but no connectable instance
-    return cluster, engine
+
+def _transaction_not_found_error(txn_id):
+    return _error(
+        "TransactionNotFoundException",
+        f"Transaction {txn_id} not found",
+        404,
+    )
+
+
+def _transaction_completion_not_found_error(txn_id):
+    return _error(
+        "NotFoundException",
+        f"Transaction {txn_id} not found",
+        404,
+    )
+
+
+def _validate_http_endpoint_enabled(cluster, resource_arn):
+    if cluster is not None and not cluster.get("HttpEndpointEnabled", False):
+        return _http_endpoint_not_enabled_error(resource_arn)
+    return None
+
+
+def _is_statement_timeout_error(exc):
+    err_str = str(exc).lower()
+    return any(
+        marker in err_str
+        for marker in (
+            "statement timeout",
+            "statement timed out",
+            "max_statement_time",
+            "maximum statement execution time",
+        )
+    )
+
+
+def _sql_execution_error(exc):
+    if _is_statement_timeout_error(exc):
+        return _error("StatementTimeoutException", f"Statement timed out: {exc}", 400)
+    if _is_connection_error(exc):
+        logger.warning("DB connection failed for real endpoint: %s", exc)
+        return _transient_database_error(f"Database endpoint is not available: {exc}")
+    return _error("BadRequestException", f"Database error: {exc}")
 
 
 def _get_secret_credentials(secret_arn):
@@ -233,29 +381,57 @@ def _get_secret_credentials(secret_arn):
     """
     from ministack.services import secretsmanager
 
-    for _name, secret in secretsmanager._secrets.items():
-        if secret.get("ARN") == secret_arn or _name == secret_arn:
-            # Find the AWSCURRENT version
-            for _vid, ver in secret.get("Versions", {}).items():
-                if "AWSCURRENT" in ver.get("Stages", []):
-                    secret_string = ver.get("SecretString")
-                    if secret_string:
-                        try:
-                            parsed = json.loads(secret_string)
-                            return (parsed.get("username"),
-                                    parsed.get("password", secret_string))
-                        except (json.JSONDecodeError, TypeError):
-                            return None, secret_string
-            # Fallback to any version
-            for _vid, ver in secret.get("Versions", {}).items():
-                secret_string = ver.get("SecretString")
-                if secret_string:
-                    try:
-                        parsed = json.loads(secret_string)
-                        return (parsed.get("username"),
-                                parsed.get("password", secret_string))
-                    except (json.JSONDecodeError, TypeError):
-                        return None, secret_string
+    _name, secret = secretsmanager._resolve(secret_arn, use_arn_scope=True)
+    if not secret:
+        return None, None
+    return _credentials_from_secret(secret)
+
+
+def _require_secret_credentials(secret_arn):
+    from ministack.services import secretsmanager
+
+    _name, secret = secretsmanager._resolve(secret_arn, use_arn_scope=True)
+    if not secret:
+        return None, None, _error(
+            "SecretsErrorException",
+            f"Secret not found for ARN: {secret_arn}",
+        )
+    if secret.get("DeletedDate"):
+        return None, None, _error(
+            "SecretsErrorException",
+            f"Secret is scheduled for deletion for ARN: {secret_arn}",
+        )
+    user, password = _credentials_from_secret(secret)
+    if not password:
+        return None, None, _error(
+            "InvalidSecretException",
+            f"Secret does not contain a password for ARN: {secret_arn}",
+        )
+    return user, password, None
+
+
+def _credentials_from_secret_string(secret_string):
+    try:
+        parsed = json.loads(secret_string)
+    except (json.JSONDecodeError, TypeError):
+        return None, secret_string
+    if isinstance(parsed, dict):
+        return parsed.get("username"), parsed.get("password")
+    return None, secret_string
+
+
+def _credentials_from_secret(secret):
+    # Find the AWSCURRENT version
+    for _vid, ver in secret.get("Versions", {}).items():
+        if "AWSCURRENT" in ver.get("Stages", []):
+            secret_string = ver.get("SecretString")
+            if secret_string:
+                return _credentials_from_secret_string(secret_string)
+    # Fallback to any version
+    for _vid, ver in secret.get("Versions", {}).items():
+        secret_string = ver.get("SecretString")
+        if secret_string:
+            return _credentials_from_secret_string(secret_string)
     return None, None
 
 
@@ -270,7 +446,7 @@ def _connect(instance, engine, database=None, password=None,
     port = (instance.get("_internal_port")
             or instance.get("Endpoint", {}).get("Port", 5432))
     db = database or ""
-    pw = password or "password"
+    pw = "password" if password is None else password
 
     if "mysql" in engine or "aurora-mysql" in engine or "mariadb" in engine:
         try:
@@ -295,16 +471,35 @@ def _connect(instance, engine, database=None, password=None,
     else:
         try:
             import psycopg2
+            import psycopg2.extras
         except ImportError:
             raise ImportError(
                 "psycopg2 is required for PostgreSQL/Aurora PostgreSQL rds-data support. "
                 "Install with: pip install psycopg2-binary"
             )
         pg_user = username or instance.get("MasterUsername", "admin")
-        return psycopg2.connect(
+        conn = psycopg2.connect(
             host=host, port=int(port), user=pg_user,
             password=pw, dbname=db or "postgres",
         )
+        # Parity with the pymysql branch: a non-transactional ExecuteStatement
+        # must commit, otherwise psycopg2's implicit transaction is rolled back
+        # when the connection closes and the write is lost.
+        conn.autocommit = True
+        # Aurora Data API returns json/jsonb as its stored JSON *text*. Stop
+        # psycopg2 from auto-parsing it into a dict/list (which _field_value
+        # would then emit as an invalid single-quoted Python repr). Scoped to
+        # this connection so other psycopg2 users are unaffected.
+        psycopg2.extras.register_default_json(conn_or_curs=conn, loads=lambda x: x)
+        psycopg2.extras.register_default_jsonb(conn_or_curs=conn, loads=lambda x: x)
+        return conn
+
+
+def _generated_fields(cursor, engine):
+    """The AUTO_INCREMENT value MySQL assigned; Aurora PostgreSQL returns none (use RETURNING)."""
+    if engine in ("postgres", "aurora-postgresql") or not cursor.lastrowid:
+        return []
+    return [{"longValue": cursor.lastrowid}]
 
 
 def _field_value(val, type_name=None):
@@ -348,6 +543,32 @@ def _column_metadata(description, engine):
             "typeName": "VARCHAR",
         })
     return metadata
+
+
+# A :name placeholder: a colon (not part of a "::" cast) followed by a word
+# token. Greedy \w+ consumes the whole name in one match, so ":1" and ":10"
+# are distinct tokens rather than one being a substring shadow of the other.
+_RE_NAMED_PARAM = re.compile(r"(?<!:):(\w+)")
+
+
+def _substitute_named_params(sql, param_names):
+    """Rewrite :name placeholders to DB-API %(name)s in a single pass.
+
+    AWS treats each :name as a distinct token, so a naive substring replace of
+    ":1" corrupts ":10" (the repro in #957). Matching whole tokens once, left to
+    right, makes them distinct regardless of length or order, leaves a "::type"
+    cast intact, and passes through any ":word" that is not a supplied parameter
+    (so it reaches the engine unchanged instead of becoming a bad placeholder).
+    """
+    if not param_names:
+        return sql
+    names = set(param_names)
+
+    def _repl(match):
+        name = match.group(1)
+        return f"%({name})s" if name in names else match.group(0)
+
+    return _RE_NAMED_PARAM.sub(_repl, sql)
 
 
 def _convert_parameters(parameters):
@@ -415,34 +636,41 @@ def _execute_statement(data):
     if not sql:
         return _error("BadRequestException", "sql is required")
 
-    instance, engine = _resolve_cluster(resource_arn)
+    instance, engine, cluster = _resolve_target(resource_arn)
+    endpoint_error = _validate_http_endpoint_enabled(cluster, resource_arn)
+    if endpoint_error:
+        return endpoint_error
     if not instance:
-        return _error("BadRequestException",
-                       f"Database cluster not found for ARN: {resource_arn}")
+        return _cluster_resolution_error(resource_arn, engine)
+    secret_user, password, secret_error = _require_secret_credentials(secret_arn)
+    if secret_error:
+        return secret_error
 
-    # Check if instance has a real endpoint (Docker container running).
-    # Clusters have Endpoint as a string (hostname); instances have it as a dict.
-    endpoint = instance.get("Endpoint", {})
-    if isinstance(endpoint, str) or not endpoint.get("Port"):
+    conn = None
+    if txn_id:
+        with _lock:
+            txn = _transactions.get(txn_id)
+            if not txn or txn.get("resourceArn") != resource_arn:
+                return _transaction_not_found_error(txn_id)
+            conn = txn["conn"]
+
+    # Keep stub mode for intentional mock environments only. Once RDS has a
+    # real container-backed endpoint, connection failures must surface as
+    # transient errors instead of acknowledging writes that never reached MySQL.
+    # A supplied transactionId is validated first and always uses its bound
+    # connection; stub mode is only available to non-transactional requests.
+    if not txn_id and not _has_real_endpoint(instance):
         logger.info("No endpoint for %s, using stub mode", resource_arn)
         return _stub_execute(resource_arn, sql)
 
-    secret_user, password = _get_secret_credentials(secret_arn)
-
     # Convert :name placeholders to %(name)s for DB-API
     params = _convert_parameters(parameters)
-    exec_sql = sql
-    if params:
-        for name in params:
-            exec_sql = exec_sql.replace(f":{name}", f"%({name})s")
+    exec_sql = _substitute_named_params(sql, params)
 
     own_conn = False
-    conn = None
     try:
-        with _lock:
-            if txn_id and txn_id in _transactions:
-                conn = _transactions[txn_id]["conn"]
-            else:
+        if conn is None:
+            with _lock:
                 conn = _connect(instance, engine, database, password,
                                 username=secret_user)
                 own_conn = True
@@ -450,9 +678,19 @@ def _execute_statement(data):
         cursor = conn.cursor()
         cursor.execute(exec_sql, params or None)
 
+        updated = max(cursor.rowcount, 0)
+        if engine in ("postgres", "aurora-postgresql"):
+            status = getattr(cursor, "statusmessage", None)
+            command = status.split()[:1] if isinstance(status, str) else []
+            # psycopg2 counts returned rows for SELECT, not affected rows.
+            # Use the command tag, not SQL text or description: DML RETURNING
+            # also returns rows. This is not an audit of side effects in CTEs.
+            if command == ["SELECT"]:
+                updated = 0
+
         response = {
-            "numberOfRecordsUpdated": cursor.rowcount if cursor.rowcount >= 0 else 0,
-            "generatedFields": [],
+            "numberOfRecordsUpdated": updated,
+            "generatedFields": _generated_fields(cursor, engine),
         }
 
         if cursor.description:
@@ -478,22 +716,11 @@ def _execute_statement(data):
     except ImportError as e:
         if own_conn and conn:
             conn.close()
-        if not getattr(_execute_statement, "_import_warned", False):
-            logger.warning("DB driver not available, using stub: %s", e)
-            _execute_statement._import_warned = True
-        return _stub_execute(resource_arn, sql)
+        return _error("BadRequestException", str(e))
     except Exception as e:
         if own_conn and conn:
             conn.close()
-        # Connection errors (e.g. when RDS containers are not reachable from
-        # within the MiniStack container) should fall back to stubs rather than
-        # failing the caller.  This covers LAMBDA_EXECUTOR=local where the
-        # MySQL sidecar container is not network-accessible.
-        err_str = str(e)
-        if "Can't connect" in err_str or "Connection refused" in err_str:
-            logger.warning("DB connection failed, using stub: %s", e)
-            return _stub_execute(resource_arn, sql)
-        return _error("BadRequestException", f"Database error: {e}")
+        return _sql_execution_error(e)
 
 
 def _begin_transaction(data):
@@ -506,12 +733,16 @@ def _begin_transaction(data):
     if not secret_arn:
         return _error("BadRequestException", "secretArn is required")
 
-    instance, engine = _resolve_cluster(resource_arn)
+    instance, engine, cluster = _resolve_target(resource_arn)
+    endpoint_error = _validate_http_endpoint_enabled(cluster, resource_arn)
+    if endpoint_error:
+        return endpoint_error
     if not instance:
-        return _error("BadRequestException",
-                       f"Database cluster not found for ARN: {resource_arn}")
+        return _cluster_resolution_error(resource_arn, engine)
 
-    secret_user, password = _get_secret_credentials(secret_arn)
+    secret_user, password, secret_error = _require_secret_credentials(secret_arn)
+    if secret_error:
+        return secret_error
 
     try:
         conn = _connect(instance, engine, database, password,
@@ -523,7 +754,7 @@ def _begin_transaction(data):
     except ImportError as e:
         return _error("BadRequestException", str(e))
     except Exception as e:
-        return _error("BadRequestException", f"Database connection error: {e}")
+        return _sql_execution_error(e)
 
     txn_id = str(uuid.uuid4())
     with _lock:
@@ -541,12 +772,31 @@ def _commit_transaction(data):
     txn_id = data.get("transactionId")
     if not txn_id:
         return _error("BadRequestException", "transactionId is required")
+    resource_arn = data.get("resourceArn")
+    secret_arn = data.get("secretArn")
+    if not resource_arn:
+        return _error("BadRequestException", "resourceArn is required")
+    if not secret_arn:
+        return _error("BadRequestException", "secretArn is required")
+
+    instance, engine, cluster = _resolve_target(resource_arn)
+    endpoint_error = _validate_http_endpoint_enabled(cluster, resource_arn)
+    if endpoint_error:
+        return endpoint_error
+    if not instance:
+        return _cluster_resolution_error(resource_arn, engine)
+    _secret_user, _password, secret_error = _require_secret_credentials(secret_arn)
+    if secret_error:
+        return secret_error
 
     with _lock:
-        txn = _transactions.pop(txn_id, None)
+        txn = _transactions.get(txn_id)
+        if txn and txn.get("resourceArn") != resource_arn:
+            return _transaction_completion_not_found_error(txn_id)
+        if txn:
+            _transactions.pop(txn_id)
     if not txn:
-        return _error("NotFoundException",
-                       f"Transaction {txn_id} not found", 404)
+        return _transaction_completion_not_found_error(txn_id)
 
     try:
         txn["conn"].commit()
@@ -561,12 +811,31 @@ def _rollback_transaction(data):
     txn_id = data.get("transactionId")
     if not txn_id:
         return _error("BadRequestException", "transactionId is required")
+    resource_arn = data.get("resourceArn")
+    secret_arn = data.get("secretArn")
+    if not resource_arn:
+        return _error("BadRequestException", "resourceArn is required")
+    if not secret_arn:
+        return _error("BadRequestException", "secretArn is required")
+
+    instance, engine, cluster = _resolve_target(resource_arn)
+    endpoint_error = _validate_http_endpoint_enabled(cluster, resource_arn)
+    if endpoint_error:
+        return endpoint_error
+    if not instance:
+        return _cluster_resolution_error(resource_arn, engine)
+    _secret_user, _password, secret_error = _require_secret_credentials(secret_arn)
+    if secret_error:
+        return secret_error
 
     with _lock:
-        txn = _transactions.pop(txn_id, None)
+        txn = _transactions.get(txn_id)
+        if txn and txn.get("resourceArn") != resource_arn:
+            return _transaction_completion_not_found_error(txn_id)
+        if txn:
+            _transactions.pop(txn_id)
     if not txn:
-        return _error("NotFoundException",
-                       f"Transaction {txn_id} not found", 404)
+        return _transaction_completion_not_found_error(txn_id)
 
     try:
         txn["conn"].rollback()
@@ -592,19 +861,26 @@ def _batch_execute_statement(data):
     if not sql:
         return _error("BadRequestException", "sql is required")
 
-    instance, engine = _resolve_cluster(resource_arn)
+    instance, engine, cluster = _resolve_target(resource_arn)
+    endpoint_error = _validate_http_endpoint_enabled(cluster, resource_arn)
+    if endpoint_error:
+        return endpoint_error
     if not instance:
-        return _error("BadRequestException",
-                       f"Database cluster not found for ARN: {resource_arn}")
+        return _cluster_resolution_error(resource_arn, engine)
 
-    secret_user, password = _get_secret_credentials(secret_arn)
+    secret_user, password, secret_error = _require_secret_credentials(secret_arn)
+    if secret_error:
+        return secret_error
 
     own_conn = False
     conn = None
     try:
         with _lock:
-            if txn_id and txn_id in _transactions:
-                conn = _transactions[txn_id]["conn"]
+            if txn_id:
+                txn = _transactions.get(txn_id)
+                if not txn or txn.get("resourceArn") != resource_arn:
+                    return _transaction_not_found_error(txn_id)
+                conn = txn["conn"]
             else:
                 conn = _connect(instance, engine, database, password,
                                 username=secret_user)
@@ -615,19 +891,16 @@ def _batch_execute_statement(data):
 
         if not parameter_sets:
             cursor.execute(sql)
-            update_results.append({"generatedFields": []})
+            update_results.append({"generatedFields": _generated_fields(cursor, engine)})
         else:
             # Convert :name placeholders to %(name)s for DB-API
-            exec_sql = sql
-            if parameter_sets:
-                sample = _convert_parameters(parameter_sets[0])
-                for name in sample:
-                    exec_sql = exec_sql.replace(f":{name}", f"%({name})s")
+            sample = _convert_parameters(parameter_sets[0])
+            exec_sql = _substitute_named_params(sql, sample)
 
             for param_set in parameter_sets:
                 params = _convert_parameters(param_set)
                 cursor.execute(exec_sql, params or None)
-                update_results.append({"generatedFields": []})
+                update_results.append({"generatedFields": _generated_fields(cursor, engine)})
 
         cursor.close()
         if own_conn:
@@ -642,7 +915,7 @@ def _batch_execute_statement(data):
     except Exception as e:
         if own_conn and conn:
             conn.close()
-        return _error("BadRequestException", f"Database error: {e}")
+        return _sql_execution_error(e)
 
 
 def reset():
@@ -656,3 +929,11 @@ def reset():
     _stub_databases.clear()
     _stub_users.clear()
     _stub_grants.clear()
+
+
+def get_state() -> dict:
+    return {}
+
+
+def load_persisted_state(data: dict) -> None:
+    pass

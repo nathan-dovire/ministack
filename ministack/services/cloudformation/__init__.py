@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 CloudFormation Service Emulator -- AWS-compatible.
 Supports: CreateStack, UpdateStack, DeleteStack, DescribeStacks, ListStacks,
@@ -5,37 +7,31 @@ Supports: CreateStack, UpdateStack, DeleteStack, DescribeStacks, ListStacks,
           ListStackResources, GetTemplate, ValidateTemplate, ListExports,
           CreateChangeSet, DescribeChangeSet, ExecuteChangeSet,
           DeleteChangeSet, ListChangeSets,
-          GetTemplateSummary.
+          GetTemplateSummary, RollbackStack, DetectStackDrift,
+          DescribeStackDriftDetectionStatus, DetectStackResourceDrift,
+          DescribeStackResourceDrifts.
 Uses Query API (Action=...) with form-encoded body.
 """
 
+import copy
 import json
 import logging
 import os
 from urllib.parse import parse_qs
 
-from ministack.core.responses import AccountScopedDict
+from ministack.core.responses import AccountRegionScopedDict
 
 logger = logging.getLogger("cloudformation")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
 # In-memory state (shared across all submodules)
-_stacks = AccountScopedDict()          # stack_name -> stack dict
-_stack_events = AccountScopedDict()    # stack_id -> [event list]
-_exports = AccountScopedDict()         # export_name -> {StackId, Name, Value}
-_change_sets = AccountScopedDict()     # cs_id -> change set dict
+_stacks = AccountRegionScopedDict()        # stack_name -> stack dict
+_stack_events = AccountRegionScopedDict()  # stack_id -> [event list]
+_exports = AccountRegionScopedDict()       # export_name -> {StackId, Name, Value}
+_change_sets = AccountRegionScopedDict()   # cs_id -> change set dict
+_stack_sets = AccountRegionScopedDict()    # StackSetId -> StackSet resource record
 
-# Re-exports for compatibility
-from .engine import (  # noqa: E402
-    _NO_VALUE,
-    _evaluate_conditions,
-    _extract_deps,
-    _parse_template,
-    _resolve_parameters,
-    _resolve_refs,
-    _topological_sort,
-)
 from .helpers import _p  # noqa: E402
 
 
@@ -57,7 +53,9 @@ async def handle_request(method: str, path: str, headers: dict,
             except (json.JSONDecodeError, TypeError):
                 pass
     elif method == "POST" and body:
-        form_params = parse_qs(body.decode("utf-8", errors="replace"))
+        # keep_blank_values: an empty list arrives as ``Tags=`` and must stay
+        # distinguishable from an omitted parameter.
+        form_params = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
         for k, v in form_params.items():
             params[k] = v
 
@@ -66,7 +64,27 @@ async def handle_request(method: str, path: str, headers: dict,
     if not handler:
         from .helpers import _error
         return _error("InvalidAction", f"Unknown action: {action}", 400)
-    return handler(params)
+    if action not in _TOKEN_ACTIONS:
+        return handler(params)
+    from .helpers import _error, client_request_token_problems, validation_error_message
+    from .stacks import CLIENT_REQUEST_TOKEN
+    token = _p(params, "ClientRequestToken")
+    if token and (problems := client_request_token_problems(token)):
+        return _error("ValidationError", validation_error_message(problems))
+    # The events the operation records, now and from the task it schedules
+    # (which copies this context), carry the token.
+    scope = CLIENT_REQUEST_TOKEN.set(token)
+    try:
+        return handler(params)
+    finally:
+        CLIENT_REQUEST_TOKEN.reset(scope)
+
+
+# The stack operations that take a ClientRequestToken and record stack events.
+_TOKEN_ACTIONS = frozenset({
+    "CreateStack", "UpdateStack", "DeleteStack", "ExecuteChangeSet",
+    "ContinueUpdateRollback", "CancelUpdateStack", "RollbackStack",
+})
 
 
 def reset():
@@ -74,11 +92,50 @@ def reset():
     _stack_events.clear()
     _exports.clear()
     _change_sets.clear()
+    _stack_sets.clear()
     from ministack.services.cloudformation import custom_resource as _cr
     _cr.reset()
+    from ministack.services.cloudformation import wait_conditions as _wc
+    _wc.reset()
+
+
+# Stores that need to survive a PERSIST_STATE=1 stop/restore cycle. The actual
+# provisioned resources (buckets, functions, tables, …) are persisted by their
+# own services; only the CloudFormation metadata (stack records, events,
+# exports, and change sets) lived nowhere, so ListStacks/DescribeStacks/
+# ListExports came back empty after a warm boot. (#1345, item 8)
+_PERSISTED_STORES = (
+    (lambda: _stacks, "stacks"),
+    (lambda: _stack_events, "stack_events"),
+    (lambda: _exports, "exports"),
+    (lambda: _change_sets, "change_sets"),
+    (lambda: _stack_sets, "stack_sets"),
+)
+
+
+def get_state():
+    return {key: copy.deepcopy(store()) for store, key in _PERSISTED_STORES}
+
+
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
+    if not data:
+        return
+    for store, key in _PERSISTED_STORES:
+        restored = data.get(key)
+        target = store()
+        if isinstance(restored, AccountRegionScopedDict):
+            # Merge the (account, region, key)-scoped entries directly. Restore
+            # runs at startup with no request scope, so re-scoping through
+            # the public dict interface would misattribute every entry.
+            target._data.update(restored._data)
+        elif isinstance(restored, dict):
+            for k, v in restored.items():
+                target[k] = v
 
 
 # Must be last — handlers imports from this module
-from ministack.core.responses import AccountScopedDict, get_account_id
-
-from .handlers import _ACTION_HANDLERS, _validate_template  # noqa: E402
+from .handlers import _ACTION_HANDLERS  # noqa: E402

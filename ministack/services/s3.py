@@ -1,12 +1,16 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 S3 Service Emulator – AWS-compatible.
 Supports: CreateBucket, DeleteBucket, ListBuckets, HeadBucket,
-          PutObject, GetObject, DeleteObject, HeadObject, CopyObject,
+          PutObject, GetObject, GetObjectAttributes, DeleteObject, HeadObject, CopyObject,
           ListObjectsV1 (with Marker/NextMarker pagination),
           ListObjectsV2 (with ContinuationToken pagination),
           DeleteObjects (batch),
           Multipart Upload (Create, UploadPart, Complete, Abort, List, ListParts),
           Object Tagging (Get, Put, Delete),
+          Object Annotations (PutObjectAnnotation, GetObjectAnnotation,
+          ListObjectAnnotations, DeleteObjectAnnotation; carried by CopyObject),
           ListObjectVersions,
           Bucket sub-resources (Policy, Versioning, Encryption, Lifecycle,
           CORS, ACL, Tagging, Notification, Logging, Accelerate, RequestPayment,
@@ -23,33 +27,63 @@ Storage: In-memory (optionally backed by S3_DATA_DIR).
 """
 
 import base64
+import contextvars
 import copy
 import datetime as _dt
 import hashlib
+import hmac
+import ipaddress
+import itertools
 import json
 import logging
 import os
+import random
 import re
+import shutil
+import string
+import struct
 import threading
 import time
+import zlib
+from contextlib import contextmanager
 from urllib.parse import parse_qs as _parse_qs
 from urllib.parse import quote as url_quote
+from urllib.parse import quote_plus as _url_quote_plus
 from urllib.parse import unquote as url_unquote
 from urllib.parse import urlparse as _urlparse
-from xml.etree.ElementTree import Element, SubElement, tostring
+from xml.etree.ElementTree import Element, ParseError, SubElement, tostring
 from xml.sax.saxutils import escape as _esc
 
 from defusedxml.ElementTree import fromstring
 
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import esm_wake
+from ministack.core.iam_evaluator import (
+    AmbiguousAccessKeyError,
+    CredentialResolutionError,
+    find_iam_access_key_account,
+    resolve_credential,
+)
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     get_account_id,
+    get_region,
     iso_to_rfc7231,
     md5_hash,
     new_uuid,
     now_iso,
-    sha256_hash,
+    request_scope,
+    set_request_account_id,
+    set_request_region,
+)
+from ministack.core.router import extract_access_key_id, extract_signed_region
+from ministack.core.sigv4 import (
+    build_canonical_request,
+    build_string_to_sign,
+    calculate_signature,
+    presigned_request_is_expired,
+    signatures_match,
 )
 
 logger = logging.getLogger("s3")
@@ -69,6 +103,293 @@ _bucket_versioning = AccountScopedDict()
 _bucket_encryption = AccountScopedDict()
 _bucket_lifecycle = AccountScopedDict()
 _bucket_cors = AccountScopedDict()
+# Multi-Region Access Points. Keyed by ALIAS rather than name, because the alias
+# is what the data plane is addressed by: `<alias>.mrap.accesspoint.s3-global.amazonaws.com`.
+# Alias -> {Name, Alias, Regions: [bucket, ...], CreatedAt, PublicAccessBlockConfiguration,
+#           Routes: {bucket: dial}, Policy}
+_mraps = AccountScopedDict()
+# S3 Control async request token -> the AsyncOperation DescribeMultiRegionAccessPointOperation reports.
+_mrap_operations = AccountScopedDict()
+# Regional access points, by name within an account and region:
+# {Name, Bucket, BucketAccountId, Alias, CreationDate, NetworkOrigin, VpcConfiguration,
+#  PublicAccessBlockConfiguration, Policy, Tags}
+_access_points = AccountRegionScopedDict()
+# The access point record a data-plane request came through, while it is handled.
+_request_access_point: contextvars.ContextVar[dict | None] = contextvars.ContextVar("s3_access_point", default=None)
+# The account that called, kept once the request is pinned to the bucket owner's account (another account's
+# bucket or access point): KMS keys are resolved in the caller's account.
+_request_caller: contextvars.ContextVar[str | None] = contextvars.ContextVar("s3_request_caller", default=None)
+
+# Object Lambda Access Points, by name within an account and region:
+# {Name, Alias: {Value, Status}, CreationDate, Configuration, Policy, PublicAccessBlockConfiguration}
+_object_lambda_access_points = AccountRegionScopedDict()
+# GetObject requests waiting on the Lambda's WriteGetObjectResponse, keyed by
+# (route, token). In flight only: never persisted, cleared on reset.
+_olap_requests: dict[tuple[str, str], dict] = {}
+_olap_requests_lock = threading.Lock()
+_OBJECT_LAMBDA_ALIAS_SUFFIX = "--ol-s3"
+
+# Account-level public access block, per account (it applies in every region): {"config": {flags}}.
+_account_public_access_block = AccountScopedDict()
+
+
+def object_lambda_arn(name: str, account_id: str | None = None, region: str | None = None) -> str:
+    return f"arn:aws:s3-object-lambda:{region or get_region()}:{account_id or get_account_id()}:accesspoint/{name}"
+
+
+def new_object_lambda_alias(name: str, region: str) -> str:
+    """Shape of the documented example ``myolap-1a4n8yjrb3kda96f67zwrwiiuse1a--ol-s3``."""
+    alphabet = string.ascii_lowercase + string.digits
+    return f"{name[:20]}-{''.join(random.choices(alphabet, k=24))}{_region_code(region)}a{_OBJECT_LAMBDA_ALIAS_SUFFIX}"
+
+
+def resolve_object_lambda_alias(alias: str):
+    """``(account, region, record)`` for an Object Lambda alias in any tenant, or None."""
+    for (account, region, _name), record in list(_object_lambda_access_points._data.items()):
+        if (record.get("Alias") or {}).get("Value") == alias:
+            return account, region, record
+    return None
+
+
+_ACCESS_POINT_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{1,48}[a-z0-9])$")
+_OBJECT_LAMBDA_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{1,43}[a-z0-9])$")
+_COMPASS_CODES = {"northeast": "ne", "southeast": "se", "northwest": "nw", "southwest": "sw"}
+
+
+def _region_code(region: str) -> str:
+    """AWS's short region code in access point aliases: ``use1``, ``euw1``…"""
+    parts = region.split("-")
+    if len(parts) < 3:
+        return region.replace("-", "")
+    middle = "".join(_COMPASS_CODES.get(p, p[:1]) for p in parts[1:-1])
+    return f"{parts[0]}{middle}{parts[-1]}"
+
+
+def new_access_point_alias(name: str, region: str) -> str:
+    """The alias S3 mints for an access point (observed shape):
+    ``<first 20 chars of name>-<29 lowercase alnum><region code>b-s3alias``."""
+    alphabet = string.ascii_lowercase + string.digits
+    return f"{name[:20]}-{''.join(random.choices(alphabet, k=29))}{_region_code(region)}b-s3alias"
+
+
+def access_point_arn(name: str, account_id: str | None = None, region: str | None = None) -> str:
+    return f"arn:aws:s3:{region or get_region()}:{account_id or get_account_id()}:accesspoint/{name}"
+
+
+def resolve_access_point(name: str, account_id: str, region: str) -> dict | None:
+    return _access_points.get_scoped(account_id, region, name)
+
+
+def access_point_regions(name: str, account_id: str) -> list[str]:
+    """Regions in which an account has an access point of this name."""
+    return [region for (account, region, ap_name) in _access_points._data
+            if account == account_id and ap_name == name]
+
+
+def resolve_access_point_alias(alias: str):
+    """``(account, region, record)`` for an access point alias in any tenant, or None."""
+    for (account, region, _name), record in list(_access_points._data.items()):
+        if record.get("Alias") == alias:
+            return account, region, record
+    return None
+
+
+_ACCESS_POINT_ALIAS_SUFFIX = "-s3alias"
+
+
+def access_point_for_alias(alias: str, foreign: bool = False) -> tuple[str, str, dict] | None:
+    """``(access point ARN, bucket, condition keys)`` of an alias for IAM checks: in the caller's account,
+    or in any account with *foreign* (a PutObject through another account's access point)."""
+    if not alias.endswith(_ACCESS_POINT_ALIAS_SUFFIX):
+        return None
+    resolved = resolve_access_point_alias(alias)
+    if resolved is None or (resolved[0] != get_account_id() and not foreign):
+        return None
+    account, region, record = resolved
+    arn = access_point_arn(record["Name"], account, region)
+    return arn, record["Bucket"], {"s3:DataAccessPointArn": arn, "s3:DataAccessPointAccount": account,
+                                   "s3:AccessPointNetworkOrigin": record["NetworkOrigin"]}
+
+
+def access_point_policy_for_arn(resource_arn: str) -> tuple[str, str] | None:
+    """The access point policy and owner for an IAM check on an access point ARN."""
+    try:
+        arn = parse_arn(resource_arn)
+    except ArnParseError:
+        return None
+    kind, _, rest = arn.resource.partition("/")
+    if arn.service != "s3" or kind != "accesspoint":
+        return None
+    record = resolve_access_point(rest.split("/", 1)[0], arn.account_id, arn.region)
+    return (record.get("Policy") or "", arn.account_id) if record else None
+
+
+def is_foreign_access_point_put(method: str, key: str, headers: dict, query_params: dict) -> bool:
+    """Whether a request is a plain PutObject, the one operation served through another account's access point
+    (the only one recorded on AWS, us-east-2): not a part, a copy or a sub-resource write."""
+    return (method == "PUT" and bool(key) and "x-amz-copy-source" not in headers
+            and not set(query_params) - {"x-id"})
+
+
+def _resolve_copy_source_alias(headers: dict) -> tuple:
+    """``(headers, denied)``: an ``x-amz-copy-source`` access point alias rewritten to its bucket."""
+    source = headers.get("x-amz-copy-source", "")
+    src_bucket, sep, rest = source.lstrip("/").partition("/")
+    if not sep or not src_bucket.endswith(_ACCESS_POINT_ALIAS_SUFFIX):
+        return headers, None
+    resolved = resolve_access_point_alias(src_bucket)
+    if resolved is None:
+        return headers, None
+    if resolved[0] != get_account_id():
+        return headers, _error("AccessDenied", "Access Denied", 403, f"/{src_bucket}")
+    return {**headers, "x-amz-copy-source": f"{resolved[2]['Bucket']}/{rest}"}, None
+
+
+def resolve_access_point_host(name: str, account_id: str, signed_region: str | None, allow_foreign: bool = False):
+    """The target of an access point host ``<name>-<account>.<host>`` as
+    ``(bucket, access point region, error)``, or None when no such access
+    point exists (the host then names a bucket). An access point in another
+    region than the signing one still resolves, so the region check answers
+    with the access point's region. ``allow_foreign`` serves another account's."""
+    regions = access_point_regions(name, account_id)
+    if not regions:
+        return None
+    if account_id != get_account_id() and not allow_foreign:
+        # Requests from another account through an access point are refused, a PutObject excepted.
+        return None, None, _error("AccessDenied", "Access Denied", 403, f"/{name}")
+    region = signed_region if signed_region in regions else regions[0]
+    return resolve_access_point(name, account_id, region)["Bucket"], region, None
+
+
+def signed_service(headers: dict, query_params: dict) -> str | None:
+    """The service a SigV4 request was signed for, from its credential scope."""
+    auth = headers.get("authorization", "")
+    if auth.startswith("AWS4-HMAC-SHA256"):
+        m = _SIGV4_SCOPE_SERVICE_RE.search(auth)
+        return m.group(1) if m else None
+    parts = (_qp(query_params, "X-Amz-Credential", "") or _qp(query_params, "x-amz-credential", "")).split("/")
+    return parts[3] if len(parts) == 5 else None
+
+
+def bucket_access_points_attached(bucket: str) -> bool:
+    """Whether a bucket in the current account fronts an MRAP or an access point."""
+    account = get_account_id()
+    return mrap_member(bucket) or any(
+        a == account and r.get("Bucket") == bucket for (a, _region, _n), r in list(_access_points._data.items()))
+
+
+def new_mrap_alias() -> str:
+    """The alias S3 mints for a Multi-Region Access Point: a letter followed
+    by twelve lowercase letters or digits, suffixed with ``.mrap`` (e.g.
+    ``mfzwi23gnjvgw.mrap``; the documented pattern is
+    ``^[a-z][a-z0-9]*[.]mrap$``). The suffix is part of the alias itself —
+    GetAtt/GetMultiRegionAccessPoint return it, and the hostname is
+    ``<alias>.accesspoint.s3-global.amazonaws.com``."""
+    alphabet = string.ascii_lowercase + string.digits
+    base = random.choice(string.ascii_lowercase) + "".join(random.choices(alphabet, k=12))
+    return base + ".mrap"
+
+
+class MrapError(Exception):
+    """A Multi-Region Access Point request S3 refuses: ``code`` and ``message``
+    as AWS reports them."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def mrap_routes(record: dict) -> dict[str, int]:
+    """Traffic dial per member bucket. Records persisted before routes existed
+    have none, and every member then receives traffic (dial 100)."""
+    routes = record.get("Routes") or {}
+    return {bucket: int(routes.get(bucket, 100)) for bucket in record.get("Regions") or []}
+
+
+def find_mrap(ref: str) -> dict | None:
+    """The MRAP in the current account named by alias, name or ARN
+    (``arn:aws:s3::<account>:accesspoint/<alias>``)."""
+    if ref.startswith("arn:"):
+        ref = ref.rsplit("/", 1)[-1]
+    record = _mraps.get(ref)
+    if record is not None:
+        return record
+    return next((r for r in _mraps.values() if r.get("Name") == ref), None)
+
+
+def create_mrap(name: str, buckets: list[str], public_access_block: dict | None = None,
+                strict: bool = True) -> dict:
+    """Create a Multi-Region Access Point over ``buckets`` and return its record.
+
+    ``strict`` applies the S3 Control checks AWS makes (observed 2026-10-12):
+    a unique name in the account, every bucket existing in it, and one bucket
+    per region. The CloudFormation provisioner predates them and passes False,
+    getting back an existing record of the same name instead of an error."""
+    existing = find_mrap(name)
+    if existing is not None and existing.get("Name") == name:
+        if not strict:
+            return existing
+        raise MrapError(
+            "MultiRegionAccessPointAlreadyOwnedByYou",
+            "You must provide a unique name for each Multi-Region Access Point in your account. "
+            "A MRAP with this name already exists.",
+        )
+    if strict:
+        seen: set[str] = set()
+        for bucket in buckets:
+            region = bucket_region(bucket)
+            if region is None:
+                raise MrapError("NoSuchBucket", "The specified bucket does not exist.")
+            if region in seen:
+                raise MrapError("MultiRegionAccessPointSameBucketRegion",
+                                "The buckets specified must be part of different Regions.")
+            seen.add(region)
+    alias = new_mrap_alias()
+    record = {
+        "Name": name,
+        "Alias": alias,
+        "Regions": list(buckets),
+        "CreatedAt": now_iso(),
+        "PublicAccessBlockConfiguration": public_access_block or {},
+        "Routes": {bucket: 100 for bucket in buckets},
+        "Policy": None,
+    }
+    _mraps[alias] = record
+    return record
+
+
+def delete_mrap(name: str) -> bool:
+    record = find_mrap(name)
+    if record is None:
+        return False
+    _mraps.pop(record["Alias"], None)
+    return True
+
+
+def mrap_member(bucket: str) -> bool:
+    """Whether a bucket in the current account fronts any MRAP."""
+    return any(bucket in (r.get("Regions") or []) for r in _mraps.values())
+
+
+def resolve_mrap_bucket(alias: str):
+    """The bucket an MRAP alias serves, or None.
+
+    AWS routes a request to the closest active member by network proximity,
+    not by the region the client signs for (observed: boto3 signs MRAP requests
+    with SigV4a and region set ``*``). MiniStack stands in for proximity with
+    its own location: among members with a traffic dial of 100, the one homed
+    in MINISTACK_REGION wins, otherwise the first in the MRAP's region order.
+    """
+    record = _mraps.get(alias)
+    if not record:
+        return None
+    routes = mrap_routes(record)
+    candidates = [bucket for bucket, dial in routes.items() if dial] or list(routes)
+    if not candidates:
+        return None
+    local = os.environ.get("MINISTACK_REGION", "us-east-1")
+    return next((b for b in candidates if bucket_region(b) == local), candidates[0])
 _bucket_acl = AccountScopedDict()
 _bucket_websites = AccountScopedDict()
 _bucket_logging_config = AccountScopedDict()
@@ -76,20 +397,28 @@ _bucket_accelerate_config = AccountScopedDict()
 _bucket_request_payment_config = AccountScopedDict()
 
 _object_tags = AccountScopedDict()
+_object_acl = AccountScopedDict()  # (bucket, key, version_id) -> stored ACL XML string
+_object_annotations = AccountScopedDict()
 _object_versions = AccountScopedDict()  # (bucket, key) -> [{version_id, obj_record}, ...]
 
 _bucket_object_lock = AccountScopedDict()
 _bucket_replication = AccountScopedDict()
+_MALFORMED_XML = "The XML you provided was not well-formed or did not validate against our published schema"
 _object_retention = AccountScopedDict()
 _object_legal_hold = AccountScopedDict()
 
 _multipart_uploads = AccountScopedDict()
+# Completed uploads, keyed by upload id -> the (status, headers, body) response.
+# CompleteMultipartUpload is idempotent: a retry with the same upload id and
+# parts returns the original 200 result rather than NoSuchUpload (which real S3
+# only returns later, once the upload id is garbage-collected).
+_completed_multipart_uploads = AccountScopedDict()
 
 # ── Persistence (metadata only — object bodies are NOT persisted here) ────
 
 # Module-level registry of per-bucket dicts that round-trip through s3.json.
 # One entry per module global: adding a new _bucket_* dict means one line here,
-# not two separate edits in get_state/restore_state. Must sit below every
+# not two separate edits in get_state/_restore_state. Must sit below every
 # _bucket_* declaration above — the dict literal holds live references.
 # Excludes _buckets (has bespoke objects-stripping + legacy fallback) and
 # per-bucket keys like _ownership_controls / _public_access_block that live
@@ -109,6 +438,14 @@ _PERSISTED_BUCKET_DICTS = {
     "bucket_request_payment_config": _bucket_request_payment_config,
     "bucket_object_lock": _bucket_object_lock,
     "bucket_replication": _bucket_replication,
+    # An access point outliving a restart matters more than most: its alias is
+    # baked into client configuration, so member buckets coming back without the
+    # alias fronting them fails where a missing bucket would not.
+    "mraps": _mraps,
+    "mrap_operations": _mrap_operations,
+    "access_points": _access_points,
+    "object_lambda_access_points": _object_lambda_access_points,
+    "account_public_access_block": _account_public_access_block,
 }
 
 
@@ -125,33 +462,28 @@ def get_state():
     return state
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     if not data:
         return
     bm = data.get("buckets_meta", {})
+    # Object persistence may already have created placeholder buckets during
+    # import. Restore metadata onto those records without replacing objects.
     if isinstance(bm, AccountScopedDict):
         # Restore all accounts' buckets directly via _data
         for scoped_key, meta in bm._data.items():
-            if scoped_key not in _buckets._data:
-                _buckets._data[scoped_key] = {**meta, "objects": {}}
+            _buckets._data.setdefault(scoped_key, {"objects": {}}).update(meta)
     else:
         # Legacy plain-dict format (pre-multi-tenancy)
         for name, meta in bm.items():
-            if name not in _buckets:
-                _buckets[name] = {**meta, "objects": {}}
+            _buckets.setdefault(name, {"objects": {}}).update(meta)
     for key, d in _PERSISTED_BUCKET_DICTS.items():
         d.update(data.get(key, {}))
 
 
-try:
-    _restored = load_state("s3")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")
@@ -163,14 +495,26 @@ _PRESERVED_HEADERS = (
     "content-disposition",
     "content-language",
     "expires",
+    "x-amz-website-redirect-location",
 )
 
 # Per botocore/data/s3/2006-03-01/service-2.json (StorageClass enum).
-_VALID_STORAGE_CLASSES = frozenset({
-    "STANDARD", "REDUCED_REDUNDANCY", "STANDARD_IA", "ONEZONE_IA",
-    "INTELLIGENT_TIERING", "GLACIER", "DEEP_ARCHIVE", "OUTPOSTS",
-    "GLACIER_IR", "SNOW", "EXPRESS_ONEZONE", "FSX_OPENZFS",
-})
+_VALID_STORAGE_CLASSES = frozenset(
+    {
+        "STANDARD",
+        "REDUCED_REDUNDANCY",
+        "STANDARD_IA",
+        "ONEZONE_IA",
+        "INTELLIGENT_TIERING",
+        "GLACIER",
+        "DEEP_ARCHIVE",
+        "OUTPOSTS",
+        "GLACIER_IR",
+        "SNOW",
+        "EXPRESS_ONEZONE",
+        "FSX_OPENZFS",
+    }
+)
 
 
 def _resolve_storage_class(headers: dict, default: str = "STANDARD"):
@@ -185,6 +529,522 @@ def _resolve_storage_class(headers: dict, default: str = "STANDARD"):
             400,
         )
     return sc, None
+
+
+# ---------------------------------------------------------------------------
+# Glacier restore (RestoreObject, x-amz-restore, s3:ObjectRestore:* events)
+# ---------------------------------------------------------------------------
+
+# Storage classes whose objects are unreadable until restored. GLACIER_IR is
+# deliberately absent: instant retrieval is an active tier, readable directly,
+# and RestoreObject against it fails InvalidObjectState ("Restore is not
+# allowed for the object's current storage class.").
+_ARCHIVE_STORAGE_CLASSES = frozenset({"GLACIER", "DEEP_ARCHIVE"})
+
+# Simulated retrieval latency. Fixed on purpose: every caller passes through
+# the ongoing-request="true" state it must handle against real AWS, and the
+# emulator compresses Glacier's hours to the same few seconds for everyone.
+_RESTORE_DELAY_SECONDS = 2.0
+
+
+def _restore_expiry_epoch(start: float, days: int) -> float:
+    """AWS expires the temporary copy at midnight UTC after the restore
+    period (expiry-date always reads 00:00:00 GMT), not at an hour offset."""
+    return float((int(start + days * 86400) // 86400 + 1) * 86400)
+
+
+def _restore_expiry_iso(expires_at: float) -> str:
+    return _dt.datetime.fromtimestamp(expires_at, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def _sync_restore(bucket_name: str, key: str, obj: dict | None) -> str | None:
+    """Derive the object's restore phase from its timestamps.
+
+    Returns "in_progress", "restored", or None (no active restore). State is
+    derived rather than flipped by a timer so it survives a restart under
+    S3_PERSIST=1. A lapsed temporary copy reverts the object to archived here,
+    on the next touch, and fires s3:ObjectRestore:Delete — an expiry is Days
+    out, so it rides this lazy sweep instead of a sleeping thread."""
+    restore = (obj or {}).get("restore")
+    if not restore:
+        return None
+    now = time.time()
+    if now < restore["available_at"]:
+        return "in_progress"
+    if now < restore["expires_at"]:
+        return "restored"
+    obj.pop("restore", None)
+    _fire_s3_event_async(bucket_name, key, "s3:ObjectRestore:Delete", size=obj.get("size", 0), etag=obj.get("etag", ""))
+    return None
+
+
+def _invalid_object_state(bucket_name: str, key: str, storage_class: str) -> tuple:
+    """403 InvalidObjectState, carrying the StorageClass member the error
+    shape models."""
+    root = Element("Error")
+    SubElement(root, "Code").text = "InvalidObjectState"
+    SubElement(root, "Message").text = "The operation is not valid for the object's storage class"
+    SubElement(root, "StorageClass").text = storage_class
+    SubElement(root, "Resource").text = f"/{bucket_name}/{key}"
+    SubElement(root, "RequestId").text = new_uuid()
+    return 403, {"Content-Type": "application/xml"}, _xml_body(root)
+
+
+def _schedule_restore_completed(bucket_name: str, key: str, requested_at: float) -> None:
+    """Fire s3:ObjectRestore:Completed once the simulated retrieval lands.
+
+    Same copied-context daemon-thread shape as _fire_s3_event_async (#876).
+    The requested_at stamp guards the sleep window: if the object is deleted,
+    overwritten, or the restore superseded meanwhile, the timer wakes up,
+    sees a different stamp, and fires nothing."""
+    ctx = contextvars.copy_context()
+
+    def _worker():
+        bucket = _buckets.get(bucket_name)
+        obj = bucket["objects"].get(key) if bucket else None
+        restore = (obj or {}).get("restore")
+        if not restore or restore.get("requested_at") != requested_at:
+            return
+        delay = restore["available_at"] - time.time()
+        if delay > 0:
+            time.sleep(delay)
+        bucket = _buckets.get(bucket_name)
+        obj = bucket["objects"].get(key) if bucket else None
+        restore = (obj or {}).get("restore")
+        if not restore or restore.get("requested_at") != requested_at:
+            return
+        restore["completed_fired"] = True
+        _fire_s3_event(
+            bucket_name,
+            key,
+            "s3:ObjectRestore:Completed",
+            size=obj.get("size", 0),
+            etag=obj.get("etag", ""),
+            restore_event_data={
+                "lifecycleRestorationExpiryTime": _restore_expiry_iso(restore["expires_at"]),
+                "lifecycleRestoreStorageClass": obj.get("storage_class") or "GLACIER",
+            },
+        )
+
+    t = threading.Thread(target=ctx.run, args=(_worker,), daemon=True)
+    t.start()
+
+
+def _schedule_restore_expiry(bucket_name: str, key: str, expires_at: float) -> None:
+    """Fire s3:ObjectRestore:Delete when the temporary copy lapses.
+
+    Real S3 removes the restored copy and emits the event at expiry time, not
+    on the next read, so a non-polling consumer still hears it. The expires_at
+    stamp guards the sleep: an extension re-arms a new timer and the stale one
+    wakes, sees a different stamp, and exits. The lazy check in _sync_restore
+    stays as a belt-and-braces path for reads that race the timer."""
+    ctx = contextvars.copy_context()
+
+    def _worker():
+        delay = expires_at - time.time()
+        if delay > 0:
+            time.sleep(delay)
+        bucket = _buckets.get(bucket_name)
+        obj = bucket["objects"].get(key) if bucket else None
+        restore = (obj or {}).get("restore")
+        if not restore or restore.get("expires_at") != expires_at:
+            return
+        _sync_restore(bucket_name, key, obj)
+
+    t = threading.Thread(target=ctx.run, args=(_worker,), daemon=True)
+    t.start()
+
+
+def _restore_object(bucket_name: str, key: str, body: bytes) -> tuple:
+    bucket = _ensure_bucket(bucket_name)
+    if bucket is None:
+        return _no_such_bucket(bucket_name)
+    obj = bucket["objects"].get(key)
+    if obj is None:
+        return _error("NoSuchKey", "The specified key does not exist.", 404, f"/{bucket_name}/{key}")
+
+    sc = obj.get("storage_class") or "STANDARD"
+    if sc == "GLACIER_IR":
+        # Real AWS distinguishes instant retrieval from active tiers here:
+        # restore on GLACIER_IR fails InvalidObjectState ("Restore is not
+        # allowed..."), not ObjectAlreadyInActiveTierError.
+        return _error(
+            "InvalidObjectState",
+            "Restore is not allowed for the object's current storage class.",
+            403,
+            f"/{bucket_name}/{key}",
+        )
+    if sc not in _ARCHIVE_STORAGE_CLASSES:
+        return _error(
+            "ObjectAlreadyInActiveTierError",
+            "This action is not allowed against this storage tier.",
+            403,
+            f"/{bucket_name}/{key}",
+        )
+
+    days = None
+    tier = "Standard"
+    if body:
+        try:
+            root = fromstring(body)
+        except ParseError:
+            return _error(
+                "MalformedXML",
+                "The XML you provided was not well-formed or did not " "validate against our published schema",
+                400,
+                f"/{bucket_name}/{key}",
+            )
+        for el in root.iter():
+            name = el.tag.rsplit("}", 1)[-1]
+            if name == "Days" and el.text:
+                try:
+                    days = int(el.text.strip())
+                except ValueError:
+                    days = None
+            elif name == "Tier" and el.text:
+                # Covers both GlacierJobParameters/Tier and top-level Tier.
+                tier = el.text.strip()
+    if days is None:
+        # The Days element is required for regular (non-select) restores.
+        return _error(
+            "MalformedXML",
+            "The XML you provided was not well-formed or did not validate " "against our published schema",
+            400,
+            f"/{bucket_name}/{key}",
+        )
+
+    now = time.time()
+    phase = _sync_restore(bucket_name, key, obj)
+    if phase == "in_progress":
+        return _error(
+            "RestoreAlreadyInProgress", "Object restore is already in progress.", 409, f"/{bucket_name}/{key}"
+        )
+    if phase == "restored":
+        # Re-request while the copy is live: only the expiry moves, relative
+        # to now, and AWS answers 200 rather than 202.
+        obj["restore"]["expires_at"] = _restore_expiry_epoch(now, days)
+        obj["restore"]["days"] = days
+        _schedule_restore_expiry(bucket_name, key, obj["restore"]["expires_at"])
+        return 200, {}, b""
+
+    obj["restore"] = {
+        "requested_at": now,
+        "available_at": now + _RESTORE_DELAY_SECONDS,
+        "expires_at": _restore_expiry_epoch(now + _RESTORE_DELAY_SECONDS, days),
+        "days": days,
+        "tier": tier,
+        "completed_fired": False,
+    }
+    _fire_s3_event_async(bucket_name, key, "s3:ObjectRestore:Post", size=obj.get("size", 0), etag=obj.get("etag", ""))
+    _schedule_restore_completed(bucket_name, key, now)
+    _schedule_restore_expiry(bucket_name, key, obj["restore"]["expires_at"])
+    return 202, {}, b""
+
+
+def _reschedule_restores() -> None:
+    """Re-arm pending s3:ObjectRestore:Completed timers after a restart.
+
+    Invoked once at the end of module import, after persisted state loads:
+    a restore in flight when the process died fires on schedule, and one that
+    landed while the process was down (completed_fired still False) fires
+    immediately — the consumer it exists for wasn't polling. A copy that
+    lapsed entirely while down is left to the lazy sweep, which fires
+    s3:ObjectRestore:Delete on the next touch."""
+    try:
+        entries = list(_buckets._data.items())
+    except Exception:
+        return
+    now = time.time()
+    for (account_id, bucket_name), bucket in entries:
+        for key, obj in list((bucket.get("objects") or {}).items()):
+            restore = obj.get("restore")
+            if not restore:
+                continue
+            # The workers copy their context at schedule time, so pin the
+            # owning account around the calls (#876 shape).
+            set_request_account_id(account_id)
+            try:
+                if now >= restore["expires_at"]:
+                    # Lapsed while down: revert to archived and fire :Delete.
+                    _sync_restore(bucket_name, key, obj)
+                    continue
+                if not restore.get("completed_fired"):
+                    _schedule_restore_completed(bucket_name, key, restore["requested_at"])
+                _schedule_restore_expiry(bucket_name, key, restore["expires_at"])
+            finally:
+                set_request_account_id("")
+
+
+# ---------------------------------------------------------------------------
+# Server-side encryption (SSE-S3 / SSE-KMS / SSE-C)
+#
+# MiniStack does not encrypt at rest — like the ACL plane, SSE is contract
+# state: validated on write, persisted with the object, echoed on every
+# response, and enforced on reads for SSE-C (whose whole point is that the
+# object is unreadable without the key).  The state rides the object record's
+# `preserved_headers`, so it follows versions, copies and multipart completes
+# through the existing plumbing.  The customer key itself is NEVER stored —
+# only its MD5, which is all AWS keeps visible too.
+# ---------------------------------------------------------------------------
+
+# NoSuchUpload's message (recorded on AWS, us-east-2).
+_NO_SUCH_UPLOAD_MESSAGE = (
+    "The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted "
+    "or completed."
+)
+
+
+def _no_such_upload(upload_id: str) -> tuple:
+    """NoSuchUpload as every multipart operation answers it: the message and ``<UploadId>``, no
+    ``<Resource>`` (recorded on AWS, us-east-2, for an unknown upload id and one used under another key)."""
+    return _object_error("NoSuchUpload", _NO_SUCH_UPLOAD_MESSAGE, 404, UploadId=upload_id or "")
+
+# The SSE headers persisted on an object (the customer KEY is deliberately
+# not among them).
+_SSE_STORED_HEADERS = (
+    "x-amz-server-side-encryption",
+    "x-amz-server-side-encryption-aws-kms-key-id",
+    "x-amz-server-side-encryption-customer-algorithm",
+    "x-amz-server-side-encryption-customer-key-md5",
+    "x-amz-server-side-encryption-bucket-key-enabled",
+)
+
+
+def _validate_sse_c_headers(c_alg: str, c_key: str, c_md5: str):
+    """Validate an SSE-C header trio; None when coherent, an error otherwise.
+
+    AWS requires all three headers together: the algorithm (AES256 only), a
+    base64 256-bit key, and the base64 MD5 of the raw key bytes, which it
+    checks to catch corruption in transit."""
+    if not c_alg:
+        return _error(
+            "InvalidArgument",
+            "Requests specifying Server Side Encryption with Customer provided keys "
+            "must provide a valid encryption algorithm.",
+            400,
+        )
+    if c_alg != "AES256":
+        return _error("InvalidArgument", f"Invalid x-amz-server-side-encryption-customer-algorithm value: {c_alg}", 400)
+    if not c_key:
+        return _error(
+            "InvalidArgument",
+            "Requests specifying Server Side Encryption with Customer provided keys "
+            "must provide an appropriate secret key.",
+            400,
+        )
+    try:
+        raw_key = base64.b64decode(c_key, validate=True)
+    except Exception:
+        raw_key = b""
+    if len(raw_key) != 32:
+        return _error("InvalidArgument", "The secret key was invalid for the specified algorithm.", 400)
+    if not c_md5:
+        return _error(
+            "InvalidArgument",
+            "Requests specifying Server Side Encryption with Customer provided keys "
+            "must provide the object encryption key MD5.",
+            400,
+        )
+    if base64.b64encode(hashlib.md5(raw_key).digest()).decode() != c_md5:
+        return _error(
+            "InvalidArgument", "The calculated MD5 hash of the key did not match the hash that was provided.", 400
+        )
+    return None
+
+
+_SSE_KMS_KEY_HEADER = "x-amz-server-side-encryption-aws-kms-key-id"
+
+
+def _resolve_kms_write(headers: dict, bucket_name: str, reject_orphan_key: bool = False):
+    """The KMS key ARN a write encrypts with and the error it earns, as ``(arn | None, error | None)``.
+
+    Recorded on AWS, us-east-2, ahead of any authorization: a key header needs ``aws:kms`` (a key ID with
+    AES256 or no SSE header is InvalidArgument); ``aws:kms`` without a key header takes the account's
+    ``aws/s3`` key; the bucket default applies when the request sends no SSE header and names its key
+    the same way.  A key KMS refuses is refused with KMS's own error.  An SSE-C request is not looked at.
+    """
+    from ministack.services.kms import resolve_key_for_s3
+
+    if any(h.startswith("x-amz-server-side-encryption-customer-") for h in headers):
+        return None, None
+    sse = headers.get("x-amz-server-side-encryption", "")
+    key_ref = headers.get(_SSE_KMS_KEY_HEADER) or None
+    if sse in ("", "AES256"):
+        if key_ref and reject_orphan_key:
+            fields = {"ArgumentName": "x-amz-server-side-encryption", **({"ArgumentValue": sse} if sse else {})}
+            return None, _object_error(
+                "InvalidArgument",
+                "Server Side Encryption with AWS KMS managed key requires HTTP header "
+                "x-amz-server-side-encryption : aws:kms",
+                400,
+                **fields,
+            )
+        if sse:
+            return None, None
+        default_bucket = _condition_bucket_name(bucket_name)
+        if default_bucket.endswith(_ACCESS_POINT_ALIAS_SUFFIX) and (found := resolve_access_point_alias(default_bucket)):
+            # Another account's access point: its bucket's default applies.
+            bucket_owner, default_bucket = found[0], found[2]["Bucket"]
+        else:
+            # The bucket owner's default, also for another account's bucket before the request is pinned to it.
+            bucket_owner = _bucket_owner_account(default_bucket) or get_account_id()
+        with request_scope(bucket_owner, get_region()):
+            default = _bucket_default_sse_headers(default_bucket)
+        if default.get("x-amz-server-side-encryption") != "aws:kms":
+            return None, None
+        key_ref = default.get(_SSE_KMS_KEY_HEADER)
+    elif sse not in ("aws:kms", "aws:kms:dsse"):
+        return None, None
+    elif headers.get(_SSE_KMS_KEY_HEADER) == "":
+        # An empty key header with aws:kms is S3's InternalError, ahead of any authorization (recorded on AWS,
+        # us-east-2).
+        return None, _object_error("InternalError", "We encountered an internal error. Please try again.", 500)
+    # The key is resolved in the caller's account, also once the request is pinned to a bucket owner's.
+    with request_scope(_request_caller.get() or get_account_id(), get_region()):
+        arn, err = resolve_key_for_s3(key_ref)
+    if err:
+        return None, _object_error(*err)
+    return arn, None
+
+
+def _resolve_sse_write_headers(headers: dict, bucket_name: str, reject_orphan_key: bool = False):
+    """Validate a write's SSE headers and return (headers_to_persist, error).
+
+    SSE-S3/KMS and SSE-C are mutually exclusive (InvalidArgument together, as
+    AWS answers).  `aws:kms` without a key id takes the account's `aws/s3`
+    key, and the key is persisted and echoed as its ARN, whatever the request
+    named it by.  A write with no SSE headers takes the bucket's explicit
+    default encryption configuration, so the applied algorithm is visible on
+    later reads and not only stamped on the PUT reply."""
+    sse = headers.get("x-amz-server-side-encryption", "")
+    c_alg = headers.get("x-amz-server-side-encryption-customer-algorithm", "")
+    c_key = headers.get("x-amz-server-side-encryption-customer-key", "")
+    c_md5 = headers.get("x-amz-server-side-encryption-customer-key-md5", "")
+    bucket_key = headers.get("x-amz-server-side-encryption-bucket-key-enabled", "").lower()
+
+    if sse and (c_alg or c_key or c_md5):
+        return None, _error(
+            "InvalidArgument",
+            "Server Side Encryption with Customer provided key is incompatible "
+            "with the encryption method specified.",
+            400,
+        )
+    kms_arn, kms_err = _resolve_kms_write(headers, bucket_name, reject_orphan_key)
+    if kms_err is not None:
+        return None, kms_err
+    if sse:
+        if sse not in ("AES256", "aws:kms"):
+            return None, _error("InvalidArgument", f"Invalid x-amz-server-side-encryption value: {sse}", 400)
+        out = {"x-amz-server-side-encryption": sse}
+        if sse == "aws:kms":
+            out[_SSE_KMS_KEY_HEADER] = kms_arn
+            if bucket_key:
+                out["x-amz-server-side-encryption-bucket-key-enabled"] = bucket_key
+        return out, None
+    if c_alg or c_key or c_md5:
+        err = _validate_sse_c_headers(c_alg, c_key, c_md5)
+        if err is not None:
+            return None, err
+        return {
+            "x-amz-server-side-encryption-customer-algorithm": "AES256",
+            "x-amz-server-side-encryption-customer-key-md5": c_md5,
+        }, None
+    default = dict(_bucket_default_sse_headers(bucket_name))
+    if default.get("x-amz-server-side-encryption") == "aws:kms":
+        default[_SSE_KMS_KEY_HEADER] = kms_arn
+        if bucket_key:
+            default["x-amz-server-side-encryption-bucket-key-enabled"] = bucket_key
+    return default, None
+
+
+def _stored_sse_headers(obj: dict) -> dict:
+    return {k: v for k, v in obj.get("preserved_headers", {}).items() if k in _SSE_STORED_HEADERS}
+
+
+def _check_sse_c_against(stored_md5, c_alg: str, c_key: str, c_md5: str, part: bool = False):
+    """The SSE-C access rule shared by reads, copy sources and upload parts.
+
+    An SSE-C object (or upload) is inaccessible without its key: the request
+    must carry a coherent trio whose key MD5 matches the stored one.  Keyless
+    and incoherent requests are 400s, but AWS splits the wrong key: a read
+    answers 403 AccessDenied, a part request answers 400.  And a request
+    offering SSE-C parameters for something not stored that way is refused
+    too."""
+    if stored_md5:
+        if not (c_alg or c_key or c_md5):
+            if part:
+                return _error(
+                    "InvalidRequest",
+                    "The multipart upload initiate requested encryption. "
+                    "Subsequent part requests must include the appropriate "
+                    "encryption parameters.",
+                    400,
+                )
+            return _error(
+                "InvalidRequest",
+                "The object was stored using a form of Server Side Encryption. "
+                "The correct parameters must be provided to retrieve the object.",
+                400,
+            )
+        err = _validate_sse_c_headers(c_alg, c_key, c_md5)
+        if err is not None:
+            return err
+        if c_md5 != stored_md5:
+            if part:
+                return _error(
+                    "InvalidRequest",
+                    "The provided encryption parameters did not match the ones " "used originally.",
+                    400,
+                )
+            return _error(
+                "AccessDenied",
+                "Requests specifying Server Side Encryption with Customer "
+                "provided keys must provide the correct secret key.",
+                403,
+            )
+    elif c_alg or c_key or c_md5:
+        return _error("InvalidRequest", "The encryption parameters are not applicable to this object.", 400)
+    return None
+
+
+def _check_sse_read_headers(headers: dict, obj: dict):
+    """Gate a GET/HEAD on the object's SSE state; None to proceed.
+
+    x-amz-server-side-encryption is a write-request header — AWS rejects it
+    on reads."""
+    if headers.get("x-amz-server-side-encryption"):
+        return _error("InvalidArgument", "x-amz-server-side-encryption is not valid on a read request.", 400)
+    return _check_sse_c_against(
+        obj.get("preserved_headers", {}).get("x-amz-server-side-encryption-customer-key-md5"),
+        headers.get("x-amz-server-side-encryption-customer-algorithm", ""),
+        headers.get("x-amz-server-side-encryption-customer-key", ""),
+        headers.get("x-amz-server-side-encryption-customer-key-md5", ""),
+    )
+
+
+def _check_sse_c_copy_source(headers: dict, src_obj: dict):
+    """Gate reading a copy source, using the x-amz-copy-source-server-side-
+    encryption-customer-* trio the way _check_sse_read_headers gates GET."""
+    return _check_sse_c_against(
+        src_obj.get("preserved_headers", {}).get("x-amz-server-side-encryption-customer-key-md5"),
+        headers.get("x-amz-copy-source-server-side-encryption-customer-algorithm", ""),
+        headers.get("x-amz-copy-source-server-side-encryption-customer-key", ""),
+        headers.get("x-amz-copy-source-server-side-encryption-customer-key-md5", ""),
+    )
+
+
+def _check_sse_c_part(headers: dict, upload: dict):
+    """Each part of an SSE-C multipart upload — and its completion — must
+    carry the key the upload was initiated with; a part of a non-SSE-C
+    upload must carry none."""
+    return _check_sse_c_against(
+        upload.get("preserved_headers", {}).get("x-amz-server-side-encryption-customer-key-md5"),
+        headers.get("x-amz-server-side-encryption-customer-algorithm", ""),
+        headers.get("x-amz-server-side-encryption-customer-key", ""),
+        headers.get("x-amz-server-side-encryption-customer-key-md5", ""),
+        part=True,
+    )
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -205,13 +1065,19 @@ def _xml_body(root: Element) -> bytes:
     return XML_DECL + b"\n" + tostring(root, encoding="unicode").encode("utf-8")
 
 
-def _error(code: str, message: str, status: int, resource: str = "") -> tuple:
+def _error(code: str, message: str, status: int, resource: str = "",
+           extra: dict[str, str] | None = None, headers: dict | None = None) -> tuple:
+    """S3 error document. ``extra`` adds error-specific elements after
+    ``<Resource>`` (``<Region>``, ``<Endpoint>``, ``<BucketName>``…) and
+    ``headers`` adds response headers such as ``x-amz-bucket-region``."""
     root = Element("Error")
     SubElement(root, "Code").text = code
     SubElement(root, "Message").text = message
     SubElement(root, "Resource").text = resource
+    for tag, text in (extra or {}).items():
+        SubElement(root, tag).text = text
     SubElement(root, "RequestId").text = new_uuid()
-    return status, {"Content-Type": "application/xml"}, _xml_body(root)
+    return status, {"Content-Type": "application/xml", **(headers or {})}, _xml_body(root)
 
 
 def _get_object_data(bucket_name: str, key: str, version_id: str | None = None) -> bytes | None:
@@ -225,7 +1091,7 @@ def _get_object_data(bucket_name: str, key: str, version_id: str | None = None) 
     if version_id:
         for v in _object_versions.get((bucket_name, key), []):
             if v["version_id"] == version_id:
-                return v.get("data")
+                return _version_body(bucket, bucket_name, key, v)
         return None
     obj = bucket["objects"].get(key)
     if obj is None:
@@ -233,14 +1099,520 @@ def _get_object_data(bucket_name: str, key: str, version_id: str | None = None) 
     return _read_body(bucket_name, key, obj)
 
 
+def _get_object_data_for_caller(bucket_name: str, key: str, version_id: str | None = None) -> bytes | None:
+    """Object bytes as the current account may read them, or None.
+
+    A bucket name identifies one bucket for every account. A bucket that another
+    account owns answers only when the owner's ACLs or bucket policy allow the
+    caller's GetObject, as for an S3 request."""
+    owner = _bucket_owner_for_caller(bucket_name)
+    caller = get_account_id()
+    if owner is None or owner == caller:
+        return _get_object_data(bucket_name, key, version_id)
+    query_params = {"versionId": version_id} if version_id else {}
+    if not _foreign_bucket_allows(owner, bucket_name, key, "GET", query_params, caller):
+        return None
+    with request_scope(owner, get_region()):
+        return _get_object_data(bucket_name, key, version_id)
+
+
+_ACL_GROUP_AUTHENTICATED = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers"
+# The permissions that answer an object read, FULL_CONTROL included.
+_ACL_READ_PERMS = ("READ", "FULL_CONTROL")
+_ACL_READ_ACP_PERMS = ("READ_ACP", "FULL_CONTROL")
+# Object reads an object ACL grants nothing for: READ covers the data, READ_ACP the ACL.
+_ACL_UNGRANTED_OBJECT_READS = ("uploadId", "annotation", "tagging", "retention", "legal-hold", "attributes")
+
+
+def _acl_grants(stored_xml: str | None, grantee: str = "URI") -> list[tuple[str, str]]:
+    """``(grantee, permission)`` for every grant in a stored ACL naming a group ``URI`` or a canonical ``ID``."""
+    if not stored_xml:
+        return []
+    try:
+        root = fromstring(stored_xml.encode() if isinstance(stored_xml, str) else stored_xml)
+    except Exception:
+        return []
+    grants = []
+    for grant in root.iter():
+        if not grant.tag.endswith("Grant"):
+            continue
+        value = permission = ""
+        for child in grant.iter():
+            if child.tag.rsplit("}", 1)[-1] == grantee and child.text:
+                value = child.text.strip()
+            elif child.tag.endswith("Permission") and child.text:
+                permission = child.text.strip()
+        if value and permission:
+            grants.append((value, permission))
+    return grants
+
+
+def _public_access_blocked(owner_account: str, bucket_name: str, setting: str) -> bool:
+    """Whether the account's, the bucket's or the request's access point's Public Access Block turns *setting* on."""
+    if (_account_public_access_block.get_scoped(owner_account, None, "config") or {}).get(setting):
+        return True
+    access_point = _request_access_point.get()
+    # An access point's BlockPublicPolicy does not cover the bucket's policy.
+    if access_point and access_point["Bucket"] == bucket_name and setting != "BlockPublicPolicy" and \
+            access_point["PublicAccessBlockConfiguration"].get(setting):
+        return True
+    record = _buckets.get_scoped(owner_account, None, bucket_name) or {}
+    stored = record.get("_public_access_block")
+    if not stored:
+        return False
+    try:
+        root = fromstring(stored.encode() if isinstance(stored, str) else stored)
+    except Exception:
+        return False
+    for child in root.iter():
+        if child.tag.rsplit("}", 1)[-1] == setting:
+            return (child.text or "").strip().lower() == "true"
+    return False
+
+
+def _account_from_access_key(access_key: str) -> str:
+    """The tenant an access key selects, the way the router scopes a request."""
+    try:
+        return find_iam_access_key_account(access_key) or access_key
+    except AmbiguousAccessKeyError:
+        return ""
+
+
+def _bucket_owner_account(name: str) -> str | None:
+    """The account that owns *name*, or None.
+
+    "General purpose buckets exist in a global namespace, which means that each
+    bucket name must be unique across all AWS accounts in all the AWS Regions
+    within a partition" — so a name identifies one bucket, whoever asks. The
+    store stays account-scoped; this is the index over it.
+    """
+    # A copy of the keys: internal reads call this from worker threads.
+    for account_id, bucket_name in list(_buckets._data):
+        if bucket_name == name:
+            return account_id
+    return None
+
+
+def _bucket_owner_for_caller(name: str) -> str | None:
+    """The account whose bucket *name* the current caller reads: its own, else the owner, or None."""
+    caller = get_account_id()
+    return caller if _buckets.contains_scoped(caller, None, name) else _bucket_owner_account(name)
+
+
+# A Multi-Region Access Point or an object through it: arn:aws:s3::<account>:accesspoint/<alias>[/object/<key>].
+_MRAP_RESOURCE_ARN_RE = re.compile(
+    r"^arn:aws:s3::(\d{12}):accesspoint/([a-z][a-z0-9]*\.mrap)(?:/object/.*)?$", re.DOTALL)
+
+
+def bucket_policy_for_arn(resource_arn: str) -> tuple[str, str] | None:
+    """The bucket (or MRAP) policy and owner for the identity check; ``_apply_bucket_scope`` gates foreign buckets."""
+    mrap = _MRAP_RESOURCE_ARN_RE.match(resource_arn)
+    if mrap:
+        record = find_mrap(mrap.group(2)) if mrap.group(1) == get_account_id() else None
+        return (record.get("Policy") or "", mrap.group(1)) if record else None
+    if not resource_arn.startswith("arn:aws:s3:::"):
+        return None
+    bucket = resource_arn[len("arn:aws:s3:::"):].split("/", 1)[0]
+    owner = get_account_id()
+    if not _buckets.contains_scoped(owner, None, bucket):
+        return None
+    return _bucket_policies.get_scoped(owner, None, bucket) or "", owner
+
+
+def bucket_policy_for_owner(resource_arn: str, owner: str) -> tuple[str, str] | None:
+    """The policy and owner of a bucket another account owns, for the bucket check of a PutObject through
+    that account's access point."""
+    if not resource_arn.startswith("arn:aws:s3:::"):
+        return None
+    bucket = resource_arn[len("arn:aws:s3:::"):].split("/", 1)[0]
+    if not _buckets.contains_scoped(owner, None, bucket):
+        return None
+    return _bucket_policies.get_scoped(owner, None, bucket) or "", owner
+
+
+def _condition_bucket_name(bucket_name: str) -> str:
+    """The bucket an identity check is about: an access point alias of this account resolved to its bucket."""
+    if bucket_name.endswith(_ACCESS_POINT_ALIAS_SUFFIX):
+        resolved = resolve_access_point_alias(bucket_name)
+        if resolved is not None and resolved[0] == get_account_id():
+            return resolved[2]["Bucket"]
+    return bucket_name
+
+
+def object_tags_for_condition(bucket_name: str, key: str, query_params: dict) -> dict:
+    """The tags of the object version a read names, for ``s3:ExistingObjectTag`` in the identity check."""
+    bucket_name = _condition_bucket_name(bucket_name)
+    bucket = _buckets.get(bucket_name)
+    if bucket is None:
+        return {}
+    return _object_tags.get((bucket_name, key, _resolve_subresource_version(query_params, bucket, key)), {})
+
+
+def _upload_in_bucket_scope(bucket_name: str, upload_id: str) -> dict | None:
+    """The multipart upload, read in the bucket owner's account: before the request is pinned to the owner, an
+    upload in another account's bucket is not in the caller's state."""
+    owner = _bucket_owner_account(_condition_bucket_name(bucket_name)) or get_account_id()
+    with request_scope(owner, get_region()):
+        return _multipart_uploads.get(upload_id)
+
+
+def upload_encryption_header(upload_id: str, bucket_name: str = "") -> str | None:
+    """The ``x-amz-server-side-encryption`` its CreateMultipartUpload carried, for the identity check of a part."""
+    upload = _upload_in_bucket_scope(bucket_name, upload_id) if bucket_name else _multipart_uploads.get(upload_id)
+    return upload.get("requested_sse") if upload else None
+
+
+def _write_kms_key(bucket_name: str, headers: dict) -> str | None:
+    """The ARN of the KMS key a write encrypts with, or None.
+
+    ``aws:kms`` without a key header and an ``aws:kms`` bucket default without a key take the ``aws/s3``
+    key; an SSE header of its own (AES256 included) overrides the bucket default; a key KMS refuses is None
+    (all recorded on AWS, us-east-2: that write fails before the policy).
+    """
+    return _resolve_kms_write(headers, bucket_name)[0]
+
+
+def kms_key_for_condition(bucket_name: str, headers: dict, upload_id: str | None = None) -> str | None:
+    """The key ARN of ``s3:x-amz-server-side-encryption-aws-kms-key-id`` for a PutObject, or None.
+
+    AWS holds the key ARN whether the request names the key by ID, alias, alias ARN or ARN, in this
+    account or another; a part, a part copy and the completion carry the key their upload started with
+    (recorded on AWS, us-east-2).
+    """
+    if upload_id:
+        upload = _upload_in_bucket_scope(bucket_name, upload_id)
+        return upload.get("kms_key") if upload else None
+    return _write_kms_key(_condition_bucket_name(bucket_name), headers)
+
+
+def _foreign_bucket_allows(owner_account: str, bucket_name: str, key: str,
+                           method: str, query_params: dict, caller: str, headers: dict | None = None) -> bool:
+    """Whether a caller who does not own the bucket may have this request.
+
+    The owner's grants decide it: a Group grant on the bucket or the object
+    ACL, a grant to the caller's canonical ID on the object ACL, or an allow
+    in the bucket policy. Nothing granted means the request is denied, which
+    is S3's default for a bucket nobody has opened up. IgnorePublicAcls drops
+    the Group grants and RestrictPublicBuckets a public policy.
+    """
+    object_acl, object_wants = _foreign_object_acl(owner_account, bucket_name, key, method, query_params)
+    caller_id = _canonical_owner_id(caller) if caller else ""
+    if any(grantee == caller_id and permission in object_wants
+           for grantee, permission in _acl_grants(object_acl, "ID")):
+        # A grant to one account is not public, so Block Public Access leaves it alone.
+        return True
+    wants = _bucket_acl_wants(method, bucket_name, key, query_params)
+    groups = [_ACL_GROUP_ALL_USERS] if not caller else [
+        _ACL_GROUP_ALL_USERS, _ACL_GROUP_AUTHENTICATED]
+    bucket = _buckets.get_scoped(owner_account, None, bucket_name)
+    # BucketOwnerEnforced disables the bucket ACL as well.
+    bucket_acl = None if bucket is None or _bucket_owner_enforced(bucket) else _bucket_acl.get_scoped(
+        owner_account, None, bucket_name)
+
+    if not _public_access_blocked(owner_account, bucket_name, "IgnorePublicAcls"):
+        for stored, granted in ((bucket_acl, wants), (object_acl, object_wants)):
+            for uri, permission in _acl_grants(stored):
+                if uri in groups and permission in granted:
+                    return True
+
+    return _bucket_policy_allows(owner_account, bucket_name, key, method, query_params, caller, headers)
+
+
+def _bucket_policy_allows(owner_account: str, bucket_name: str, key: str, method: str, query_params: dict,
+                          caller: str, headers: dict | None = None, extra_context: dict | None = None) -> bool:
+    """Whether the owner's bucket policy allows the caller's account (anonymous when *caller* is empty);
+    *extra_context* adds request condition keys, an access point's."""
+    policy = _bucket_policies.get_scoped(owner_account, None, bucket_name)
+    if policy and not (_public_access_blocked(owner_account, bucket_name, "RestrictPublicBuckets")
+                       and _policy_is_public(policy)):
+        from ministack.core.iam_actions import _s3_action, s3_service_context
+        from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+
+        path = f"/{bucket_name}/{key}" if key else f"/{bucket_name}"
+        action = f"s3:{_s3_action(method, path, query_params) or ('GetObject' if method in ('GET', 'HEAD') else 'PutObject')}"
+        resource = f"arn:aws:s3:::{bucket_name}"
+        with request_scope(owner_account, get_region()):
+            service_context = s3_service_context(action, query_params, path, headers or {})
+        ctx = EvalContext(
+            principal_arn=f"arn:aws:iam::{caller}:root" if caller else "*",
+            principal_type="Root" if caller else "Anonymous",
+            principal_account=caller or "",
+            action=action,
+            resource_arn=f"{resource}/{key}" if key else resource,
+            region=get_region(),
+            service_context={k.lower(): v for k, v in {**service_context, **(extra_context or {})}.items()},
+        )
+        if evaluate_resource_policy(policy, ctx).decision == "Allow":
+            return True
+    return False
+
+
+def _foreign_access_point_allows(owner_account: str, caller: str, record: dict, region: str, key: str,
+                                 headers: dict) -> bool:
+    """Without IAM enforcement, whether the owner's grants let another account PutObject through its access
+    point, as ``_foreign_bucket_allows`` decides a direct request: the access point policy and the bucket
+    policy must both allow the caller's account."""
+    from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+
+    arn = access_point_arn(record["Name"], owner_account, region)
+    keys = {"s3:DataAccessPointArn": arn, "s3:DataAccessPointAccount": owner_account,
+            "s3:AccessPointNetworkOrigin": record["NetworkOrigin"]}
+    ctx = EvalContext(
+        principal_arn=f"arn:aws:iam::{caller}:root", principal_type="Root", principal_account=caller,
+        action="s3:PutObject", resource_arn=f"{arn}/object/{key}", region=get_region(),
+        service_context={k.lower(): v for k, v in keys.items()},
+    )
+    if not _bucket_policy_allows(owner_account, record["Bucket"], key, "PUT", {}, caller, headers, keys):
+        return False
+    return evaluate_resource_policy(record.get("Policy") or "", ctx).decision == "Allow"
+
+
+def _foreign_object_acl(owner_account: str, bucket_name: str, key: str, method: str,
+                        query_params: dict) -> tuple[str | None, tuple[str, ...]]:
+    """The stored ACL of the object version a read addresses, and the permissions that grant the read."""
+    if not key or method not in ("GET", "HEAD") or any(q in query_params for q in _ACL_UNGRANTED_OBJECT_READS):
+        return None, ()
+    bucket = _buckets.get_scoped(owner_account, None, bucket_name)
+    if bucket is None or _bucket_owner_enforced(bucket):
+        # BucketOwnerEnforced disables ACLs: only policies grant access.
+        return None, ()
+    version_id = _resolve_subresource_version(query_params, bucket, key)
+    wants = _ACL_READ_ACP_PERMS if "acl" in query_params else _ACL_READ_PERMS
+    return _object_acl.get_scoped(owner_account, None, (bucket_name, key, version_id)), wants
+
+
+# The bucket ACL permission each action needs: READ lists, WRITE adds and removes objects.
+_BUCKET_ACL_PERMISSIONS = {
+    "ListBucket": "READ", "ListBucketVersions": "READ", "ListBucketMultipartUploads": "READ",
+    "ListMultipartUploadParts": "READ", "PutObject": "WRITE", "DeleteObject": "WRITE",
+    "AbortMultipartUpload": "WRITE", "GetBucketAcl": "READ_ACP", "PutBucketAcl": "WRITE_ACP",
+}
+
+
+def _bucket_acl_wants(method: str, bucket_name: str, key: str, query_params: dict) -> tuple[str, ...]:
+    """The bucket ACL permissions that grant the request's action, none for an action a bucket ACL cannot grant."""
+    from ministack.core.iam_actions import _s3_action
+
+    action = _s3_action(method, f"/{bucket_name}/{key}" if key else f"/{bucket_name}", query_params)
+    permission = _BUCKET_ACL_PERMISSIONS.get(action or "")
+    return (permission, "FULL_CONTROL") if permission else ()
+
+
+def _request_access_key(method: str, key: str, headers: dict, query_params: dict,
+                        body: bytes) -> str:
+    """The caller's access key, including the one a browser POST signs into its
+    form rather than a header or the query string."""
+    access_key = extract_access_key_id(headers, query_params)
+    if not access_key and method == "POST" and not key:
+        access_key = _post_form_access_key_id(
+            _parse_multipart_form(headers.get("content-type", ""), body))
+    return access_key
+
+
+_SIGV4_SCOPE_SERVICE_RE = re.compile(r"Credential=[^/]+/\d{8}/[^/]+/([^/]+)/aws4_request")
+
+
+def _signed_region(headers: dict, query_params: dict) -> str | None:
+    """The region a SigV4 request was signed for with service ``s3``, or None.
+
+    Unsigned, SigV2 and SigV4a requests carry no single signing region an S3
+    endpoint can be matched against, so they never fall back to a default."""
+    auth = headers.get("authorization", "")
+    if auth.startswith("AWS4-HMAC-SHA256"):
+        m = _SIGV4_SCOPE_SERVICE_RE.search(auth)
+        service = m.group(1) if m else ""
+    elif (_qp(query_params, "X-Amz-Algorithm", "") or _qp(query_params, "x-amz-algorithm", "")) == "AWS4-HMAC-SHA256":
+        parts = (_qp(query_params, "X-Amz-Credential", "") or _qp(query_params, "x-amz-credential", "")).split("/")
+        service = parts[3] if len(parts) == 5 else ""
+    else:
+        return None
+    if service != "s3":
+        return None
+    return extract_signed_region(headers, query_params)
+
+
+def bucket_region(name: str) -> str | None:
+    """Home region of a bucket in the current scope, or None if it doesn't exist."""
+    record = _buckets.get(name)
+    if record is None:
+        return None
+    return record.get("region") or os.environ.get("MINISTACK_REGION", "us-east-1")
+
+
+def _bucket_region_for_caller(name: str) -> str | None:
+    """Home region of the bucket *name* that the current caller reads, in the account that owns it."""
+    owner = _bucket_owner_for_caller(name)
+    if owner is None:
+        return None
+    with request_scope(owner, get_region()):
+        return bucket_region(name)
+
+
+_REGION_LABEL_RE = re.compile(r"^[a-z]{2}(?:-[a-z]+)+-\d+$")
+
+
+def _host_region(headers: dict) -> str | None:
+    """Region named by a regional S3 host (``s3.<region>.…`` or
+    ``<bucket>.s3.<region>.…``), or None for a global or custom host."""
+    labels = headers.get("host", "").lower().rsplit(":", 1)[0].split(".")
+    for i, label in enumerate(labels[:-1]):
+        if label == "s3" and _REGION_LABEL_RE.match(labels[i + 1]):
+            return labels[i + 1]
+    return None
+
+
+_PERMANENT_REDIRECT_MSG = (
+    "The bucket you are attempting to access must be addressed using the specified "
+    "endpoint. Please send all future requests to this endpoint."
+)
+
+
+def _check_bucket_region(method: str, bucket: str, key: str, headers: dict, query_params: dict,
+                         home: str | None = None):
+    """Refuse a request signed for another region than the bucket's home.
+
+    A client configured for the signing region calls that region's endpoint,
+    and AWS answers it with ``301 PermanentRedirect`` plus
+    ``x-amz-bucket-region``, which SDKs follow. Only a request that reached the
+    bucket's own regional endpoint with a signature for another region gets the
+    ``400`` authorization errors carrying ``<Region>``. ``home`` overrides the
+    bucket's region (an access point's region)."""
+    if not bucket:
+        return None
+    signed = _signed_region(headers, query_params)
+    if signed is None:
+        return None
+    if method == "GET" and not key and "location" in query_params:
+        return None
+    if method == "PUT" and not key and not query_params:
+        return None  # CreateBucket has its own location-constraint rules
+    home = home or bucket_region(bucket)
+    if home is None or home == signed:
+        return None
+    return region_mismatch_error(method, bucket, key, headers, query_params, signed, home)
+
+
+def _region_set_mismatch(bucket: str, key: str, headers: dict, query_params: dict, home: str | None = None):
+    """Under AUTH=true, refuse a SigV4a request whose region set leaves out the bucket's (or access point's) region."""
+    from ministack.app import AUTH
+    from ministack.core.sigv4 import SIGV4A, region_set_covers
+
+    if not AUTH or not bucket:
+        return None
+    if headers.get("authorization", "").startswith(SIGV4A):
+        region_set = headers.get("x-amz-region-set", "")
+    elif (_qp(query_params, "X-Amz-Algorithm", "") or _qp(query_params, "x-amz-algorithm", "")) == SIGV4A:
+        region_set = _qp(query_params, "X-Amz-Region-Set", "") or _qp(query_params, "x-amz-region-set", "")
+    else:
+        return None
+    home = home or bucket_region(bucket)
+    if home is None or region_set_covers(region_set, home):
+        return None
+    return _error("RegionSetMismatch", "The provided X-Amz-Region-Set doesn't match against the requested S3 region.",
+                  400, f"/{bucket}/{key}" if key else f"/{bucket}")
+
+
+def region_mismatch_error(method: str, bucket: str, key: str, headers: dict, query_params: dict,
+                          signed: str, home: str) -> tuple:
+    """The response to a request signed for ``signed`` that belongs to ``home``."""
+    resource = f"/{bucket}/{key}" if key else f"/{bucket}"
+    presigned = bool(_qp(query_params, "X-Amz-Algorithm", "") or _qp(query_params, "x-amz-algorithm", ""))
+    if _host_region(headers) == home:
+        if method == "HEAD":
+            hdrs = {} if key else {"x-amz-bucket-region": home}
+            return 400, {"Content-Type": "application/xml", **hdrs}, b""
+        if presigned:
+            return _error(
+                "AuthorizationQueryParametersError",
+                f"Error parsing the X-Amz-Credential parameter; the region '{signed}' is wrong; "
+                f"expecting '{home}'",
+                400, resource, extra={"Region": home},
+            )
+        return _error(
+            "AuthorizationHeaderMalformed",
+            f"The authorization header is malformed; the region '{signed}' is wrong; expecting '{home}'",
+            400, resource, extra={"Region": home},
+        )
+
+    region_header = {"x-amz-bucket-region": home}
+    if method == "HEAD":
+        return 301, {"Content-Type": "application/xml", **region_header}, b""
+    if signed == "us-east-1" and _host_region(headers) is None:
+        endpoint = f"{bucket}.s3.amazonaws.com"
+    else:
+        endpoint = f"{bucket}.s3-{home}.amazonaws.com"
+    return _error("PermanentRedirect", _PERMANENT_REDIRECT_MSG, 301, resource,
+                  extra={"Endpoint": endpoint, "Bucket": bucket}, headers=region_header)
+
+
+def _apply_bucket_scope(method: str, bucket: str, key: str, headers: dict,
+                        query_params: dict, body: bytes = b"", internal: bool = False):
+    """Resolve the request's bucket in the global namespace and gate it.
+
+    A bucket name identifies one bucket whoever asks, so a request for a name
+    another account owns is answered by that bucket — if its owner granted the
+    access. The scope is pinned to the owner for the rest of the request, so
+    every account-scoped lookup behind this reads the right tenant's state.
+
+    Under AUTH=true a request without credentials is anonymous, as on AWS: only
+    the owner's public grants let it in, whichever account owns the bucket. An
+    ``internal`` call another service makes in process is never anonymous.
+    """
+    if not bucket:
+        return None
+    owner = _bucket_owner_account(bucket)
+    if owner is None:
+        return None
+    from ministack.app import AUTH
+    anonymous = AUTH and not internal and not _request_access_key(method, key, headers, query_params, body)
+    source_denied = _copy_source_denied(headers, "" if anonymous else get_account_id(), anonymous, internal)
+    if source_denied is not None:
+        return source_denied
+    if anonymous:
+        if not _foreign_bucket_allows(owner, bucket, key, method, query_params, "", headers):
+            return _error("AccessDenied", "Access Denied", 403, f"/{bucket}/{key}" if key else f"/{bucket}")
+        set_request_account_id(owner)
+        return None
+    caller = get_account_id()
+    if owner is None or owner == caller:
+        return None
+    if method == "PUT" and not key and not query_params:
+        # CreateBucket answers BucketAlreadyExists for a taken name.
+        return None
+    access_key = _request_access_key(method, key, headers, query_params, body)
+    if access_key and _account_from_access_key(access_key) == owner:
+        # The caller is the owner; the credential just was not in a header.
+        set_request_account_id(owner)
+        return None
+    if not _foreign_bucket_allows(owner, bucket, key, method, query_params, access_key and caller, headers):
+        return _error("AccessDenied", "Access Denied", 403, f"/{bucket}/{key}" if key else f"/{bucket}")
+    set_request_account_id(owner)
+    return None
+
+
+def _copy_source_denied(headers: dict, caller: str, anonymous: bool, internal: bool):
+    """AccessDenied when a copy reads a source object its caller may not read in another account's bucket."""
+    source = headers.get("x-amz-copy-source", "")
+    if internal or not source:
+        return None
+    src, _, query = source.partition("?")
+    src_bucket, _, src_key = url_unquote(src).lstrip("/").partition("/")
+    src_owner = _bucket_owner_account(src_bucket)
+    if src_owner is None or (not anonymous and src_owner == caller):
+        return None
+    version = _parse_qs(query).get("versionId")
+    if _foreign_bucket_allows(src_owner, src_bucket, src_key, "GET", {"versionId": version} if version else {},
+                              caller):
+        return None
+    return _error("AccessDenied", "Access Denied", 403, f"/{src_bucket}/{src_key}")
+
+
 def _ensure_bucket(name: str):
     return _buckets.get(name)
 
 
 def _no_such_bucket(name: str) -> tuple:
-    return _error(
-        "NoSuchBucket", "The specified bucket does not exist", 404, f"/{name}"
-    )
+    return _error("NoSuchBucket", "The specified bucket does not exist", 404, f"/{name}")
 
 
 def _validate_bucket_name(name: str) -> bool:
@@ -255,8 +1627,193 @@ def _validate_bucket_name(name: str) -> bool:
     return True
 
 
+def _object_error(code: str, message: str, status: int, **fields) -> tuple:
+    """Error envelope observed on real S3 PUT/GET/DELETE (Osaka, 2026-10-16/18/23)."""
+    request_id = "".join(random.choices(string.ascii_uppercase + string.digits, k=16))
+    host_id = base64.b64encode(os.urandom(57)).decode()
+    root = Element("Error")
+    for name, value in {"Code": code, "Message": message, **fields,
+                        "RequestId": request_id, "HostId": host_id}.items():
+        SubElement(root, name).text = value
+    return status, {"Content-Type": "application/xml", "x-amz-request-id": request_id,
+                    "x-amz-id-2": host_id}, _xml_body(root)
+
+
+def is_standard_object_request(method: str, path: str, headers: dict, query_params: dict) -> bool:
+    """Limit error precedence changes to ordinary header-signed bucket/object calls."""
+    bucket, key = _parse_bucket_key(path, headers)
+    return (method in {"PUT", "GET", "HEAD", "DELETE"} and bool(bucket) and (bool(key) or method == "HEAD")
+            and "x-amz-copy-source" not in headers and not query_params.keys() - {"x-id"}
+            and headers.get("authorization", "").startswith("AWS4-HMAC-SHA256")
+            and not bucket.endswith((_ACCESS_POINT_ALIAS_SUFFIX, _OBJECT_LAMBDA_ALIAS_SUFFIX)))
+
+
+def format_head_response(path: str, headers: dict, response: tuple) -> tuple:
+    """HEAD observations from real S3, Osaka, 2026-10-23: no error body or length.
+
+    Run after IAM as well as preflight so a HeadBucket denial exposes location,
+    without granting access. Successful HeadObject retains its object metadata.
+    """
+    bucket, key = _parse_bucket_key(path, headers)
+    status, response_headers, _ = response
+    response_headers = {k: v for k, v in response_headers.items()
+                        if k.lower() != "content-length" or (key and status in {200, 206})}
+    if status == 301 or status >= 400:
+        response_headers["Content-Type"] = "application/xml"
+    # Preflight already supplies S3 IDs. Normal handlers may supply a UUID,
+    # and IAM denials may supply none: normalize only those request IDs while
+    # retaining an existing HostId and any already compatible RequestId.
+    if not re.fullmatch(r"[A-Z0-9]{16}", response_headers.get("x-amz-request-id", "")):
+        response_headers["x-amz-request-id"] = "".join(random.choices(string.ascii_uppercase + string.digits, k=16))
+    if not response_headers.get("x-amz-id-2"):
+        response_headers["x-amz-id-2"] = base64.b64encode(os.urandom(57)).decode()
+    owner = _bucket_owner_account(bucket) if _validate_bucket_name(bucket) else None
+    if not key and owner is not None:
+        record = _buckets.get_scoped(owner, None, bucket)
+        response_headers["x-amz-bucket-region"] = record.get("region") or os.environ.get("MINISTACK_REGION", "us-east-1")
+        if status == 200:
+            response_headers["x-amz-bucket-arn"] = f"arn:aws:s3:::{bucket}"
+    return status, response_headers, b""
+
+
+def validate_write_request(method: str, path: str, headers: dict, query_params: dict) -> tuple | None:
+    """Before IAM, the encryption and upload-id answers S3 gives ahead of any authorization.
+
+    Recorded on AWS, us-east-2, under a bucket policy denying PutObject, an identity policy without an S3
+    allow and an explicit identity deny: PutObject, CopyObject and CreateMultipartUpload answer the SSE
+    header errors and KMS's refusal of the key, UploadPart and CompleteMultipartUpload answer NoSuchUpload
+    for an unknown upload.  Only an authenticated request for an existing bucket; the rest keep their
+    paths.
+    """
+    from ministack.core.iam_evaluator import AuthError, authenticate
+    from ministack.core.sigv4 import parse_header_signature
+
+    bucket, key = _parse_bucket_key(path, headers)
+    if not bucket or not key or not headers.get("authorization", "").startswith("AWS4-HMAC-SHA256"):
+        return None
+    if _write_operation(method, headers, query_params) is None:
+        return None
+    signature = parse_header_signature(headers)
+    if isinstance(signature, tuple) or isinstance(authenticate(signature.access_key_id, get_account_id()), AuthError):
+        return None  # The shared malformed-signature and authentication answers.
+    return write_request_error(method, bucket, key, headers, query_params)
+
+
+def _write_operation(method: str, headers: dict, query_params: dict) -> str | None:
+    """``write`` (PutObject, CopyObject, CreateMultipartUpload), ``part`` (UploadPart) or ``complete``."""
+    params = set(query_params) - {"x-id"}
+    copy = "x-amz-copy-source" in headers
+    if method == "PUT" and not params:
+        operation = "write"  # PutObject or CopyObject
+    elif method == "POST" and params == {"uploads"}:
+        operation = "write"  # CreateMultipartUpload
+    elif method == "PUT" and params == {"partNumber", "uploadId"} and not copy:
+        operation = "part"
+    elif method == "POST" and params == {"uploadId"}:
+        operation = "complete"
+    else:
+        return None
+    return operation
+
+
+def write_request_error(method: str, bucket: str, key: str, headers: dict, query_params: dict) -> tuple | None:
+    """The encryption and upload-id answer S3 gives a write ahead of any authorization, or None.
+
+    Shared by the pre-IAM check and, without IAM, by the handler ahead of the owner's grants of another account's
+    bucket or access point, so both modes answer in AWS's order.
+    """
+    operation = _write_operation(method, headers, query_params)
+    if operation is None or not bucket or not key:
+        return None
+    upload_id = _qp(query_params, "uploadId")
+    resolved = _condition_bucket_name(bucket)
+    if (resolved.endswith(_ACCESS_POINT_ALIAS_SUFFIX) and is_foreign_access_point_put(method, key, headers, query_params)
+            and (found := resolve_access_point_alias(resolved))):
+        resolved, alias = found[2]["Bucket"], resolved  # Another account's access point, as its bucket.
+    else:
+        alias = resolved
+    if _bucket_owner_account(resolved) is None:
+        return None
+    if operation == "write":
+        _, error = _resolve_kms_write(headers, alias, reject_orphan_key=True)
+        return error
+    with request_scope(_bucket_owner_account(resolved) or get_account_id(), get_region()):
+        known = upload_id in _multipart_uploads
+        cached = _completed_multipart_uploads.get(upload_id)
+    if known:
+        return None
+    if operation == "complete" and cached is not None and cached.get("key") == key:
+        return None
+    return _no_such_upload(upload_id)
+
+
+def validate_object_request(method: str, path: str, headers: dict, query_params: dict) -> tuple | None:
+    """Before IAM, check ordinary header-signed object calls in S3's observed order.
+
+    Called only with AUTH=true. Regional hosts distinguish the endpoint region
+    from the signing region. The handler still enforces the bucket's home
+    region for bare local endpoints. GET checks the signing region before the
+    bucket's home; PUT, HEAD and DELETE check the home first. Copy, multipart, presigned and
+    subresource requests keep their existing validation paths.
+    """
+    from ministack.core.iam_actions import _auth_failure
+    from ministack.core.iam_evaluator import AuthError, authenticate
+    from ministack.core.sigv4 import parse_header_signature
+
+    bucket, key = _parse_bucket_key(path, headers)
+    if not is_standard_object_request(method, path, headers, query_params):
+        return None
+    if not _validate_bucket_name(bucket):
+        return _object_error("InvalidBucketName", "The specified bucket is not valid.", 400, BucketName=bucket)
+    signature = parse_header_signature(headers)
+    if isinstance(signature, tuple):
+        return None  # Keep the shared malformed-signature handling.
+    owner = _bucket_owner_account(bucket)
+    record = _buckets.get_scoped(owner, None, bucket) if owner is not None else None
+    host = headers.get("host", "").lower()
+    regional = re.search(r"(?:^|\.)s3[.-]([a-z]{2}(?:-[a-z]+)+-\d+)\.(.+)$", host)
+    if regional:
+        endpoint_region, suffix = regional.groups()
+        if method == "GET" and signature.region != endpoint_region:
+            return _object_error(
+                "AuthorizationHeaderMalformed", "The authorization header is malformed; "
+                f"the region '{signature.region}' is wrong; expecting '{endpoint_region}'", 400, Region=endpoint_region,
+            )
+        bucket_region = (record or {}).get("region") or os.environ.get("MINISTACK_REGION", "us-east-1")
+        if record is not None and bucket_region != endpoint_region:
+            endpoint = f"{bucket}.s3.{bucket_region}.{suffix}"
+            fields = ({"Bucket": bucket, "Endpoint": endpoint} if method == "GET"
+                      else {"Endpoint": endpoint, "Bucket": bucket})
+            response = _object_error(
+                "PermanentRedirect", "The bucket you are attempting to access must be addressed using the specified "
+                "endpoint. Please send all future requests to this endpoint.", 301,
+                **fields,
+            )
+            response[1]["x-amz-bucket-region"] = bucket_region
+            return response
+        if signature.region != endpoint_region:
+            return _object_error(
+                "AuthorizationHeaderMalformed", "The authorization header is malformed; "
+                f"the region '{signature.region}' is wrong; expecting '{endpoint_region}'", 400, Region=endpoint_region,
+            )
+    denied = authenticate(signature.access_key_id, get_account_id())
+    if isinstance(denied, AuthError):
+        code, status, message = _auth_failure("s3", denied.code, denied.message, headers)
+        fields = denied.details
+        if code == "InvalidAccessKeyId":
+            fields = {"AWSAccessKeyId": signature.access_key_id}
+        return _object_error(code, message, status, **fields)
+    if record is None:
+        return _object_error("NoSuchBucket", "The specified bucket does not exist", 404, BucketName=bucket)
+    return None
+
+
 def _url_encode(value: str) -> str:
-    return url_quote(value, safe="")
+    # S3's `encoding-type=url` percent-encodes key names (spaces, `+`, unicode,
+    # control chars) but leaves the forward slash intact, so a delimiter-collapsed
+    # `CommonPrefixes`/`Delimiter`/`Key` keeps its `/` separators readable — matching
+    # real S3 and RGW. Encoding `/` as %2F broke folder-tree listings. (#1322)
+    return url_quote(value, safe="/")
 
 
 def _parse_bucket_key(path: str, headers: dict):
@@ -294,16 +1851,113 @@ def _parse_range(range_header: str, total: int):
     return start, end
 
 
+_RESPONSE_OVERRIDE_PARAMS = (
+    "response-cache-control",
+    "response-content-disposition",
+    "response-content-encoding",
+    "response-content-language",
+    "response-content-type",
+    "response-expires",
+)
+
+
+def _apply_response_overrides(resp_headers: dict, query_params: dict) -> None:
+    """Apply the six ``response-*`` GetObject query-string overrides to the
+    outgoing response headers, matching real S3:
+
+      response-cache-control       → Cache-Control
+      response-content-disposition → Content-Disposition
+      response-content-encoding    → Content-Encoding
+      response-content-language    → Content-Language
+      response-content-type        → Content-Type
+      response-expires             → Expires
+
+    Each override REPLACES the corresponding response header. Empty values
+    are ignored (boto3 doesn't send the param if you pass ``None``). The
+    signedness gate runs separately in ``_reject_response_overrides_if_unsigned``;
+    by the time this helper runs we've already accepted the request.
+    """
+    overrides = (
+        ("response-cache-control", "Cache-Control"),
+        ("response-content-disposition", "Content-Disposition"),
+        ("response-content-encoding", "Content-Encoding"),
+        ("response-content-language", "Content-Language"),
+        ("response-content-type", "Content-Type"),
+        ("response-expires", "Expires"),
+    )
+    for qkey, hkey in overrides:
+        val = _qp(query_params, qkey, "")
+        if not val:
+            continue
+        # Replace, don't append: the put-side preserved-headers dict stores
+        # keys lowercased (cache-control, content-disposition, …) and the
+        # default headers dict uses mixed case (Cache-Control). HTTP libs
+        # serialise both, so without an explicit case-insensitive remove the
+        # client sees the override appended to the original (e.g.
+        # "max-age=600, no-store"). Strip every case variant of the target
+        # before writing the override value.
+        target_lc = hkey.lower()
+        for existing in list(resp_headers):
+            if existing.lower() == target_lc:
+                del resp_headers[existing]
+        resp_headers[hkey] = val
+
+
+def _reject_response_overrides_if_unsigned(
+    headers: dict,
+    query_params: dict,
+    bucket_name: str,
+    key: str,
+):
+    """Implement the AWS rule for GetObject's six ``response-*`` query params.
+
+    Per the AWS API reference:
+
+      "When you use these parameters, you must sign the request by using
+       either an Authorization header or a presigned URL. These parameters
+       cannot be used with an unsigned (anonymous) request."
+
+    A request is considered signed if it carries an ``Authorization`` header
+    or a presigned-URL marker (``X-Amz-Signature`` / ``X-Amz-Algorithm`` in
+    the query string — boto3 lower-cases query keys when calling our
+    handlers, so check both cases). Otherwise the six ``response-*`` params
+    are rejected with ``InvalidRequest`` (400) and the AWS-canonical message
+    "Request specific response headers cannot be used for anonymous GET
+    requests."
+    """
+    has_override = any(_qp(query_params, p, "") for p in _RESPONSE_OVERRIDE_PARAMS)
+    if not has_override:
+        return None
+    if headers.get("authorization"):
+        return None
+    if (
+        _qp(query_params, "X-Amz-Signature", "")
+        or _qp(query_params, "x-amz-signature", "")
+        or _qp(query_params, "X-Amz-Algorithm", "")
+        or _qp(query_params, "x-amz-algorithm", "")
+    ):
+        return None
+    return _error(
+        "InvalidRequest",
+        "Request specific response headers cannot be used for anonymous GET requests.",
+        400,
+        f"/{bucket_name}/{key}",
+    )
+
+
 def _validate_content_md5(headers: dict, body: bytes):
     md5_header = headers.get("content-md5", "")
     if not md5_header:
         return None
     try:
-        expected = base64.b64decode(md5_header)
+        expected = base64.b64decode(md5_header, validate=True)
     except Exception:
-        return _error(
-            "InvalidDigest", "The Content-MD5 you specified is not valid.", 400
-        )
+        return _error("InvalidDigest", "The Content-MD5 you specified is not valid.", 400)
+    # A valid MD5 digest is exactly 16 bytes. A wrong-length (e.g. truncated) value
+    # is malformed, so AWS answers InvalidDigest, not BadDigest (which is reserved
+    # for a well-formed digest that simply doesn't match the body). (#1322)
+    if len(expected) != 16:
+        return _error("InvalidDigest", "The Content-MD5 you specified is not valid.", 400)
     actual = hashlib.md5(body).digest()
     if expected != actual:
         return _error(
@@ -314,6 +1968,167 @@ def _validate_content_md5(headers: dict, body: bytes):
     return None
 
 
+def _check_put_preconditions(headers: dict, existing_obj: dict | None):
+    """Evaluate `If-Match` and `If-None-Match` on a conditional write.
+
+    AWS S3 added native conditional writes — on PutObject and
+    CompleteMultipartUpload alike — in November 2024:
+      - `If-None-Match: "*"` — succeed only when no object exists at the key.
+        Used to implement create-once semantics (idempotent writes, distributed
+        leader election via S3, two-file pair serialization).
+      - `If-None-Match: "<etag>"` — succeed only when the existing object's
+        ETag does NOT match.
+      - `If-Match: "*"` — succeed only when an object already exists.
+      - `If-Match: "<etag>"` — succeed only when the existing object's ETag
+        matches.
+
+    Returns an error tuple when a condition is violated — 412
+    PreconditionFailed, except that If-Match against a missing key is 404
+    NoSuchKey — otherwise returns None and the caller proceeds with the write.
+
+    ETag comparison strips surrounding quotes on both sides — S3 stores ETags
+    with quotes but client code is inconsistent about including them.
+    """
+    if_none_match = headers.get("if-none-match", "").strip()
+    if_match = headers.get("if-match", "").strip()
+
+    if not if_none_match and not if_match:
+        return None
+
+    existing_etag = existing_obj["etag"].strip('"') if existing_obj is not None else None
+
+    if if_none_match:
+        # "*" form: any existing object violates the condition.
+        if if_none_match == "*":
+            if existing_obj is not None:
+                return _error(
+                    "PreconditionFailed",
+                    "At least one of the pre-conditions you specified did not hold",
+                    412,
+                )
+        # ETag form: existing object with matching ETag violates the condition.
+        elif existing_obj is not None and if_none_match.strip('"') == existing_etag:
+            return _error(
+                "PreconditionFailed",
+                "At least one of the pre-conditions you specified did not hold",
+                412,
+            )
+
+    if if_match:
+        if existing_obj is None:
+            # AWS S3 specifically returns 404 (NoSuchKey) — not the RFC 7232
+            # 412 — when If-Match targets a key that doesn't exist (or whose
+            # current version is a delete marker), for the "*" form as well as
+            # the ETag form.  Documented under "Conditional write behavior" in
+            # the user guide:
+            # https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html#conditional-error-response
+            return _error(
+                "NoSuchKey",
+                "The specified key does not exist.",
+                404,
+            )
+        if if_match != "*" and if_match.strip('"') != existing_etag:
+            return _error(
+                "PreconditionFailed",
+                "At least one of the pre-conditions you specified did not hold",
+                412,
+            )
+
+    return None
+
+
+def _etag_condition_matches(field_value: str, etag: str) -> bool:
+    """Whether an `If-Match`/`If-None-Match` field value selects this object.
+
+    The value is a comma-separated list of entity tags, or `*` for "any
+    representation" — which is always satisfied here, since the caller has
+    already resolved the object. A weak tag compares equal to its strong form:
+    S3 only ever mints strong ETags, and If-None-Match uses the weak comparison
+    anyway (RFC 9110 13.1.2). `etag` is expected unquoted.
+    """
+    if field_value == "*":
+        return True
+    for candidate in field_value.split(","):
+        candidate = candidate.strip()
+        if candidate[:2].upper() == "W/":
+            candidate = candidate[2:]
+        if candidate.strip('"') == etag:
+            return True
+    return False
+
+
+def _not_modified(resp_headers: dict):
+    """A 304 for a read whose caller already holds the current representation.
+
+    Keeps the validators the 200 would have carried — the ETag above all, which
+    is how the client confirms which representation it just revalidated — and
+    drops the headers that describe a payload, since a 304 ends at the header
+    section and can never carry one (RFC 9110 15.4.5).
+    """
+    payload_headers = {
+        "content-length",
+        "content-type",
+        "content-encoding",
+        "accept-ranges",
+    }
+
+    def describes_payload(name: str) -> bool:
+        lowered = name.lower()
+        # x-amz-checksum-* is a checksum of bytes this response does not carry.
+        # boto3 asks for them by default and, seeing one, wraps the body in a
+        # validating stream it then cannot parse — the same hazard that keeps
+        # them off a 206 partial response.
+        return lowered in payload_headers or lowered.startswith("x-amz-checksum-")
+
+    return (
+        304,
+        {k: v for k, v in resp_headers.items() if not describes_payload(k)},
+        b"",
+    )
+
+
+def _check_read_preconditions(headers: dict, obj: dict, resp_headers: dict):
+    """Evaluate the four conditional-read headers on GetObject/HeadObject.
+
+    Returns a finished response tuple — 412 PreconditionFailed when the request
+    asked for a representation this object no longer is, or 304 Not Modified
+    when the caller's copy is still current — otherwise None, and the read
+    proceeds normally. Answering conditional reads is what lets caches, `curl
+    -z`, and every "download only if it changed" client avoid refetching a body
+    they already have.
+
+    Precedence follows RFC 9110 13.2.2 and the AWS GetObject reference: the
+    entity-tag header wins over its date counterpart, so If-Unmodified-Since is
+    consulted only without If-Match, and If-Modified-Since only without
+    If-None-Match.
+    """
+    _precond_msg = "At least one of the pre-conditions you specified did not hold"
+    etag = (obj.get("etag") or "").strip('"')
+    mtime = _object_mtime_dt(obj)
+
+    if_match = (headers.get("if-match") or "").strip()
+    if if_match:
+        if not _etag_condition_matches(if_match, etag):
+            return _error("PreconditionFailed", _precond_msg, 412)
+    else:
+        unmod = _parse_http_date(headers.get("if-unmodified-since", ""))
+        # "Unmodified since" fails when the object was written after that time.
+        if unmod and mtime and mtime > unmod:
+            return _error("PreconditionFailed", _precond_msg, 412)
+
+    if_none_match = (headers.get("if-none-match") or "").strip()
+    if if_none_match:
+        if _etag_condition_matches(if_none_match, etag):
+            return _not_modified(resp_headers)
+    else:
+        mod = _parse_http_date(headers.get("if-modified-since", ""))
+        # Not modified since that time means the caller's copy is still current.
+        if mod and mtime and mtime <= mod:
+            return _not_modified(resp_headers)
+
+    return None
+
+
 def _find_xml_tag(parent, tag_name, ns=S3_NS):
     el = parent.find("{%s}%s" % (ns, tag_name))
     if el is None:
@@ -321,24 +2136,83 @@ def _find_xml_tag(parent, tag_name, ns=S3_NS):
     return el
 
 
-def _parse_tags_xml(body: bytes) -> dict:
-    xml_root = fromstring(body)
-    tags = {}
+def _iter_tag_pairs(xml_root):
+    """Yield (key, value) for each <Tag> element, preserving duplicate keys."""
     for tag_el in xml_root.iter():
         local = tag_el.tag.split("}")[-1] if "}" in tag_el.tag else tag_el.tag
         if local == "Tag":
             key_text = val_text = None
             for child in tag_el:
-                child_local = (
-                    child.tag.split("}")[-1] if "}" in child.tag else child.tag
-                )
+                child_local = child.tag.split("}")[-1] if "}" in child.tag else child.tag
                 if child_local == "Key":
                     key_text = child.text
                 elif child_local == "Value":
                     val_text = child.text
             if key_text is not None:
-                tags[key_text] = val_text or ""
-    return tags
+                yield key_text, val_text or ""
+
+
+def _parse_tags_xml(body: bytes) -> dict:
+    """Parse a <Tag> set into {key: value}. Duplicate keys collapse last-writer-wins."""
+    return {key: value for key, value in _iter_tag_pairs(fromstring(body))}
+
+
+def _duplicate_tag_error(xml_root, resource: str = ""):
+    """Return the 500 InternalError that real S3 raises when a CreateBucket
+    <Tags> body repeats a tag key, or None when every key is unique."""
+    seen = set()
+    for key, _value in _iter_tag_pairs(xml_root):
+        if key in seen:
+            return _error(
+                "InternalError",
+                "We encountered an internal error. Please try again.",
+                500,
+                resource,
+            )
+        seen.add(key)
+    return None
+
+
+def _validate_bucket_tags(tags: dict, resource: str = ""):
+    """Validate an already-parsed {key: value} bucket tag set against the S3
+    tag constraints. Returns an S3 error-response tuple on the first violation,
+    or None when the tag set is valid:
+      key   : 1-128 Unicode chars, cannot use the reserved "aws:" prefix
+      value : 0-256 Unicode chars (an empty value is allowed)
+      at most 50 tags per bucket.
+    """
+    for key, value in tags.items():
+        if not (1 <= len(key) <= 128):
+            return _error(
+                "InvalidTag",
+                "The TagKey you have provided is invalid",
+                400,
+                resource,
+            )
+        if len(value) > 256:
+            return _error(
+                "InvalidTag",
+                "The TagValue you have provided is invalid",
+                400,
+                resource,
+            )
+        if key.startswith("aws:"):
+            return _error(
+                "InvalidTag",
+                'User-defined tag keys can\'t start with "aws:". This prefix is '
+                'reserved for system tags. Remove "aws:" from your tag keys and '
+                "try again.",
+                400,
+                resource,
+            )
+    if len(tags) > 50:
+        return _error(
+            "BadRequest",
+            "Bucket tag count cannot be greater than 50",
+            400,
+            resource,
+        )
+    return None
 
 
 def _extract_user_metadata(headers: dict) -> dict:
@@ -349,7 +2223,7 @@ def _extract_user_metadata(headers: dict) -> dict:
     return meta
 
 
-def _build_object_record(body: bytes, headers: dict, etag: str = None) -> dict:
+def _build_object_record(body: bytes, headers: dict, etag: str = None, checksums: dict | None = None) -> dict:
     content_type = headers.get("content-type", "application/octet-stream")
     content_encoding = headers.get("content-encoding")
     preserved = {}
@@ -368,10 +2242,240 @@ def _build_object_record(body: bytes, headers: dict, etag: str = None) -> dict:
         "metadata": _extract_user_metadata(headers),
         "preserved_headers": preserved,
         "storage_class": headers.get("x-amz-storage-class") or "STANDARD",
+        # AWS-shape checksums (SHA256 / SHA1 / CRC32 / CRC32C / CRC64NVME),
+        # stored uppercase-keyed and base64-encoded per the S3 wire contract.
+        # Surfaced on Get/HeadObject via the `x-amz-checksum-*` headers only
+        # when the caller sends `x-amz-checksum-mode: ENABLED`.
+        "checksums": checksums or {},
     }
 
 
-def _object_response_headers(obj: dict, bucket_name: str = "", key: str = "") -> dict:
+# ---------------------------------------------------------------------------
+# AWS-shape checksum handling (SHA256 / SHA1 / CRC32 / CRC32C / CRC64NVME)
+# ---------------------------------------------------------------------------
+
+_S3_CHECKSUM_HEADERS = ("crc32", "crc32c", "crc64nvme", "sha1", "sha256")
+
+# CRC-64/NVME is the algorithm current AWS SDKs and the CLI checksum uploads
+# with by default, so refusing it fails a stock `aws s3 cp` before it starts.
+# It is plain arithmetic — the reflected form of polynomial 0xAD93D23594C93659
+# with all-ones init and xorout — so a byte-at-a-time table keeps it in the
+# stdlib instead of pulling in a native CRC library. Checked against the
+# algorithm's published check value in tests: b"123456789" hashes to
+# 0xAE8B14860A799888.
+_CRC64NVME_POLY = 0x9A6C9329AC4BC9B5
+_CRC64NVME_INIT = 0xFFFFFFFFFFFFFFFF
+
+
+def _build_crc64nvme_table() -> tuple:
+    table = []
+    for byte in range(256):
+        crc = byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ _CRC64NVME_POLY if crc & 1 else crc >> 1
+        table.append(crc)
+    return tuple(table)
+
+
+_CRC64NVME_TABLE = _build_crc64nvme_table()
+
+
+def _crc64nvme(body: bytes) -> int:
+    crc = _CRC64NVME_INIT
+    table = _CRC64NVME_TABLE
+    for byte in body:
+        crc = table[(crc ^ byte) & 0xFF] ^ (crc >> 8)
+    return crc ^ _CRC64NVME_INIT
+
+
+# CRC32C (Castagnoli) -- the same table-driven approach as CRC64NVME.
+# Reflected polynomial 0x82F63B78 with all-ones init and xorout.
+# Check value: crc32c(b"123456789") == 0xE3069283.
+_CRC32C_POLY = 0x82F63B78
+_CRC32C_INIT = 0xFFFFFFFF
+
+
+def _build_crc32c_table() -> tuple:
+    table = []
+    for byte in range(256):
+        crc = byte
+        for _ in range(8):
+            crc = (crc >> 1) ^ _CRC32C_POLY if crc & 1 else crc >> 1
+        table.append(crc)
+    return tuple(table)
+
+
+_CRC32C_TABLE = _build_crc32c_table()
+
+
+def _crc32c(body: bytes) -> int:
+    crc = _CRC32C_INIT
+    table = _CRC32C_TABLE
+    for byte in body:
+        crc = table[(crc ^ byte) & 0xFF] ^ (crc >> 8)
+    return crc ^ _CRC32C_INIT
+
+
+def _compute_s3_checksum(algorithm: str, body: bytes) -> str | None:
+    """Return base64-encoded checksum for the given AWS S3 algorithm name.
+
+    SHA256 / SHA1 / CRC32 come from the stdlib; CRC64NVME and CRC32C from the
+    tables above. An algorithm outside those five returns None and the caller
+    refuses the request rather than storing a value it could never verify.
+    """
+    algo = (algorithm or "").upper().replace("_", "")
+    if algo == "SHA256":
+        return base64.b64encode(hashlib.sha256(body).digest()).decode()
+    if algo == "SHA1":
+        return base64.b64encode(hashlib.sha1(body).digest()).decode()
+    if algo == "CRC32":
+        crc = zlib.crc32(body) & 0xFFFFFFFF
+        return base64.b64encode(struct.pack(">I", crc)).decode()
+    if algo == "CRC32C":
+        return base64.b64encode(struct.pack(">I", _crc32c(body))).decode()
+    if algo == "CRC64NVME":
+        return base64.b64encode(struct.pack(">Q", _crc64nvme(body))).decode()
+    return None
+
+
+def _resolve_object_checksums(body: bytes, headers: dict):
+    """Build the stored checksum dict and validate any client-supplied values.
+
+    AWS PutObject contract:
+      - `x-amz-checksum-{alg}` headers carry a client-computed value, which
+        the server recomputes from the body and MUST reject with `BadDigest`
+        (HTTP 400) when the two disagree.  A value that is never checked is
+        worse than none: it round-trips on Get as though the body had been
+        verified.
+      - `x-amz-sdk-checksum-algorithm: ALG` asks the server to compute that
+        algorithm; the resulting value is returned alongside the response.
+
+    An algorithm we cannot compute is refused up front: silently accepting an
+    unverifiable checksum would round-trip on Get without ever being validated
+    against the body — a worse failure mode than refusing the request.
+
+    Returns ``(checksums_dict, error_response_or_None)``.
+    """
+    provided = {}
+    unverifiable = set()
+    for alg in _S3_CHECKSUM_HEADERS:
+        val = headers.get(f"x-amz-checksum-{alg}")
+        if val:
+            provided[alg.upper()] = val
+            if _compute_s3_checksum(alg.upper(), b"") is None:
+                unverifiable.add(alg.upper())
+
+    sdk_alg_raw = headers.get("x-amz-sdk-checksum-algorithm")
+    if sdk_alg_raw:
+        sdk_key = sdk_alg_raw.upper().replace("_", "")
+        if _compute_s3_checksum(sdk_alg_raw, b"") is None:
+            unverifiable.add(sdk_key)
+
+    if unverifiable:
+        return {}, _error(
+            "InvalidRequest",
+            (
+                f"Checksum algorithm not supported: "
+                f"{', '.join(sorted(unverifiable))}. Supported: SHA256, SHA1, "
+                f"CRC32, CRC32C, CRC64NVME."
+            ),
+            400,
+        )
+
+    # Every supplied value is verified against the body, whether or not the
+    # request also names an algorithm for the server to compute: the client
+    # asked for the object to be checked, and an unverified value would be
+    # stored and echoed as if it had been.
+    checksums = dict(provided)
+    for alg, supplied in provided.items():
+        computed = _compute_s3_checksum(alg, body)
+        if computed is not None and supplied != computed:
+            return {}, _error(
+                "BadDigest",
+                f"The {alg} you specified did not match the calculated checksum.",
+                400,
+            )
+
+    if sdk_alg_raw:
+        sdk_key = sdk_alg_raw.upper().replace("_", "")
+        computed = _compute_s3_checksum(sdk_alg_raw, body)
+        if computed is not None:
+            checksums[sdk_key] = computed
+    return checksums, None
+
+
+def _resolve_multipart_checksum_algorithm(headers: dict):
+    """Read the algorithm CreateMultipartUpload names for its parts.
+
+    Returns ``(algorithm_or_None, error_response_or_None)``.  An algorithm
+    ministack cannot compute is refused here rather than at completion, where
+    the caller has already uploaded every part.
+    """
+    raw = headers.get("x-amz-checksum-algorithm") or headers.get("x-amz-sdk-checksum-algorithm")
+    if not raw:
+        return None, None
+    algorithm = raw.upper().replace("_", "")
+    if _compute_s3_checksum(algorithm, b"") is None:
+        return None, _error(
+            "InvalidRequest",
+            (
+                f"Checksum algorithm not supported in this ministack build: "
+                f"{algorithm}. Supported: SHA256, SHA1, CRC32, CRC64NVME."
+            ),
+            400,
+        )
+    return algorithm, None
+
+
+def _resolve_part_checksums(body: bytes, headers: dict, upload: dict):
+    """Build a part's checksum dict, validating whatever the caller supplied.
+
+    A part carrying its own ``x-amz-checksum-*`` header is validated against
+    the bytes the same way PutObject validates one.  A part that carries none
+    still gets the upload's algorithm computed for it, since the completion
+    builds the composite out of every part's digest and AWS asks the caller
+    for one part checksum at a time rather than for all of them.
+
+    Returns ``(checksums_dict, error_response_or_None)``.
+    """
+    checksums, err = _resolve_object_checksums(body, headers)
+    if err:
+        return {}, err
+
+    algorithm = upload.get("checksum_algorithm")
+    if algorithm and algorithm not in checksums:
+        computed = _compute_s3_checksum(algorithm, body)
+        if computed is not None:
+            checksums[algorithm] = computed
+    return checksums, None
+
+
+def _composite_checksum(algorithm: str, part_checksums: list) -> str | None:
+    """Build the multipart composite: the digest of the parts' digests.
+
+    AWS hashes the raw part digests end to end, base64s the result and suffixes
+    the part count -- so a composite reads as ``<digest>-<parts>`` and cannot be
+    confused with the whole-object checksum of a single PUT.  Returns None when
+    a part is missing its checksum, since a composite over some of the parts
+    would be a value no caller could reproduce.
+    """
+    if not algorithm or not part_checksums:
+        return None
+    digests = b""
+    for value in part_checksums:
+        if not value:
+            return None
+        try:
+            digests += base64.b64decode(value)
+        except ValueError:  # binascii.Error subclasses it
+            return None
+    combined = _compute_s3_checksum(algorithm, digests)
+    if combined is None:
+        return None
+    return f"{combined}-{len(part_checksums)}"
+
+
+def _object_response_headers(obj: dict, bucket_name: str = "", key: str = "", include_checksums: bool = False) -> dict:
     h = {
         "Content-Type": obj["content_type"],
         "ETag": obj["etag"],
@@ -386,18 +2490,40 @@ def _object_response_headers(obj: dict, bucket_name: str = "", key: str = "") ->
     h.update(obj.get("metadata", {}))
     if obj.get("version_id"):
         h["x-amz-version-id"] = obj["version_id"]
+    if obj.get("replication_status"):
+        h["x-amz-replication-status"] = obj["replication_status"]
     sc = obj.get("storage_class") or "STANDARD"
     if sc != "STANDARD":
         # AWS omits the header for STANDARD; SDKs default to STANDARD when absent.
         h["x-amz-storage-class"] = sc
+    restore = obj.get("restore")
+    if restore:
+        now = time.time()
+        if now < restore["available_at"]:
+            h["x-amz-restore"] = 'ongoing-request="true"'
+        elif now < restore["expires_at"]:
+            expiry = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime(restore["expires_at"]))
+            h["x-amz-restore"] = f'ongoing-request="false", expiry-date="{expiry}"'
     if bucket_name and key:
-        retention = _object_retention.get((bucket_name, key))
+        retention = _object_retention.get((bucket_name, key, obj.get("version_id")))
         if retention:
             h["x-amz-object-lock-mode"] = retention["Mode"]
             h["x-amz-object-lock-retain-until-date"] = retention["RetainUntilDate"]
-        hold = _object_legal_hold.get((bucket_name, key))
+        hold = _object_legal_hold.get((bucket_name, key, obj.get("version_id")))
         if hold:
             h["x-amz-object-lock-legal-hold"] = hold
+    # AWS only returns x-amz-checksum-* headers when the request opted in via
+    # `x-amz-checksum-mode: ENABLED` — silent on Head/Get otherwise to match
+    # the documented contract and avoid leaking checksums into clients that
+    # didn't ask for them.
+    if include_checksums:
+        stored = obj.get("checksums") or {}
+        for alg, val in stored.items():
+            h[f"x-amz-checksum-{alg.lower()}"] = val
+        if stored:
+            # A single PutObject hashes the whole body; a completed multipart
+            # object hashes its parts' digests, which AWS names COMPOSITE.
+            h["x-amz-checksum-type"] = obj.get("checksum_type") or "FULL_OBJECT"
     return h
 
 
@@ -406,12 +2532,335 @@ def _object_response_headers(obj: dict, bucket_name: str = "", key: str = "") ->
 # ---------------------------------------------------------------------------
 
 
+_PRESIGN_MAX_EXPIRES = 604800
+
+
+def _presign_time_error(amz_date: str, expires: str, path: str) -> tuple | None:
+    """Under AUTH=true, refuse a presign with a malformed time, a lifetime over a week or a date in the future."""
+    from ministack.app import AUTH
+    if not AUTH:
+        return None
+    try:
+        signed_at = _dt.datetime.strptime(amz_date, "%Y%m%dT%H%M%SZ").replace(tzinfo=_dt.timezone.utc)
+    except ValueError:
+        return _error("AuthorizationQueryParametersError",
+                      "X-Amz-Date must be in the ISO8601 Long Format \"yyyyMMdd'T'HHmmss'Z'\"", 400, path)
+    if not expires:
+        return _error("AuthorizationQueryParametersError",
+                      "Query-string authentication version 4 requires the X-Amz-Algorithm, X-Amz-Credential, "
+                      "X-Amz-Signature, X-Amz-Date, X-Amz-SignedHeaders, and X-Amz-Expires parameters.", 400, path)
+    if expires.startswith("-") and expires[1:].isdigit():
+        return _error("AuthorizationQueryParametersError", "X-Amz-Expires must be non-negative", 400, path)
+    if not expires.isdigit():
+        return _error("AuthorizationQueryParametersError", "X-Amz-Expires should be a number", 400, path)
+    if int(expires) > _PRESIGN_MAX_EXPIRES:
+        return _error("AuthorizationQueryParametersError",
+                      "X-Amz-Expires must be less than a week (in seconds); that is, the given X-Amz-Expires "
+                      f"must be less than {_PRESIGN_MAX_EXPIRES} seconds", 400, path)
+    if signed_at > _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(minutes=15):
+        return _error("AccessDenied", "Request is not yet valid", 403, path)
+    return None
+
+
+def _verify_presigned_sigv4(method, path, headers, query_params):
+    """Verify a SigV4 presigned S3 URL. Returns an error tuple for a bad
+    signature, or None when the request is not a SigV4 presigned URL (header-
+    signed and anonymous requests are handled elsewhere / left lax).
+
+    Expiry is checked in both AUTH modes. Under AUTH=true MiniStack resolves
+    root, IAM-user, and STS credentials before recomputing the signature, and
+    temporary credentials must include the exact session token STS issued.
+    """
+    signature = _qp(query_params, "X-Amz-Signature", "") or _qp(query_params, "x-amz-signature", "")
+    if not signature:
+        return None  # not a presigned URL
+    algorithm = _qp(query_params, "X-Amz-Algorithm", "") or _qp(query_params, "x-amz-algorithm", "")
+    if algorithm == "AWS4-ECDSA-P256-SHA256":
+        # The IAM layer verifies a SigV4a signature; its query parameters follow the same rules.
+        return _presign_time_error(_qp(query_params, "X-Amz-Date", "") or _qp(query_params, "x-amz-date", ""),
+                                   _qp(query_params, "X-Amz-Expires", "") or _qp(query_params, "x-amz-expires", ""),
+                                   path)
+    if algorithm != "AWS4-HMAC-SHA256":
+        return None  # only SigV4 presigned URLs are verified
+
+    def _bad_signature():
+        return _error(
+            "SignatureDoesNotMatch",
+            "The request signature we calculated does not match the signature "
+            "you provided. Check your key and signing method.",
+            403,
+            path,
+        )
+
+    credential = _qp(query_params, "X-Amz-Credential", "") or _qp(query_params, "x-amz-credential", "")
+    amz_date = _qp(query_params, "X-Amz-Date", "") or _qp(query_params, "x-amz-date", "")
+    signed_headers = _qp(query_params, "X-Amz-SignedHeaders", "") or _qp(query_params, "x-amz-signedheaders", "")
+    cred_parts = credential.split("/")
+    if len(cred_parts) != 5 or not amz_date or not signed_headers:
+        return _bad_signature()
+    _akid, date_stamp, region, service, _terminator = cred_parts
+
+    # Expiry: a presigned URL past X-Amz-Date + X-Amz-Expires is rejected by S3
+    # with 403 AccessDenied "Request has expired", independent of the signature.
+    expires = _qp(query_params, "X-Amz-Expires", "") or _qp(query_params, "x-amz-expires", "")
+    time_error = _presign_time_error(amz_date, expires, path)
+    if time_error:
+        return time_error
+    if expires:
+        try:
+            if presigned_request_is_expired(amz_date, expires):
+                return _error("AccessDenied", "Request has expired", 403, path)
+        except (ValueError, TypeError):
+            pass
+
+    canonical_request = build_canonical_request(
+        method,
+        path,
+        headers,
+        query_params,
+        signed_headers,
+    )
+    string_to_sign = build_string_to_sign(
+        amz_date,
+        date_stamp,
+        region,
+        service,
+        canonical_request,
+    )
+
+    session_token = _qp(query_params, "X-Amz-Security-Token", "") or _qp(
+        query_params, "x-amz-security-token", ""
+    )
+    # Resolve the tenant of a presigned request here, without changing routing
+    # for other requests.
+    try:
+        owner = find_iam_access_key_account(_akid)
+    except AmbiguousAccessKeyError:
+        # Two tenants holding one key is an emulator-only state; S3 has no
+        # error for it, so it answers as it does for a key it cannot resolve.
+        return _error(
+            "InvalidAccessKeyId",
+            "The AWS Access Key Id you provided does not exist in our records.",
+            403,
+            path,
+        )
+    if owner:
+        set_request_account_id(owner)
+    from ministack.app import AUTH
+    if not AUTH:
+        # With AUTH off a presigned URL is trusted like a header-signed request:
+        # its key selects the tenant, and the credential and signature are not checked.
+        return None
+    credential = resolve_credential(_akid, get_account_id(), session_token)
+    if isinstance(credential, CredentialResolutionError):
+        # S3's own error table: ExpiredToken and InvalidToken are 400, while
+        # InvalidAccessKeyId is 403.
+        if credential.code == "ExpiredTokenException":
+            return _error("ExpiredToken", "The provided token has expired.", 400, path)
+        if credential.code == "InvalidToken":
+            return _error("InvalidToken", credential.message, 400, path)
+        return _error(
+            "InvalidAccessKeyId",
+            "The AWS Access Key Id you provided does not exist in our records.",
+            403,
+            path,
+        )
+    computed = calculate_signature(
+        credential.secret_access_key,
+        date_stamp,
+        region,
+        service,
+        string_to_sign,
+    )
+
+    if not signatures_match(computed, signature):
+        return _bad_signature()
+    return None
+
+
+# SigV4 / SigV2 presign machinery: query parameters that are part of the
+# signature itself, never a hoisted request header.
+_PRESIGN_SIGNING_PARAMS = {
+    "x-amz-algorithm",
+    "x-amz-credential",
+    "x-amz-date",
+    "x-amz-expires",
+    "x-amz-signedheaders",
+    "x-amz-signature",
+    "x-amz-security-token",
+    "x-amz-content-sha256",
+}
+
+# A presigned URL's checksum *value* is signed but never read as a supplied
+# integrity value. Current SDKs (JS since v3.729.0) compute it over the *empty*
+# body at presign time, because whoever holds the URL picks the body later, so
+# the value cannot describe what gets uploaded. Real S3 signs the parameter —
+# rewriting it still yields 403 — and then ignores it, storing the body it was
+# sent. Hoisting it into the headers instead hands it to
+# `_resolve_object_checksums`, which rejects the upload with `BadDigest` for a
+# request AWS answers 200.
+#
+# Only the value parameters are excluded. `x-amz-checksum-algorithm` and
+# `x-amz-sdk-checksum-algorithm` name an algorithm for the server to compute
+# rather than carrying a value, so they cannot disagree with a body and are
+# never the reason a request is refused; CreateMultipartUpload is presigned
+# with either of them to choose the algorithm its parts are digested with.
+_PRESIGN_UNHOISTED_CHECKSUM_PARAMS = frozenset(
+    f"x-amz-checksum-{alg}" for alg in _S3_CHECKSUM_HEADERS
+)
+
+
+def _merge_hoisted_amz_headers(headers: dict, query_params: dict) -> dict:
+    """Fold a presigned URL's hoisted ``x-amz-*`` query params into headers.
+
+    A presigned URL is handed to a caller who sends nothing but the URL and a
+    body, so the ``x-amz-*`` headers the operation asked for — user metadata
+    (``x-amz-meta-*``), ACL, storage class, tagging, SSE, copy source — cannot
+    travel as headers. SigV4 allows them to be *hoisted* into the query string
+    instead, where the signature covers them exactly as a signed header would,
+    and several SDKs presign that way (some hoist every ``x-amz-`` header, some
+    only what the operation set). Real S3 applies those params as the headers
+    they stand for.
+
+    MiniStack only ever looked at headers, so a presigned upload carrying
+    metadata in its query string stored the object without any: the PUT
+    succeeded and the metadata was silently dropped.
+
+    An explicitly sent header always wins over its hoisted twin. The checksum
+    values in ``_PRESIGN_UNHOISTED_CHECKSUM_PARAMS`` are the exception AWS
+    itself makes and stay out of the headers.
+    """
+    hoisted = None
+    for name, values in query_params.items():
+        lname = name.lower()
+        if not lname.startswith("x-amz-") or lname in _PRESIGN_SIGNING_PARAMS:
+            continue
+        if lname in _PRESIGN_UNHOISTED_CHECKSUM_PARAMS:
+            continue
+        if lname in headers:
+            continue
+        value = values[0] if isinstance(values, list) else values
+        if value is None:
+            continue
+        if hoisted is None:
+            hoisted = dict(headers)
+        hoisted[lname] = value
+    return hoisted if hoisted is not None else headers
+
+
 async def handle_request(
-    method: str, path: str, headers: dict, body: bytes, query_params: dict
+    method: str,
+    path: str,
+    headers: dict,
+    body: bytes,
+    query_params: dict,
+    signed_path: str | None = None,
+    enforce_bucket_region: bool = True,
+    internal: bool = False,
+    access_point_region: str | None = None,
+    access_point: dict | None = None,
 ) -> tuple:
+    """``access_point_region`` and ``access_point`` are set for a request that came
+    through an access point host; the region check then compares against the
+    access point."""
     bucket, key = _parse_bucket_key(path, headers)
 
-    result = _dispatch(method, bucket, key, headers, body, query_params)
+    # A virtual-hosted request is rewritten to path-style before it reaches here
+    # (``/{bucket}{path}``), but the client signed the canonical URI it actually
+    # sent (``{path}``, no bucket) against the vhost Host header. ``signed_path``
+    # carries that original URI so the presigned signature recomputes correctly;
+    # path-style requests pass None and verify against ``path`` as before.
+    sig_error = _verify_presigned_sigv4(method, signed_path if signed_path is not None else path, headers, query_params)
+    if sig_error is not None:
+        status, resp_headers, resp_body = sig_error
+        resp_headers.setdefault("x-amz-request-id", new_uuid())
+        resp_headers.setdefault("x-amz-id-2", base64.b64encode(os.urandom(48)).decode())
+        return status, resp_headers, resp_body
+
+    # A presigned URL may carry its `x-amz-*` headers in the query string; fold
+    # them back in before routing so metadata, ACL, storage class and friends
+    # reach the handlers exactly as a header-signed request delivers them.
+    headers = _merge_hoisted_amz_headers(headers, query_params)
+
+    from ministack.app import AUTH as _AUTH
+    if not _AUTH and not internal:
+        # Without IAM there is no pre-IAM check: answer the write's encryption and upload-id errors here, before
+        # the owner's grants of another account's bucket or access point, as AWS does.
+        early = write_request_error(method, bucket, key, headers, query_params)
+        if early is not None:
+            return early
+
+    if (access_point_region is not None or bucket.endswith(_ACCESS_POINT_ALIAS_SUFFIX)) and not internal:
+        from ministack.app import AUTH
+
+        if (AUTH and (not _request_access_key(method, key, headers, query_params, body)
+                      or headers.get("authorization", "").startswith("AWS "))
+                and (access_point_region is not None or resolve_access_point_alias(bucket))):
+            # Access points take signed requests only, a header signature in Signature Version 4.
+            return _error("InvalidRequest", "The authorization mechanism you have provided is not supported. "
+                          "Please use Signature Version 4.", 400)
+
+    # An Object Lambda Access Point alias goes to the Object Lambda flow.
+    if bucket.endswith(_OBJECT_LAMBDA_ALIAS_SUFFIX):
+        resolved = resolve_object_lambda_alias(bucket)
+        if resolved is not None:
+            from ministack.services import s3_object_lambda
+
+            account, olap_region, record = resolved
+            if account != get_account_id():
+                return _error("AccessDenied", "Access Denied", 403, f"/{bucket}")
+            return await s3_object_lambda.handle_request(record, olap_region, method, key, headers, body,
+                                                         query_params, path)
+
+    # An access point alias works wherever a bucket name does on the S3 API.
+    if bucket.endswith(_ACCESS_POINT_ALIAS_SUFFIX):
+        resolved = resolve_access_point_alias(bucket)
+        if resolved is not None:
+            account, access_point_region, record = resolved
+            if account != get_account_id() and not is_foreign_access_point_put(method, key, headers, query_params):
+                return _error("AccessDenied", "Access Denied", 403, f"/{bucket}")
+            bucket, access_point = record["Bucket"], record
+    headers, denied = _resolve_copy_source_alias(headers)
+    if denied is not None:
+        return denied
+
+    caller_token = _request_caller.set(get_account_id())
+    if (access_point is not None and not internal and access_point.get("BucketAccountId", get_account_id()) != get_account_id()
+            and is_foreign_access_point_put(method, key, headers, query_params)):
+        # Another account's access point: the owner's grants were checked as IAM policies under AUTH=true,
+        # and are here without it. The request then runs in the owner's account, the caller kept for its KMS key.
+        from ministack.app import AUTH
+
+        owner = access_point["BucketAccountId"]
+        # An unsigned request is anonymous, never the default account: through another account's access point it
+        # is refused, as access points take signed requests only under AUTH=true too.
+        caller = get_account_id() if _request_access_key(method, key, headers, query_params, body) else ""
+        if not AUTH and not (caller and _foreign_access_point_allows(owner, caller, access_point,
+                                                                     access_point_region, key, headers)):
+            _request_caller.reset(caller_token)
+            return _error("AccessDenied", "Access Denied", 403, f"/{bucket}/{key}")
+        set_request_account_id(owner)
+        denied = None
+    else:
+        denied = _apply_bucket_scope(method, bucket, key, headers, query_params, body, internal)
+    if denied is None:
+        denied = _region_set_mismatch(bucket, key, headers, query_params, home=access_point_region)
+    if denied is None and enforce_bucket_region:
+        # After the scope is pinned, so the owner's record names the home region.
+        denied = _check_bucket_region(method, bucket, key, headers, query_params, home=access_point_region)
+    if denied is not None:
+        _request_caller.reset(caller_token)
+        status, resp_headers, resp_body = denied
+        resp_headers.setdefault("x-amz-request-id", new_uuid())
+        resp_headers.setdefault("x-amz-id-2", base64.b64encode(os.urandom(48)).decode())
+        return status, resp_headers, resp_body
+
+    token = _request_access_point.set(access_point)
+    try:
+        result = _dispatch(method, bucket, key, headers, body, query_params)
+    finally:
+        _request_access_point.reset(token)
+        _request_caller.reset(caller_token)
 
     status, resp_headers, resp_body = result
     resp_headers.setdefault("x-amz-request-id", new_uuid())
@@ -424,23 +2873,30 @@ async def handle_request(
     return status, resp_headers, resp_body
 
 
-def _dispatch(
-    method: str, bucket: str, key: str, headers: dict, body: bytes, query_params: dict
-) -> tuple:
+def _dispatch(method: str, bucket: str, key: str, headers: dict, body: bytes, query_params: dict) -> tuple:
     if method == "GET" and not bucket:
-        return _list_buckets()
+        return _list_buckets(query_params, _signed_region(headers, query_params))
 
     # ---- Routes with key ----
     if key:
         if method == "GET":
             if "uploadId" in query_params:
                 return _list_parts(bucket, key, query_params)
+            if "annotation" in query_params:
+                # One path for both: GetObjectAnnotation names an annotation, ListObjectAnnotations does not.
+                if "annotationName" in query_params:
+                    return _get_object_annotation(bucket, key, headers, query_params)
+                return _list_object_annotations(bucket, key, query_params)
             if "tagging" in query_params:
-                return _get_object_tagging(bucket, key)
+                return _get_object_tagging(bucket, key, query_params)
             if "retention" in query_params:
-                return _get_object_retention(bucket, key)
+                return _get_object_retention(bucket, key, query_params)
             if "legal-hold" in query_params:
-                return _get_object_legal_hold(bucket, key)
+                return _get_object_legal_hold(bucket, key, query_params)
+            if "acl" in query_params:
+                return _get_object_acl(bucket, key, query_params)
+            if "attributes" in query_params:
+                return _get_object_attributes(bucket, key, headers, query_params)
             return _get_object(bucket, key, headers, query_params)
 
         if method == "PUT":
@@ -448,21 +2904,27 @@ def _dispatch(
                 if "x-amz-copy-source" in headers:
                     return _upload_part_copy(bucket, key, query_params, headers)
                 return _upload_part(bucket, key, body, query_params, headers)
+            if "annotation" in query_params:
+                return _put_object_annotation(bucket, key, body, headers, query_params)
             if "tagging" in query_params:
-                return _put_object_tagging(bucket, key, body)
+                return _put_object_tagging(bucket, key, body, query_params)
             if "retention" in query_params:
-                return _put_object_retention(bucket, key, body, headers)
+                return _put_object_retention(bucket, key, body, headers, query_params)
             if "legal-hold" in query_params:
-                return _put_object_legal_hold(bucket, key, body)
+                return _put_object_legal_hold(bucket, key, body, query_params)
+            if "acl" in query_params:
+                return _put_object_acl(bucket, key, body, headers, query_params)
             if "x-amz-copy-source" in headers:
                 return _copy_object(bucket, key, headers)
             return _put_object(bucket, key, body, headers)
 
         if method == "POST":
+            if "restore" in query_params:
+                return _restore_object(bucket, key, body)
             if "uploads" in query_params:
                 return _create_multipart_upload(bucket, key, headers)
             if "uploadId" in query_params:
-                return _complete_multipart_upload(bucket, key, body, query_params)
+                return _complete_multipart_upload(bucket, key, body, query_params, headers)
             return _error(
                 "MethodNotAllowed",
                 "The specified method is not allowed against this resource.",
@@ -470,14 +2932,16 @@ def _dispatch(
             )
 
         if method == "HEAD":
-            return _head_object(bucket, key)
+            return _head_object(bucket, key, headers, query_params)
 
         if method == "DELETE":
             if "uploadId" in query_params:
                 return _abort_multipart_upload(bucket, key, query_params)
+            if "annotation" in query_params:
+                return _delete_object_annotation(bucket, key, headers, query_params)
             if "tagging" in query_params:
-                return _delete_object_tagging(bucket, key)
-            return _delete_object(bucket, key, headers)
+                return _delete_object_tagging(bucket, key, query_params)
+            return _delete_object(bucket, key, headers, query_params)
 
         return _error(
             "MethodNotAllowed",
@@ -540,7 +3004,7 @@ def _dispatch(
         if "policy" in query_params:
             return _put_bucket_policy(bucket, body)
         if "notification" in query_params:
-            return _put_bucket_notification(bucket, body)
+            return _put_bucket_notification(bucket, body, headers)
         if "tagging" in query_params:
             return _put_bucket_tagging(bucket, body)
         if "versioning" in query_params:
@@ -548,11 +3012,11 @@ def _dispatch(
         if "encryption" in query_params:
             return _put_bucket_encryption(bucket, body)
         if "lifecycle" in query_params:
-            return _put_bucket_lifecycle(bucket, body)
+            return _put_bucket_lifecycle(bucket, body, headers)
         if "cors" in query_params:
             return _put_bucket_cors(bucket, body)
         if "acl" in query_params:
-            return _put_bucket_acl(bucket, body)
+            return _put_bucket_acl(bucket, body, headers)
         if "website" in query_params:
             return _put_bucket_website(bucket, body)
         if "logging" in query_params:
@@ -569,7 +3033,7 @@ def _dispatch(
             return _put_bucket_ownership_controls(bucket, body)
         if "publicAccessBlock" in query_params:
             return _put_public_access_block(bucket, body)
-        return _create_bucket(bucket, body, headers)
+        return _create_bucket(bucket, body, headers, endpoint_region=_signed_region(headers, query_params))
 
     if method == "DELETE":
         if "policy" in query_params:
@@ -618,58 +3082,227 @@ def _dispatch(
 # ---------------------------------------------------------------------------
 
 
-def _list_buckets():
+def _canonical_owner_id(account_id: str = "") -> str:
+    """The S3 canonical user ID for *account_id*, the current account by default.
+
+    Real S3 reports an opaque 64-character hex canonical ID (not the account
+    ID) and returns the same value from every Owner / CanonicalUser field
+    (ListBuckets, GetBucketAcl, GetObjectAcl, object listings). MiniStack
+    derives a stable one from the account so those fields agree (#1459)."""
+    return hashlib.sha256((account_id or get_account_id()).encode()).hexdigest()
+
+
+def _list_buckets(query_params=None, signed_region: str | None = None):
+    query_params = query_params or {}
+    prefix = _qp(query_params, "prefix", "")
+    max_buckets = int(_qp(query_params, "max-buckets", "0") or "0")
+    continuation = _qp(query_params, "continuation-token", "")
+    region_filter = _qp(query_params, "bucket-region", "")
+    if region_filter and signed_region and region_filter != signed_region:
+        return _error(
+            "InvalidArgument",
+            "Requests with bucket-region specified must be made to the corresponding regional endpoint",
+            400,
+            extra={"ArgumentName": "bucket-region"},
+        )
+
+    all_names = sorted(
+        n for n in _buckets
+        if n.startswith(prefix) and (not region_filter or bucket_region(n) == region_filter)
+    )
+    if continuation:
+        idx = next((i for i, n in enumerate(all_names) if n > continuation), len(all_names))
+        all_names = all_names[idx:]
+
+    if max_buckets > 0:
+        page = all_names[:max_buckets]
+        is_truncated = len(all_names) > max_buckets
+    else:
+        page = all_names
+        is_truncated = False
+
     root = Element("ListAllMyBucketsResult", xmlns=S3_NS)
     owner = SubElement(root, "Owner")
-    SubElement(owner, "ID").text = "owner-id"
+    SubElement(owner, "ID").text = _canonical_owner_id()
     SubElement(owner, "DisplayName").text = "ministack"
     buckets_el = SubElement(root, "Buckets")
-    for name, data in sorted(_buckets.items()):
+    for name in page:
+        data = _buckets[name]
         b = SubElement(buckets_el, "Bucket")
         SubElement(b, "Name").text = name
         SubElement(b, "CreationDate").text = data["created"]
-        SubElement(b, "BucketRegion").text = data.get("region") or os.environ.get("MINISTACK_REGION", "us-east-1")
+        SubElement(b, "BucketRegion").text = bucket_region(name)
         SubElement(b, "BucketArn").text = f"arn:aws:s3:::{name}"
+    if prefix:
+        SubElement(root, "Prefix").text = prefix
+    # ListBucketsOutput has no IsTruncated member (botocore s3 model): a
+    # further page is signalled by ContinuationToken alone.
+    if is_truncated:
+        SubElement(root, "ContinuationToken").text = page[-1] if page else ""
     return 200, {"Content-Type": "application/xml"}, _xml_body(root)
 
 
-def _create_bucket(name: str, body: bytes, headers: dict = None):
+def _location_constraint(body: bytes) -> str | None:
+    if not body:
+        return None
+    try:
+        loc_el = _find_xml_tag(fromstring(body), "LocationConstraint")
+    except Exception:
+        return None
+    return loc_el.text if loc_el is not None and loc_el.text else None
+
+
+def _constraint_region(constraint: str | None) -> str | None:
+    """``EU`` is the legacy LocationConstraint for eu-west-1, which still
+    accepts it (observed on AWS 2026-10-20); the AWS SDK for .NET sends it."""
+    return "eu-west-1" if constraint == "EU" else constraint
+
+
+def _location_constraint_error(name: str, constraint: str | None, endpoint_region: str):
+    """CreateBucket's location-constraint rules for a request signed for
+    ``endpoint_region`` (observed on AWS 2026-10-12): us-east-1 is never a
+    valid constraint, and any other regional endpoint only creates buckets in
+    its own region, named explicitly."""
+    if constraint == "us-east-1":
+        return _error("InvalidLocationConstraint", "The specified location-constraint is not valid",
+                      400, f"/{name}", extra={"LocationConstraint": constraint})
+    if endpoint_region != "us-east-1" and _constraint_region(constraint) != endpoint_region:
+        return _error(
+            "IllegalLocationConstraintException",
+            f"The {constraint or 'unspecified'} location constraint is incompatible for the region "
+            "specific endpoint this request was sent to.",
+            400, f"/{name}",
+        )
+    return None
+
+
+def _create_bucket(name: str, body: bytes, headers: dict = None, endpoint_region: str | None = None):
+    """``endpoint_region`` is the region a signed request was sent to; internal
+    callers leave it None and keep the lax ``constraint or get_region()`` rule."""
     headers = headers or {}
     if not _validate_bucket_name(name):
-        return _error(
-            "InvalidBucketName", "The specified bucket is not valid.", 400, f"/{name}"
-        )
+        return _error("InvalidBucketName", "The specified bucket is not valid.", 400, f"/{name}")
+    # A canned ACL supplied at CreateBucket time is validated up front and
+    # stored below, so GetBucketAcl reflects it instead of dropping it.
+    canned_acl = headers.get("x-amz-acl")
+    if canned_acl and canned_acl not in _CANNED_BUCKET_ACLS:
+        return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned_acl}", 400)
+    current = _buckets.get(name)
+    enforced = (_bucket_owner_enforced(current) if current
+                else headers.get("x-amz-object-ownership", "BucketOwnerEnforced") == "BucketOwnerEnforced")
+    grant_acl, err = _grant_headers_acl(headers, enforced)
+    if err:
+        return err
+    if enforced and not _owner_only_acl(headers, ("private",)):
+        return _error("InvalidBucketAclWithObjectOwnership",
+                      "Bucket cannot have ACLs set with ObjectOwnership's BucketOwnerEnforced setting", 400)
+    if endpoint_region:
+        err = _location_constraint_error(name, _location_constraint(body), endpoint_region)
+        if err is not None:
+            return err
     if name in _buckets:
-        # Idempotent: same account already owns it — return 200 like real AWS
+        # Outside us-east-1 AWS returns BucketAlreadyOwnedByYou; in us-east-1,
+        # "returns 200 OK and resets the bucket access control lists (ACLs)".
+        if _buckets[name].get("region", "us-east-1") != "us-east-1":
+            return _error("BucketAlreadyOwnedByYou",
+                          "Your previous request to create the named bucket succeeded and you already own it.",
+                          409, f"/{name}", extra={"BucketName": name})
+        _bucket_acl.pop(name, None)
+        if canned_acl:
+            _bucket_acl[name] = _canned_acl_policy_xml(canned_acl, _canonical_owner_id())
+        elif grant_acl:
+            _bucket_acl[name] = grant_acl
         return 200, {"Location": f"/{name}"}, b""
+    if _bucket_owner_account(name) is not None:
+        # "After creating a general purpose bucket in the shared global
+        # namespace, that bucket name is unavailable for anyone else to create
+        # within a partition."
+        return _error(
+            "BucketAlreadyExists",
+            "The requested bucket name is not available. The bucket namespace "
+            "is shared by all users of the system. Please select a different "
+            "name and try again.",
+            409,
+            f"/{name}",
+            extra={"BucketName": name},
+        )
 
-    region = None
+    if not enforced and _public_acl(headers) and _new_bucket_public_access_block():
+        # The Block Public Access settings of the new bucket refuse it.
+        return _error("InvalidBucketAclWithBlockPublicAccessError",
+                      "Bucket cannot have public ACLs set with BlockPublicAccess enabled", 400)
+
+    constraint = None
+    tags = {}
     if body:
         try:
             xml_root = fromstring(body)
             loc_el = _find_xml_tag(xml_root, "LocationConstraint")
             if loc_el is not None and loc_el.text:
-                region = loc_el.text
+                constraint = loc_el.text
+
+            err = _duplicate_tag_error(xml_root, resource=f"/{name}")
+            if err is not None:
+                return err
+
+            tags = _parse_tags_xml(body)
         except Exception:
             pass
 
-    _buckets[name] = {"created": now_iso(), "objects": {}, "region": region}
+    err = _validate_bucket_tags(tags, resource=f"/{name}")
+    if err is not None:
+        return err
+
+    # No explicit LocationConstraint: the bucket lands in the region the
+    # request was signed for, like real AWS.
+    region = _constraint_region(constraint) or get_region()
+    _buckets[name] = {"created": now_iso(), "objects": {}, "region": region, **_new_bucket_public_access_block()}
+    if constraint == "EU":
+        # GetBucketLocation answers EU for a bucket created with EU (observed on AWS 2026-10-20).
+        _buckets[name]["location_constraint"] = constraint
+    ownership = headers.get("x-amz-object-ownership")
+    if ownership:
+        # The same document PutBucketOwnershipControls stores.
+        root = Element("OwnershipControls", xmlns=S3_NS)
+        SubElement(SubElement(root, "Rule"), "ObjectOwnership").text = ownership
+        _buckets[name]["_ownership_controls"] = _xml_body(root).decode()
+    if tags:
+        _bucket_tags[name] = tags
+    if canned_acl:
+        _bucket_acl[name] = _canned_acl_policy_xml(canned_acl, _canonical_owner_id())
+    elif grant_acl:
+        _bucket_acl[name] = grant_acl
 
     if headers.get("x-amz-bucket-object-lock-enabled", "").lower() == "true":
         _bucket_object_lock[name] = {"enabled": True, "default_retention": None}
         _bucket_versioning[name] = "Enabled"
 
     if S3_PERSIST:
-        os.makedirs(os.path.join(DATA_DIR, name), exist_ok=True)
+        # Account-scope the on-disk dir to match where objects are actually
+        # written (_object_disk_path / _persist_object). Omitting the account id
+        # here created a spurious empty folder at DATA_DIR/<bucket> (#824).
+        os.makedirs(os.path.join(DATA_DIR, get_account_id(), name), exist_ok=True)
     logger.info("S3 bucket created: %s%s", name, f" (region={region})" if region else "")
     return 200, {"Location": f"/{name}"}, b""
+
+
+def _bucket_has_versions(name: str) -> bool:
+    """Whether any version or delete marker remains under `name`.
+
+    A versioned bucket whose current objects are all shadowed by delete
+    markers still holds every one of those versions, and AWS refuses to
+    delete it until they are removed by version id."""
+    return any(bn == name and versions for (bn, _), versions in _object_versions.items())
 
 
 def _delete_bucket(name: str):
     bucket = _ensure_bucket(name)
     if bucket is None:
         return _no_such_bucket(name)
-    if bucket["objects"]:
+    if bucket_access_points_attached(name):
+        return _error("BucketHasAccessPointsAttached",
+                      "Bucket has access points attached and cannot be deleted.", 400, f"/{name}")
+    if bucket["objects"] or _bucket_has_versions(name):
         return _error(
             "BucketNotEmpty",
             "The bucket you tried to delete is not empty",
@@ -693,10 +3326,16 @@ def _delete_bucket(name: str):
     _bucket_replication.pop(name, None)
     for k in [k for k in _object_tags if k[0] == name]:
         del _object_tags[k]
+    for k in [k for k in _object_annotations if k[0] == name]:
+        del _object_annotations[k]
+    for k in [k for k in _object_acl if k[0] == name]:
+        del _object_acl[k]
     for k in [k for k in _object_retention if k[0] == name]:
         del _object_retention[k]
     for k in [k for k in _object_legal_hold if k[0] == name]:
         del _object_legal_hold[k]
+    if S3_PERSIST:
+        _delete_persisted_bucket(name)
     return 204, {}, b""
 
 
@@ -707,7 +3346,7 @@ def _head_bucket(name: str):
         200,
         {
             "Content-Type": "application/xml",
-            "x-amz-bucket-region": _buckets[name].get("region") or os.environ.get("MINISTACK_REGION", "us-east-1"),
+            "x-amz-bucket-region": bucket_region(name),
         },
         b"",
     )
@@ -717,10 +3356,11 @@ def _get_bucket_location(name: str):
     if name not in _buckets:
         return _no_such_bucket(name)
     root = Element("LocationConstraint", xmlns=S3_NS)
-    region = _buckets[name].get("region")
-    # AWS returns empty LocationConstraint for us-east-1.
-    if region and region != os.environ.get("MINISTACK_REGION", "us-east-1"):
-        root.text = region
+    region = bucket_region(name)
+    # AWS returns an empty LocationConstraint only for us-east-1 buckets;
+    # every other region is echoed back verbatim.
+    if region != "us-east-1":
+        root.text = _buckets[name].get("location_constraint") or region
     return 200, {"Content-Type": "application/xml"}, _xml_body(root)
 
 
@@ -734,15 +3374,84 @@ def _get_bucket_policy(name: str):
         return _no_such_bucket(name)
     policy = _bucket_policies.get(name)
     if not policy:
-        return _error(
-            "NoSuchBucketPolicy", "The bucket policy does not exist", 404, f"/{name}"
-        )
+        return _error("NoSuchBucketPolicy", "The bucket policy does not exist", 404, f"/{name}")
     return 200, {"Content-Type": "application/json"}, policy.encode("utf-8")
+
+
+# Condition keys whose fixed value makes a statement non-public, per the S3 "meaning of public".
+_NON_PUBLIC_CONDITION_KEYS = {
+    "aws:principalorgid", "aws:principalaccount", "aws:principalarn", "aws:sourceip", "aws:sourcearn",
+    "aws:sourcevpc", "aws:sourcevpce", "aws:sourceowner", "aws:sourceaccount", "aws:userid",
+    "s3:dataaccesspointarn", "s3:dataaccesspointaccount",
+}
+# Operators that narrow access to the values they name; negated, Null and ForAllValues ones do not.
+_NARROWING_OPERATORS = {
+    "stringequals", "stringequalsignorecase", "stringlike", "arnequals", "arnlike", "ipaddress",
+    "foranyvalue:stringequals", "foranyvalue:stringequalsignorecase", "foranyvalue:stringlike",
+    "foranyvalue:arnequals", "foranyvalue:arnlike",
+}
+
+
+def _fixed_condition_value(key: str, value: str) -> bool:
+    if key == "s3:dataaccesspointarn":
+        # A wildcard access point name with a fixed account still delegates to that account only.
+        parts = value.split(":")
+        return len(parts) >= 6 and parts[4].isdigit() and not any(c in ":".join(parts[:5]) for c in "*?")
+    if any(c in value for c in "*?") or "${" in value:
+        return False
+    if key == "aws:sourceip":
+        try:
+            net = ipaddress.ip_network(value, strict=False)
+        except ValueError:
+            return False
+        return net.is_private or net.prefixlen >= (8 if net.version == 4 else 32)
+    return True
+
+
+def _statement_is_public(statement: dict) -> bool:
+    """Whether an Allow statement grants access the S3 Block Public Access rules count as public."""
+    if statement.get("Effect") != "Allow":
+        return False
+    if "NotPrincipal" in statement:
+        return True
+    principal = statement.get("Principal")
+    if isinstance(principal, dict):
+        aws = principal.get("AWS", [])
+        aws = aws if isinstance(aws, list) else [aws]
+        if not any("*" in str(p) for p in aws):
+            return False
+    elif principal != "*":
+        return False
+    conditions = statement.get("Condition") or {}
+    if not isinstance(conditions, dict):
+        return True
+    for operator, keys in conditions.items():
+        if str(operator).lower().removesuffix("ifexists") not in _NARROWING_OPERATORS or not isinstance(keys, dict):
+            continue
+        for key, values in keys.items():
+            values = values if isinstance(values, list) else [values]
+            if str(key).lower() in _NON_PUBLIC_CONDITION_KEYS and values and all(
+                    _fixed_condition_value(str(key).lower(), str(v)) for v in values):
+                return False
+    return True
+
+
+def _policy_is_public(policy_text: str) -> bool:
+    try:
+        statements = json.loads(policy_text).get("Statement", [])
+    except (ValueError, AttributeError):
+        return False
+    statements = [statements] if isinstance(statements, dict) else statements
+    return any(isinstance(s, dict) and _statement_is_public(s) for s in statements)
 
 
 def _put_bucket_policy(name: str, body: bytes):
     if name not in _buckets:
         return _no_such_bucket(name)
+    if _public_access_blocked(get_account_id(), name, "BlockPublicPolicy") and _policy_is_public(
+            body.decode("utf-8", errors="replace")):
+        return _error("AccessDenied",
+                      "public policies are prevented by the BlockPublicPolicy setting in S3 Block Public Access.", 403)
     _bucket_policies[name] = body.decode("utf-8")
     return 204, {}, b""
 
@@ -769,11 +3478,15 @@ def _put_bucket_versioning(name: str, body: bytes):
         return _no_such_bucket(name)
     try:
         xml_root = fromstring(body)
-        status_el = _find_xml_tag(xml_root, "Status")
-        if status_el is not None and status_el.text:
-            _bucket_versioning[name] = status_el.text
     except Exception:
-        pass
+        return _error("MalformedXML", _MALFORMED_XML, 400)
+    status_el = _find_xml_tag(xml_root, "Status")
+    mfa_el = _find_xml_tag(xml_root, "MfaDelete")
+    if (status_el is not None and status_el.text not in ("Enabled", "Suspended")) or (
+            mfa_el is not None and mfa_el.text not in ("Enabled", "Disabled")):
+        return _error("MalformedXML", _MALFORMED_XML, 400)
+    if status_el is not None:
+        _bucket_versioning[name] = status_el.text
     return 200, {}, b""
 
 
@@ -783,17 +3496,33 @@ def _get_bucket_encryption(name: str):
     config = _bucket_encryption.get(name)
     if config:
         return 200, {"Content-Type": "application/xml"}, config
-    return _error(
-        "ServerSideEncryptionConfigurationNotFoundError",
-        "The server side encryption configuration was not found",
-        404,
-        f"/{name}",
+    # Since 5 Jan 2023 every S3 bucket has SSE-S3 (AES256) default encryption, so
+    # GetBucketEncryption returns that default configuration rather than the
+    # historical ServerSideEncryptionConfigurationNotFoundError when nothing was
+    # explicitly PUT.
+    default = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        f'<ServerSideEncryptionConfiguration xmlns="{S3_NS}">'
+        "<Rule><ApplyServerSideEncryptionByDefault>"
+        "<SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault>"
+        "<BucketKeyEnabled>false</BucketKeyEnabled></Rule>"
+        "</ServerSideEncryptionConfiguration>"
     )
+    return 200, {"Content-Type": "application/xml"}, default
+
+
+_SSE_ALGORITHMS = ("AES256", "aws:fsx", "aws:backup", "aws:kms", "aws:kms:dsse")
 
 
 def _put_bucket_encryption(name: str, body: bytes):
     if name not in _buckets:
         return _no_such_bucket(name)
+    try:
+        root = fromstring(body)
+    except Exception:
+        return _error("MalformedXML", _MALFORMED_XML, 400)
+    if any(el.tag.rsplit("}", 1)[-1] == "SSEAlgorithm" and el.text not in _SSE_ALGORITHMS for el in root.iter()):
+        return _error("MalformedXML", _MALFORMED_XML, 400)
     _bucket_encryption[name] = body.decode("utf-8", errors="replace")
     return 200, {}, b""
 
@@ -803,6 +3532,41 @@ def _delete_bucket_encryption(name: str):
         return _no_such_bucket(name)
     _bucket_encryption.pop(name, None)
     return 204, {}, b""
+
+
+def _bucket_default_sse_headers(bucket_name: str) -> dict:
+    """SSE headers a PutObject echoes when the bucket has explicit default
+    encryption (PutBucketEncryption). Real S3 stamps the applied algorithm on the
+    reply (`x-amz-server-side-encryption`, plus the KMS key id for `aws:kms`), which
+    lets a client confirm the object was encrypted as configured. (#1322)"""
+    raw = _bucket_encryption.get(bucket_name)
+    if not raw:
+        return {}
+    try:
+        root = fromstring(raw)
+    except Exception:
+        return {}
+
+    def _first_text(local_name):
+        # SSEAlgorithm / KMSMasterKeyID sit under Rule/ApplyServerSideEncryptionByDefault,
+        # so search descendants by local name (namespace-agnostic), not direct children.
+        for el in root.iter():
+            tag = el.tag.split("}")[-1] if "}" in el.tag else el.tag
+            if tag == local_name and el.text and el.text.strip():
+                return el.text.strip()
+        return None
+
+    algo = _first_text("SSEAlgorithm")
+    if not algo:
+        return {}
+    out = {"x-amz-server-side-encryption": algo}
+    if algo == "aws:kms":
+        kms = _first_text("KMSMasterKeyID")
+        if kms:
+            out["x-amz-server-side-encryption-aws-kms-key-id"] = kms
+        if (_first_text("BucketKeyEnabled") or "").lower() == "true":
+            out["x-amz-server-side-encryption-bucket-key-enabled"] = "true"
+    return out
 
 
 def _get_bucket_lifecycle(name: str):
@@ -816,21 +3580,34 @@ def _get_bucket_lifecycle(name: str):
             xml += "<Rule>"
             if rule.get("ID"):
                 xml += f"<ID>{_esc(rule['ID'])}</ID>"
+            legacy = "Filter" not in rule and "Prefix" in rule
+            if legacy:
+                xml += f"<Prefix>{_esc(rule['Prefix'])}</Prefix>"
             # Filter
             filt = rule.get("Filter", {})
-            xml += "<Filter>"
+            xml += "" if legacy else "<Filter>"
             if "Prefix" in filt:
                 xml += f"<Prefix>{_esc(filt['Prefix'])}</Prefix>"
             if "Tag" in filt:
                 xml += f"<Tag><Key>{_esc(filt['Tag']['Key'])}</Key><Value>{_esc(filt['Tag']['Value'])}</Value></Tag>"
+            if "ObjectSizeGreaterThan" in filt:
+                xml += f"<ObjectSizeGreaterThan>{filt['ObjectSizeGreaterThan']}</ObjectSizeGreaterThan>"
+            if "ObjectSizeLessThan" in filt:
+                xml += f"<ObjectSizeLessThan>{filt['ObjectSizeLessThan']}</ObjectSizeLessThan>"
             if "And" in filt:
+                and_f = filt["And"]
                 xml += "<And>"
-                if "Prefix" in filt["And"]:
-                    xml += f"<Prefix>{_esc(filt['And']['Prefix'])}</Prefix>"
-                for tag in filt["And"].get("Tags", []):
+                # AWS always echoes Prefix (empty when unset) and ObjectSizeGreaterThan
+                # (0 when unset) inside an And operator; omitting either breaks the
+                # aws-sdk-go equality waiter (the provider expands them as "" / 0).
+                xml += f"<Prefix>{_esc(and_f.get('Prefix', ''))}</Prefix>"
+                for tag in and_f.get("Tags", []):
                     xml += f"<Tag><Key>{_esc(tag['Key'])}</Key><Value>{_esc(tag['Value'])}</Value></Tag>"
+                xml += f"<ObjectSizeGreaterThan>{and_f.get('ObjectSizeGreaterThan', 0)}</ObjectSizeGreaterThan>"
+                if and_f.get("ObjectSizeLessThan"):
+                    xml += f"<ObjectSizeLessThan>{and_f['ObjectSizeLessThan']}</ObjectSizeLessThan>"
                 xml += "</And>"
-            xml += "</Filter>"
+            xml += "" if legacy else "</Filter>"
             xml += f"<Status>{rule.get('Status', 'Enabled')}</Status>"
             for t in rule.get("Transitions", []):
                 xml += "<Transition>"
@@ -844,6 +3621,8 @@ def _get_bucket_lifecycle(name: str):
                 xml += "<NoncurrentVersionTransition>"
                 if "NoncurrentDays" in t:
                     xml += f"<NoncurrentDays>{t['NoncurrentDays']}</NoncurrentDays>"
+                if "NewerNoncurrentVersions" in t:
+                    xml += f"<NewerNoncurrentVersions>{t['NewerNoncurrentVersions']}</NewerNoncurrentVersions>"
                 xml += f"<StorageClass>{t.get('StorageClass', 'STANDARD_IA')}</StorageClass>"
                 xml += "</NoncurrentVersionTransition>"
             if "Expiration" in rule:
@@ -861,6 +3640,8 @@ def _get_bucket_lifecycle(name: str):
                 xml += "<NoncurrentVersionExpiration>"
                 if "NoncurrentDays" in nve:
                     xml += f"<NoncurrentDays>{nve['NoncurrentDays']}</NoncurrentDays>"
+                if "NewerNoncurrentVersions" in nve:
+                    xml += f"<NewerNoncurrentVersions>{nve['NewerNoncurrentVersions']}</NewerNoncurrentVersions>"
                 xml += "</NoncurrentVersionExpiration>"
             if rule.get("AbortIncompleteMultipartUpload"):
                 aimu = rule["AbortIncompleteMultipartUpload"]
@@ -869,10 +3650,15 @@ def _get_bucket_lifecycle(name: str):
                 xml += "</AbortIncompleteMultipartUpload>"
             xml += "</Rule>"
         xml += "</LifecycleConfiguration>"
-        return 200, {
-            "Content-Type": "application/xml",
-            "x-amz-transition-default-minimum-object-size": "all_storage_classes_128K",
-        }, xml.encode()
+        return (
+            200,
+            {
+                "Content-Type": "application/xml",
+                "x-amz-transition-default-minimum-object-size":
+                    _buckets[name].get("_lifecycle_min_object_size", "all_storage_classes_128K"),
+            },
+            xml.encode(),
+        )
     return _error(
         "NoSuchLifecycleConfiguration",
         "The lifecycle configuration does not exist",
@@ -881,13 +3667,14 @@ def _get_bucket_lifecycle(name: str):
     )
 
 
-def _put_bucket_lifecycle(name: str, body: bytes):
+def _put_bucket_lifecycle(name: str, body: bytes, headers: dict | None = None):
     if name not in _buckets:
         return _no_such_bucket(name)
     # Parse incoming XML into structured rules for canonical GET responses.
     rules = []
     try:
         from defusedxml import ElementTree as ET
+
         root = ET.fromstring(body)
         ns = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
         for rule_el in root.findall("Rule", ns) or root.findall("s3:Rule", ns):
@@ -916,6 +3703,12 @@ def _put_bucket_lifecycle(name: str, body: bytes):
                 tag_el = _lc_find(filt_el, "Tag")
                 if tag_el is not None:
                     filt["Tag"] = {"Key": _lc_text(tag_el, "Key"), "Value": _lc_text(tag_el, "Value")}
+                f_gt = _lc_text(filt_el, "ObjectSizeGreaterThan")
+                if f_gt:
+                    filt["ObjectSizeGreaterThan"] = int(f_gt)
+                f_lt = _lc_text(filt_el, "ObjectSizeLessThan")
+                if f_lt:
+                    filt["ObjectSizeLessThan"] = int(f_lt)
                 and_el = _lc_find(filt_el, "And")
                 if and_el is not None:
                     and_data: dict = {}
@@ -927,8 +3720,18 @@ def _put_bucket_lifecycle(name: str, body: bytes):
                         tags.append({"Key": _lc_text(t, "Key"), "Value": _lc_text(t, "Value")})
                     if tags:
                         and_data["Tags"] = tags
+                    gt = _lc_text(and_el, "ObjectSizeGreaterThan")
+                    if gt:
+                        and_data["ObjectSizeGreaterThan"] = int(gt)
+                    lt = _lc_text(and_el, "ObjectSizeLessThan")
+                    if lt:
+                        and_data["ObjectSizeLessThan"] = int(lt)
                     filt["And"] = and_data
-            rule["Filter"] = filt
+            legacy_prefix = _lc_find(rule_el, "Prefix")
+            if legacy_prefix is not None and filt_el is None:
+                rule["Prefix"] = _lc_text(rule_el, "Prefix")
+            else:
+                rule["Filter"] = filt
             # Transitions
             transitions = []
             for t in _lc_findall(rule_el, "Transition"):
@@ -950,6 +3753,9 @@ def _put_bucket_lifecycle(name: str, body: bytes):
                 days = _lc_text(t, "NoncurrentDays")
                 if days:
                     td["NoncurrentDays"] = int(days)
+                newer = _lc_text(t, "NewerNoncurrentVersions")
+                if newer:
+                    td["NewerNoncurrentVersions"] = int(newer)
                 td["StorageClass"] = _lc_text(t, "StorageClass") or "STANDARD_IA"
                 nv_transitions.append(td)
             if nv_transitions:
@@ -975,21 +3781,45 @@ def _put_bucket_lifecycle(name: str, body: bytes):
                 days = _lc_text(nve_el, "NoncurrentDays")
                 if days:
                     nve["NoncurrentDays"] = int(days)
+                newer = _lc_text(nve_el, "NewerNoncurrentVersions")
+                if newer:
+                    nve["NewerNoncurrentVersions"] = int(newer)
                 rule["NoncurrentVersionExpiration"] = nve
             # AbortIncompleteMultipartUpload
             aimu_el = _lc_find(rule_el, "AbortIncompleteMultipartUpload")
             if aimu_el is not None:
                 days = _lc_text(aimu_el, "DaysAfterInitiation")
-                rule["AbortIncompleteMultipartUpload"] = {
-                    "DaysAfterInitiation": int(days) if days else 7
-                }
+                rule["AbortIncompleteMultipartUpload"] = {"DaysAfterInitiation": int(days) if days else 7}
             rules.append(rule)
     except Exception:
         # Fallback: store raw if parsing fails
         _bucket_lifecycle[name] = body.decode("utf-8", errors="replace")
         return 200, {"x-amz-transition-default-minimum-object-size": "all_storage_classes_128K"}, b""
+    err = _lifecycle_rules_error(rules)
+    if err:
+        return err
+    min_size = (headers or {}).get("x-amz-transition-default-minimum-object-size") or "all_storage_classes_128K"
     _bucket_lifecycle[name] = rules
-    return 200, {"x-amz-transition-default-minimum-object-size": "all_storage_classes_128K"}, b""
+    _buckets[name]["_lifecycle_min_object_size"] = min_size
+    return 200, {"x-amz-transition-default-minimum-object-size": min_size}, b""
+
+
+_TRANSITION_STORAGE_CLASSES = ("GLACIER", "STANDARD_IA", "ONEZONE_IA", "INTELLIGENT_TIERING", "DEEP_ARCHIVE", "GLACIER_IR")
+
+
+def _lifecycle_rules_error(rules: list) -> tuple | None:
+    """The refusals real S3 returns for an out-of-schema or non-positive lifecycle value."""
+    for rule in rules:
+        if rule.get("Status") not in ("Enabled", "Disabled") or any(
+                t.get("StorageClass") not in _TRANSITION_STORAGE_CLASSES for t in rule.get("Transitions", [])):
+            return _error("MalformedXML", _MALFORMED_XML, 400)
+        if "Days" in rule.get("Expiration", {}) and rule["Expiration"]["Days"] <= 0:
+            return _error("InvalidArgument", "'Days' for Expiration action must be a positive integer", 400)
+        nve = rule.get("NoncurrentVersionExpiration", {})
+        if "NoncurrentDays" in nve and nve["NoncurrentDays"] <= 0:
+            return _error("InvalidArgument",
+                          "'NoncurrentDays' for NoncurrentVersionExpiration action must be a positive integer", 400)
+    return None
 
 
 def _delete_bucket_lifecycle(name: str):
@@ -1027,30 +3857,167 @@ def _delete_bucket_cors(name: str):
     return 204, {}, b""
 
 
+_CORS_VARY = "Origin, Access-Control-Request-Headers, Access-Control-Request-Method"
+_CORS_NOT_ALLOWED = (
+    "CORSResponse: This CORS request is not allowed. This is usually because the evalution of Origin, "
+    "request method / Access-Control-Request-Method or Access-Control-Request-Headers are not whitelisted "
+    "by the resource's CORS spec."
+)
+
+
+def _cors_rules(bucket_name: str) -> list[dict] | None:
+    """The bucket's CORS rules as ``{element: [values]}`` in its owner's account, or None without a configuration."""
+    owner = _bucket_owner_account(bucket_name)
+    stored = _bucket_cors.get_scoped(owner, None, bucket_name) if owner else None
+    if not stored:
+        return None
+    try:
+        root = fromstring(stored.encode() if isinstance(stored, str) else stored)
+    except Exception:
+        return None
+    rules = []
+    for rule in root.iter():
+        if rule.tag.rsplit("}", 1)[-1] == "CORSRule":
+            values = {}
+            for child in rule:
+                values.setdefault(child.tag.rsplit("}", 1)[-1], []).append((child.text or "").strip())
+            rules.append(values)
+    return rules
+
+
+def _cors_pattern_matches(pattern: str, value: str, flags: int = 0) -> bool:
+    """Whether *value* matches an AllowedOrigin or AllowedHeader, where ``*`` stands for any characters."""
+    return re.fullmatch(re.escape(pattern).replace(r"\*", ".*"), value, flags) is not None
+
+
+def _cors_answer(rules: list[dict], origin: str, method: str, request_headers: list[str]) -> dict | None:
+    """The Access-Control-* headers of the first rule that allows the origin, method and headers, or None."""
+    for rule in rules:
+        origins = [o for o in rule.get("AllowedOrigin", []) if _cors_pattern_matches(o, origin)]
+        if not origins or method not in rule.get("AllowedMethod", []):
+            continue
+        allowed_headers = rule.get("AllowedHeader", [])
+        if not all(any(_cors_pattern_matches(allowed, wanted, re.IGNORECASE) for allowed in allowed_headers)
+                   for wanted in request_headers):
+            continue
+        answer = {"Access-Control-Allow-Origin": "*"} if origins == ["*"] else {
+            "Access-Control-Allow-Origin": origin, "Access-Control-Allow-Credentials": "true"}
+        answer["Access-Control-Allow-Methods"] = ", ".join(rule["AllowedMethod"])
+        if request_headers:
+            answer["Access-Control-Allow-Headers"] = ", ".join(request_headers)
+        if rule.get("ExposeHeader"):
+            answer["Access-Control-Expose-Headers"] = ", ".join(rule["ExposeHeader"])
+        if rule.get("MaxAgeSeconds"):
+            answer["Access-Control-Max-Age"] = rule["MaxAgeSeconds"][0]
+        answer["Vary"] = _CORS_VARY
+        return answer
+    return None
+
+
+def _cors_error(code: str, message: str, status: int, method: str = "", resource_type: str = "") -> tuple:
+    """A CORS refusal, which names the method and resource type instead of a resource."""
+    root = Element("Error")
+    SubElement(root, "Code").text = code
+    SubElement(root, "Message").text = message
+    if method:
+        SubElement(root, "Method").text = method
+        SubElement(root, "ResourceType").text = resource_type
+    SubElement(root, "RequestId").text = new_uuid()
+    return status, {"Content-Type": "application/xml"}, _xml_body(root)
+
+
+def cors_preflight(bucket_name: str, key: str, headers: dict) -> tuple:
+    """The answer to a browser preflight (OPTIONS) from the bucket's CORS configuration."""
+    origin = headers.get("origin")
+    if not origin:
+        return _cors_error("BadRequest", "Insufficient information. Origin request header needed.", 400)
+    method = headers.get("access-control-request-method", "")
+    rules = _cors_rules(bucket_name)
+    if rules is None:
+        return _cors_error("AccessForbidden", "CORSResponse: CORS is not enabled for this bucket.", 403,
+                           method or "OPTIONS", "BUCKET")
+    wanted = [h.strip() for h in headers.get("access-control-request-headers", "").split(",") if h.strip()]
+    answer = _cors_answer(rules, origin, method, wanted) if method else None
+    if answer is None:
+        return _cors_error("AccessForbidden", _CORS_NOT_ALLOWED, 403, method or "OPTIONS",
+                           "OBJECT" if key else "BUCKET")
+    return 200, {**answer, "Content-Length": "0"}, b""
+
+
+def cors_response_headers(bucket_name: str, method: str, headers: dict) -> dict:
+    """The Access-Control-* headers for a request with an Origin that one of the bucket's CORS rules allows."""
+    origin = headers.get("origin")
+    rules = _cors_rules(bucket_name) if origin else None
+    return (_cors_answer(rules, origin, method, []) if rules else None) or {}
+
+
 def _get_bucket_acl(name: str):
     if name not in _buckets:
         return _no_such_bucket(name)
     stored = _bucket_acl.get(name)
     if stored:
         return 200, {"Content-Type": "application/xml"}, stored
+    _oid = _canonical_owner_id().encode()
     body = (
         XML_DECL + b"\n"
         b'<AccessControlPolicy xmlns="' + S3_NS.encode() + b'">'
-        b"<Owner><ID>owner-id</ID><DisplayName>ministack</DisplayName></Owner>"
+        b"<Owner><ID>" + _oid + b"</ID><DisplayName>ministack</DisplayName></Owner>"
         b"<AccessControlList><Grant>"
         b'<Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="CanonicalUser">'
-        b"<ID>owner-id</ID><DisplayName>ministack</DisplayName></Grantee>"
+        b"<ID>" + _oid + b"</ID><DisplayName>ministack</DisplayName></Grantee>"
         b"<Permission>FULL_CONTROL</Permission>"
         b"</Grant></AccessControlList></AccessControlPolicy>"
     )
     return 200, {"Content-Type": "application/xml"}, body
 
 
-def _put_bucket_acl(name: str, body: bytes):
+def _put_bucket_acl(name: str, body: bytes, headers: dict | None = None):
+    headers = headers or {}
     if name not in _buckets:
         return _no_such_bucket(name)
-    if body:
-        _bucket_acl[name] = body.decode("utf-8", errors="replace")
+    refused = _public_acl_refused(name, headers, body)
+    if refused:
+        return refused
+    enforced = _bucket_owner_enforced(_buckets[name])
+    grant_acl, err = _grant_headers_acl(headers, enforced)
+    if err:
+        return err
+    if enforced and (err := _acls_disabled_error(headers, body, _CANNED_BUCKET_ACLS)):
+        return err
+
+    # Canned ACL from x-amz-acl header takes precedence and is mutually
+    # exclusive with an XML body per the AWS API reference. SDK callers send
+    # the canned value as a header with an EMPTY body, so ignoring the header
+    # silently dropped every `put-bucket-acl --acl public-read`. Either path
+    # stores the resulting policy XML so GetBucketAcl round-trips the value
+    # the caller set, matching what real AWS would return.
+    canned = headers.get("x-amz-acl")
+    if canned:
+        if canned not in _CANNED_BUCKET_ACLS:
+            return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned}", 400)
+        _bucket_acl[name] = _canned_acl_policy_xml(canned, _canonical_owner_id())
+        return 200, {}, b""
+    if grant_acl:
+        if body:
+            return _error("UnexpectedContent", "This request does not support content", 400)
+        _bucket_acl[name] = grant_acl
+        return 200, {}, b""
+
+    if not body:
+        return _error("MissingSecurityHeader", "Your request was missing a required header.", 400)
+    try:
+        # Validate XML well-formedness — real AWS rejects malformed bodies
+        # with MalformedACLError. We don't enforce grantee/permission
+        # semantics on the data plane, so any well-formed AccessControlPolicy
+        # is accepted and round-tripped verbatim.
+        fromstring(body)
+    except Exception:
+        return _error(
+            "MalformedACLError",
+            "The XML you provided was not well-formed or did not validate " "against our published schema.",
+            400,
+        )
+    _bucket_acl[name] = body.decode("utf-8", errors="replace")
     return 200, {}, b""
 
 
@@ -1075,7 +4042,7 @@ def _put_bucket_tagging(name: str, body: bytes):
     try:
         tags = _parse_tags_xml(body)
     except Exception:
-        return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+        return _error("MalformedXML", _MALFORMED_XML, 400)
     if len(tags) > 50:
         return _error("BadRequest", "Object tags cannot be greater than 50", 400)
     _bucket_tags[name] = tags
@@ -1092,7 +4059,13 @@ def _delete_bucket_tagging(name: str):
 def _put_bucket_ownership_controls(name: str, body: bytes):
     if name not in _buckets:
         return _no_such_bucket(name)
+    stored_acl = _bucket_acl.get(name)
+    if b"BucketOwnerEnforced" in body and (_acl_grants(stored_acl) or any(
+            grantee != _canonical_owner_id() for grantee, _ in _acl_grants(stored_acl, "ID"))):
+        return _error("InvalidBucketAclWithObjectOwnership",
+                      "Bucket cannot have ACLs set with ObjectOwnership's BucketOwnerEnforced setting", 400)
     _buckets[name]["_ownership_controls"] = body.decode("utf-8", errors="replace")
+    _buckets[name].pop("_ownership_controls_deleted", None)
     return 200, {}, b""
 
 
@@ -1102,6 +4075,16 @@ def _get_bucket_ownership_controls(name: str):
     stored = _buckets[name].get("_ownership_controls")
     if stored:
         return 200, {"Content-Type": "application/xml"}, stored
+    if _buckets[name].get("_ownership_controls_deleted"):
+        # Explicitly deleted: real S3 returns 404 (not a default block) so the
+        # Terraform delete waiter can complete.
+        return _error(
+            "OwnershipControlsNotFoundError",
+            "The bucket ownership controls were not found",
+            404,
+            f"/{name}",
+        )
+    # Never configured: real S3 reports the default Object Ownership.
     root = Element("OwnershipControls", xmlns=S3_NS)
     rule = SubElement(root, "Rule")
     SubElement(rule, "ObjectOwnership").text = "BucketOwnerEnforced"
@@ -1112,8 +4095,27 @@ def _delete_bucket_ownership_controls(name: str):
     if name not in _buckets:
         return _no_such_bucket(name)
     _buckets[name].pop("_ownership_controls", None)
+    _buckets[name]["_ownership_controls_deleted"] = True
     return 204, {}, b""
 
+
+# Under AUTH=true a new bucket blocks all public access until PutPublicAccessBlock or DeletePublicAccessBlock
+# changes it.
+_NEW_BUCKET_PUBLIC_ACCESS_BLOCK = (
+    XML_DECL.decode() + "\n"
+    f'<PublicAccessBlockConfiguration xmlns="{S3_NS}">'
+    "<BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls>"
+    "<BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>true</RestrictPublicBuckets>"
+    "</PublicAccessBlockConfiguration>"
+)
+
+
+
+def _new_bucket_public_access_block() -> dict:
+    """The Block Public Access record of a new bucket: all four settings on under AUTH=true, none otherwise."""
+    from ministack.app import AUTH
+
+    return {"_public_access_block": _NEW_BUCKET_PUBLIC_ACCESS_BLOCK} if AUTH else {}
 
 def _put_public_access_block(name: str, body: bytes):
     if name not in _buckets:
@@ -1128,13 +4130,15 @@ def _get_public_access_block(name: str):
     stored = _buckets[name].get("_public_access_block")
     if stored:
         return 200, {"Content-Type": "application/xml"}, stored
-    # Default: all public access blocked
-    root = Element("PublicAccessBlockConfiguration", xmlns=S3_NS)
-    SubElement(root, "BlockPublicAcls").text = "true"
-    SubElement(root, "IgnorePublicAcls").text = "true"
-    SubElement(root, "BlockPublicPolicy").text = "true"
-    SubElement(root, "RestrictPublicBuckets").text = "true"
-    return 200, {"Content-Type": "application/xml"}, _xml_body(root)
+    # No configuration set (never put, or deleted): real S3 returns 404 rather
+    # than a default block, so DeletePublicAccessBlock is observable and the
+    # Terraform delete waiter can complete.
+    return _error(
+        "NoSuchPublicAccessBlockConfiguration",
+        "The public access block configuration was not found",
+        404,
+        f"/{name}",
+    )
 
 
 def _delete_public_access_block(name: str):
@@ -1154,16 +4158,76 @@ def _get_bucket_notification(name: str):
     return 200, {"Content-Type": "application/xml"}, _xml_body(root)
 
 
-def _put_bucket_notification(name: str, body: bytes):
+def _generated_notification_id() -> str:
+    """An omitted Id is base64 of a UUID (captured us-east-1 2026-09-20)."""
+    return base64.b64encode(new_uuid().encode()).decode().rstrip("=")
+
+
+def _notification_configs_to_xml(configs, has_eventbridge: bool) -> str:
+    """The canonical wire form of a notification configuration.
+
+    Element names come from the S3 model's locationName, which is what every
+    AWS SDK reads: LambdaFunctionConfigurations -> CloudFunctionConfiguration
+    and LambdaFunctionArn -> CloudFunction. Storing whatever spelling the
+    caller happened to send means a GET only parses for that same client.
+    """
+    root = Element("NotificationConfiguration", xmlns=S3_NS)
+    wire = {
+        "sqs": ("QueueConfiguration", "Queue"),
+        "sns": ("TopicConfiguration", "Topic"),
+        "lambda": ("CloudFunctionConfiguration", "CloudFunction"),
+    }
+    for config in configs or []:
+        names = wire.get(config.get("type"))
+        if not names:
+            continue
+        cfg_tag, arn_tag = names
+        cfg_el = SubElement(root, cfg_tag)
+        if config.get("id"):
+            SubElement(cfg_el, "Id").text = str(config["id"])
+        SubElement(cfg_el, arn_tag).text = str(config.get("arn", ""))
+        for event in config.get("events") or []:
+            SubElement(cfg_el, "Event").text = str(event)
+        rules = [("prefix", config.get("filter_prefix")),
+                 ("suffix", config.get("filter_suffix"))]
+        if any(value is not None for _name, value in rules):
+            s3key_el = SubElement(SubElement(cfg_el, "Filter"), "S3Key")
+            for name, value in rules:
+                if value is None:
+                    continue
+                rule_el = SubElement(s3key_el, "FilterRule")
+                SubElement(rule_el, "Name").text = name
+                SubElement(rule_el, "Value").text = value
+    if has_eventbridge:
+        SubElement(root, "EventBridgeConfiguration")
+    return tostring(root, encoding="unicode")
+
+
+def _put_bucket_notification(name: str, body: bytes, headers: dict | None = None):
     if name not in _buckets:
         return _no_such_bucket(name)
-    _bucket_notifications[name] = body.decode("utf-8", errors="replace")
+    raw = body.decode("utf-8", errors="replace")
+    configs = _parse_notification_config_raw(raw)
+    bucket_region = _notification_bucket_region(name)
+    # x-amz-skip-destination-validation skips the destination probe below (the
+    # existence + policy check); malformed ARNs and out-of-scope targets are
+    # still rejected as config-shape errors.
+    skip_probe = (headers or {}).get("x-amz-skip-destination-validation", "").lower() == "true"
+    validation_error = _validate_notification_configs(
+        configs, bucket_region, name, skip_probe)
+    if validation_error:
+        return validation_error
+    _bucket_notifications[name] = _notification_configs_to_xml(
+        configs, "EventBridgeConfiguration" in raw)
     # Fire the s3:TestEvent synchronously so it's delivered before PutBucketNotification
     # returns — matches AWS's effective behaviour and avoids a race where the
     # client polls the destination queue/topic before the background thread has
     # delivered the message (also loses the caller's account contextvar across
-    # threads, which broke multi-tenant tests).
-    _fire_s3_test_event(name)
+    # threads, which broke multi-tenant tests). Queue and topic destinations only;
+    # AWS does not send the test event to Lambda targets. With validation
+    # skipped there is no probe, hence no test event either.
+    if not skip_probe:
+        _fire_s3_test_event(name)
     return 200, {}, b""
 
 
@@ -1253,6 +4317,7 @@ def _list_object_versions(bucket_name: str, query_params: dict):
         return _no_such_bucket(bucket_name)
 
     prefix = _qp(query_params, "prefix", "")
+    delimiter = _qp(query_params, "delimiter", "")
     key_marker = _qp(query_params, "key-marker", "")
     version_id_marker = _qp(query_params, "version-id-marker", "")
     max_keys = int(_qp(query_params, "max-keys", "1000"))
@@ -1260,21 +4325,88 @@ def _list_object_versions(bucket_name: str, query_params: dict):
     root = Element("ListVersionsResult", xmlns=S3_NS)
     SubElement(root, "Name").text = bucket_name
     SubElement(root, "Prefix").text = prefix
+    if delimiter:
+        SubElement(root, "Delimiter").text = delimiter
     SubElement(root, "KeyMarker").text = key_marker
     SubElement(root, "VersionIdMarker").text = version_id_marker
     SubElement(root, "MaxKeys").text = str(max_keys)
 
-    # Collect all keys: from objects AND from version history (deleted objects)
-    all_keys = set(k for k in bucket["objects"] if k.startswith(prefix) and k > key_marker)
-    for (bn, k) in _object_versions:
-        if bn == bucket_name and k.startswith(prefix) and k > key_marker:
+    owner_id = _canonical_owner_id()
+
+    # Collect all keys: from objects AND from version history (deleted objects).
+    # When a version-id-marker is supplied we must resume *within* key-marker,
+    # so that key is included; otherwise key-marker is exclusive.
+    def _in_page(k):
+        if not k.startswith(prefix):
+            return False
+        if version_id_marker:
+            return k >= key_marker
+        return k > key_marker
+
+    all_keys = set(k for k in bucket["objects"] if _in_page(k))
+    for bn, k in _object_versions:
+        if bn == bucket_name and _in_page(k):
             all_keys.add(k)
     keys = sorted(all_keys)
 
     is_truncated = False
-    SubElement(root, "IsTruncated").text = "false"
+    is_truncated_el = SubElement(root, "IsTruncated")
+    is_truncated_el.text = "false"
 
     count = 0
+    next_key_marker = None
+    next_version_id_marker = None
+
+    def _emit_version(k, v):
+        if v.get("is_delete_marker"):
+            dm = SubElement(root, "DeleteMarker")
+            SubElement(dm, "Key").text = k
+            SubElement(dm, "VersionId").text = v["version_id"]
+            SubElement(dm, "IsLatest").text = "true" if v["is_latest"] else "false"
+            SubElement(dm, "LastModified").text = v["last_modified"]
+            owner = SubElement(dm, "Owner")
+        else:
+            ver = SubElement(root, "Version")
+            SubElement(ver, "Key").text = k
+            SubElement(ver, "VersionId").text = v["version_id"]
+            SubElement(ver, "IsLatest").text = "true" if v["is_latest"] else "false"
+            SubElement(ver, "LastModified").text = v["last_modified"]
+            SubElement(ver, "ETag").text = v["etag"]
+            SubElement(ver, "Size").text = str(v["size"])
+            SubElement(ver, "StorageClass").text = (
+                v.get("storage_class") or bucket["objects"].get(k, {}).get("storage_class") or "STANDARD"
+            )
+            owner = SubElement(ver, "Owner")
+        SubElement(owner, "ID").text = owner_id
+        SubElement(owner, "DisplayName").text = "ministack"
+
+    # A delimiter rolls every key that carries one after the prefix up into a
+    # CommonPrefixes entry, and none of that key's versions is listed --
+    # ListObjectVersions groups exactly as ListObjects does.  Each distinct
+    # prefix counts once against MaxKeys.
+    common_prefixes = []
+    if delimiter:
+        rolled = []
+        for k in keys:
+            tail = k[len(prefix) :]
+            cut = tail.find(delimiter)
+            if cut == -1:
+                rolled.append(k)
+                continue
+            group = prefix + tail[: cut + len(delimiter)]
+            if group not in common_prefixes:
+                common_prefixes.append(group)
+        keys = rolled
+
+    for group in common_prefixes:
+        if count >= max_keys:
+            is_truncated = True
+            break
+        cp = SubElement(root, "CommonPrefixes")
+        SubElement(cp, "Prefix").text = group
+        next_key_marker, next_version_id_marker = group, None
+        count += 1
+
     for k in keys:
         if count >= max_keys:
             is_truncated = True
@@ -1282,36 +4414,20 @@ def _list_object_versions(bucket_name: str, query_params: dict):
         vkey = (bucket_name, k)
         versions = _object_versions.get(vkey)
         if versions:
-            # Return all stored versions (newest first)
+            # Resume within key-marker: skip versions up to and including the
+            # supplied version-id-marker (versions are stored oldest-first, so
+            # newest-first iteration matches the S3 listing order).
+            skipping = bool(version_id_marker and k == key_marker)
             for v in reversed(versions):
+                if skipping:
+                    if v["version_id"] == version_id_marker:
+                        skipping = False
+                    continue
                 if count >= max_keys:
                     is_truncated = True
                     break
-                if v.get("is_delete_marker"):
-                    dm = SubElement(root, "DeleteMarker")
-                    SubElement(dm, "Key").text = k
-                    SubElement(dm, "VersionId").text = v["version_id"]
-                    SubElement(dm, "IsLatest").text = "true" if v["is_latest"] else "false"
-                    SubElement(dm, "LastModified").text = v["last_modified"]
-                    owner = SubElement(dm, "Owner")
-                    SubElement(owner, "ID").text = "owner-id"
-                    SubElement(owner, "DisplayName").text = "ministack"
-                else:
-                    ver = SubElement(root, "Version")
-                    SubElement(ver, "Key").text = k
-                    SubElement(ver, "VersionId").text = v["version_id"]
-                    SubElement(ver, "IsLatest").text = "true" if v["is_latest"] else "false"
-                    SubElement(ver, "LastModified").text = v["last_modified"]
-                    SubElement(ver, "ETag").text = v["etag"]
-                    SubElement(ver, "Size").text = str(v["size"])
-                    SubElement(ver, "StorageClass").text = (
-                        v.get("storage_class")
-                        or bucket["objects"].get(k, {}).get("storage_class")
-                        or "STANDARD"
-                    )
-                    owner = SubElement(ver, "Owner")
-                    SubElement(owner, "ID").text = "owner-id"
-                    SubElement(owner, "DisplayName").text = "ministack"
+                _emit_version(k, v)
+                next_key_marker, next_version_id_marker = k, v["version_id"]
                 count += 1
         else:
             # No version history — return current object with null version
@@ -1327,12 +4443,17 @@ def _list_object_versions(bucket_name: str, query_params: dict):
             SubElement(ver, "Size").text = str(obj["size"])
             SubElement(ver, "StorageClass").text = obj.get("storage_class") or "STANDARD"
             owner = SubElement(ver, "Owner")
-            SubElement(owner, "ID").text = "owner-id"
+            SubElement(owner, "ID").text = owner_id
             SubElement(owner, "DisplayName").text = "ministack"
+            next_key_marker, next_version_id_marker = k, obj.get("version_id", "null")
             count += 1
 
-    # Update IsTruncated after actual count
-    root.find("IsTruncated").text = "true" if is_truncated else "false"
+    is_truncated_el.text = "true" if is_truncated else "false"
+    # A truncated response must carry the continuation markers, or a paginating
+    # client loops on page one (or, as boto3 does, rejects KeyMarker=None).
+    if is_truncated and next_key_marker is not None:
+        SubElement(root, "NextKeyMarker").text = next_key_marker
+        SubElement(root, "NextVersionIdMarker").text = next_version_id_marker or "null"
 
     return 200, {"Content-Type": "application/xml"}, _xml_body(root)
 
@@ -1343,8 +4464,12 @@ def _list_object_versions(bucket_name: str, query_params: dict):
 
 
 def _parse_notification_config(bucket_name: str) -> list[dict]:
-    """Parse the raw notification XML into structured config dicts."""
-    raw = _bucket_notifications.get(bucket_name)
+    """Parse the stored notification XML into structured config dicts."""
+    return _parse_notification_config_raw(_bucket_notifications.get(bucket_name))
+
+
+def _parse_notification_config_raw(raw: str | None) -> list[dict]:
+    """Parse raw notification XML into structured config dicts."""
     if not raw:
         return []
 
@@ -1367,14 +4492,13 @@ def _parse_notification_config(bucket_name: str) -> list[dict]:
         "TopicConfiguration": ("sns", ("Topic",)),
         "CloudFunctionConfiguration": ("lambda", ("CloudFunction", "Function")),
         "LambdaFunctionConfiguration": (
-            "lambda", ("LambdaFunctionArn", "CloudFunction", "Function"),
+            "lambda",
+            ("LambdaFunctionArn", "CloudFunction", "Function"),
         ),
     }
 
     for tag_suffix, (target_type, arn_tags) in _CONFIG_MAP.items():
-        for cfg_el in list(root.findall(f"{{{S3_NS}}}{tag_suffix}")) + list(
-            root.findall(tag_suffix)
-        ):
+        for cfg_el in list(root.findall(f"{{{S3_NS}}}{tag_suffix}")) + list(root.findall(tag_suffix)):
             arn = ""
             for at in arn_tags:
                 el = _find_xml_tag(cfg_el, at)
@@ -1385,12 +4509,11 @@ def _parse_notification_config(bucket_name: str) -> list[dict]:
                 continue
 
             id_el = _find_xml_tag(cfg_el, "Id")
-            config_id = id_el.text if id_el is not None and id_el.text else new_uuid()
+            config_id = (id_el.text if id_el is not None and id_el.text
+                         else _generated_notification_id())
 
             events: list[str] = []
-            for ev_el in list(cfg_el.findall(f"{{{S3_NS}}}Event")) + list(
-                cfg_el.findall("Event")
-            ):
+            for ev_el in list(cfg_el.findall(f"{{{S3_NS}}}Event")) + list(cfg_el.findall("Event")):
                 if ev_el.text:
                     events.append(ev_el.text.strip())
 
@@ -1400,9 +4523,9 @@ def _parse_notification_config(bucket_name: str) -> list[dict]:
             if filter_el is not None:
                 s3key_el = _find_xml_tag(filter_el, "S3Key")
                 if s3key_el is not None:
-                    for rule_el in list(
-                        s3key_el.findall(f"{{{S3_NS}}}FilterRule")
-                    ) + list(s3key_el.findall("FilterRule")):
+                    for rule_el in list(s3key_el.findall(f"{{{S3_NS}}}FilterRule")) + list(
+                        s3key_el.findall("FilterRule")
+                    ):
                         name_el = _find_xml_tag(rule_el, "Name")
                         val_el = _find_xml_tag(rule_el, "Value")
                         if name_el is not None and name_el.text and val_el is not None:
@@ -1425,6 +4548,157 @@ def _parse_notification_config(bucket_name: str) -> list[dict]:
             )
 
     return configs
+
+
+def _invalid_notification_config(message: str) -> tuple:
+    return _error("InvalidArgument", message, 400)
+
+
+def _notification_bucket_region(bucket_name: str) -> str:
+    bucket = _buckets.get(bucket_name, {})
+    return bucket.get("region") or os.environ.get("MINISTACK_REGION", "us-east-1")
+
+
+_NOTIFICATION_TARGET_SERVICES = {
+    "sqs": "sqs",
+    "sns": "sns",
+    "lambda": "lambda",
+}
+
+
+def _queue_name_from_sqs_arn_spec(spec) -> str | None:
+    if spec.service != "sqs" or not spec.resource or ":" in spec.resource or "/" in spec.resource:
+        return None
+    return spec.resource
+
+
+def _topic_name_from_sns_arn_spec(spec) -> str | None:
+    if spec.service != "sns" or not spec.resource or ":" in spec.resource or "/" in spec.resource:
+        return None
+    return spec.resource
+
+
+def _lambda_name_from_arn_spec(spec) -> str | None:
+    if spec.service != "lambda":
+        return None
+    parts = spec.resource.split(":", 2)
+    if len(parts) < 2 or parts[0] != "function" or not parts[1]:
+        return None
+    return parts[1]
+
+
+def _parse_notification_target_arn(target_type: str, arn: str, bucket_region: str):
+    expected_service = _NOTIFICATION_TARGET_SERVICES.get(target_type)
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None, "destination ARN is not in the correct format"
+
+    if spec.service != expected_service:
+        return spec, f"expected {expected_service} ARN, got {spec.service}"
+    if not spec.account_id:
+        return spec, "destination ARN must include an account ID"
+    if target_type == "lambda" and spec.account_id != get_account_id():
+        # SQS/SNS destinations may live in another account: real S3 delivers
+        # to them when their resource policy allows it, and the probe below
+        # verifies exactly that. Lambda stays same-account — function policies
+        # are not modeled, so a foreign function could never be verified.
+        return spec, "destination account must match bucket owner account"
+    if not spec.region:
+        return spec, "destination ARN must include a region"
+    if spec.region != bucket_region:
+        return spec, "destination region must match bucket region"
+    return spec, None
+
+
+def _validate_notification_target_arn(target_type: str, arn: str, bucket_region: str) -> tuple | None:
+    spec, error = _parse_notification_target_arn(target_type, arn, bucket_region)
+    if error:
+        return _invalid_notification_config(f"Unable to validate destination configuration: {error}")
+
+    if target_type == "sqs" and not _queue_name_from_sqs_arn_spec(spec):
+        return _invalid_notification_config("Unable to validate destination configuration: invalid SQS queue ARN")
+    if target_type == "sns" and not _topic_name_from_sns_arn_spec(spec):
+        return _invalid_notification_config("Unable to validate destination configuration: invalid SNS topic ARN")
+    if target_type == "lambda" and not _lambda_name_from_arn_spec(spec):
+        return _invalid_notification_config("Unable to validate destination configuration: invalid Lambda function ARN")
+    return None
+
+
+def _notification_destination_exists(target_type: str, arn: str, bucket_region: str) -> bool:
+    """Whether the queue or topic an SQS/SNS destination names is there.
+
+    S3 verifies an SNS or SQS destination by sending it a test notification,
+    and "if the message fails, the entire PUT action will fail, and Amazon S3
+    will not add the configuration to your bucket". A Lambda destination is
+    verified through its function permissions instead, which this emulator
+    does not model, so a Lambda target is not checked here.
+    """
+    spec = _parse_delivery_notification_target(target_type, arn, bucket_region)
+    if not spec:
+        return False
+    if target_type == "sqs":
+        from ministack.services import sqs as _sqs
+
+        return bool(_queue_name_from_sqs_arn_spec(spec)) and _sqs._queue_by_arn(str(spec)) is not None
+    from ministack.services import sns as _sns
+
+    # The topic may belong to another account, so resolve it in its owner's
+    # scope — a current-scope lookup would reject a cross-account topic whose
+    # policy allows the delivery.
+    return bool(_topic_name_from_sns_arn_spec(spec)) and _sns._topic_by_arn_any_scope(arn) is not None
+
+
+def _notification_destination_allows(target_type: str, arn: str,
+                                      bucket_name: str, owner: str) -> bool:
+    """Whether the destination's resource policy lets S3 publish to it.
+
+    The Put-time probe half of the AWS verification ("S3 verifies an SNS or
+    SQS destination by sending it a test notification, and if the message
+    fails, the entire PUT action will fail"): no probe message is actually
+    sent here — the delivery-time check answers the same question, and the
+    single test event goes out after the config is stored.
+    """
+    source_arn = f"arn:aws:s3:::{bucket_name}" if bucket_name else ""
+    if target_type == "sqs":
+        from ministack.services import sqs as _sqs
+
+        return _sqs.queue_policy_allows(arn, "s3.amazonaws.com",
+                                        source_arn, owner)
+    from ministack.services import sns as _sns
+
+    return _sns.topic_policy_allows(arn, "s3.amazonaws.com", source_arn, owner)
+
+
+def _validate_notification_configs(configs: list[dict], bucket_region: str,
+                                   bucket_name: str = "",
+                                   skip_destination_validation: bool = False,
+                                   ) -> tuple | None:
+    for cfg in configs:
+        error = _validate_notification_target_arn(cfg["type"], cfg["arn"], bucket_region)
+        if error:
+            return error
+    if skip_destination_validation:
+        return None
+    # The destination check is second: an ARN that does not parse is reported
+    # as malformed before anything tries to reach what it names. A destination
+    # fails the probe when it does not exist or when its resource policy does
+    # not let S3 publish — either way the whole PUT fails, like real S3. The
+    # policy half is permissive while AUTH is off, leaving the existence check.
+    owner = _bucket_owner_account(bucket_name) if bucket_name else None
+    unreachable = [
+        cfg["arn"] for cfg in configs
+        if cfg["type"] in ("sqs", "sns")
+        and (not _notification_destination_exists(cfg["type"], cfg["arn"], bucket_region)
+             or not _notification_destination_allows(cfg["type"], cfg["arn"],
+                                                     bucket_name, owner or ""))
+    ]
+    if unreachable:
+        return _invalid_notification_config(
+            "Unable to validate the following destination configurations: "
+            + ", ".join(unreachable)
+        )
+    return None
 
 
 def _event_matches(event_name: str, patterns: list[str]) -> bool:
@@ -1452,8 +4726,74 @@ def _key_matches_filter(key: str, prefix: str | None, suffix: str | None) -> boo
     return True
 
 
+# Amazon S3 → EventBridge uses a fixed set of detail-types (per event family) and a per-API `reason`.
+# See https://docs.aws.amazon.com/AmazonS3/latest/userguide/EventBridge.html
+_S3_EVENTBRIDGE_DETAIL_TYPE = {
+    "ObjectCreated": "Object Created",
+    "ObjectRemoved": "Object Deleted",
+}
+# The restore family is the one family whose events map to distinct
+# detail-types (and whose details carry no `reason` field).
+_S3_EVENTBRIDGE_EVENT_DETAIL_TYPE = {
+    "ObjectRestore:Post": "Object Restore Initiated",
+    "ObjectRestore:Completed": "Object Restore Completed",
+    "ObjectRestore:Delete": "Object Restore Expired",
+}
+# `reason` reflects the S3 API that produced the event.
+_S3_EVENTBRIDGE_REASON = {
+    "Put": "PutObject",
+    "Post": "POST Object",
+    "Copy": "CopyObject",
+    "CompleteMultipartUpload": "CompleteMultipartUpload",
+    "Delete": "DeleteObject",
+}
+
+
+def _s3_event_to_eventbridge(event_name: str) -> tuple[str, str | None]:
+    """Map an S3 notification event name (e.g. ``s3:ObjectCreated:Put``) to the EventBridge
+    ``detail-type`` and ``reason`` Amazon S3 emits. Created/Removed collapse per family
+    exactly as real S3 does; the restore events each carry their own detail-type and no
+    reason."""
+    parts = event_name.split(":")
+    family = parts[1] if len(parts) > 1 else ""
+    action = parts[2] if len(parts) > 2 else ""
+    per_event = _S3_EVENTBRIDGE_EVENT_DETAIL_TYPE.get(f"{family}:{action}")
+    if per_event is not None:
+        return per_event, None
+    detail_type = _S3_EVENTBRIDGE_DETAIL_TYPE.get(family, "Object Created")
+    reason = _S3_EVENTBRIDGE_REASON.get(action, "DeleteObject" if family == "ObjectRemoved" else "PutObject")
+    return detail_type, reason
+
+
+# Clock-seeded so sequencers keep growing across restarts.
+_event_sequence = itertools.count(time.time_ns() // 1000)
+_EVENT_SEQUENCED_FAMILIES = ("s3:ObjectCreated:", "s3:ObjectRemoved:")
+
+
+def _next_event_sequencer(event_name: str) -> str | None:
+    """Sequencer for create/delete events only; None otherwise."""
+    if not event_name.startswith(_EVENT_SEQUENCED_FAMILIES):
+        return None
+    return f"{next(_event_sequence):018X}"
+
+
+def _event_object_key(key: str) -> str:
+    """URL-encoded key for notification records (EventBridge keeps it raw)."""
+    return _url_quote_plus(key, safe="/")
+
+
 def _fire_s3_event(
-    bucket_name: str, key: str, event_name: str, size: int = 0, etag: str = ""
+    bucket_name: str,
+    key: str,
+    event_name: str,
+    size: int = 0,
+    etag: str = "",
+    deletion_type: str | None = None,
+    restore_event_data: dict | None = None,
+    version_id: str | None = None,
+    sequencer: str | None = None,
+    object_extra: dict | None = None,
+    record_extra: dict | None = None,
 ) -> None:
     """Build and deliver an S3 event notification. Best-effort — errors are logged."""
     try:
@@ -1462,18 +4802,27 @@ def _fire_s3_event(
         has_eventbridge = "EventBridgeConfiguration" in raw_xml
         if not configs and not has_eventbridge:
             return
+        bucket_region = _notification_bucket_region(bucket_name)
 
         short_event = event_name.replace("s3:", "", 1)
         event_time = now_iso()
         request_id = new_uuid()
         clean_etag = etag.strip('"')
+        event_object = {"key": _event_object_key(key), "size": size, "eTag": clean_etag}
+        if version_id:
+            event_object["versionId"] = version_id
+        if sequencer:
+            event_object["sequencer"] = sequencer
+        if object_extra:
+            event_object.update(object_extra)
 
         event_payload = {
             "Records": [
                 {
-                    "eventVersion": "2.1",
+                    # One unified version for every event type since 2.4.
+                    "eventVersion": "2.6",
                     "eventSource": "aws:s3",
-                    "awsRegion": os.environ.get("MINISTACK_REGION", "us-east-1"),
+                    "awsRegion": bucket_region,
                     "eventTime": event_time,
                     "eventName": short_event,
                     "userIdentity": {"principalId": "EXAMPLE"},
@@ -1490,24 +4839,24 @@ def _fire_s3_event(
                             "ownerIdentity": {"principalId": "EXAMPLE"},
                             "arn": f"arn:aws:s3:::{bucket_name}",
                         },
-                        "object": {
-                            "key": key,
-                            "size": size,
-                            "eTag": clean_etag,
-                            "sequencer": "0",
-                        },
+                        "object": event_object,
                     },
                 }
             ],
         }
+        if record_extra:
+            event_payload["Records"][0].update(record_extra)
+        if restore_event_data:
+            # glacierEventData appears only on s3:ObjectRestore:Completed.
+            event_payload["Records"][0]["glacierEventData"] = {
+                "restoreEventData": restore_event_data,
+            }
 
         for cfg in configs:
             try:
                 if not _event_matches(event_name, cfg["events"]):
                     continue
-                if not _key_matches_filter(
-                    key, cfg["filter_prefix"], cfg["filter_suffix"]
-                ):
+                if not _key_matches_filter(key, cfg["filter_prefix"], cfg["filter_suffix"]):
                     continue
 
                 payload = dict(event_payload)
@@ -1516,58 +4865,97 @@ def _fire_s3_event(
                 payload["Records"][0]["s3"]["configurationId"] = cfg["id"]
 
                 if cfg["type"] == "sqs":
-                    _deliver_event_to_sqs(cfg["arn"], payload)
+                    _deliver_event_to_sqs(cfg["arn"], payload, bucket_region,
+                                          bucket_name=bucket_name)
                 elif cfg["type"] == "sns":
-                    _deliver_event_to_sns(cfg["arn"], payload)
+                    _deliver_event_to_sns(cfg["arn"], payload, bucket_region,
+                                          bucket_name=bucket_name)
                 elif cfg["type"] == "lambda":
-                    _deliver_event_to_lambda(cfg["arn"], payload)
+                    _deliver_event_to_lambda(cfg["arn"], payload, bucket_region)
             except Exception:
-                logger.exception(
-                    "S3 notification delivery failed for config %s", cfg.get("id")
-                )
+                logger.exception("S3 notification delivery failed for config %s", cfg.get("id"))
 
         # S3 → EventBridge delivery (if EventBridgeConfiguration is enabled)
         try:
             if has_eventbridge:
                 from ministack.services import eventbridge as _eb
+
+                detail_type, reason = _s3_event_to_eventbridge(event_name)
+                detail = {
+                    "version": "0",
+                    "event-version": "1.0",
+                    "bucket": {"name": bucket_name},
+                    "object": {"key": key, "size": size, "etag": clean_etag, "sequencer": sequencer or "0"},
+                    "request-id": request_id,
+                    "requester": get_account_id(),
+                    "source-ip-address": "127.0.0.1",
+                }
+                if reason is not None:
+                    detail["reason"] = reason
+                if detail_type == "Object Deleted":
+                    # AWS always carries a deletion-type on Object Deleted; default to the
+                    # unversioned/permanent case unless the caller created a delete marker.
+                    detail["deletion-type"] = deletion_type or "Permanently Deleted"
                 eb_event = {
                     "EventId": request_id,
                     "Source": "aws.s3",
-                    "DetailType": event_name.replace("s3:", "Object ").replace(":", " ").replace("*", ""),
-                    "Detail": json.dumps({
-                        "version": "0",
-                        "bucket": {"name": bucket_name},
-                        "object": {"key": key, "size": size, "etag": clean_etag, "sequencer": "0"},
-                        "request-id": request_id,
-                        "requester": get_account_id(),
-                        "source-ip-address": "127.0.0.1",
-                        "reason": "PutObject",
-                    }),
+                    "DetailType": detail_type,
+                    "Detail": json.dumps(detail),
                     "EventBusName": "default",
                     "Time": event_time,
                     "Resources": [f"arn:aws:s3:::{bucket_name}"],
                     "Account": get_account_id(),
-                    "Region": os.environ.get("MINISTACK_REGION", "us-east-1"),
+                    "Region": bucket_region,
                 }
-                _eb._dispatch_event(eb_event)
-                logger.debug("S3→EventBridge: %s for %s/%s", event_name, bucket_name, key)
+                previous_region = get_region()
+                set_request_region(bucket_region)
+                try:
+                    _eb._dispatch_event(eb_event)
+                finally:
+                    set_request_region(previous_region)
+                logger.debug("S3→EventBridge: %s (%s) for %s/%s", detail_type, event_name, bucket_name, key)
         except Exception:
             logger.exception("S3→EventBridge delivery failed for %s/%s", bucket_name, key)
 
     except Exception:
-        logger.exception(
-            "S3 event notification fire failed for %s/%s", bucket_name, key
+        logger.exception("S3 event notification fire failed for %s/%s", bucket_name, key)
+
+
+def _parse_delivery_notification_target(target_type: str, arn: str, bucket_region: str):
+    spec, error = _parse_notification_target_arn(target_type, arn, bucket_region)
+    if error:
+        logger.warning(
+            "S3 notification: invalid %s target ARN %s: %s",
+            target_type.upper(),
+            arn,
+            error,
         )
+        return None
+    return spec
 
 
-def _deliver_event_to_sqs(arn: str, event_payload: dict) -> None:
+def _deliver_event_to_sqs(arn: str, event_payload: dict, bucket_region: str,
+                          bucket_name: str = "") -> None:
     from ministack.services import sqs as _sqs
 
-    queue_name = arn.rsplit(":", 1)[-1]
-    queue_url = _sqs._queue_url(queue_name)
-    queue = _sqs._queues.get(queue_url)
+    spec = _parse_delivery_notification_target("sqs", arn, bucket_region)
+    if not spec:
+        return
+    queue_name = _queue_name_from_sqs_arn_spec(spec)
+    if not queue_name:
+        logger.warning("S3 notification: invalid SQS queue ARN %s", arn)
+        return
+    queue = _sqs._queue_by_arn(str(spec))
     if not queue:
         logger.warning("S3 notification: SQS queue %s not found", queue_name)
+        return
+    owner = _bucket_owner_account(bucket_name) if bucket_name else None
+    if not _sqs.queue_policy_allows(
+            str(spec), "s3.amazonaws.com",
+            f"arn:aws:s3:::{bucket_name}" if bucket_name else "",
+            owner or get_account_id()):
+        logger.warning("S3 notification: queue policy denies delivery from %s to %s",
+                       bucket_name, queue_name)
         return
 
     body = json.dumps(event_payload)
@@ -1578,20 +4966,36 @@ def _deliver_event_to_sqs(arn: str, event_payload: dict) -> None:
         "md5": hashlib.md5(body.encode()).hexdigest(),
         "receipt_handle": None,
         "sent_at": now,
-        "visible_at": now,
+        "visible_at": now + _sqs.queue_delay(queue),
         "receive_count": 0,
     }
     _sqs._ensure_msg_fields(msg)
     queue["messages"].append(msg)
+    esm_wake.set()
     logger.info("S3 notification → SQS %s", queue_name)
 
 
-def _deliver_event_to_sns(arn: str, event_payload: dict) -> None:
+def _deliver_event_to_sns(arn: str, event_payload: dict, bucket_region: str,
+                          bucket_name: str = "") -> None:
     from ministack.services import sns as _sns
 
-    topic = _sns._topics.get(arn)
+    spec = _parse_delivery_notification_target("sns", arn, bucket_region)
+    if not spec:
+        return
+    if not _topic_name_from_sns_arn_spec(spec):
+        logger.warning("S3 notification: invalid SNS topic ARN %s", arn)
+        return
+    topic = _sns._topic_by_arn_any_scope(arn)
     if not topic:
         logger.warning("S3 notification: SNS topic %s not found", arn)
+        return
+    owner = _bucket_owner_account(bucket_name) if bucket_name else None
+    if not _sns.topic_policy_allows(
+            arn, "s3.amazonaws.com",
+            f"arn:aws:s3:::{bucket_name}" if bucket_name else "",
+            owner or get_account_id()):
+        logger.warning("S3 notification: topic policy denies delivery from %s to %s",
+                       bucket_name, arn)
         return
 
     message = json.dumps(event_payload)
@@ -1600,12 +5004,17 @@ def _deliver_event_to_sns(arn: str, event_payload: dict) -> None:
     logger.info("S3 notification → SNS %s", arn)
 
 
-def _deliver_event_to_lambda(arn: str, event_payload: dict) -> None:
+def _deliver_event_to_lambda(arn: str, event_payload: dict, bucket_region: str) -> None:
     from ministack.services import lambda_svc as _lambda
 
-    func_name = arn.rsplit(":", 1)[-1]
-    func = _lambda._functions.get(func_name)
-    if not func:
+    spec = _parse_delivery_notification_target("lambda", arn, bucket_region)
+    if not spec:
+        return
+    if not _lambda_name_from_arn_spec(spec):
+        logger.warning("S3 notification: invalid Lambda function ARN %s", arn)
+        return
+    func, config, func_name = _lambda._get_func_record_for_ref(arn)
+    if not func or not config:
         logger.warning("S3 notification: Lambda function %s not found", func_name)
         return
 
@@ -1613,30 +5022,54 @@ def _deliver_event_to_lambda(arn: str, event_payload: dict) -> None:
     # (MaximumRetryAttempts, default 2) and routing to the function's DLQ /
     # DestinationConfig.OnFailure on final failure. Shared helper keeps the
     # semantics identical to direct Invoke(InvocationType=Event).
-    _lambda.invoke_async_with_retry(func, event_payload)
+    _lambda.invoke_async_with_retry(_lambda._execution_record_for_config(func, config), event_payload)
     logger.info("S3 notification → Lambda %s (async with retry+DLQ)", func_name)
 
 
 def _fire_s3_event_async(
-    bucket_name: str, key: str, event_name: str, size: int = 0, etag: str = ""
+    bucket_name: str,
+    key: str,
+    event_name: str,
+    size: int = 0,
+    etag: str = "",
+    deletion_type: str | None = None,
+    version_id: str | None = None,
+    object_extra: dict | None = None,
+    record_extra: dict | None = None,
 ) -> None:
     """Fire S3 event notification in a background thread (non-blocking)."""
     if bucket_name not in _bucket_notifications:
         return
+    sequencer = _next_event_sequencer(event_name)
+    # threading.Thread does not copy contextvars, so without this snapshot the
+    # worker runs under the default account (000000000000): the account-scoped
+    # _bucket_notifications lookup comes back empty and the event is silently
+    # dropped for any non-default account, and SQS/SNS/Lambda/EventBridge
+    # targets resolve under the wrong account. Carry the request context in.
+    # See issue #876.
+    ctx = contextvars.copy_context()
     t = threading.Thread(
-        target=_fire_s3_event,
-        args=(bucket_name, key, event_name, size, etag),
+        target=ctx.run,
+        args=(_fire_s3_event, bucket_name, key, event_name, size, etag, deletion_type),
+        kwargs={
+            "version_id": version_id,
+            "sequencer": sequencer,
+            "object_extra": object_extra,
+            "record_extra": record_extra,
+        },
         daemon=True,
     )
     t.start()
 
 
 def _fire_s3_test_event(bucket_name: str) -> None:
-    """Deliver an s3:TestEvent to every destination in the bucket notification config."""
+    """Deliver an s3:TestEvent to the SQS and SNS destinations in the bucket
+    notification config. AWS does not send it to Lambda targets."""
     try:
         configs = _parse_notification_config(bucket_name)
         if not configs:
             return
+        bucket_region = _notification_bucket_region(bucket_name)
         payload = {
             "Service": "Amazon S3",
             "Event": "s3:TestEvent",
@@ -1648,23 +5081,17 @@ def _fire_s3_test_event(bucket_name: str) -> None:
         for cfg in configs:
             try:
                 if cfg["type"] == "sqs":
-                    _deliver_event_to_sqs(cfg["arn"], payload)
+                    _deliver_event_to_sqs(cfg["arn"], payload, bucket_region,
+                                          bucket_name=bucket_name)
                 elif cfg["type"] == "sns":
-                    _deliver_event_to_sns(cfg["arn"], payload)
-                elif cfg["type"] == "lambda":
-                    _deliver_event_to_lambda(cfg["arn"], payload)
+                    _deliver_event_to_sns(cfg["arn"], payload, bucket_region,
+                                          bucket_name=bucket_name)
+                # No lambda branch: AWS verifies Lambda destinations by checking the
+                # function's permissions, not by invoking them.
             except Exception:
-                logger.exception(
-                    "S3 test-event delivery failed for config %s", cfg.get("id")
-                )
+                logger.exception("S3 test-event delivery failed for config %s", cfg.get("id"))
     except Exception:
         logger.exception("S3 test-event fire failed for %s", bucket_name)
-
-
-def _fire_s3_test_event_async(bucket_name: str) -> None:
-    """Fire s3:TestEvent in a background thread (non-blocking)."""
-    t = threading.Thread(target=_fire_s3_test_event, args=(bucket_name,), daemon=True)
-    t.start()
 
 
 # ---------------------------------------------------------------------------
@@ -1685,48 +5112,88 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
     if sc_err:
         return sc_err
 
+    precondition_err = _check_put_preconditions(headers, bucket.get("objects", {}).get(key))
+    if precondition_err:
+        return precondition_err
+
+    checksums, csum_err = _resolve_object_checksums(body, headers)
+    if csum_err:
+        return csum_err
+
+    sse_headers, sse_err = _resolve_sse_write_headers(headers, bucket_name, reject_orphan_key=True)
+    if sse_err:
+        return sse_err
+
+    # A canned ACL supplied at PutObject time is validated up front (an invalid
+    # value rejects the whole request, as AWS does) and applied below once the
+    # version id is assigned, so GetObjectAcl reflects it instead of dropping
+    # it. (#1322, rest of defect 9)
+    canned_acl = headers.get("x-amz-acl")
+    if canned_acl and canned_acl not in _CANNED_OBJECT_ACLS:
+        return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned_acl}", 400)
+    grant_acl, err = _grant_headers_acl(headers, _bucket_owner_enforced(bucket))
+    if err:
+        return err
+    if _bucket_owner_enforced(bucket) and (err := _acls_disabled_error(headers)):
+        return err
+    refused = _public_acl_refused(bucket_name, headers)
+    if refused:
+        return refused
+
+    lock_err = _object_lock_header_error(bucket_name, headers)
+    if lock_err:
+        return lock_err
     etag = f'"{md5_hash(body)}"'
-    obj = _build_object_record(body, headers, etag=etag)
+    obj = _build_object_record(body, headers, etag=etag, checksums=checksums)
+    obj["preserved_headers"].update(sse_headers)
+    prior_obj = bucket["objects"].get(key)
     bucket["objects"][key] = obj
 
-    # --- Object Lock headers on PutObject ---
-    _apply_object_lock_from_headers(bucket_name, key, headers)
-
     # --- x-amz-tagging header on PutObject ---
+    # Parse + validate up front so the count error returns before persist/event,
+    # but defer the dict write until version_id is assigned (tags are per-version).
+    pending_tags = None
     tagging_header = headers.get("x-amz-tagging", "")
     if tagging_header:
-        tags = {k: v[0] for k, v in _parse_qs(tagging_header).items()}
-        if len(tags) > 10:
+        pending_tags = {k: v[0] for k, v in _parse_qs(tagging_header, keep_blank_values=True).items()}
+        if len(pending_tags) > 10:
             return _error("BadRequest", "Object tags cannot be greater than 10", 400)
-        _object_tags[(bucket_name, key)] = tags
-
-    if S3_PERSIST:
-        _persist_object(bucket_name, key, obj)
-
-    _fire_s3_event_async(
-        bucket_name, key, "s3:ObjectCreated:Put", size=obj["size"], etag=obj["etag"]
-    )
 
     resp_headers = {"ETag": obj["etag"], "Content-Length": "0"}
-    if _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
-        version_id = new_uuid()
-        obj["version_id"] = version_id
+    resp_headers.update(sse_headers)
+    _maybe_replicate(bucket_name, key, obj, body, pending_tags)
+    version_id = _record_object_version(bucket_name, key, prior_obj, obj, body)
+    _apply_object_lock_from_headers(bucket_name, key, headers, obj.get("version_id"))
+    if version_id:
         resp_headers["x-amz-version-id"] = version_id
-        vkey = (bucket_name, key)
-        if vkey not in _object_versions:
-            _object_versions[vkey] = []
-        _object_versions[vkey].append({
-            "version_id": version_id,
-            "last_modified": obj["last_modified"],
-            "etag": obj["etag"],
-            "size": obj["size"],
-            "is_latest": True,
-            "data": body,
-            "storage_class": obj.get("storage_class") or "STANDARD",
-        })
-        # Mark all previous versions as not latest
-        for v in _object_versions[vkey][:-1]:
-            v["is_latest"] = False
+    # After the version is cut, so the record names it.
+    _fire_s3_event_async(
+        bucket_name, key, "s3:ObjectCreated:Put", size=obj["size"], etag=obj["etag"], version_id=version_id
+    )
+
+    if pending_tags is not None:
+        _object_tags[(bucket_name, key, obj.get("version_id"))] = pending_tags
+        if obj.get("_replica"):
+            dest_name, replica_version, dest_account = obj["_replica"]
+            with _in_account(dest_account):
+                _object_tags[(dest_name, key, replica_version)] = dict(pending_tags)
+                _persist_version_state(dest_name, key, _buckets[dest_name])
+    else:
+        # A new object: an overwritten one's tags do not carry over.
+        _object_tags.pop((bucket_name, key, obj.get("version_id")), None)
+    if canned_acl:
+        _object_acl[(bucket_name, key, obj.get("version_id"))] = _canned_acl_policy_xml(
+            canned_acl, _canonical_owner_id()
+        )
+    elif grant_acl:
+        _object_acl[(bucket_name, key, obj.get("version_id"))] = grant_acl
+    else:
+        _object_acl.pop((bucket_name, key, obj.get("version_id")), None)
+
+    # Persist only after the versioning block: the .meta.json sidecar must
+    # carry the version_id assigned above (#1058), and the tags and ACL.
+    if S3_PERSIST:
+        _persist_object(bucket_name, key, obj)
     return 200, resp_headers, b""
 
 
@@ -1736,6 +5203,7 @@ def _parse_multipart_form(content_type: str, body: bytes) -> list[tuple]:
     Returns [] if the body is malformed or the boundary cannot be found.
     """
     import re as _re
+
     m = _re.search(r'boundary=("?)([^";\s]+)\1', content_type, _re.IGNORECASE)
     if not m:
         return []
@@ -1762,12 +5230,14 @@ def _parse_multipart_form(content_type: str, body: bytes) -> list[tuple]:
         # ASCII-clean values; real S3 accepts both, so we do too.
         name_m = _re.search(r'name=(?:"([^"]*)"|([^;\s]+))', cd)
         fn_m = _re.search(r'filename=(?:"([^"]*)"|([^;\s]+))', cd)
-        out.append((
-            (name_m.group(1) or name_m.group(2)) if name_m else "",
-            (fn_m.group(1) or fn_m.group(2)) if fn_m else None,
-            part_headers,
-            value,
-        ))
+        out.append(
+            (
+                (name_m.group(1) or name_m.group(2)) if name_m else "",
+                (fn_m.group(1) or fn_m.group(2)) if fn_m else None,
+                part_headers,
+                value,
+            )
+        )
     return out
 
 
@@ -1775,8 +5245,8 @@ def _enforce_post_policy_size(policy_b64: str, size: int):
     """Apply the `content-length-range` condition from a POST policy.
 
     Returns an error response when size is outside [min, max], else None.
-    Other policy conditions (key, starts-with, signature) are not enforced —
-    same lenient stance as ministack's presigned-URL handling.
+    Unsigned forms use this size-only check; signed forms validate all
+    conditions and credentials in _enforce_signed_post_policy.
     """
     if not policy_b64:
         return None
@@ -1786,9 +5256,12 @@ def _enforce_post_policy_size(policy_b64: str, size: int):
     except (ValueError, json.JSONDecodeError):
         return None
     for cond in policy.get("conditions", []):
-        if (isinstance(cond, list) and len(cond) == 3
-                and isinstance(cond[0], str)
-                and cond[0].lower() == "content-length-range"):
+        if (
+            isinstance(cond, list)
+            and len(cond) == 3
+            and isinstance(cond[0], str)
+            and cond[0].lower() == "content-length-range"
+        ):
             try:
                 lo = int(cond[1])
                 hi = int(cond[2])
@@ -1808,33 +5281,201 @@ def _enforce_post_policy_size(policy_b64: str, size: int):
                 )
     return None
 
+def _enforce_signed_post_policy(fields: dict, bucket_name: str, region: str, size: int, sigv4: bool):
+    """Check a signed form's policy before any write; the signature and signer only under AUTH=true."""
+    from ministack.app import AUTH
+    def invalid():
+        logger.debug("S3 POST rejected: invalid policy document")
+        return _error("InvalidPolicyDocument", "The content of the form does not meet the conditions "
+                      "specified in the policy document.", 400)
+
+    def denied(reason):
+        logger.debug("S3 POST rejected: %s", reason)
+        return _error("AccessDenied", f"Invalid according to Policy: {reason}", 403)
+
+    def condition_failed(operator, name, value):
+        return denied(f"Policy Condition failed: {json.dumps([operator, name, value])}")
+
+    def invalid_argument(reason):
+        logger.debug("S3 POST rejected: %s", reason)
+        return _error("InvalidArgument", "Invalid Argument", 400)
+
+    if sigv4:
+        required = ("policy", "x-amz-algorithm", "x-amz-credential", "x-amz-date", "x-amz-signature")
+    else:
+        required = ("policy", "awsaccesskeyid", "signature")
+    if not all(fields.get(name) for name in required):
+        return invalid_argument("missing required signing field")
+    if sigv4:
+        scope = fields["x-amz-credential"].split("/")
+        if (fields["x-amz-algorithm"] != "AWS4-HMAC-SHA256" or len(scope) != 5 or not all(scope)):
+            return invalid_argument("invalid signing fields")
+        access_key, date_stamp, signed_region, service, terminator = scope
+        try:
+            signed_at = _dt.datetime.strptime(fields["x-amz-date"], "%Y%m%dT%H%M%SZ")
+        except ValueError:
+            return invalid_argument("invalid signing date")
+        if (date_stamp != signed_at.strftime("%Y%m%d") or signed_region != region
+                or service != "s3" or terminator != "aws4_request"):
+            return invalid_argument("invalid credential scope")
+    else:
+        access_key, signed_region = fields["awsaccesskeyid"], region
+
+    encoded = fields["policy"]
+    if AUTH:
+        # Use the signer's tenant only for credential and IAM resolution. The
+        # bucket-owner scope chosen by _apply_bucket_scope must survive the upload.
+        try:
+            account = find_iam_access_key_account(access_key) or access_key
+        except AmbiguousAccessKeyError:
+            return _error("InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.", 403)
+        with request_scope(get_account_id(), region):
+            set_request_account_id(account)
+            credential = resolve_credential(access_key, get_account_id(), fields.get("x-amz-security-token", ""))
+        if isinstance(credential, CredentialResolutionError):
+            if credential.code == "ExpiredTokenException":
+                return _error("ExpiredToken", "The provided token has expired.", 400)
+            if credential.code == "InvalidToken":
+                return _error("InvalidToken", credential.message, 400)
+            return _error("InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.", 403)
+        if sigv4:
+            computed = calculate_signature(credential.secret_access_key, date_stamp, signed_region, "s3", encoded)
+            signature = fields["x-amz-signature"]
+            signed = re.fullmatch(r"[0-9a-f]{64}", signature) and signatures_match(computed, signature)
+        else:
+            digest = hmac.new(credential.secret_access_key.encode(), encoded.encode(), hashlib.sha1).digest()
+            signature = fields["signature"]
+            signed = signature.isascii() and signatures_match(base64.b64encode(digest).decode(), signature)
+        if not signed:
+            logger.debug("S3 POST rejected: signature mismatch")
+            return _error("SignatureDoesNotMatch", "The request signature we calculated does not match the signature "
+                          "you provided. Check your key and signing method.", 403)
+
+    try:
+        policy = json.loads(base64.b64decode(encoded, validate=True).decode("utf-8"))
+        if not isinstance(policy, dict):
+            return invalid()
+        expiration = policy.get("expiration")
+        conditions = policy.get("conditions")
+        if not isinstance(expiration, str) or not isinstance(conditions, list):
+            return invalid()
+        expires = _dt.datetime.fromisoformat(expiration.replace("Z", "+00:00"))
+        if expires.tzinfo is None:
+            return invalid()
+    except (ValueError, TypeError, RecursionError):
+        return invalid()
+    if _dt.datetime.now(_dt.timezone.utc) >= expires:
+        return denied("Policy expired.")
+
+    values = dict(fields, bucket=bucket_name)
+    if "bucket" in fields and fields["bucket"] != bucket_name:
+        return condition_failed("eq", "$bucket", bucket_name)
+    covered = set()
+    for condition in conditions:
+        if isinstance(condition, dict) and condition:
+            matches = [("eq", f"${name}", value) for name, value in condition.items()]
+        elif isinstance(condition, list) and len(condition) == 3:
+            operator, name, value = condition
+            if operator == "content-length-range":
+                # AWS accepts numeric strings; other bounds fail the condition.
+                try:
+                    name, value = int(name), int(value)
+                except (TypeError, ValueError):
+                    return condition_failed(operator, name, value)
+                if name < 0 or value < name:
+                    return invalid()
+                if size < name:
+                    return _error("EntityTooSmall", "Your proposed upload is smaller than the minimum allowed object size.", 400)
+                if size > value:
+                    return _error("EntityTooLarge", "Your proposed upload exceeds the maximum allowed size.", 400)
+                continue
+            if operator not in ("eq", "starts-with") or not isinstance(name, str) or not name.startswith("$"):
+                return invalid()
+            matches = [(operator, name, value)]
+        else:
+            return invalid()
+        for operator, field, value in matches:
+            if not isinstance(field, str) or len(field) < 2 or not isinstance(value, str):
+                return invalid()
+            name = field[1:].lower()
+            if name not in values:
+                return condition_failed(operator, field, value)
+            actual = values[name]
+            candidates = actual.split(",") if name == "content-type" and operator == "starts-with" else [actual]
+            if not all(candidate == value if operator == "eq" else candidate.startswith(value) for candidate in candidates):
+                return condition_failed(operator, field, value)
+            covered.add(name)
+    exempt = {"policy", "x-amz-signature", "awsaccesskeyid", "signature", "file"}
+    extra = [name for name in values if name not in covered and name not in exempt and not name.startswith("x-ignore-")]
+    if extra:
+        return denied(f"Extra input fields: {', '.join(extra)}")
+
+    # The form's signer, not the request's Authorization header, needs the write permissions.
+    if AUTH:
+        from ministack.core.iam_evaluator import enforce
+
+        actions = {"s3:PutObject"}
+        if "acl" in fields or "x-amz-acl" in fields:
+            actions.add("s3:PutObjectAcl")
+        if "x-amz-tagging" in fields:
+            actions.add("s3:PutObjectTagging")
+        if "x-amz-object-lock-mode" in fields or "x-amz-object-lock-retain-until-date" in fields:
+            actions.add("s3:PutObjectRetention")
+        if "x-amz-object-lock-legal-hold" in fields:
+            actions.add("s3:PutObjectLegalHold")
+        context = {f"s3:{name}": value for name, value in fields.items() if name.startswith("x-amz-")}
+        if "acl" in fields:
+            context["s3:x-amz-acl"] = fields["acl"]
+        with request_scope(credential.account_id, signed_region):
+            for action in sorted(actions):
+                if enforce(access_key, action, "s3", signed_region,
+                           resource_arn=f"arn:aws:s3:::{bucket_name}/{fields['key']}", service_context=context) is not None:
+                    return _error("AccessDenied", "Access Denied", 403)
+    return None
+
+
+def _post_form_access_key_id(parts) -> str:
+    for name, _filename, _part_headers, value in parts:
+        if name.lower() not in ("x-amz-credential", "awsaccesskeyid"):
+            continue
+        try:
+            credential = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return ""
+        return credential.split("/", 1)[0]
+    return ""
 
 def _post_object(bucket_name: str, body: bytes, headers: dict):
     """Browser-based form upload (RFC 1867 / S3 PostObject).
 
-    Per https://docs.aws.amazon.com/AmazonS3/latest/API/RTPM-mpuoverview.html,
+    Per https://docs.aws.amazon.com/AmazonS3/latest/developerguide/RESTObjectPOST.html,
     callers POST a multipart/form-data body to the bucket root. We honour
     `key` (with `${filename}` substitution), `Content-Type`, `x-amz-meta-*`,
     `x-amz-storage-class`, `x-amz-tagging`, `success_action_status`, and
-    `success_action_redirect`. Policy and signature fields are accepted and
-    ignored — same lenient stance as ministack's presigned-URL handling.
+    `success_action_redirect`. Signed forms (SigV4 or SigV2) verify policy and
+    signature before writing the object, independently of AUTH.
     """
+    parts = _parse_multipart_form(headers.get("content-type", ""), body)
+
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
 
-    parts = _parse_multipart_form(headers.get("content-type", ""), body)
     if not parts:
-        return _error("MalformedPOSTRequest",
-                      "The body of your POST request is not well-formed multipart/form-data.",
-                      400)
+        return _error(
+            "MalformedPOSTRequest", "The body of your POST request is not well-formed multipart/form-data.", 400
+        )
 
     fields: dict[str, str] = {}
     file_value: bytes | None = None
     file_filename: str | None = None
     file_headers: dict = {}
     for name, filename, ph, value in parts:
-        if name == "file" or filename is not None:
+        # Only the field literally named "file" is the object body. A filename
+        # attribute on any other field does NOT make it the body — browsers and
+        # HTTP libraries (e.g. Python requests' files=) set filename on ordinary
+        # form fields, and S3 treats those as form fields, not content.
+        if name == "file":
             file_value = value
             file_filename = filename or ""
             file_headers = ph
@@ -1845,18 +5486,22 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
                 fields[name.lower()] = value.decode("latin-1")
 
     if file_value is None:
-        return _error("InvalidArgument",
-                      "POST requires a file field.", 400)
+        return _error("InvalidArgument", "POST requires a file field.", 400)
 
-    err = _enforce_post_policy_size(fields.get("policy", ""), len(file_value))
+    sigv4 = any(name in fields for name in ("x-amz-algorithm", "x-amz-credential", "x-amz-date", "x-amz-signature"))
+    signed = sigv4 or "awsaccesskeyid" in fields or "signature" in fields
+    # Form variables are expanded once, before the policy is checked.
+    fields = {name: value.replace("${filename}", file_filename or "")
+              if name not in {"policy", "x-amz-signature", "signature"} else value for name, value in fields.items()}
+    key = fields.get("key", "")
+    if not key:
+        return _error("InvalidArgument", "Bucket POST must contain a field named 'key'.", 400)
+    if signed:
+        err = _enforce_signed_post_policy(fields, bucket_name, bucket_region(bucket_name), len(file_value), sigv4)
+    else:
+        err = _enforce_post_policy_size(fields.get("policy", ""), len(file_value))
     if err:
         return err
-
-    key_template = fields.get("key", "")
-    if not key_template:
-        return _error("InvalidArgument",
-                      "Bucket POST must contain a field named 'key'.", 400)
-    key = key_template.replace("${filename}", file_filename or "")
 
     # Build a synthetic header dict so _build_object_record reuses the PUT path.
     synth = {}
@@ -1867,54 +5512,94 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
     for fname, fval in fields.items():
         if fname.startswith("x-amz-meta-"):
             synth[fname] = fval
-    for h in ("cache-control", "content-disposition", "content-encoding",
-              "content-language", "expires", "x-amz-storage-class",
-              "x-amz-tagging", "x-amz-acl",
-              "x-amz-object-lock-mode", "x-amz-object-lock-retain-until-date",
-              "x-amz-object-lock-legal-hold"):
+    for h in (
+        "cache-control",
+        "content-disposition",
+        "content-encoding",
+        "content-language",
+        "expires",
+        "x-amz-storage-class",
+        "x-amz-tagging",
+        "x-amz-acl",
+        "x-amz-object-lock-mode",
+        "x-amz-object-lock-retain-until-date",
+        "x-amz-object-lock-legal-hold",
+    ):
         if h in fields:
             synth[h] = fields[h]
+    # The POST form names its canned-ACL field `acl` (not `x-amz-acl`).
+    if "acl" in fields:
+        synth["x-amz-acl"] = fields["acl"]
 
     _, sc_err = _resolve_storage_class(synth)
     if sc_err:
         return sc_err
 
+    canned_acl = synth.get("x-amz-acl")
+    if canned_acl and canned_acl not in _CANNED_OBJECT_ACLS:
+        return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned_acl}", 400)
+    if _bucket_owner_enforced(bucket) and (err := _acls_disabled_error(synth)):
+        return err
+    refused = _public_acl_refused(bucket_name, synth)
+    if refused:
+        return refused
+
+    # The POST form names its SSE fields exactly like the request headers.
+    sse_fields = {
+        h: fields[h]
+        for h in (
+            "x-amz-server-side-encryption",
+            "x-amz-server-side-encryption-aws-kms-key-id",
+            "x-amz-server-side-encryption-customer-algorithm",
+            "x-amz-server-side-encryption-customer-key",
+            "x-amz-server-side-encryption-customer-key-md5",
+        )
+        if h in fields
+    }
+    sse_headers, sse_err = _resolve_sse_write_headers(sse_fields, bucket_name)
+    if sse_err:
+        return sse_err
+
+    lock_err = _object_lock_header_error(bucket_name, synth)
+    if lock_err:
+        return lock_err
     etag = f'"{md5_hash(file_value)}"'
     obj = _build_object_record(file_value, synth, etag=etag)
+    obj["preserved_headers"].update(sse_headers)
+    prior_obj = bucket["objects"].get(key)
     bucket["objects"][key] = obj
-    _apply_object_lock_from_headers(bucket_name, key, synth)
 
+    # Defer tag write until version_id is assigned (tags are per-version).
+    pending_tags = None
     tagging_header = synth.get("x-amz-tagging", "")
     if tagging_header:
-        tags = {k: v[0] for k, v in _parse_qs(tagging_header).items()}
-        if len(tags) <= 10:
-            _object_tags[(bucket_name, key)] = tags
+        parsed = {k: v[0] for k, v in _parse_qs(tagging_header, keep_blank_values=True).items()}
+        if len(parsed) <= 10:
+            pending_tags = parsed
 
+    _maybe_replicate(bucket_name, key, obj, file_value, pending_tags)
+    version_id = _record_object_version(bucket_name, key, prior_obj, obj, file_value)
+    _apply_object_lock_from_headers(bucket_name, key, synth, obj.get("version_id"))
+    _fire_s3_event_async(bucket_name, key, "s3:ObjectCreated:Post", size=obj["size"], etag=etag, version_id=version_id)
+
+    if pending_tags is not None:
+        _object_tags[(bucket_name, key, version_id)] = pending_tags
+        if obj.get("_replica"):
+            dest_name, replica_version, dest_account = obj["_replica"]
+            with _in_account(dest_account):
+                _object_tags[(dest_name, key, replica_version)] = dict(pending_tags)
+                _persist_version_state(dest_name, key, _buckets[dest_name])
+    else:
+        _object_tags.pop((bucket_name, key, version_id), None)
+    if canned_acl:
+        _object_acl[(bucket_name, key, version_id)] = _canned_acl_policy_xml(canned_acl, _canonical_owner_id())
+    else:
+        _object_acl.pop((bucket_name, key, version_id), None)
+
+    # Persist only after the versioning block: the .meta.json sidecar must
+    # carry the version_id assigned above (#1058), and the tags and ACL.
     if S3_PERSIST:
         _persist_object(bucket_name, key, obj)
-
-    _fire_s3_event_async(
-        bucket_name, key, "s3:ObjectCreated:Post", size=obj["size"], etag=etag
-    )
-
-    version_id = None
-    if _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
-        version_id = new_uuid()
-        obj["version_id"] = version_id
-        vkey = (bucket_name, key)
-        if vkey not in _object_versions:
-            _object_versions[vkey] = []
-        _object_versions[vkey].append({
-            "version_id": version_id,
-            "last_modified": obj["last_modified"],
-            "etag": etag,
-            "size": obj["size"],
-            "is_latest": True,
-            "data": file_value,
-            "storage_class": obj.get("storage_class") or "STANDARD",
-        })
-        for v in _object_versions[vkey][:-1]:
-            v["is_latest"] = False
 
     location = f"http://{bucket_name}.s3.amazonaws.com/{url_quote(key, safe='/')}"
     base_resp = {"ETag": etag, "Location": location}
@@ -1924,9 +5609,11 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
     redirect = fields.get("success_action_redirect") or fields.get("redirect")
     if redirect:
         sep = "&" if "?" in redirect else "?"
-        target = (f"{redirect}{sep}bucket={bucket_name}"
-                  f"&key={url_quote(key, safe='/')}"
-                  f"&etag={url_quote(etag, safe='')}")
+        target = (
+            f"{redirect}{sep}bucket={bucket_name}"
+            f"&key={url_quote(key, safe='/')}"
+            f"&etag={url_quote(etag, safe='')}"
+        )
         return 303, {**base_resp, "Location": target}, b""
 
     status_str = fields.get("success_action_status", "204")
@@ -1948,13 +5635,25 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
     return status, base_resp, b""
 
 
-def _apply_object_lock_from_headers(bucket_name: str, key: str, headers: dict):
+_OBJECT_LOCK_HEADERS = ("x-amz-object-lock-mode", "x-amz-object-lock-retain-until-date",
+                        "x-amz-object-lock-legal-hold", "x-amz-object-lock-legal-hold-status")
+
+
+def _object_lock_header_error(bucket_name: str, headers: dict) -> tuple | None:
+    if any(headers.get(h) for h in _OBJECT_LOCK_HEADERS) and not _bucket_object_lock.get(bucket_name):
+        return _error("InvalidRequest", "Bucket is missing ObjectLockConfiguration", 400)
+    return None
+
+
+def _apply_object_lock_from_headers(bucket_name: str, key: str, headers: dict, version_id):
     lock_mode = headers.get("x-amz-object-lock-mode", "")
     lock_until = headers.get("x-amz-object-lock-retain-until-date", "")
-    lock_legal = headers.get("x-amz-object-lock-legal-hold", "") or headers.get("x-amz-object-lock-legal-hold-status", "")
+    lock_legal = headers.get("x-amz-object-lock-legal-hold", "") or headers.get(
+        "x-amz-object-lock-legal-hold-status", ""
+    )
 
     if lock_mode and lock_until:
-        _object_retention[(bucket_name, key)] = {
+        _object_retention[(bucket_name, key, version_id)] = {
             "Mode": lock_mode,
             "RetainUntilDate": lock_until,
         }
@@ -1972,13 +5671,20 @@ def _apply_object_lock_from_headers(bucket_name: str, key: str, headers: dict):
                 until = now.replace(year=now.year + years)
             else:
                 return
-            _object_retention[(bucket_name, key)] = {
+            _object_retention[(bucket_name, key, version_id)] = {
                 "Mode": dr["Mode"],
                 "RetainUntilDate": until.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
             }
 
     if lock_legal in ("ON", "OFF"):
-        _object_legal_hold[(bucket_name, key)] = lock_legal
+        _object_legal_hold[(bucket_name, key, version_id)] = lock_legal
+
+
+def _object_tagging_count_header(bucket_name: str, key: str, version_id) -> dict:
+    """GetObject returns ``x-amz-tagging-count`` (boto3 surfaces it as ``TagCount``)
+    only when the object carries at least one tag; AWS omits the header at zero (#1026)."""
+    n = len(_object_tags.get((bucket_name, key, version_id), {}))
+    return {"x-amz-tagging-count": str(n)} if n else {}
 
 
 def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = None):
@@ -1987,35 +5693,130 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
     if bucket is None:
         return _no_such_bucket(bucket_name)
 
+    # AWS rule: the six response-* override query parameters require a signed
+    # request (Authorization header or presigned URL). An unsigned/anonymous
+    # GET that carries any of them is rejected with InvalidRequest (400).
+    # See: https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html
+    err = _reject_response_overrides_if_unsigned(headers, query_params, bucket_name, key)
+    if err is not None:
+        return err
+
     version_id = _qp(query_params, "versionId", "")
+    if version_id == "null" and not any(
+        v["version_id"] == "null" for v in _object_versions.get((bucket_name, key), [])
+    ):
+        # The literal "null" addresses the pre-versioning object; before any
+        # versioned write records it in the index, that is the current object.
+        obj = bucket["objects"].get(key)
+        if obj is not None and not obj.get("version_id"):
+            version_id = ""
     if version_id:
         vkey = (bucket_name, key)
         versions = _object_versions.get(vkey, [])
         for v in versions:
             if v["version_id"] == version_id:
-                resp_headers = {
-                    "Content-Type": "application/octet-stream",
-                    "ETag": v["etag"],
-                    "Content-Length": str(v["size"]),
-                    "Last-Modified": iso_to_rfc7231(v["last_modified"]),
-                    "x-amz-version-id": v["version_id"],
-                }
-                return 200, resp_headers, v["data"]
+                if v.get("is_delete_marker"):
+                    return _delete_marker_read_refused(v)
+                # Route through the shared header builder (same path as versioned
+                # HeadObject) so a version's user metadata (x-amz-meta-*),
+                # preserved headers and content-encoding are emitted — not just
+                # the five wire basics. Versioned reads honor
+                # `x-amz-checksum-mode: ENABLED` exactly as current-version reads do.
+                include_checksums = (headers.get("x-amz-checksum-mode") or "").upper() == "ENABLED"
+                vobj = _object_record_from_version(v)
+                sse_gate = _check_sse_read_headers(headers, vobj)
+                if sse_gate is not None:
+                    return sse_gate
+                vsc = vobj.get("storage_class") or "STANDARD"
+                if vsc in _ARCHIVE_STORAGE_CLASSES:
+                    # Restore state lives on the current object record;
+                    # noncurrent archived versions are simply unreadable
+                    # (restore-by-versionId is not implemented).
+                    cur = bucket["objects"].get(key)
+                    cur_phase = (
+                        _sync_restore(bucket_name, key, cur)
+                        if cur is not None and cur.get("version_id") == version_id
+                        else None
+                    )
+                    if cur_phase != "restored":
+                        return _invalid_object_state(bucket_name, key, vsc)
+                resp_headers = _object_response_headers(vobj, bucket_name, key, include_checksums=include_checksums)
+                resp_headers.update(_object_tagging_count_header(bucket_name, key, version_id))
+                precondition = _check_read_preconditions(headers, vobj, resp_headers)
+                if precondition is not None:
+                    return precondition
+                body = _version_body(bucket, bucket_name, key, v)
+                if body is None:
+                    break
+                return 200, resp_headers, body
         return _error("NoSuchVersion", "The specified version does not exist.", 404, f"/{bucket_name}/{key}")
 
     if key not in bucket["objects"]:
-        return _error(
-            "NoSuchKey",
-            "The specified key does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
+        # The response shape AWS gives a header-signed GET, whatever MiniStack's AUTH setting.
+        if (not query_params.keys() - {"x-id"}
+                and headers.get("authorization", "").startswith("AWS4-HMAC-SHA256")):
+            status, err_headers, err_body = _object_error(
+                "NoSuchKey", "The specified key does not exist.", 404, Key=key,
+            )
+        else:
+            status, err_headers, err_body = _error(
+                "NoSuchKey", "The specified key does not exist.", 404, f"/{bucket_name}/{key}",
+            )
+        # A key hidden by a delete marker announces the marker on its 404.
+        err_headers.update(_delete_marker_404_headers(bucket_name, key))
+        return status, err_headers, err_body
 
     obj = bucket["objects"][key]
-    resp_headers = _object_response_headers(obj, bucket_name, key)
-
+    sse_gate = _check_sse_read_headers(headers, obj)
+    if sse_gate is not None:
+        return sse_gate
+    restore_phase = _sync_restore(bucket_name, key, obj)
+    sc = obj.get("storage_class") or "STANDARD"
+    if sc in _ARCHIVE_STORAGE_CLASSES and restore_phase != "restored":
+        # Archived objects are unreadable until a restore lands; HeadObject
+        # deliberately keeps working — that asymmetry is how callers poll.
+        return _invalid_object_state(bucket_name, key, sc)
     range_header = headers.get("range", "")
+    # AWS returns whole-object checksums only on full-object responses (HTTP
+    # 200). On a 206 Partial Content reply the bytes are a slice, and a
+    # whole-object checksum can't validate them — boto3 raises
+    # `FlexibleChecksumError` if it sees one alongside sliced bytes.
+    checksum_mode_on = (headers.get("x-amz-checksum-mode") or "").upper() == "ENABLED"
+    include_checksums = checksum_mode_on and not range_header
+    resp_headers = _object_response_headers(obj, bucket_name, key, include_checksums=include_checksums)
+    resp_headers.update(_object_tagging_count_header(bucket_name, key, obj.get("version_id")))
+
+    # Evaluated before the range and partNumber slicing below: a failed
+    # precondition preempts the read entirely, and a 304 describes the whole
+    # representation the caller already has, not the slice they asked for.
+    precondition = _check_read_preconditions(headers, obj, resp_headers)
+    if precondition is not None:
+        return precondition
+
     body = _read_body(bucket_name, key, obj)
+
+    # partNumber: return a single part of a completed multipart object as 206
+    # Partial Content with a Content-Range and x-amz-mp-parts-count, rather than
+    # the whole object. Parts are matched by their part number (which may be
+    # non-contiguous), and their byte offset is the sum of the preceding sizes.
+    part_number = _qp(query_params, "partNumber") if query_params else None
+    if part_number and obj.get("parts"):
+        try:
+            pn = int(part_number)
+        except (TypeError, ValueError):
+            pn = None
+        parts = obj["parts"]
+        idx = next((i for i, p in enumerate(parts) if p["PartNumber"] == pn), None)
+        if idx is not None:
+            offset = sum(p["Size"] for p in parts[:idx])
+            length = parts[idx]["Size"]
+            slice_body = body[offset : offset + length]
+            resp_headers["Content-Length"] = str(len(slice_body))
+            resp_headers["Content-Range"] = f"bytes {offset}-{offset + length - 1}/{obj['size']}"
+            resp_headers["x-amz-mp-parts-count"] = str(len(parts))
+            _apply_response_overrides(resp_headers, query_params)
+            return 206, resp_headers, slice_body
+
     if range_header:
         rng = _parse_range(range_header, obj["size"])
         if rng is None:
@@ -2031,9 +5832,112 @@ def _get_object(bucket_name: str, key: str, headers: dict, query_params: dict = 
         slice_body = body[start : end + 1]
         resp_headers["Content-Length"] = str(len(slice_body))
         resp_headers["Content-Range"] = f"bytes {start}-{end}/{obj['size']}"
+        _apply_response_overrides(resp_headers, query_params)
         return 206, resp_headers, slice_body
 
+    _apply_response_overrides(resp_headers, query_params)
     return 200, resp_headers, body
+
+
+def _append_object_parts(root: Element, record: dict, headers: dict) -> None:
+    """Emit the ObjectParts (ListParts) block. Multipart-completed objects carry
+    retained `parts`; single-PUT objects have no parts and list an empty page."""
+    op = SubElement(root, "ObjectParts")
+    try:
+        max_parts = int(headers.get("x-amz-max-parts", 1000))
+    except (TypeError, ValueError):
+        max_parts = 1000
+    try:
+        marker = int(headers.get("x-amz-part-number-marker", 0))
+    except (TypeError, ValueError):
+        marker = 0
+    SubElement(op, "PartNumberMarker").text = str(marker)
+    SubElement(op, "MaxParts").text = str(max_parts)
+
+    parts = record.get("parts") or []
+    after = [p for p in parts if p["PartNumber"] > marker]
+    page = after[:max_parts] if max_parts >= 0 else after
+    truncated = len(after) > len(page)
+    SubElement(op, "IsTruncated").text = "true" if truncated else "false"
+    SubElement(op, "NextPartNumberMarker").text = str(page[-1]["PartNumber"] if page else 0)
+    for p in page:
+        pe = SubElement(op, "Part")
+        SubElement(pe, "PartNumber").text = str(p["PartNumber"])
+        SubElement(pe, "Size").text = str(p["Size"])
+    # TotalPartsCount is reported only for genuine multipart objects.
+    if parts:
+        SubElement(op, "PartsCount").text = str(len(parts))
+
+
+def _get_object_attributes(bucket_name: str, key: str, headers: dict, query_params: dict):
+    """S3 GetObjectAttributes — GET /{bucket}/{key}?attributes. Returns only the
+    root-level fields named in the required `x-amz-object-attributes` header."""
+    bucket = _ensure_bucket(bucket_name)
+    if bucket is None:
+        return _no_such_bucket(bucket_name)
+
+    raw_attrs = headers.get("x-amz-object-attributes")
+    if not raw_attrs:
+        return _error(
+            "InvalidRequest",
+            "The x-amz-object-attributes header is required for GetObjectAttributes.",
+            400,
+            f"/{bucket_name}/{key}",
+        )
+    requested = {a.strip() for a in raw_attrs.split(",") if a.strip()}
+
+    resp_headers = {"Content-Type": "application/xml"}
+    version_id = _qp(query_params, "versionId", "")
+    if version_id:
+        record = None
+        for v in _object_versions.get((bucket_name, key), []):
+            if v["version_id"] == version_id:
+                record = {
+                    "etag": v["etag"],
+                    "size": v["size"],
+                    "last_modified": v["last_modified"],
+                    "storage_class": v.get("storage_class") or "STANDARD",
+                    "checksums": v.get("checksums") or {},
+                    "parts": v.get("parts"),
+                }
+                break
+        if record is None:
+            return _error("NoSuchVersion", "The specified version does not exist.", 404, f"/{bucket_name}/{key}")
+        resp_headers["x-amz-version-id"] = version_id
+    else:
+        obj = bucket["objects"].get(key)
+        if obj is None:
+            return _error("NoSuchKey", "The specified key does not exist.", 404, f"/{bucket_name}/{key}")
+        record = obj
+        if obj.get("version_id"):
+            resp_headers["x-amz-version-id"] = obj["version_id"]
+
+    resp_headers["Last-Modified"] = iso_to_rfc7231(record["last_modified"])
+
+    # Emit only requested attributes, in the AWS response order.
+    root = Element("GetObjectAttributesResponse", xmlns=S3_NS)
+    if "ETag" in requested:
+        # GetObjectAttributes returns the ETag WITHOUT the surrounding quotes
+        # that the ETag HTTP header carries on Get/HeadObject.
+        SubElement(root, "ETag").text = (record.get("etag") or "").strip('"')
+    if "Checksum" in requested:
+        checksums = record.get("checksums") or {}
+        cks = SubElement(root, "Checksum")
+        for alg, val in checksums.items():
+            SubElement(cks, f"Checksum{alg}").text = val
+        if checksums:
+            SubElement(cks, "ChecksumType").text = "COMPOSITE" if record.get("parts") else "FULL_OBJECT"
+    if "ObjectParts" in requested:
+        _append_object_parts(root, record, headers)
+    if "StorageClass" in requested:
+        sc = record.get("storage_class") or "STANDARD"
+        # AWS returns StorageClass for every class except S3 Standard.
+        if sc != "STANDARD":
+            SubElement(root, "StorageClass").text = sc
+    if "ObjectSize" in requested:
+        SubElement(root, "ObjectSize").text = str(record["size"])
+
+    return 200, resp_headers, _xml_body(root)
 
 
 def _range_error_xml(bucket_name: str, key: str) -> Element:
@@ -2045,62 +5949,621 @@ def _range_error_xml(bucket_name: str, key: str) -> Element:
     return root
 
 
-def _head_object(bucket_name: str, key: str):
+def _head_object(bucket_name: str, key: str, headers: dict | None = None, query_params: dict | None = None):
+    headers = headers or {}
+    query_params = query_params or {}
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
-    if key not in bucket["objects"]:
+
+    # A `?versionId=` selects a specific version's metadata, matching AWS
+    # HeadObject(VersionId); without it, the current object is used.
+    version_id = _qp(query_params, "versionId", "")
+    if version_id == "null" and not any(
+        v["version_id"] == "null" for v in _object_versions.get((bucket_name, key), [])
+    ):
+        # The literal "null" addresses the pre-versioning object; before any
+        # versioned write records it in the index, that is the current object.
+        obj = bucket["objects"].get(key)
+        if obj is not None and not obj.get("version_id"):
+            version_id = ""
+    if version_id:
+        ventry = next(
+            (v for v in _object_versions.get((bucket_name, key), []) if v["version_id"] == version_id),
+            None,
+        )
+        if ventry is None:
+            return _error(
+                "NoSuchVersion",
+                "The specified version does not exist.",
+                404,
+                f"/{bucket_name}/{key}",
+            )
+        if ventry.get("is_delete_marker"):
+            return _delete_marker_read_refused(ventry)
+        obj = _object_record_from_version(ventry)
+    else:
+        if key not in bucket["objects"]:
+            status, err_headers, err_body = _error(
+                "NoSuchKey",
+                "The specified key does not exist.",
+                404,
+                f"/{bucket_name}/{key}",
+            )
+            # A key hidden by a delete marker announces the marker on its 404.
+            err_headers.update(_delete_marker_404_headers(bucket_name, key))
+            return status, err_headers, err_body
+        obj = bucket["objects"][key]
+        # Lazily lapse an expired restore so the x-amz-restore header (and the
+        # s3:ObjectRestore:Delete event) reflect reality on the poll path.
+        _sync_restore(bucket_name, key, obj)
+
+    sse_gate = _check_sse_read_headers(headers, obj)
+    if sse_gate is not None:
+        return sse_gate
+    include_checksums = (headers.get("x-amz-checksum-mode") or "").upper() == "ENABLED"
+    resp_headers = _object_response_headers(obj, bucket_name, key, include_checksums=include_checksums)
+    if version_id:
+        resp_headers["x-amz-version-id"] = version_id
+    precondition = _check_read_preconditions(headers, obj, resp_headers)
+    if precondition is not None:
+        return precondition
+    return 200, resp_headers, b""
+
+
+def _cloudfront_origin_allows(owner: str, bucket_name: str, key: str, source_arn: str, oai_id: str) -> bool:
+    """Whether S3 lets CloudFront read the object: OAC as cloudfront.amazonaws.com, OAI as its user, else anonymous."""
+    if _foreign_bucket_allows(owner, bucket_name, key, "GET", {}, ""):
+        return True
+    policy = _bucket_policies.get_scoped(owner, None, bucket_name)
+    if not policy or not (source_arn or oai_id):
+        return False
+    from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+
+    ctx = EvalContext(
+        principal_arn=(f"arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity {oai_id}"
+                       if oai_id else "*"),
+        principal_type="User" if oai_id else "Service",
+        principal_account="",
+        action="s3:GetObject",
+        resource_arn=f"arn:aws:s3:::{bucket_name}/{key}",
+        region=get_region(),
+        service_context={"aws:sourcearn": source_arn} if source_arn else {},
+    )
+    service = None if oai_id else "cloudfront.amazonaws.com"
+    return evaluate_resource_policy(policy, ctx, service=service).decision == "Allow"
+
+
+def serve_cloudfront_origin_fetch(bucket_name: str, key: str, method: str, headers: dict,
+                                  source_arn: str = "", oai_id: str = "") -> tuple:
+    """A CloudFront origin fetch from an S3 bucket, served in-process."""
+    headers = dict(headers or {})
+    bucket = _ensure_bucket(bucket_name)
+    if bucket is None:
+        return _no_such_bucket(bucket_name)
+    owner = _bucket_owner_account(bucket_name) or get_account_id()
+    if not _cloudfront_origin_allows(owner, bucket_name, key, source_arn, oai_id) or key not in bucket["objects"]:
+        return _error("AccessDenied", "Access Denied", 403, f"/{bucket_name}/{key}")
+    if method == "HEAD":
+        status, resp_headers, _ = _head_object(bucket_name, key, headers, {})
+        return status, resp_headers, b""
+    return _get_object(bucket_name, key, headers, {})
+
+
+def _purge_current_object(bucket_name: str, key: str, bucket: dict):
+    """Remove the current object plus its key-level metadata and on-disk copy."""
+    bucket["objects"].pop(key, None)
+    _object_tags.pop((bucket_name, key, None), None)
+    _object_annotations.pop((bucket_name, key, None), None)
+    _object_retention.pop((bucket_name, key, None), None)
+    _object_legal_hold.pop((bucket_name, key, None), None)
+    _object_acl.pop((bucket_name, key, None), None)
+    _delete_persisted_object(bucket_name, key)
+
+
+def _object_record_from_version(v: dict) -> dict:
+    """Rebuild a current-object record from a stored version entry.
+
+    Used when a version delete removes the current version/marker and an older
+    real version becomes current again — the version index keeps the body plus
+    the wire-relevant metadata (etag/size/checksums/storage class), which is
+    enough to serve Head/GetObject without a VersionId."""
+    return {
+        "body": v.get("data"),
+        "content_type": v.get("content_type", "application/octet-stream"),
+        "content_encoding": v.get("content_encoding"),
+        "etag": v["etag"],
+        "last_modified": v["last_modified"],
+        "size": v["size"],
+        "metadata": v.get("metadata", {}),
+        "preserved_headers": v.get("preserved_headers", {}),
+        "storage_class": v.get("storage_class") or "STANDARD",
+        "checksums": v.get("checksums") or {},
+        "replication_status": v.get("replication_status"),
+        # The "null" version promotes to a current object WITHOUT a version
+        # id, the same shape a pre-versioning object has — per-version tags
+        # and subresources key it as None, and the literal "null" is only a
+        # wire-level name for it.
+        "version_id": None if v["version_id"] == "null" else v["version_id"],
+    }
+
+
+def _version_entry_from_record(obj: dict, version_id: str, data) -> dict:
+    """A version-index entry projected from a current-object record."""
+    return {
+        "version_id": version_id,
+        "last_modified": obj["last_modified"],
+        "etag": obj["etag"],
+        "size": obj["size"],
+        "is_latest": False,
+        "data": data,
+        "content_type": obj.get("content_type") or "application/octet-stream",
+        "content_encoding": obj.get("content_encoding"),
+        "metadata": obj.get("metadata", {}),
+        "preserved_headers": obj.get("preserved_headers", {}),
+        "storage_class": obj.get("storage_class") or "STANDARD",
+        "checksums": obj.get("checksums") or {},
+        "parts": obj.get("parts"),
+        "replication_status": obj.get("replication_status"),
+    }
+
+
+def _preserve_null_version(bucket_name: str, key: str, versions: list, prior_obj: dict | None):
+    """Keep the pre-versioning object addressable as the "null" version.
+
+    An object written before versioning was enabled has no version id; the
+    first versioned write (or delete marker) that lands on top of it must
+    leave it in the version index under VersionId "null" rather than silently
+    discarding it — AWS keeps the null version in the stack."""
+    if prior_obj is None or prior_obj.get("version_id"):
+        return
+    if any(v["version_id"] == "null" for v in versions):
+        return
+    versions.append(_version_entry_from_record(prior_obj, "null", _read_body(bucket_name, key, prior_obj)))
+
+
+def _replication_rule_prefix(rule: dict) -> str:
+    """Legacy V1 rules carry ``Prefix`` directly, V2 rules inside ``Filter``."""
+    prefix = rule.get("Prefix")
+    if prefix is None:
+        rule_filter = rule.get("Filter") or {}
+        prefix = rule_filter.get("Prefix") or (rule_filter.get("And") or {}).get("Prefix") or ""
+    return prefix
+
+
+def _replication_rule_tags(rule: dict) -> dict[str, str]:
+    """Tags a V2 rule's ``Filter.Tag`` or ``Filter.And.Tags`` requires."""
+    rule_filter = rule.get("Filter") or {}
+    tags = [rule_filter["Tag"]] if rule_filter.get("Tag") else (rule_filter.get("And") or {}).get("Tags", [])
+    return {t.get("Key", ""): t.get("Value", "") for t in tags}
+
+
+def _replication_rule_for(bucket_name: str, key: str, tags: dict | None) -> tuple[dict | None, str]:
+    """The first Enabled rule whose filter covers `key` and `tags`, plus the
+    config Role.
+
+    A rule matches when the key falls under its prefix and the object carries
+    every tag the rule's filter names. ``tags`` are the tags the write stores.
+    Replication runs only while the source bucket's versioning is Enabled, as
+    on AWS (a Suspended bucket stops replicating; the stored config stays).
+    """
+    config = _bucket_replication.get(bucket_name)
+    if not config or _bucket_versioning.get(bucket_name) != "Enabled":
+        return None, ""
+    tags = tags or {}
+    for rule in config.get("Rules", []):
+        if rule.get("Status") != "Enabled":
+            continue
+        if not key.startswith(_replication_rule_prefix(rule)):
+            continue
+        if all(tags.get(k) == v for k, v in _replication_rule_tags(rule).items()):
+            return rule, config.get("Role", "")
+    return None, ""
+
+
+@contextmanager
+def _in_account(account_id: str):
+    """Run the wrapped block inside *account_id*'s tenancy, then restore.
+
+    A cross-account replica lands in a bucket another account owns; pinning
+    the request account keeps every account-scoped store (objects, versions,
+    tags, annotations, on-disk files) inside the destination tenant.
+    """
+    previous = get_account_id()
+    if account_id == previous:
+        yield
+        return
+    set_request_account_id(account_id)
+    try:
+        yield
+    finally:
+        set_request_account_id(previous)
+
+
+def _bucket_owner_enforced(bucket: dict) -> bool:
+    stored = bucket.get("_ownership_controls")
+    if stored:
+        return "BucketOwnerEnforced" in stored
+    return not bucket.get("_ownership_controls_deleted")
+
+
+def _replication_destination_allows(dest_account: str, dest_name: str, key: str,
+                                    role: str, dest: dict, dest_bucket: dict) -> bool:
+    """Whether the destination bucket policy grants the replication role.
+
+    Cross-account replication requires the destination owner to allow the
+    source's replication role ``s3:ReplicateObject`` on the destination
+    objects, plus ``s3:ObjectOwnerOverrideToBucketOwner`` when the rule
+    carries ``AccessControlTranslation`` and the destination is not
+    ``BucketOwnerEnforced``. A missing or denying policy stamps
+    the source FAILED, as AWS reports a replica it could not write.
+    """
+    policy = _bucket_policies.get_scoped(dest_account, None, dest_name)
+    if not policy:
+        return False
+    from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+
+    role_parts = role.split(":")
+    role_account = role_parts[4] if role.startswith("arn:") and len(role_parts) > 4 else ""
+    resource = f"arn:aws:s3:::{dest_name}/{key}"
+    ctx = EvalContext(
+        principal_arn=role,
+        principal_type="AssumedRole",
+        principal_account=role_account,
+        action="s3:ReplicateObject",
+        resource_arn=resource,
+        region=get_region(),
+    )
+    if evaluate_resource_policy(policy, ctx).decision != "Allow":
+        return False
+    if dest.get("AccessControlTranslation") and not _bucket_owner_enforced(dest_bucket):
+        ctx = EvalContext(
+            principal_arn=role,
+            principal_type="AssumedRole",
+            principal_account=role_account,
+            action="s3:ObjectOwnerOverrideToBucketOwner",
+            resource_arn=resource,
+            region=get_region(),
+        )
+        return evaluate_resource_policy(policy, ctx).decision == "Allow"
+    return True
+
+
+def _replication_destination(bucket_name: str, key: str, rule: dict, role: str):
+    """``(dest_name, dest_account, dest_bucket)`` for a rule's destination, or
+    None when the replica can't be written: the destination is gone, is the
+    source, isn't versioned, or (cross-account) its policy doesn't grant the
+    replication role."""
+    dest = rule.get("Destination") or {}
+    dest_ref = dest.get("Bucket") or ""
+    dest_name = dest_ref.split(":::")[-1] if ":::" in dest_ref else dest_ref
+    # The name identifies the bucket; Destination.Account only names the owner for AccessControlTranslation.
+    dest_account = _bucket_owner_account(dest_name)
+    dest_bucket = _buckets.get_scoped(dest_account, None, dest_name) if dest_account else None
+    if (dest_bucket is None or dest_name == bucket_name
+            or _bucket_versioning.get_scoped(dest_account, None, dest_name) != "Enabled"):
+        return None
+    if (dest_account != get_account_id() and not _replication_destination_allows(
+            dest_account, dest_name, key, role, dest, dest_bucket)):
+        return None
+    return dest_name, dest_account, dest_bucket
+
+
+def _maybe_replicate_delete_marker(bucket_name: str, key: str) -> None:
+    """Replicate a delete marker the way AWS does: always for a V1 rule (no
+    ``Filter``), and for a V2 rule only with ``DeleteMarkerReplication`` Enabled
+    and no tag filter. Called only for deletes without a version id; version-id
+    deletes never replicate. Replica markers are not re-replicated, so two-way
+    setups don't loop."""
+    config = _bucket_replication.get(bucket_name)
+    if not config or _bucket_versioning.get(bucket_name) != "Enabled":
+        return
+    rule = next((r for r in config.get("Rules", [])
+                 if r.get("Status") == "Enabled" and key.startswith(_replication_rule_prefix(r))), None)
+    if rule is None:
+        return
+    if "Filter" in rule and (_replication_rule_tags(rule)
+                             or (rule.get("DeleteMarkerReplication") or {}).get("Status") != "Enabled"):
+        return
+    target = _replication_destination(bucket_name, key, rule, config.get("Role", ""))
+    if target is None:
+        return
+    dest_name, dest_account, dest_bucket = target
+    with _in_account(dest_account):
+        _record_delete_marker(dest_name, key, dest_bucket["objects"].get(key))
+        dest_bucket["objects"].pop(key, None)
+
+
+def _maybe_replicate(bucket_name: str, key: str, obj: dict, data, tags: dict | None = None) -> None:
+    """Write the replica a matching replication rule asks for, and stamp the
+    source's x-amz-replication-status.
+
+    AWS marks the source PENDING and flips it to COMPLETED (or FAILED) once
+    the copy lands; the destination copy reads REPLICA. The emulator's copy is
+    synchronous, so the source is stamped with its final status immediately
+    and tests see a deterministic answer. Runs BEFORE the source's version
+    entry is recorded, so a version-addressed read carries the status too.
+    A destination that no longer exists or is no longer versioned stamps the
+    source FAILED, which is how AWS reports a replica it could not write.
+    A destination owned by another account also requires the destination's
+    bucket policy to grant the replication role; otherwise AWS fails the
+    replica the same way. ``tags`` are the tags the write stores, matched
+    against tag-filtered rules.
+    """
+    rule, role = _replication_rule_for(bucket_name, key, tags)
+    if rule is None:
+        return
+    target = _replication_destination(bucket_name, key, rule, role)
+    if target is None:
+        obj["replication_status"] = "FAILED"
+        return
+    dest_name, dest_account, dest_bucket = target
+    dest = rule.get("Destination") or {}
+
+    replica = copy.deepcopy(obj)
+    replica["replication_status"] = "REPLICA"
+    replica.pop("version_id", None)
+    replica.pop("_replica", None)
+    if dest.get("StorageClass"):
+        replica["storage_class"] = dest["StorageClass"]
+    prior = dest_bucket["objects"].get(key)
+    dest_bucket["objects"][key] = replica
+    with _in_account(dest_account):
+        replica_version = _record_object_version(dest_name, key, prior, replica, data)
+        if S3_PERSIST:
+            _persist_object(dest_name, key, replica)
+    # The write paths store the source's tags after the version is cut; the
+    # pointer lets them mirror the tags onto the replica, as AWS replicates
+    # them. Internal bookkeeping only — never serialized onto a response.
+    obj["_replica"] = (dest_name, replica_version, dest_account)
+    obj["replication_status"] = "COMPLETED"
+
+
+def _record_object_version(bucket_name: str, key: str, prior_obj: dict | None, obj: dict, data) -> str | None:
+    """Version bookkeeping for a write landing at `key`.
+
+    An Enabled bucket mints a new version id; a Suspended bucket stores the
+    write as the "null" version, REPLACING any previous null version, and
+    answers without x-amz-version-id — so this returns the id to put on the
+    response, or None for unversioned and suspended writes.  `prior_obj` is
+    the current-object record the write displaced (captured before the
+    overwrite), preserved as the null version when it predates versioning."""
+    versioning = _bucket_versioning.get(bucket_name)
+    if versioning != "Enabled":
+        # Overwriting the null version drops its annotations.
+        _object_annotations.pop((bucket_name, key, None), None)
+    if versioning not in ("Enabled", "Suspended"):
+        return None
+    _persist_displaced_version(bucket_name, key, prior_obj, versioning)
+    vkey = (bucket_name, key)
+    versions = _object_versions.setdefault(vkey, [])
+    if versioning == "Enabled":
+        _preserve_null_version(bucket_name, key, versions, prior_obj)
+        version_id = new_uuid()
+        obj["version_id"] = version_id
+    else:
+        version_id = "null"
+        versions[:] = [v for v in versions if v["version_id"] != "null"]
+    entry = _version_entry_from_record(obj, version_id, data)
+    entry["is_latest"] = True
+    for v in versions:
+        v["is_latest"] = False
+    versions.append(entry)
+    return version_id if versioning == "Enabled" else None
+
+
+def _record_delete_marker(bucket_name: str, key: str, prior_obj: dict | None) -> str:
+    """Append a delete marker per the bucket's versioning state and return its
+    version id: a fresh id on Enabled, the literal "null" on Suspended — where
+    the marker REPLACES any existing null version, as AWS does."""
+    enabled = _bucket_versioning.get(bucket_name) == "Enabled"
+    _persist_displaced_version(bucket_name, key, prior_obj, "Enabled" if enabled else "Suspended")
+    vkey = (bucket_name, key)
+    versions = _object_versions.setdefault(vkey, [])
+    if enabled:
+        _preserve_null_version(bucket_name, key, versions, prior_obj)
+        marker_id = new_uuid()
+    else:
+        marker_id = "null"
+        versions[:] = [v for v in versions if v["version_id"] != "null"]
+    for v in versions:
+        v["is_latest"] = False
+    marker = {
+        "version_id": marker_id,
+        "last_modified": now_iso(),
+        "etag": "",
+        "size": 0,
+        "is_latest": True,
+        "is_delete_marker": True,
+    }
+    versions.append(marker)
+    # Persist the marker to the key's sidecar so a restart keeps the object
+    # hidden instead of resurrecting it from its still-present data file.
+    _persist_delete_marker(bucket_name, key, marker)
+    return marker_id
+
+
+def _delete_marker_read_refused(version: dict) -> tuple:
+    """The refusal a read of a delete marker draws.
+
+    A marker has no content to return, and AWS says so with 405 rather than
+    a 404: the version is there, it just cannot be read.  The marker's id
+    and the delete-marker flag ride on the response, and Allow names the
+    one method that does work on it."""
+    status, headers, body = _error(
+        "MethodNotAllowed",
+        "The specified method is not allowed against this resource.",
+        405,
+    )
+    headers = dict(headers)
+    headers["x-amz-delete-marker"] = "true"
+    headers["x-amz-version-id"] = version["version_id"]
+    # AWS also stamps the marker's creation time on the 405.
+    if version.get("last_modified"):
+        headers["Last-Modified"] = iso_to_rfc7231(version["last_modified"])
+    headers["Allow"] = "DELETE"
+    return status, headers, body
+
+
+def _delete_marker_404_headers(bucket_name: str, key: str) -> dict:
+    """Headers a 404 for `key` must carry when its current version is a delete
+    marker: AWS marks the miss with x-amz-delete-marker and the marker's id."""
+    versions = _object_versions.get((bucket_name, key)) or []
+    latest = versions[-1] if versions else None
+    if latest is not None and latest.get("is_delete_marker") and latest.get("is_latest"):
+        return {"x-amz-delete-marker": "true", "x-amz-version-id": latest["version_id"]}
+    return {}
+
+
+def _delete_object_version(bucket: dict, bucket_name: str, key: str, version_id: str) -> tuple[bool, bool]:
+    """Physically remove the exact version (or delete marker) addressed by
+    `version_id`, then reconcile the current-object pointer and is_latest flags.
+
+    Returns (found, was_delete_marker). `found` is False when no version matched
+    — S3 reports that as an error in the batch API but 204s the single delete.
+    """
+    vkey = (bucket_name, key)
+    versions = _object_versions.get(vkey)
+
+    # No tracked history: the only addressable version is the current object,
+    # exposed under the "null" id (objects put before versioning was enabled).
+    # The guard on version_id matters: "null" only addresses a current object
+    # that actually IS the null version — one without a version id of its own.
+    if not versions:
+        if version_id == "null" and key in bucket["objects"] and not bucket["objects"][key].get("version_id"):
+            _purge_current_object(bucket_name, key, bucket)
+            return True, False
+        return False, False
+
+    idx = next((i for i, v in enumerate(versions) if v["version_id"] == version_id), None)
+    if idx is None:
+        if version_id == "null" and key in bucket["objects"] and not bucket["objects"][key].get("version_id"):
+            _purge_current_object(bucket_name, key, bucket)
+            return True, False
+        return False, False
+
+    removed = versions.pop(idx)
+    _delete_version_file(bucket_name, key, version_id)
+    was_delete_marker = bool(removed.get("is_delete_marker"))
+    # Per-version tags and ACLs travel with the version being removed.
+    _object_tags.pop((bucket_name, key, version_id), None)
+    _object_acl.pop((bucket_name, key, version_id), None)
+    _object_annotations.pop((bucket_name, key, None if version_id == "null" else version_id), None)
+    _object_retention.pop((bucket_name, key, version_id), None)
+    _object_legal_hold.pop((bucket_name, key, version_id), None)
+
+    if not versions:
+        # History is now empty — drop the index entry and the current object.
+        _object_versions.pop(vkey, None)
+        _purge_current_object(bucket_name, key, bucket)
+        return True, was_delete_marker
+
+    # The newest surviving entry becomes latest (list is append-ordered).
+    for v in versions:
+        v["is_latest"] = False
+    latest = versions[-1]
+    latest["is_latest"] = True
+
+    # Reconcile the current-object pointer (used by Head/GetObject without a
+    # VersionId): a delete marker hides the object; a real version exposes it.
+    if latest.get("is_delete_marker"):
+        bucket["objects"].pop(key, None)
+    else:
+        record = _object_record_from_version(latest)
+        record["body"] = _version_body(bucket, bucket_name, key, latest)
+        bucket["objects"][key] = record
+    # The key now resolves to a different version (or to a marker): align the
+    # sidecar so a restart does not restore the pre-delete view.
+    _persist_version_state(bucket_name, key, bucket)
+    return True, was_delete_marker
+
+
+def _delete_object(bucket_name: str, key: str, headers: dict | None = None, query_params: dict | None = None):
+    headers = headers or {}
+    query_params = query_params or {}
+    bucket = _ensure_bucket(bucket_name)
+    if bucket is None:
+        return _no_such_bucket(bucket_name)
+
+    # x-amz-if-match-size and x-amz-if-match-last-modified-time are directory-
+    # bucket features that general-purpose buckets refuse outright. Measured
+    # against live S3 (eu-west-1): returns NotImplemented and the object stays.
+    if headers.get("x-amz-if-match-size") or headers.get("x-amz-if-match-last-modified-time"):
         return _error(
-            "NoSuchKey",
-            "The specified key does not exist.",
-            404,
+            "NotImplemented",
+            "A header you provided implies functionality that is not implemented",
+            501,
             f"/{bucket_name}/{key}",
         )
 
-    obj = bucket["objects"][key]
-    return 200, _object_response_headers(obj, bucket_name, key), b""
+    # Conditional delete. Measured against S3 in eu-west-1: the condition is
+    # evaluated against the current object and nothing else, matching the
+    # guide's "Conditional delete evaluations only apply to the current
+    # version of the object."
+    #
+    #   no current object (absent, or a delete marker on top)  -> 404 NoSuchKey
+    #   current object, ETag differs                           -> 412
+    #   current object, matching ETag or If-Match: *           -> 204
+    #
+    # S3 does not look under a delete marker, so a key whose history still
+    # holds a real version is as gone as one that was never written. An
+    # absent key is not an already-completed delete either: the request is
+    # conditional, and there is nothing for the condition to hold against.
+    if_match = (headers.get("if-match") or "").strip()
+    if if_match:
+        _cur = bucket["objects"].get(key)
+        if _cur is None:
+            return _error("NoSuchKey", "The specified key does not exist.", 404, f"/{bucket_name}/{key}")
+        if if_match != "*" and if_match.strip('"') != _cur["etag"].strip('"'):
+            return _error(
+                "PreconditionFailed",
+                "At least one of the preconditions you specified did not hold.",
+                412,
+                f"/{bucket_name}/{key}",
+            )
 
-
-def _delete_object(bucket_name: str, key: str, headers: dict | None = None):
-    headers = headers or {}
-    bucket = _ensure_bucket(bucket_name)
-    if bucket is None:
-        return _no_such_bucket(bucket_name)
-
-    if key in bucket["objects"]:
-        lock_err = _check_object_lock(bucket_name, key, headers)
+    # An explicit VersionId permanently removes exactly that version (or that
+    # specific delete marker) — it never creates a new marker. Only a delete
+    # WITHOUT a VersionId falls through to the delete-marker path below.
+    version_id = _qp(query_params, "versionId", "")
+    if version_id:
+        lock_err = _check_object_lock(bucket_name, key, headers, None if version_id == "null" else version_id)
         if lock_err:
             return lock_err
+        _found, was_delete_marker = _delete_object_version(bucket, bucket_name, key, version_id)
+        # S3 returns 204 whether or not the version existed, echoing the
+        # addressed VersionId (and delete-marker flag when one was removed).
+        resp_headers = {"x-amz-version-id": version_id}
+        if was_delete_marker:
+            resp_headers["x-amz-delete-marker"] = "true"
+        if _found:
+            _fire_s3_event_async(bucket_name, key, "s3:ObjectRemoved:Delete", version_id=version_id)
+        return 204, resp_headers, b""
 
     versioning = _bucket_versioning.get(bucket_name, "")
     if versioning in ("Enabled", "Suspended"):
         # Add a delete marker instead of removing version history
-        delete_marker_id = new_uuid()
-        vkey = (bucket_name, key)
-        if vkey not in _object_versions:
-            _object_versions[vkey] = []
-        # Mark all previous versions as not latest
-        for v in _object_versions[vkey]:
-            v["is_latest"] = False
-        _object_versions[vkey].append({
-            "version_id": delete_marker_id,
-            "last_modified": now_iso(),
-            "etag": "",
-            "size": 0,
-            "is_latest": True,
-            "is_delete_marker": True,
-        })
+        delete_marker_id = _record_delete_marker(bucket_name, key, bucket["objects"].get(key))
         existed = key in bucket["objects"]
         bucket["objects"].pop(key, None)
+        _maybe_replicate_delete_marker(bucket_name, key)
         if existed:
-            _fire_s3_event_async(bucket_name, key, "s3:ObjectRemoved:Delete")
+            _fire_s3_event_async(
+                bucket_name,
+                key,
+                "s3:ObjectRemoved:DeleteMarkerCreated",
+                deletion_type="Delete Marker Created",
+                version_id=delete_marker_id,
+            )
         return 204, {"x-amz-delete-marker": "true", "x-amz-version-id": delete_marker_id}, b""
 
     existed = key in bucket["objects"]
     bucket["objects"].pop(key, None)
-    _object_tags.pop((bucket_name, key), None)
-    _object_retention.pop((bucket_name, key), None)
-    _object_legal_hold.pop((bucket_name, key), None)
+    _object_tags.pop((bucket_name, key, None), None)
+    _object_annotations.pop((bucket_name, key, None), None)
+    _object_retention.pop((bucket_name, key, None), None)
+    _object_legal_hold.pop((bucket_name, key, None), None)
+    _object_acl.pop((bucket_name, key, None), None)
     _delete_persisted_object(bucket_name, key)
 
     if existed:
@@ -2108,8 +6571,9 @@ def _delete_object(bucket_name: str, key: str, headers: dict | None = None):
     return 204, {}, b""
 
 
-def _check_object_lock(bucket_name: str, key: str, headers: dict) -> tuple | None:
-    hold = _object_legal_hold.get((bucket_name, key))
+def _check_object_lock(bucket_name: str, key: str, headers: dict, version_id) -> tuple | None:
+    """Refusal for a permanent delete of a version under retention or legal hold."""
+    hold = _object_legal_hold.get((bucket_name, key, version_id))
     if hold == "ON":
         return _error(
             "AccessDenied",
@@ -2117,7 +6581,7 @@ def _check_object_lock(bucket_name: str, key: str, headers: dict) -> tuple | Non
             403,
         )
 
-    retention = _object_retention.get((bucket_name, key))
+    retention = _object_retention.get((bucket_name, key, version_id))
     if retention:
         retain_until = retention.get("RetainUntilDate", "")
         if retain_until and retain_until > now_iso():
@@ -2139,9 +6603,78 @@ def _check_object_lock(bucket_name: str, key: str, headers: dict) -> tuple | Non
     return None
 
 
+def _parse_http_date(value: str):
+    """Parse an RFC 7231 HTTP-date header into a tz-aware UTC datetime, or None."""
+    from email.utils import parsedate_to_datetime
+
+    try:
+        dt = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_dt.timezone.utc)
+    return dt
+
+
+def _object_mtime_dt(obj: dict):
+    """The object's Last-Modified as a tz-aware datetime at second granularity
+    (Last-Modified is second-precise, so preconditions must compare at that resolution)."""
+    iso = obj.get("last_modified")
+    if not iso:
+        return None
+    try:
+        dt = _dt.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt.replace(microsecond=0)
+
+
+def _check_copy_source_preconditions(headers: dict, src_obj: dict):
+    """Judge the x-amz-copy-source-if-* headers against the source.
+
+    Per the AWS CopyObject reference (RFC 7232 precedence):
+    x-amz-copy-source-if-match takes precedence over -if-unmodified-since,
+    and -if-none-match over -if-modified-since, so the date header only
+    applies when its ETag counterpart is absent.  UploadPartCopy carries the
+    same four headers and judges them the same way, so both ask here.
+
+    Returns an error response, or None when every condition holds."""
+    msg = "At least one of the pre-conditions you specified did not hold"
+    src_mtime = _object_mtime_dt(src_obj)
+    src_etag = (src_obj.get("etag") or "").strip('"')
+
+    if_match = headers.get("x-amz-copy-source-if-match", "")
+    if if_match:
+        if if_match.strip('"') != src_etag:
+            return _error("PreconditionFailed", msg, 412)
+    else:
+        unmod = _parse_http_date(headers.get("x-amz-copy-source-if-unmodified-since", ""))
+        # "Unmodified since" fails when the source was modified after it.
+        if unmod and src_mtime and src_mtime > unmod:
+            return _error("PreconditionFailed", msg, 412)
+
+    if_none_match = headers.get("x-amz-copy-source-if-none-match", "")
+    if if_none_match:
+        if if_none_match.strip('"') == src_etag:
+            return _error("PreconditionFailed", msg, 412)
+    else:
+        mod = _parse_http_date(headers.get("x-amz-copy-source-if-modified-since", ""))
+        # "Modified since" fails when the source has NOT changed since it.
+        if mod and src_mtime and src_mtime <= mod:
+            return _error("PreconditionFailed", msg, 412)
+    return None
+
+
 def _copy_object(bucket_name: str, dest_key: str, headers: dict):
-    source = url_unquote(headers.get("x-amz-copy-source", "").lstrip("/"))
-    src_parts = source.split("?", 1)[0].split("/", 1)
+    # Split the raw header at "?" before percent-decoding: a key legitimately
+    # containing "?versionId" arrives encoded (%3FversionId) and must stay
+    # part of the key, while a real versionId qualifier arrives as a bare "?".
+    raw_source = headers.get("x-amz-copy-source", "").lstrip("/")
+    raw_path, _, src_query = raw_source.partition("?")
+    src_path = url_unquote(raw_path)
+    src_parts = src_path.split("/", 1)
     if len(src_parts) < 2:
         return _error(
             "InvalidArgument",
@@ -2153,45 +6686,102 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     src_bucket = _ensure_bucket(src_bucket_name)
     if src_bucket is None:
         return _no_such_bucket(src_bucket_name)
-    if src_key not in src_bucket["objects"]:
-        return _error(
-            "NoSuchKey",
-            "The specified key does not exist.",
-            404,
-            f"/{src_bucket_name}/{src_key}",
-        )
+
+    # A `?versionId=` on the copy source selects a specific version to copy,
+    # rather than the current object (AWS copies that exact version).
+    src_version_id = None
+    if src_query:
+        src_version_id = _parse_qs(src_query, keep_blank_values=True).get("versionId", [None])[0]
 
     dest_bucket = _ensure_bucket(bucket_name)
     if dest_bucket is None:
         return _no_such_bucket(bucket_name)
+    lock_err = _object_lock_header_error(bucket_name, headers)
+    if lock_err:
+        return lock_err
 
-    src_obj = src_bucket["objects"][src_key]
+    # A canned ACL on the copy applies to the destination, as it does on a
+    # put; an unknown value rejects the whole request rather than being
+    # dropped on the floor.
+    canned_acl = headers.get("x-amz-acl")
+    if canned_acl and canned_acl not in _CANNED_OBJECT_ACLS:
+        return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned_acl}", 400)
+    grant_acl, err = _grant_headers_acl(headers, _bucket_owner_enforced(dest_bucket))
+    if err:
+        return err
+    if _bucket_owner_enforced(dest_bucket) and (err := _acls_disabled_error(headers)):
+        return err
+    refused = _public_acl_refused(bucket_name, headers)
+    if refused:
+        return refused
 
-    # Precondition: x-amz-copy-source-if-match
-    if_match = headers.get("x-amz-copy-source-if-match", "")
-    if if_match and if_match.strip('"') != src_obj["etag"].strip('"'):
-        return _error(
-            "PreconditionFailed",
-            "At least one of the pre-conditions you specified did not hold",
-            412,
+    # A new checksum algorithm on the copy also applies to the annotations.
+    annotation_directive = headers.get("x-amz-object-annotation-directive", "COPY").upper()
+    if annotation_directive not in ("COPY", "EXCLUDE"):
+        return _error("InvalidArgument", f"Invalid annotation directive: {annotation_directive}", 400)
+    annotation_algorithm = (
+        headers.get("x-amz-checksum-algorithm") or headers.get("x-amz-sdk-checksum-algorithm") or ""
+    ).upper()
+    if annotation_algorithm and _annotation_checksum(annotation_algorithm, b"") is None:
+        return _annotation_checksum_unsupported(annotation_algorithm)
+
+    if src_version_id:
+        ventry = next(
+            (v for v in _object_versions.get((src_bucket_name, src_key), []) if v["version_id"] == src_version_id),
+            None,
         )
+        ventry_body = None
+        if ventry is not None and not ventry.get("is_delete_marker"):
+            ventry_body = _version_body(src_bucket, src_bucket_name, src_key, ventry)
+        if ventry_body is None:
+            return _error(
+                "NoSuchVersion",
+                "The specified version does not exist.",
+                404,
+                f"/{src_bucket_name}/{src_key}",
+            )
+        # Synthesize a source object from the stored version — the index keeps
+        # the body plus the wire metadata, so a COPY metadata-directive carries
+        # the version's user metadata and headers like a current-object copy.
+        src_obj = {
+            "body": ventry_body,
+            "etag": ventry["etag"],
+            "size": ventry["size"],
+            "last_modified": ventry["last_modified"],
+            "content_type": ventry.get("content_type") or "application/octet-stream",
+            "content_encoding": ventry.get("content_encoding"),
+            "metadata": ventry.get("metadata", {}),
+            "preserved_headers": ventry.get("preserved_headers", {}),
+            "storage_class": ventry.get("storage_class") or "STANDARD",
+            "checksums": ventry.get("checksums") or {},
+            "version_id": src_version_id,
+        }
+    else:
+        if src_key not in src_bucket["objects"]:
+            return _error(
+                "NoSuchKey",
+                "The specified key does not exist.",
+                404,
+                f"/{src_bucket_name}/{src_key}",
+            )
+        src_obj = src_bucket["objects"][src_key]
 
-    # Precondition: x-amz-copy-source-if-none-match — 412 for PUT-like operations.
-    if_none_match = headers.get("x-amz-copy-source-if-none-match", "")
-    if if_none_match and if_none_match.strip('"') == src_obj["etag"].strip('"'):
-        return _error(
-            "PreconditionFailed",
-            "At least one of the pre-conditions you specified did not hold",
-            412,
-        )
+    sse_src_err = _check_sse_c_copy_source(headers, src_obj)
+    if sse_src_err is not None:
+        return sse_src_err
+
+    # AWS echoes the copied source version on a versioned source.
+    copy_src_vid = src_version_id or src_obj.get("version_id")
+
+    precond_err = _check_copy_source_preconditions(headers, src_obj)
+    if precond_err is not None:
+        return precond_err
 
     directive = headers.get("x-amz-metadata-directive", "COPY").upper()
     if directive == "REPLACE":
         metadata = _extract_user_metadata(headers)
         content_type = headers.get("content-type", src_obj["content_type"])
-        content_encoding = headers.get(
-            "content-encoding", src_obj.get("content_encoding")
-        )
+        content_encoding = headers.get("content-encoding", src_obj.get("content_encoding"))
         preserved = {}
         for h in _PRESERVED_HEADERS:
             val = headers.get(h)
@@ -2203,15 +6793,35 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
         content_encoding = src_obj.get("content_encoding")
         preserved = dict(src_obj.get("preserved_headers", {}))
 
-    dest_sc, sc_err = _resolve_storage_class(
-        headers, default=src_obj.get("storage_class") or "STANDARD"
-    )
+    # The destination's encryption always comes from THIS request (or the
+    # destination bucket's default), never from the source — a COPY metadata
+    # directive must not smuggle the source's SSE state across.
+    dest_sse, dest_sse_err = _resolve_sse_write_headers(headers, bucket_name, reject_orphan_key=True)
+    if dest_sse_err is not None:
+        return dest_sse_err
+    for h in _SSE_STORED_HEADERS:
+        preserved.pop(h, None)
+    preserved.update(dest_sse)
+
+    dest_sc, sc_err = _resolve_storage_class(headers, default=src_obj.get("storage_class") or "STANDARD")
     if sc_err:
         return sc_err
 
     new_etag = src_obj["etag"]
     last_modified = now_iso()
     src_body = _read_body(src_bucket_name, src_key, src_obj)
+    # AWS CopyObject preserves the source's whole-object checksum unless the
+    # caller asks for a different algorithm via `x-amz-checksum-algorithm` /
+    # `x-amz-sdk-checksum-algorithm`. The latter case is handled by the same
+    # resolver as PutObject, against the copied body.
+    dest_checksums = dict(src_obj.get("checksums") or {})
+    if headers.get("x-amz-sdk-checksum-algorithm") or any(
+        headers.get(f"x-amz-checksum-{a}") for a in _S3_CHECKSUM_HEADERS
+    ):
+        resolved, csum_err = _resolve_object_checksums(src_body, headers)
+        if csum_err:
+            return csum_err
+        dest_checksums.update(resolved)
     dest_obj = {
         "body": src_body,
         "content_type": content_type,
@@ -2222,71 +6832,99 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
         "metadata": metadata,
         "preserved_headers": preserved,
         "storage_class": dest_sc,
+        "checksums": dest_checksums,
     }
+    dest_prior_obj = dest_bucket["objects"].get(dest_key)
     dest_bucket["objects"][dest_key] = dest_obj
 
-    # --- Preserve / replace tags ---
+    # --- Resolve tag payload now; commit after dest version_id is assigned
+    #     (object tags are per-version per AWS).
     tagging_directive = headers.get("x-amz-tagging-directive", "COPY").upper()
+    pending_dest_tags: dict | None = None
     if tagging_directive == "REPLACE":
         tagging_header = headers.get("x-amz-tagging", "")
         if tagging_header:
-            _object_tags[(bucket_name, dest_key)] = {
-                k: v[0] for k, v in _parse_qs(tagging_header).items()
-            }
-        else:
-            _object_tags.pop((bucket_name, dest_key), None)
+            pending_dest_tags = {k: v[0] for k, v in _parse_qs(tagging_header, keep_blank_values=True).items()}
     else:
-        src_tags = _object_tags.get((src_bucket_name, src_key))
+        src_tags = _object_tags.get((src_bucket_name, src_key, src_obj.get("version_id")))
         if src_tags:
-            _object_tags[(bucket_name, dest_key)] = dict(src_tags)
-        else:
-            _object_tags.pop((bucket_name, dest_key), None)
+            pending_dest_tags = dict(src_tags)
 
-    # --- Preserve lock / retention ---
-    src_retention = _object_retention.get((src_bucket_name, src_key))
-    if src_retention:
-        _object_retention[(bucket_name, dest_key)] = dict(src_retention)
-    else:
-        _object_retention.pop((bucket_name, dest_key), None)
+    pending_dest_annotations: dict | None = None
+    if annotation_directive == "COPY":
+        src_annotations = _object_annotations.get((src_bucket_name, src_key, src_obj.get("version_id")))
+        if src_annotations:
+            pending_dest_annotations = {}
+            for name, entry in src_annotations.items():
+                carried = {k: v for k, v in entry.items() if k != "replication_status"}
+                if annotation_algorithm:
+                    carried["checksums"] = {
+                        annotation_algorithm: _annotation_checksum(annotation_algorithm, entry["payload"].encode())
+                    }
+                pending_dest_annotations[name] = carried
 
-    src_hold = _object_legal_hold.get((src_bucket_name, src_key))
-    if src_hold:
-        _object_legal_hold[(bucket_name, dest_key)] = src_hold
-    else:
-        _object_legal_hold.pop((bucket_name, dest_key), None)
-
-    if S3_PERSIST:
-        _persist_object(bucket_name, dest_key, dest_obj)
-
+    resp_headers = {"Content-Type": "application/xml"}
+    resp_headers.update(dest_sse)
+    if copy_src_vid:
+        resp_headers["x-amz-copy-source-version-id"] = copy_src_vid
+    if dest_sc != "STANDARD":
+        resp_headers["x-amz-storage-class"] = dest_sc
+    _maybe_replicate(bucket_name, dest_key, dest_obj, src_body, pending_dest_tags)
+    version_id = _record_object_version(bucket_name, dest_key, dest_prior_obj, dest_obj, src_body)
+    if version_id:
+        resp_headers["x-amz-version-id"] = version_id
     _fire_s3_event_async(
         bucket_name,
         dest_key,
         "s3:ObjectCreated:Copy",
         size=dest_obj["size"],
         etag=new_etag,
+        version_id=version_id,
+        object_extra={"hasObjectAnnotation": bool(pending_dest_annotations)},
     )
 
-    resp_headers = {"Content-Type": "application/xml"}
-    if dest_sc != "STANDARD":
-        resp_headers["x-amz-storage-class"] = dest_sc
-    if _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
-        version_id = new_uuid()
-        dest_obj["version_id"] = version_id
-        resp_headers["x-amz-version-id"] = version_id
-        vkey = (bucket_name, dest_key)
-        if vkey not in _object_versions:
-            _object_versions[vkey] = []
-        _object_versions[vkey].append({
-            "version_id": version_id,
-            "last_modified": dest_obj["last_modified"],
-            "etag": dest_obj["etag"],
-            "size": dest_obj["size"],
-            "is_latest": True,
-            "data": src_body,
-            "storage_class": dest_obj.get("storage_class") or "STANDARD",
-        })
-        for v in _object_versions[vkey][:-1]:
-            v["is_latest"] = False
+    dest_version_id = dest_obj.get("version_id")
+    src_lock_key = (src_bucket_name, src_key, src_obj.get("version_id"))
+    for store in (_object_retention, _object_legal_hold):
+        if src_lock_key in store and _bucket_object_lock.get(bucket_name):
+            store[(bucket_name, dest_key, dest_version_id)] = copy.deepcopy(store[src_lock_key])
+    if pending_dest_annotations:
+        _object_annotations[(bucket_name, dest_key, dest_version_id)] = pending_dest_annotations
+        if dest_obj.get("_replica"):
+            replica_bucket, replica_version, replica_account = dest_obj["_replica"]
+            with _in_account(replica_account):
+                _object_annotations[(replica_bucket, dest_key, replica_version)] = {
+                    name: dict(entry, replication_status="REPLICA") for name, entry in pending_dest_annotations.items()
+                }
+            for entry in pending_dest_annotations.values():
+                entry["replication_status"] = "COMPLETED"
+    else:
+        _object_annotations.pop((bucket_name, dest_key, dest_version_id), None)
+    if pending_dest_tags is not None:
+        _object_tags[(bucket_name, dest_key, dest_version_id)] = pending_dest_tags
+        if dest_obj.get("_replica"):
+            replica_bucket, replica_version, replica_account = dest_obj["_replica"]
+            with _in_account(replica_account):
+                _object_tags[(replica_bucket, dest_key, replica_version)] = dict(pending_dest_tags)
+                _persist_version_state(replica_bucket, dest_key, _buckets[replica_bucket])
+    else:
+        _object_tags.pop((bucket_name, dest_key, dest_version_id), None)
+
+    if canned_acl:
+        _object_acl[(bucket_name, dest_key, dest_version_id)] = _canned_acl_policy_xml(
+            canned_acl, _canonical_owner_id()
+        )
+    elif grant_acl:
+        _object_acl[(bucket_name, dest_key, dest_version_id)] = grant_acl
+    else:
+        # The destination is a new object: it does not inherit whatever the
+        # key it replaced was permissioned with.
+        _object_acl.pop((bucket_name, dest_key, dest_version_id), None)
+
+    # Persist only after the versioning block: the .meta.json sidecar must
+    # carry the version_id assigned above (#1058), and the tags and ACL.
+    if S3_PERSIST:
+        _persist_object(bucket_name, dest_key, dest_obj)
 
     root = Element("CopyObjectResult", xmlns=S3_NS)
     SubElement(root, "LastModified").text = last_modified
@@ -2299,7 +6937,47 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
 # ---------------------------------------------------------------------------
 
 
-def _get_object_tagging(bucket_name: str, key: str):
+def _resolve_subresource_version(query_params: dict, bucket: dict, key: str):
+    """Resolve the (key, version_id) pair an object subresource op acts on.
+
+    Per AWS, object tags and ACLs are per-version: when ``?versionId=`` is
+    present the op targets that specific version; otherwise it targets the
+    current object. The literal ``versionId=null`` means the pre-versioning
+    object (stored as ``None`` in our key tuple)."""
+    vid = _qp(query_params or {}, "versionId", "")
+    if vid:
+        return None if vid == "null" else vid
+    obj = bucket["objects"].get(key)
+    return obj.get("version_id") if obj else None
+
+
+def _no_such_version(
+    bucket_name: str,
+    key: str,
+    query_params: dict,
+) -> tuple | None:
+    """Refuse a subresource op whose ?versionId= names nothing.
+
+    The id addresses a version the way a key addresses an object, so one
+    that was never minted -- or has since been deleted -- draws
+    NoSuchVersion rather than the default policy for a version that is not
+    there.  The literal "null" is exempt: it names the pre-versioning
+    object, which the index only carries once a versioned write lands on
+    top of it."""
+    vid = _qp(query_params or {}, "versionId", "")
+    if not vid or vid == "null":
+        return None
+    if any(v["version_id"] == vid for v in _object_versions.get((bucket_name, key), [])):
+        return None
+    return _error(
+        "NoSuchVersion",
+        "The specified version does not exist.",
+        404,
+        f"/{bucket_name}/{key}",
+    )
+
+
+def _get_object_tagging(bucket_name: str, key: str, query_params: dict | None = None):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
@@ -2311,17 +6989,24 @@ def _get_object_tagging(bucket_name: str, key: str):
             f"/{bucket_name}/{key}",
         )
 
-    tags = _object_tags.get((bucket_name, key), {})
+    gone = _no_such_version(bucket_name, key, query_params)
+    if gone is not None:
+        return gone
+    version_id = _resolve_subresource_version(query_params, bucket, key)
+    tags = _object_tags.get((bucket_name, key, version_id), {})
     root = Element("Tagging", xmlns=S3_NS)
     tag_set = SubElement(root, "TagSet")
     for k, v in tags.items():
         tag = SubElement(tag_set, "Tag")
         SubElement(tag, "Key").text = k
         SubElement(tag, "Value").text = v
-    return 200, {"Content-Type": "application/xml"}, _xml_body(root)
+    resp_headers = {"Content-Type": "application/xml"}
+    if version_id:
+        resp_headers["x-amz-version-id"] = version_id
+    return 200, resp_headers, _xml_body(root)
 
 
-def _put_object_tagging(bucket_name: str, key: str, body: bytes):
+def _put_object_tagging(bucket_name: str, key: str, body: bytes, query_params: dict | None = None):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
@@ -2335,14 +7020,22 @@ def _put_object_tagging(bucket_name: str, key: str, body: bytes):
     try:
         tags = _parse_tags_xml(body)
     except Exception:
-        return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+        return _error("MalformedXML", _MALFORMED_XML, 400)
     if len(tags) > 10:
         return _error("BadRequest", "Object tags cannot be greater than 10", 400)
-    _object_tags[(bucket_name, key)] = tags
-    return 200, {"Content-Type": "application/xml"}, b""
+    gone = _no_such_version(bucket_name, key, query_params)
+    if gone is not None:
+        return gone
+    version_id = _resolve_subresource_version(query_params, bucket, key)
+    _object_tags[(bucket_name, key, version_id)] = tags
+    _persist_version_state(bucket_name, key, bucket)
+    resp_headers = {"Content-Type": "application/xml"}
+    if version_id:
+        resp_headers["x-amz-version-id"] = version_id
+    return 200, resp_headers, b""
 
 
-def _delete_object_tagging(bucket_name: str, key: str):
+def _delete_object_tagging(bucket_name: str, key: str, query_params: dict | None = None):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
@@ -2353,8 +7046,450 @@ def _delete_object_tagging(bucket_name: str, key: str):
             404,
             f"/{bucket_name}/{key}",
         )
-    _object_tags.pop((bucket_name, key), None)
-    return 204, {}, b""
+    gone = _no_such_version(bucket_name, key, query_params)
+    if gone is not None:
+        return gone
+    version_id = _resolve_subresource_version(query_params, bucket, key)
+    _object_tags.pop((bucket_name, key, version_id), None)
+    _persist_version_state(bucket_name, key, bucket)
+    resp_headers = {}
+    if version_id:
+        resp_headers["x-amz-version-id"] = version_id
+    return 204, resp_headers, b""
+
+
+# ---------------------------------------------------------------------------
+# Object annotations
+# ---------------------------------------------------------------------------
+
+_ANNOTATION_MAX_PER_VERSION = 1000
+_ANNOTATION_MAX_NAME_BYTES = 512
+_ANNOTATION_MAX_PAYLOAD = 1024 * 1024
+_ANNOTATION_NAME_PUNCTUATION = frozenset("0123456789_.-")
+# XXHASH3/XXHASH128 have no stdlib implementation and are refused.
+_ANNOTATION_CHECKSUM_ALGORITHMS = (
+    "CRC32",
+    "CRC32C",
+    "CRC64NVME",
+    "SHA1",
+    "SHA256",
+    "SHA512",
+    "MD5",
+    "XXHASH64",
+    "XXHASH3",
+    "XXHASH128",
+)
+
+# XXH64 per the xxHash spec.
+_XXH64_P1 = 0x9E3779B185EBCA87
+_XXH64_P2 = 0xC2B2AE3D27D4EB4F
+_XXH64_P3 = 0x165667B19E3779F9
+_XXH64_P4 = 0x85EBCA77C2B2AE63
+_XXH64_P5 = 0x27D4EB2F165667C5
+_U64 = 0xFFFFFFFFFFFFFFFF
+
+
+def _rotl64(x: int, r: int) -> int:
+    return ((x << r) | (x >> (64 - r))) & _U64
+
+
+def _xxh64_round(acc: int, lane: int) -> int:
+    return (_rotl64((acc + lane * _XXH64_P2) & _U64, 31) * _XXH64_P1) & _U64
+
+
+def _xxh64(data: bytes, seed: int = 0) -> int:
+    n = len(data)
+    i = 0
+    if n >= 32:
+        v = [
+            (seed + _XXH64_P1 + _XXH64_P2) & _U64,
+            (seed + _XXH64_P2) & _U64,
+            seed & _U64,
+            (seed - _XXH64_P1) & _U64,
+        ]
+        while i + 32 <= n:
+            for lane in range(4):
+                v[lane] = _xxh64_round(v[lane], int.from_bytes(data[i + 8 * lane : i + 8 * lane + 8], "little"))
+            i += 32
+        h = (_rotl64(v[0], 1) + _rotl64(v[1], 7) + _rotl64(v[2], 12) + _rotl64(v[3], 18)) & _U64
+        for acc in v:
+            h = ((h ^ _xxh64_round(0, acc)) * _XXH64_P1 + _XXH64_P4) & _U64
+    else:
+        h = (seed + _XXH64_P5) & _U64
+    h = (h + n) & _U64
+    while i + 8 <= n:
+        h ^= _xxh64_round(0, int.from_bytes(data[i : i + 8], "little"))
+        h = (_rotl64(h, 27) * _XXH64_P1 + _XXH64_P4) & _U64
+        i += 8
+    if i + 4 <= n:
+        h ^= (int.from_bytes(data[i : i + 4], "little") * _XXH64_P1) & _U64
+        h = (_rotl64(h, 23) * _XXH64_P2 + _XXH64_P3) & _U64
+        i += 4
+    while i < n:
+        h ^= (data[i] * _XXH64_P5) & _U64
+        h = (_rotl64(h, 11) * _XXH64_P1) & _U64
+        i += 1
+    h ^= h >> 33
+    h = (h * _XXH64_P2) & _U64
+    h ^= h >> 29
+    h = (h * _XXH64_P3) & _U64
+    return h ^ (h >> 32)
+
+
+def _annotation_checksum(algorithm: str, data: bytes) -> str | None:
+    """Base64 checksum of a payload, or None if the algorithm is unsupported."""
+    algo = (algorithm or "").upper().replace("_", "")
+    if algo not in _ANNOTATION_CHECKSUM_ALGORITHMS:
+        return None
+    if algo == "SHA512":
+        return base64.b64encode(hashlib.sha512(data).digest()).decode()
+    if algo == "MD5":
+        return base64.b64encode(hashlib.md5(data).digest()).decode()
+    if algo == "XXHASH64":
+        return base64.b64encode(struct.pack(">Q", _xxh64(data))).decode()
+    return _compute_s3_checksum(algo, data)
+
+
+def _annotation_checksum_unsupported(algorithm: str) -> tuple:
+    supported = ", ".join(a for a in _ANNOTATION_CHECKSUM_ALGORITHMS if _annotation_checksum(a, b"") is not None)
+    return _error(
+        "InvalidRequest",
+        f"Checksum algorithm not supported: {algorithm}. Supported: {supported}.",
+        400,
+    )
+
+
+def _resolve_annotation_checksums(payload: bytes, headers: dict):
+    """Return ``(checksums, error_or_None)``; CRC64NVME when none is named."""
+    provided = {
+        alg: headers[f"x-amz-checksum-{alg.lower()}"]
+        for alg in _ANNOTATION_CHECKSUM_ALGORITHMS
+        if headers.get(f"x-amz-checksum-{alg.lower()}")
+    }
+    requested = (headers.get("x-amz-sdk-checksum-algorithm") or "").upper().replace("_", "")
+    if requested and requested not in _ANNOTATION_CHECKSUM_ALGORITHMS:
+        return {}, _error("InvalidRequest", "Value for x-amz-sdk-checksum-algorithm header is invalid.", 400)
+    if len(provided) > 1:
+        return {}, _error(
+            "InvalidRequest",
+            "Expecting a single x-amz-checksum- header. Multiple checksum Types are not allowed.",
+            400,
+        )
+    algorithm = next(iter(provided), None) or requested or "CRC64NVME"
+    if requested and provided and requested != algorithm:
+        return {}, _error(
+            "InvalidRequest",
+            f"Value for x-amz-sdk-checksum-algorithm header is invalid: {requested} does not match "
+            f"the x-amz-checksum-{algorithm.lower()} header sent.",
+            400,
+        )
+    computed = _annotation_checksum(algorithm, payload)
+    if computed is None:
+        return {}, _annotation_checksum_unsupported(algorithm)
+    if algorithm in provided and provided[algorithm] != computed:
+        return {}, _error("BadDigest", f"The {algorithm} you specified did not match the calculated checksum.", 400)
+    content_md5 = headers.get("content-md5")
+    if content_md5 and content_md5 != base64.b64encode(hashlib.md5(payload).digest()).decode():
+        return {}, _error("BadDigest", "The Content-MD5 you specified did not match what we received.", 400)
+    return {algorithm: computed}, None
+
+
+def _annotation_name_error(name: str) -> tuple | None:
+    """Validate an annotation name against S3's naming rules."""
+    if not name or not name.strip():
+        return _error("InvalidAnnotationName", "The annotation name you provided is invalid.", 400)
+    if len(name.encode("utf-8")) > _ANNOTATION_MAX_NAME_BYTES:
+        return _error("AnnotationNameTooLong", "The annotation name exceeds 512 bytes.", 400)
+    if name.lower().startswith(("aws", "s3")) or not all(
+        ch.isalpha() or ch in _ANNOTATION_NAME_PUNCTUATION for ch in name
+    ):
+        return _error("InvalidAnnotationName", "The annotation name you provided is invalid.", 400)
+    return None
+
+
+def _annotation_target(bucket_name: str, key: str, query_params: dict):
+    """Resolve the object version an annotation call acts on."""
+    bucket = _ensure_bucket(bucket_name)
+    if bucket is None:
+        return None, _no_such_bucket(bucket_name)
+    vid = _qp(query_params or {}, "versionId", "")
+    current = bucket["objects"].get(key)
+    if not vid:
+        if current is None:
+            status, err_headers, err_body = _error(
+                "NoSuchKey", "The specified key does not exist.", 404, f"/{bucket_name}/{key}"
+            )
+            err_headers = dict(err_headers)
+            err_headers.update(_delete_marker_404_headers(bucket_name, key))
+            return None, (status, err_headers, err_body)
+        return (bucket, current.get("version_id"), current), None
+    if vid == "null" and current is not None and not current.get("version_id"):
+        return (bucket, None, current), None
+    entry = next((v for v in _object_versions.get((bucket_name, key), []) if v["version_id"] == vid), None)
+    if entry is None:
+        return None, _error("NoSuchVersion", "The specified version does not exist.", 404, f"/{bucket_name}/{key}")
+    if entry.get("is_delete_marker"):
+        return None, _delete_marker_read_refused(entry)
+    return (bucket, None if vid == "null" else vid, entry), None
+
+
+def _annotation_version_header(bucket_name: str, version_key: str | None) -> dict:
+    """x-amz-object-version-id for the annotated version."""
+    if version_key:
+        return {"x-amz-object-version-id": version_key}
+    if _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
+        return {"x-amz-object-version-id": "null"}
+    return {}
+
+
+def _annotation_sse_headers(record: dict) -> dict:
+    """Annotations inherit the object's encryption; SSE-S3 when it has none."""
+    sse = _stored_sse_headers(record)
+    out = {"x-amz-server-side-encryption": sse.get("x-amz-server-side-encryption") or "AES256"}
+    if sse.get("x-amz-server-side-encryption-aws-kms-key-id"):
+        out["x-amz-server-side-encryption-aws-kms-key-id"] = sse["x-amz-server-side-encryption-aws-kms-key-id"]
+    return out
+
+
+def _annotation_if_match(headers: dict, record: dict) -> tuple | None:
+    """x-amz-object-if-match checks the object's ETag."""
+    expected = headers.get("x-amz-object-if-match")
+    if expected and expected != "*" and expected.strip('"') != (record.get("etag") or "").strip('"'):
+        return _error("PreconditionFailed", "At least one of the pre-conditions you specified did not hold", 412)
+    return None
+
+
+def _annotation_checksum_headers(entry: dict) -> dict:
+    out = {f"x-amz-checksum-{alg.lower()}": value for alg, value in (entry.get("checksums") or {}).items()}
+    if out:
+        out["x-amz-checksum-type"] = "FULL_OBJECT"
+    return out
+
+
+def _annotation_lock_error(bucket_name: str, key: str, headers: dict, version_id) -> tuple | None:
+    """Object Lock refusal for an annotation write (observed on AWS)."""
+    from ministack.app import AUTH
+    if not AUTH:
+        return None
+    if _object_legal_hold.get((bucket_name, key, version_id)) == "ON":
+        return _error("AccessDenied", "Access Denied because object protected by object lock legal hold.", 403)
+    retention = _object_retention.get((bucket_name, key, version_id))
+    if not retention:
+        return None
+    retain_until = retention.get("RetainUntilDate", "")
+    if not retain_until or retain_until <= now_iso():
+        return None
+    mode = retention.get("Mode", "")
+    bypass = headers.get("x-amz-bypass-governance-retention", "").lower() == "true"
+    if mode == "COMPLIANCE" or (mode == "GOVERNANCE" and not bypass):
+        return _error("AccessDenied", "Access Denied because object protected by object lock retention.", 403)
+    return None
+
+
+def _put_object_annotation(bucket_name: str, key: str, body: bytes, headers: dict, query_params: dict):
+    name = _qp(query_params, "annotationName", "")
+    name_error = _annotation_name_error(name)
+    if name_error:
+        return name_error
+    target, error = _annotation_target(bucket_name, key, query_params)
+    if error:
+        return error
+    bucket, version_key, record = target
+    lock_error = _annotation_lock_error(bucket_name, key, headers, version_key)
+    if lock_error:
+        return lock_error
+    precondition = _annotation_if_match(headers, record)
+    if precondition:
+        return precondition
+    if _stored_sse_headers(record).get("x-amz-server-side-encryption-customer-algorithm"):
+        return _error("InvalidRequest", "Objects encrypted with SSE-C cannot have annotations.", 400)
+    payload = body or b""
+    if not payload or len(payload) > _ANNOTATION_MAX_PAYLOAD:
+        return _error("InvalidRequest", "An annotation payload must be between 1 byte and 1 MiB.", 400)
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError:
+        return _error("UnsupportedMediaType", "The annotation payload is not valid UTF-8 encoded text.", 415)
+    checksums, checksum_error = _resolve_annotation_checksums(payload, headers)
+    if checksum_error:
+        return checksum_error
+
+    store_key = (bucket_name, key, version_key)
+    annotations = dict(_object_annotations.get(store_key) or {})
+    if name not in annotations and len(annotations) >= _ANNOTATION_MAX_PER_VERSION:
+        return _error(
+            "AnnotationLimitExceeded",
+            "The request would exceed the maximum number of annotations allowed per object.",
+            400,
+        )
+    entry = {
+        "payload": text,
+        "size": len(payload),
+        "etag": f'"{md5_hash(payload)}"',
+        "last_modified": now_iso(),
+        "checksums": checksums,
+    }
+    # Annotations replicate onto the version's replica.
+    current = bucket["objects"].get(key)
+    if current is not None and current.get("version_id") == version_key and current.get("_replica"):
+        replica_bucket, replica_version, replica_account = current["_replica"]
+        with _in_account(replica_account):
+            replica_key = (replica_bucket, key, replica_version)
+            replica_annotations = dict(_object_annotations.get(replica_key) or {})
+            replica_annotations[name] = dict(entry, replication_status="REPLICA")
+            _object_annotations[replica_key] = replica_annotations
+            _persist_version_state(replica_bucket, key, _buckets[replica_bucket])
+        entry["replication_status"] = "COMPLETED"
+    annotations[name] = entry
+    _object_annotations[store_key] = annotations
+    _persist_version_state(bucket_name, key, bucket)
+
+    version_headers = _annotation_version_header(bucket_name, version_key)
+    _fire_s3_event_async(
+        bucket_name,
+        key,
+        "s3:ObjectAnnotation:Put",
+        size=record.get("size", 0),
+        etag=record.get("etag", ""),
+        version_id=version_headers.get("x-amz-object-version-id"),
+        record_extra={"objectAnnotation": [{"name": name, "size": entry["size"], "eTag": entry["etag"].strip('"')}]},
+    )
+
+    resp_headers = {"Content-Type": "application/xml", "ETag": entry["etag"]}
+    resp_headers.update(version_headers)
+    resp_headers.update(_annotation_checksum_headers(entry))
+    resp_headers.update(_annotation_sse_headers(record))
+    root = Element("PutObjectAnnotationOutput", xmlns=S3_NS)
+    SubElement(root, "Key").text = key
+    SubElement(root, "AnnotationName").text = name
+    return 200, resp_headers, _xml_body(root)
+
+
+def _get_object_annotation(bucket_name: str, key: str, headers: dict, query_params: dict):
+    name = _qp(query_params, "annotationName", "")
+    name_error = _annotation_name_error(name)
+    if name_error:
+        return name_error
+    target, error = _annotation_target(bucket_name, key, query_params)
+    if error:
+        return error
+    _bucket, version_key, record = target
+    entry = (_object_annotations.get((bucket_name, key, version_key)) or {}).get(name)
+    if entry is None:
+        return _error(
+            "NoSuchAnnotation", "The specified annotation does not exist on this object.", 404, f"/{bucket_name}/{key}"
+        )
+    payload = entry["payload"].encode("utf-8")
+    resp_headers = {
+        "Content-Type": "application/octet-stream",
+        "Content-Length": str(len(payload)),
+        "ETag": entry["etag"],
+        "Last-Modified": iso_to_rfc7231(entry["last_modified"]),
+    }
+    resp_headers.update(_annotation_version_header(bucket_name, version_key))
+    resp_headers.update(_annotation_sse_headers(record))
+    if entry.get("replication_status"):
+        resp_headers["x-amz-replication-status"] = entry["replication_status"]
+    # As for GetObject, stored checksums come back only when asked for.
+    if (headers.get("x-amz-checksum-mode") or "").upper() == "ENABLED":
+        resp_headers.update(_annotation_checksum_headers(entry))
+    return 200, resp_headers, payload
+
+
+def _list_object_annotations(bucket_name: str, key: str, query_params: dict):
+    target, error = _annotation_target(bucket_name, key, query_params)
+    if error:
+        return error
+    _bucket, version_key, _record = target
+    prefix = _qp(query_params, "annotation-prefix", "")
+    if len(prefix.encode("utf-8")) > _ANNOTATION_MAX_NAME_BYTES:
+        return _error("InvalidPrefix", "The annotation prefix you provided is invalid.", 400)
+    raw_max = _qp(query_params, "max-annotation-results", "")
+    try:
+        max_results = int(raw_max) if raw_max else _ANNOTATION_MAX_PER_VERSION
+    except ValueError:
+        max_results = 0
+    if not 1 <= max_results <= _ANNOTATION_MAX_PER_VERSION:
+        return _error("InvalidArgument", "max-annotation-results must be between 1 and 1000.", 400)
+    token = _qp(query_params, "continuation-token", "")
+    after = ""
+    if token:
+        try:
+            after = base64.urlsafe_b64decode(token.encode()).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return _error("InvalidArgument", "The continuation token provided is incorrect.", 400)
+
+    # UTF-8 binary order (undocumented); the token is the last name returned.
+    annotations = _object_annotations.get((bucket_name, key, version_key)) or {}
+    names = sorted(
+        (n for n in annotations if n.startswith(prefix) and (not after or n.encode() > after.encode())),
+        key=lambda n: n.encode("utf-8"),
+    )
+    page = names[:max_results]
+
+    root = Element("ListObjectAnnotationsOutput", xmlns=S3_NS)
+    listed = SubElement(root, "Annotations")
+    for name in page:
+        entry = annotations[name]
+        el = SubElement(listed, "AnnotationEntry")
+        SubElement(el, "AnnotationName").text = name
+        for alg in entry.get("checksums") or {}:
+            SubElement(el, "ChecksumAlgorithm").text = alg
+        SubElement(el, "ETag").text = entry["etag"]
+        SubElement(el, "LastModified").text = entry["last_modified"]
+        if entry.get("replication_status"):
+            SubElement(el, "ReplicationStatus").text = entry["replication_status"]
+        SubElement(el, "Size").text = str(entry["size"])
+    SubElement(root, "Bucket").text = bucket_name
+    SubElement(root, "Key").text = key
+    if prefix:
+        SubElement(root, "AnnotationPrefix").text = prefix
+    SubElement(root, "MaxAnnotationResults").text = str(max_results)
+    SubElement(root, "AnnotationCount").text = str(len(page))
+    if token:
+        SubElement(root, "ContinuationToken").text = token
+    if len(names) > max_results:
+        SubElement(root, "NextContinuationToken").text = base64.urlsafe_b64encode(page[-1].encode()).decode()
+    resp_headers = {"Content-Type": "application/xml"}
+    resp_headers.update(_annotation_version_header(bucket_name, version_key))
+    return 200, resp_headers, _xml_body(root)
+
+
+def _delete_object_annotation(bucket_name: str, key: str, headers: dict, query_params: dict):
+    name = _qp(query_params, "annotationName", "")
+    name_error = _annotation_name_error(name)
+    if name_error:
+        return name_error
+    target, error = _annotation_target(bucket_name, key, query_params)
+    if error:
+        return error
+    bucket, version_key, record = target
+    lock_error = _annotation_lock_error(bucket_name, key, headers, version_key)
+    if lock_error:
+        return lock_error
+    precondition = _annotation_if_match(headers, record)
+    if precondition:
+        return precondition
+    store_key = (bucket_name, key, version_key)
+    annotations = dict(_object_annotations.get(store_key) or {})
+    version_headers = _annotation_version_header(bucket_name, version_key)
+    # A missing annotation still answers 204; only a real delete fires the event.
+    if annotations.pop(name, None) is not None:
+        if annotations:
+            _object_annotations[store_key] = annotations
+        else:
+            _object_annotations.pop(store_key, None)
+        _persist_version_state(bucket_name, key, bucket)
+        _fire_s3_event_async(
+            bucket_name,
+            key,
+            "s3:ObjectAnnotation:Delete",
+            size=record.get("size", 0),
+            etag=record.get("etag", ""),
+            version_id=version_headers.get("x-amz-object-version-id"),
+            record_extra={"objectAnnotation": [{"name": name}]},
+        )
+    return 204, version_headers, b""
 
 
 # ---------------------------------------------------------------------------
@@ -2407,36 +7542,30 @@ def _put_object_lock_configuration(bucket_name: str, body: bytes):
     try:
         xml_root = fromstring(body)
     except Exception:
-        return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+        return _error("MalformedXML", _MALFORMED_XML, 400)
 
     enabled_el = _find_xml_tag(xml_root, "ObjectLockEnabled")
     if enabled_el is None or enabled_el.text != "Enabled":
-        return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+        return _error("MalformedXML", _MALFORMED_XML, 400)
 
     default_retention = None
     rule_el = _find_xml_tag(xml_root, "Rule")
     if rule_el is not None:
         ret_el = _find_xml_tag(rule_el, "DefaultRetention")
         if ret_el is None:
-            return _error(
-                "MalformedXML", "The XML you provided was not well-formed", 400
-            )
+            return _error("MalformedXML", _MALFORMED_XML, 400)
 
         mode_el = _find_xml_tag(ret_el, "Mode")
         days_el = _find_xml_tag(ret_el, "Days")
         years_el = _find_xml_tag(ret_el, "Years")
 
         if mode_el is None or mode_el.text not in ("GOVERNANCE", "COMPLIANCE"):
-            return _error(
-                "MalformedXML", "The XML you provided was not well-formed", 400
-            )
+            return _error("MalformedXML", _MALFORMED_XML, 400)
 
         has_days = days_el is not None and days_el.text
         has_years = years_el is not None and years_el.text
         if (has_days and has_years) or (not has_days and not has_years):
-            return _error(
-                "MalformedXML", "The XML you provided was not well-formed", 400
-            )
+            return _error("MalformedXML", _MALFORMED_XML, 400)
 
         default_retention = {"Mode": mode_el.text}
         try:
@@ -2445,7 +7574,7 @@ def _put_object_lock_configuration(bucket_name: str, body: bytes):
             if has_years:
                 default_retention["Years"] = int(years_el.text)
         except (ValueError, TypeError):
-            return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+            return _error("MalformedXML", _MALFORMED_XML, 400)
 
     _bucket_object_lock[bucket_name] = {
         "enabled": True,
@@ -2454,25 +7583,30 @@ def _put_object_lock_configuration(bucket_name: str, body: bytes):
     return 200, {"Content-Type": "application/xml"}, b""
 
 
-def _get_object_retention(bucket_name: str, key: str):
+def _object_lock_target(bucket_name: str, key: str, bucket: dict, query_params: dict | None):
+    """``(lock key, error)`` for the version a retention or legal-hold call addresses."""
+    if _qp(query_params or {}, "versionId", ""):
+        missing = _no_such_version(bucket_name, key, query_params)
+        if missing:
+            return None, missing
+    elif key not in bucket["objects"]:
+        return None, _error("NoSuchKey", "The specified key does not exist.", 404, f"/{bucket_name}/{key}")
+    return (bucket_name, key, _resolve_subresource_version(query_params or {}, bucket, key)), None
+
+
+def _get_object_retention(bucket_name: str, key: str, query_params: dict | None = None):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
-    if key not in bucket["objects"]:
-        return _error(
-            "NoSuchKey",
-            "The specified key does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
+    lock_key, missing = _object_lock_target(bucket_name, key, bucket, query_params)
+    if missing:
+        return missing
 
     lock = _bucket_object_lock.get(bucket_name)
     if not lock:
-        return _error(
-            "InvalidRequest", "Bucket is missing Object Lock Configuration", 400
-        )
+        return _error("InvalidRequest", "Bucket is missing Object Lock Configuration", 400)
 
-    retention = _object_retention.get((bucket_name, key))
+    retention = _object_retention.get(lock_key)
     if not retention:
         return _error(
             "NoSuchObjectLockConfiguration",
@@ -2486,40 +7620,34 @@ def _get_object_retention(bucket_name: str, key: str):
     return 200, {"Content-Type": "application/xml"}, _xml_body(root)
 
 
-def _put_object_retention(bucket_name: str, key: str, body: bytes, headers: dict):
+def _put_object_retention(bucket_name: str, key: str, body: bytes, headers: dict, query_params: dict | None = None):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
-    if key not in bucket["objects"]:
-        return _error(
-            "NoSuchKey",
-            "The specified key does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
+    lock_key, missing = _object_lock_target(bucket_name, key, bucket, query_params)
+    if missing:
+        return missing
 
     lock = _bucket_object_lock.get(bucket_name)
     if not lock:
-        return _error(
-            "InvalidRequest", "Bucket is missing Object Lock Configuration", 400
-        )
+        return _error("InvalidRequest", "Bucket is missing Object Lock Configuration", 400)
 
     try:
         xml_root = fromstring(body)
     except Exception:
-        return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+        return _error("MalformedXML", _MALFORMED_XML, 400)
 
     mode_el = _find_xml_tag(xml_root, "Mode")
     date_el = _find_xml_tag(xml_root, "RetainUntilDate")
 
     if mode_el is None or mode_el.text not in ("GOVERNANCE", "COMPLIANCE"):
-        return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+        return _error("MalformedXML", _MALFORMED_XML, 400)
     if date_el is None or not date_el.text:
-        return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+        return _error("MalformedXML", _MALFORMED_XML, 400)
 
     retain_until = date_el.text
 
-    existing = _object_retention.get((bucket_name, key))
+    existing = _object_retention.get(lock_key)
     if existing:
         is_reducing = existing.get("RetainUntilDate", "") > retain_until or (
             mode_el.text == "GOVERNANCE" and existing.get("Mode") == "COMPLIANCE"
@@ -2540,32 +7668,27 @@ def _put_object_retention(bucket_name: str, key: str, body: bytes, headers: dict
                         403,
                     )
 
-    _object_retention[(bucket_name, key)] = {
+    _object_retention[lock_key] = {
         "Mode": mode_el.text,
         "RetainUntilDate": retain_until,
     }
+    _persist_version_state(bucket_name, key, bucket)
     return 200, {"Content-Type": "application/xml"}, b""
 
 
-def _get_object_legal_hold(bucket_name: str, key: str):
+def _get_object_legal_hold(bucket_name: str, key: str, query_params: dict | None = None):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
-    if key not in bucket["objects"]:
-        return _error(
-            "NoSuchKey",
-            "The specified key does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
+    lock_key, missing = _object_lock_target(bucket_name, key, bucket, query_params)
+    if missing:
+        return missing
 
     lock = _bucket_object_lock.get(bucket_name)
     if not lock:
-        return _error(
-            "InvalidRequest", "Bucket is missing Object Lock Configuration", 400
-        )
+        return _error("InvalidRequest", "Bucket is missing Object Lock Configuration", 400)
 
-    status = _object_legal_hold.get((bucket_name, key))
+    status = _object_legal_hold.get(lock_key)
     if status is None:
         return _error(
             "NoSuchObjectLockConfiguration",
@@ -2578,7 +7701,227 @@ def _get_object_legal_hold(bucket_name: str, key: str):
     return 200, {"Content-Type": "application/xml"}, _xml_body(root)
 
 
-def _put_object_legal_hold(bucket_name: str, key: str, body: bytes):
+def _put_object_legal_hold(bucket_name: str, key: str, body: bytes, query_params: dict | None = None):
+    bucket = _ensure_bucket(bucket_name)
+    if bucket is None:
+        return _no_such_bucket(bucket_name)
+    lock_key, missing = _object_lock_target(bucket_name, key, bucket, query_params)
+    if missing:
+        return missing
+
+    lock = _bucket_object_lock.get(bucket_name)
+    if not lock:
+        return _error("InvalidRequest", "Bucket is missing Object Lock Configuration", 400)
+
+    try:
+        xml_root = fromstring(body)
+    except Exception:
+        return _error("MalformedXML", _MALFORMED_XML, 400)
+
+    status_el = _find_xml_tag(xml_root, "Status")
+    if status_el is None or status_el.text not in ("ON", "OFF"):
+        return _error("MalformedXML", _MALFORMED_XML, 400)
+
+    _object_legal_hold[lock_key] = status_el.text
+    _persist_version_state(bucket_name, key, bucket)
+    return 200, {"Content-Type": "application/xml"}, b""
+
+
+# ---------------------------------------------------------------------------
+# Object ACL (?acl subresource)
+# ---------------------------------------------------------------------------
+
+# Canned ACLs accepted by PutObjectAcl `x-amz-acl` header per the AWS S3 API
+# reference. Stored verbatim — ministack does not enforce ACL semantics on the
+# data plane, only round-trips the value so SDK callers that read it back
+# (terraform, CDK, custom code) see what they set.
+_CANNED_OBJECT_ACLS = {
+    "private",
+    "public-read",
+    "public-read-write",
+    "authenticated-read",
+    "aws-exec-read",
+    "bucket-owner-read",
+    "bucket-owner-full-control",
+}
+
+# Canned ACLs accepted by CreateBucket / PutBucketAcl `x-amz-acl`: the object
+# set minus the object-only variants, plus log-delivery-write (bucket-only).
+_CANNED_BUCKET_ACLS = {
+    "private",
+    "public-read",
+    "public-read-write",
+    "authenticated-read",
+    "log-delivery-write",
+}
+
+
+_ACL_GROUP_ALL_USERS = "http://acs.amazonaws.com/groups/global/AllUsers"
+_ACL_GROUP_AUTH_USERS = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers"
+_ACL_GROUP_LOG_DELIVERY = "http://acs.amazonaws.com/groups/s3/LogDelivery"
+
+# Group grants each canned ACL adds on top of the owner's FULL_CONTROL, per the
+# AWS S3 "Canned ACL" reference. The bucket-owner-* / aws-exec-read variants add
+# only owner/bucket-owner grants, which collapse to the owner in MiniStack's
+# single-account model, so they carry no extra group grant here.
+_CANNED_ACL_GROUP_GRANTS = {
+    "public-read": [(_ACL_GROUP_ALL_USERS, "READ")],
+    "public-read-write": [(_ACL_GROUP_ALL_USERS, "READ"), (_ACL_GROUP_ALL_USERS, "WRITE")],
+    "authenticated-read": [(_ACL_GROUP_AUTH_USERS, "READ")],
+    "log-delivery-write": [(_ACL_GROUP_LOG_DELIVERY, "WRITE"), (_ACL_GROUP_LOG_DELIVERY, "READ_ACP")],
+}
+
+
+def _public_acl(headers: dict, acl_xml: str | bytes | None = None) -> bool:
+    """Whether the request's canned ACL, grant headers or ACL body grant AllUsers or AuthenticatedUsers."""
+    public = (_ACL_GROUP_ALL_USERS, _ACL_GROUP_AUTHENTICATED)
+    uris = [uri for uri, _ in _CANNED_ACL_GROUP_GRANTS.get(headers.get("x-amz-acl", ""), [])]
+    uris += [uri for uri, _ in _acl_grants(acl_xml)]
+    grants = " ".join(v for k, v in headers.items() if k.lower().startswith("x-amz-grant-"))
+    return any(uri in public for uri in uris) or any(group in grants for group in public)
+
+
+def _public_acl_refused(bucket_name: str, headers: dict, acl_xml: str | bytes | None = None) -> tuple | None:
+    """AccessDenied for a request that sets a public ACL on a bucket whose BlockPublicAcls is on."""
+    if not _public_acl(headers, acl_xml):
+        return None
+    if bucket_name not in _buckets or not _public_access_blocked(get_account_id(), bucket_name, "BlockPublicAcls"):
+        return None
+    return _error("AccessDenied",
+                  "public ACLs are prevented by the BlockPublicAcls setting in S3 Block Public Access.", 403)
+
+
+def _canned_acl_policy_xml(canned: str, owner_id: str) -> str:
+    """AccessControlPolicy XML for a canned ACL: the owner's FULL_CONTROL plus the
+    group grants the canned value implies (e.g. public-read grants AllUsers READ),
+    so GetObjectAcl reflects what the canned ACL actually means rather than a bare
+    owner grant. (#1322, rest of defect 9)"""
+    grants = [
+        "<Grant>"
+        '<Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+        'xsi:type="CanonicalUser">'
+        f"<ID>{owner_id}</ID><DisplayName>ministack</DisplayName></Grantee>"
+        "<Permission>FULL_CONTROL</Permission></Grant>"
+    ]
+    for uri, perm in _CANNED_ACL_GROUP_GRANTS.get(canned, []):
+        grants.append(
+            "<Grant>"
+            '<Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+            f'xsi:type="Group"><URI>{uri}</URI></Grantee>'
+            f"<Permission>{perm}</Permission></Grant>"
+        )
+    return (
+        XML_DECL.decode() + "\n"
+        f'<AccessControlPolicy xmlns="{S3_NS}">'
+        f"<Owner><ID>{owner_id}</ID><DisplayName>ministack</DisplayName></Owner>"
+        f'<AccessControlList>{"".join(grants)}</AccessControlList>'
+        "</AccessControlPolicy>"
+    )
+
+
+# The x-amz-grant-* headers in the order S3 lists their grants back.
+_GRANT_HEADER_PERMISSIONS = (
+    ("x-amz-grant-read", "READ"),
+    ("x-amz-grant-write", "WRITE"),
+    ("x-amz-grant-full-control", "FULL_CONTROL"),
+    ("x-amz-grant-read-acp", "READ_ACP"),
+    ("x-amz-grant-write-acp", "WRITE_ACP"),
+)
+
+
+def _grant_headers_acl(headers: dict, enforced: bool) -> tuple[str | None, tuple | None]:
+    """The ACL the request's ``x-amz-grant-*`` headers set (None without any or with ACLs disabled), or their error."""
+    present = [(headers[name], permission) for name, permission in _GRANT_HEADER_PERMISSIONS if headers.get(name)]
+    if not present or enforced:
+        return None, None
+    if headers.get("x-amz-acl"):
+        return None, _error("InvalidRequest", "Specifying both Canned ACLs and Header Grants is not allowed", 400)
+    grants = []
+    for value, permission in present:
+        for item in value.split(","):
+            kind, _, grantee = item.partition("=")
+            kind, grantee = kind.strip().lower(), grantee.strip().strip('"')
+            if kind == "id" and re.fullmatch(r"[0-9a-fA-F]{64}", grantee):
+                grantee_xml = f'xsi:type="CanonicalUser"><ID>{grantee}</ID>'
+            elif kind == "uri" and grantee in (_ACL_GROUP_ALL_USERS, _ACL_GROUP_AUTH_USERS, _ACL_GROUP_LOG_DELIVERY):
+                grantee_xml = f'xsi:type="Group"><URI>{grantee}</URI>'
+            elif kind in ("id", "uri"):
+                return None, _error("InvalidArgument", "Invalid id" if kind == "id" else "Invalid group uri", 400)
+            elif kind == "emailaddress":
+                return None, _error("UnsupportedArgument", "The request contained an unsupported argument.", 400)
+            else:
+                return None, _error("InvalidArgument", "Argument format not recognized", 400)
+            grants.append(
+                '<Grant><Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+                f"{grantee_xml}</Grantee><Permission>{permission}</Permission></Grant>"
+            )
+    owner_id = _canonical_owner_id()
+    return (
+        XML_DECL.decode() + "\n"
+        f'<AccessControlPolicy xmlns="{S3_NS}">'
+        f"<Owner><ID>{owner_id}</ID><DisplayName>ministack</DisplayName></Owner>"
+        f'<AccessControlList>{"".join(grants)}</AccessControlList>'
+        "</AccessControlPolicy>"
+    ), None
+
+
+# Canned ACLs that leave the bucket owner the only grantee of an object the owner writes.
+_OWNER_ONLY_OBJECT_ACLS = ("private", "bucket-owner-read", "bucket-owner-full-control")
+
+
+def _owner_only_acl(headers: dict, canned_acls: tuple[str, ...]) -> bool:
+    """Whether the request sets no ACL, one of *canned_acls* or only ``x-amz-grant-full-control`` to the owner."""
+    canned = headers.get("x-amz-acl")
+    if canned and canned not in canned_acls:
+        return False
+    present = [name for name, _ in _GRANT_HEADER_PERMISSIONS if headers.get(name)]
+    if not present:
+        return True
+    if present != ["x-amz-grant-full-control"]:
+        return False
+    owner_id = _canonical_owner_id()
+    for item in headers["x-amz-grant-full-control"].split(","):
+        kind, _, grantee = item.partition("=")
+        if kind.strip().lower() != "id" or grantee.strip().strip('"') != owner_id:
+            return False
+    return True
+
+
+def _acls_disabled_error(headers: dict, body: bytes = b"", canned_acls=None) -> tuple | None:
+    """AccessControlListNotSupported for an ACL a BucketOwnerEnforced bucket refuses, else None.
+
+    With *canned_acls* (PutBucketAcl, PutObjectAcl) every ACL is refused; object writes keep an owner-only one.
+    """
+    if canned_acls is None:
+        refused = not _owner_only_acl(headers, _OWNER_ONLY_OBJECT_ACLS)
+    else:
+        refused = bool(body) or headers.get("x-amz-acl") in canned_acls or any(
+            headers.get(name) for name, _ in _GRANT_HEADER_PERMISSIONS)
+    return _error("AccessControlListNotSupported", "The bucket does not allow ACLs", 400) if refused else None
+
+
+def _default_object_acl_xml() -> bytes:
+    """Default ACL real AWS returns when no ACL has been set on an object:
+    a single Grant of FULL_CONTROL to the bucket owner (CanonicalUser).
+    The canonical-user ID is derived from the request's account so cross-
+    account callers don't all collide on the same fake ID."""
+    owner_id = _canonical_owner_id()
+    return (
+        XML_DECL + b"\n"
+        b'<AccessControlPolicy xmlns="' + S3_NS.encode() + b'">'
+        b"<Owner><ID>" + owner_id.encode() + b"</ID>"
+        b"<DisplayName>ministack</DisplayName></Owner>"
+        b"<AccessControlList><Grant>"
+        b'<Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
+        b'xsi:type="CanonicalUser">'
+        b"<ID>" + owner_id.encode() + b"</ID>"
+        b"<DisplayName>ministack</DisplayName></Grantee>"
+        b"<Permission>FULL_CONTROL</Permission>"
+        b"</Grant></AccessControlList></AccessControlPolicy>"
+    )
+
+
+def _get_object_acl(bucket_name: str, key: str, query_params: dict | None = None):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
@@ -2590,28 +7933,358 @@ def _put_object_legal_hold(bucket_name: str, key: str, body: bytes):
             f"/{bucket_name}/{key}",
         )
 
-    lock = _bucket_object_lock.get(bucket_name)
-    if not lock:
+    # ACLs are per-version, like tags: a `?versionId=` reads that version's
+    # ACL, and a version that never had one set reads as the default policy.
+    gone = _no_such_version(bucket_name, key, query_params)
+    if gone is not None:
+        return gone
+    version_id = _resolve_subresource_version(query_params, bucket, key)
+    # BucketOwnerEnforced hides a stored ACL; it is back once ACLs are enabled again.
+    stored = None if _bucket_owner_enforced(bucket) else _object_acl.get((bucket_name, key, version_id))
+    body = stored.encode("utf-8") if stored else _default_object_acl_xml()
+    resp_headers = {"Content-Type": "application/xml"}
+    if version_id:
+        resp_headers["x-amz-version-id"] = version_id
+    return 200, resp_headers, body
+
+
+def _put_object_acl(bucket_name: str, key: str, body: bytes, headers: dict, query_params: dict | None = None):
+    bucket = _ensure_bucket(bucket_name)
+    if bucket is None:
+        return _no_such_bucket(bucket_name)
+    if key not in bucket["objects"]:
         return _error(
-            "InvalidRequest", "Bucket is missing Object Lock Configuration", 400
+            "NoSuchKey",
+            "The specified key does not exist.",
+            404,
+            f"/{bucket_name}/{key}",
         )
 
+    # A `?versionId=` sets that specific version's ACL; without it the current
+    # version's. Later versions are separate objects and keep their defaults.
+    gone = _no_such_version(bucket_name, key, query_params)
+    if gone is not None:
+        return gone
+    version_id = _resolve_subresource_version(query_params, bucket, key)
+    refused = _public_acl_refused(bucket_name, headers, body)
+    if refused:
+        return refused
+    enforced = _bucket_owner_enforced(bucket)
+    grant_acl, err = _grant_headers_acl(headers, enforced)
+    if err:
+        return err
+    if enforced and (err := _acls_disabled_error(headers, body, _CANNED_OBJECT_ACLS)):
+        return err
+
+    # Canned ACL from x-amz-acl header takes precedence and is mutually
+    # exclusive with an XML body per the AWS API reference. Either path
+    # stores the resulting policy XML so GetObjectAcl round-trips the value
+    # the caller set, matching what real AWS would return.
+    canned = headers.get("x-amz-acl")
+    if canned:
+        if canned not in _CANNED_OBJECT_ACLS:
+            return _error("InvalidArgument", f"Invalid x-amz-acl value: {canned}", 400)
+        _object_acl[(bucket_name, key, version_id)] = _canned_acl_policy_xml(canned, _canonical_owner_id())
+        _persist_version_state(bucket_name, key, bucket)
+        return 200, {}, b""
+    if grant_acl:
+        if body:
+            return _error("UnexpectedContent", "This request does not support content", 400)
+        _object_acl[(bucket_name, key, version_id)] = grant_acl
+        _persist_version_state(bucket_name, key, bucket)
+        return 200, {}, b""
+
+    if not body:
+        return _error("MissingSecurityHeader", "Your request was missing a required header.", 400)
     try:
-        xml_root = fromstring(body)
+        # Validate XML well-formedness — real AWS rejects malformed bodies
+        # with MalformedACLError. We don't enforce grantee/permission
+        # semantics on the data plane, so any well-formed AccessControlPolicy
+        # is accepted and round-tripped verbatim.
+        fromstring(body)
     except Exception:
-        return _error("MalformedXML", "The XML you provided was not well-formed", 400)
-
-    status_el = _find_xml_tag(xml_root, "Status")
-    if status_el is None or status_el.text not in ("ON", "OFF"):
-        return _error("MalformedXML", "The XML you provided was not well-formed", 400)
-
-    _object_legal_hold[(bucket_name, key)] = status_el.text
-    return 200, {"Content-Type": "application/xml"}, b""
+        return _error(
+            "MalformedACLError",
+            "The XML you provided was not well-formed or did not validate " "against our published schema.",
+            400,
+        )
+    _object_acl[(bucket_name, key, version_id)] = body.decode("utf-8", errors="replace")
+    _persist_version_state(bucket_name, key, bucket)
+    return 200, {}, b""
 
 
 # ---------------------------------------------------------------------------
 # Replication Configuration
 # ---------------------------------------------------------------------------
+
+
+def _replication_tag(tag_el) -> dict:
+    key_el, value_el = _find_xml_tag(tag_el, "Key"), _find_xml_tag(tag_el, "Value")
+    return {"Key": key_el.text if key_el is not None and key_el.text else "",
+            "Value": value_el.text if value_el is not None and value_el.text else ""}
+
+
+def _parse_replication_filter(filter_el) -> dict:
+    """A ReplicationRuleFilter: Prefix, Tag, or And (Prefix and Tags)."""
+    out: dict = {}
+    prefix_el = _find_xml_tag(filter_el, "Prefix")
+    if prefix_el is not None:
+        out["Prefix"] = prefix_el.text or ""
+    tag_el = _find_xml_tag(filter_el, "Tag")
+    if tag_el is not None:
+        out["Tag"] = _replication_tag(tag_el)
+    and_el = _find_xml_tag(filter_el, "And")
+    if and_el is not None:
+        and_op: dict = {}
+        and_prefix = _find_xml_tag(and_el, "Prefix")
+        if and_prefix is not None:
+            and_op["Prefix"] = and_prefix.text or ""
+        tags = [_replication_tag(t) for t in and_el if t.tag.split("}")[-1] == "Tag"]
+        if tags:
+            and_op["Tags"] = tags
+        out["And"] = and_op
+    return out
+
+
+def _replication_filter_xml(filter_el, rule_filter: dict) -> None:
+    def _tag(parent, tag):
+        tag_el = SubElement(parent, "Tag")
+        SubElement(tag_el, "Key").text = tag.get("Key", "")
+        SubElement(tag_el, "Value").text = tag.get("Value", "")
+
+    if "Prefix" in rule_filter:
+        SubElement(filter_el, "Prefix").text = rule_filter["Prefix"]
+    if "Tag" in rule_filter:
+        _tag(filter_el, rule_filter["Tag"])
+    if "And" in rule_filter:
+        and_el = SubElement(filter_el, "And")
+        if "Prefix" in rule_filter["And"]:
+            SubElement(and_el, "Prefix").text = rule_filter["And"]["Prefix"]
+        for tag in rule_filter["And"].get("Tags", []):
+            _tag(and_el, tag)
+
+
+# SourceSelectionCriteria on a rule and EncryptionConfiguration, ReplicationTime and
+# Metrics on its destination are stored and returned so IaC state matches; the data
+# plane ignores them (_replication_rule_for). The checks below follow AWS, in AWS's order.
+_REPLICATION_STATUSES = ("Enabled", "Disabled")
+_REPLICATION_MINUTES = 15  # the only Time and EventThreshold value AWS accepts
+_REPLICATION_V1_MESSAGE = ("{} cannot be used for this version of the replication configuration "
+                           "schema.{}Please refer to the S3 Developer Guide for more information.")
+
+
+class _MalformedReplication(Exception):
+    """An option that does not validate against the S3 schema (MalformedXML)."""
+
+
+def _replication_children(el, allowed: tuple) -> dict:
+    """Children of *el* by local name; an unknown or repeated child is a schema error."""
+    children = {}
+    for child in el:
+        name = child.tag.split("}")[-1]
+        if name not in allowed or name in children:
+            raise _MalformedReplication(name)
+        children[name] = child
+    return children
+
+
+def _replication_option(parent, name: str):
+    """The *name* child of *parent*, or None; more than one is a schema error."""
+    found = [child for child in parent if child.tag.split("}")[-1] == name]
+    if len(found) > 1:
+        raise _MalformedReplication(name)
+    return found[0] if found else None
+
+
+def _replication_status(children: dict) -> dict:
+    """The required Enabled|Disabled Status, matched exactly."""
+    status_el = children.get("Status")
+    if status_el is None or status_el.text not in _REPLICATION_STATUSES:
+        raise _MalformedReplication("Status")
+    return {"Status": status_el.text}
+
+
+def _replication_minutes(el) -> dict:
+    """A ReplicationTimeValue: Minutes is a required xs:int. An empty value parses and is
+    refused later by the 15-minute check, as on AWS."""
+    minutes_el = _replication_children(el, ("Minutes",)).get("Minutes")
+    if minutes_el is None:
+        raise _MalformedReplication("Minutes")
+    text = (minutes_el.text or "").strip()
+    if not text:
+        return {"Minutes": None}
+    if re.fullmatch(r"[+-]?\d+", text) is None or not -2**31 <= int(text) < 2**31:
+        raise _MalformedReplication("Minutes")
+    return {"Minutes": int(text)}
+
+
+def _parse_replication_options(rule_el) -> tuple[dict, dict]:
+    """(rule options, destination options) of one <Rule>; raises _MalformedReplication."""
+    rule_opts: dict = {}
+    dest_opts: dict = {}
+    ssc_el = _replication_option(rule_el, "SourceSelectionCriteria")
+    if ssc_el is not None:
+        rule_opts["SourceSelectionCriteria"] = {
+            name: _replication_status(_replication_children(el, ("Status",)))
+            for name, el in _replication_children(
+                ssc_el, ("SseKmsEncryptedObjects", "ReplicaModifications")).items()}
+    eor_el = _replication_option(rule_el, "ExistingObjectReplication")
+    if eor_el is not None:
+        rule_opts["ExistingObjectReplication"] = _replication_status(_replication_children(eor_el, ("Status",)))
+    dest_el = _find_xml_tag(rule_el, "Destination")
+    if dest_el is None:
+        return rule_opts, dest_opts
+    enc_el = _replication_option(dest_el, "EncryptionConfiguration")
+    if enc_el is not None:
+        key_el = _replication_children(enc_el, ("ReplicaKmsKeyID",)).get("ReplicaKmsKeyID")
+        dest_opts["EncryptionConfiguration"] = {} if key_el is None else {"ReplicaKmsKeyID": key_el.text or ""}
+    rtc_el = _replication_option(dest_el, "ReplicationTime")
+    if rtc_el is not None:
+        children = _replication_children(rtc_el, ("Status", "Time"))
+        status = _replication_status(children)
+        if "Time" not in children:
+            raise _MalformedReplication("Time")
+        dest_opts["ReplicationTime"] = {**status, "Time": _replication_minutes(children["Time"])}
+    metrics_el = _replication_option(dest_el, "Metrics")
+    if metrics_el is not None:
+        children = _replication_children(metrics_el, ("Status", "EventThreshold"))
+        metrics = _replication_status(children)
+        if "EventThreshold" in children:
+            metrics["EventThreshold"] = _replication_minutes(children["EventThreshold"])
+        dest_opts["Metrics"] = metrics
+    return rule_opts, dest_opts
+
+
+def _replication_destination_region(dest_bucket: str) -> str | None:
+    name = dest_bucket.split(":::")[-1]
+    owner = _bucket_owner_account(name)
+    if owner is None:
+        return None
+    record = _buckets.get_scoped(owner, None, name) or {}
+    return record.get("region") or os.environ.get("MINISTACK_REGION", "us-east-1")
+
+
+def _replica_kms_key_error(key: str, dest_bucket: str):
+    if not key:
+        return _error("InvalidArgument", "ReplicaKmsKeyID cannot be empty.", 400,
+                      extra={"ArgumentName": "ReplicaKmsKeyID", "ArgumentValue": key})
+    try:
+        spec = parse_arn(key)
+    except ArnParseError:
+        spec = None
+    # Any KMS key or alias ARN; AWS doesn't look the key up.
+    if spec is None or not spec.partition or spec.service != "kms" or not spec.resource.startswith(("key/", "alias/")):
+        return _error("InvalidArgument", "Invalid ReplicaKmsKeyID ARN.", 400,
+                      extra={"ArgumentName": "ReplicaKmsKeyID", "ArgumentValue": key})
+    try:
+        dest_partition = parse_arn(dest_bucket).partition
+    except ArnParseError:
+        dest_partition = "aws"
+    if spec.partition != dest_partition:
+        return _error("InvalidRequest",
+                      "KMS key ARN partition must match the destination bucket ARN partition.", 400)
+    dest_region = _replication_destination_region(dest_bucket)
+    if dest_region is not None and spec.region != dest_region:
+        return _error("InvalidRequest", "KMS key must be in the same region as the destination bucket.", 400)
+    return None
+
+
+def _replication_options_error(rule: dict):
+    """The first InvalidRequest or InvalidArgument for one rule's options, or None."""
+    ssc = rule.get("SourceSelectionCriteria")
+    dest = rule.get("Destination", {})
+    enc, rtc, metrics = dest.get("EncryptionConfiguration"), dest.get("ReplicationTime"), dest.get("Metrics")
+    if ssc == {}:
+        return _error("InvalidRequest", "SourceSelectionCriteria cannot be empty.", 400)
+    sse = (ssc or {}).get("SseKmsEncryptedObjects")
+    if sse is not None and enc is None:
+        return _error("InvalidRequest",
+                      "ReplicaKmsKeyID must be specified if SseKmsEncryptedObjects tag is present.", 400)
+    if enc is not None:
+        if sse is None:
+            return _error("InvalidRequest",
+                          "SseKmsEncryptedObjects must be specified if EncryptionConfiguration is present.", 400)
+        if "ReplicaKmsKeyID" not in enc:
+            return _error("InvalidRequest", "ReplicaKmsKeyID tag must be specified in EncryptionConfiguration.", 400)
+        key_error = _replica_kms_key_error(enc["ReplicaKmsKeyID"], dest.get("Bucket", ""))
+        if key_error is not None:
+            return key_error
+    if rtc is not None and rtc["Time"]["Minutes"] != _REPLICATION_MINUTES:
+        return _error("InvalidArgument", "Invalid time minute value", 400,
+                      extra={"ArgumentName": "ReplicationTime"})
+    if rtc is not None and metrics is None:
+        return _error("InvalidRequest",
+                      "Replication destination must contain both ReplicationTime and Metrics or neither.", 400)
+    if metrics is None:
+        return None
+    threshold = metrics.get("EventThreshold")
+    # Metrics without RTC: no ReplicationTime, or RTC Disabled with Metrics Enabled.
+    metrics_only = rtc is None or (rtc["Status"] == "Disabled" and metrics["Status"] == "Enabled")
+    if threshold is not None and metrics_only:
+        return _error("InvalidArgument",
+                      "Metrics cannot contain an event threshold when ReplicationTime is not specified or Disabled",
+                      400, extra={"ArgumentName": "Metrics"})
+    if threshold is not None and threshold["Minutes"] != _REPLICATION_MINUTES:
+        return _error("InvalidArgument", "Invalid event threshold minute value", 400,
+                      extra={"ArgumentName": "ReplicationMetrics"})
+    if metrics_only:
+        return None
+    if threshold is None:
+        return _error("InvalidArgument", "ReplicationMetrics must contain an event threshold", 400,
+                      extra={"ArgumentName": "ReplicationMetrics"})
+    if rtc["Status"] != metrics["Status"]:
+        return _error("InvalidArgument", "ReplicationTime and ReplicationMetrics should have the same status",
+                      400, extra={"ArgumentName": "ReplicationTime"})
+    return None
+
+
+def _replication_v1_options_error(rules: list):
+    """Rules without a Filter use the older Prefix schema, which AWS checks for these
+    options only after every rule passed the checks above."""
+    for rule in rules:
+        if "Filter" in rule:
+            continue
+        if "ReplicaModifications" in rule.get("SourceSelectionCriteria", {}):
+            return _error("InvalidRequest", _REPLICATION_V1_MESSAGE.format("ReplicaModifications", " "), 400)
+        for name in ("ReplicationTime", "Metrics"):
+            if name in rule.get("Destination", {}):
+                return _error("InvalidRequest", _REPLICATION_V1_MESSAGE.format(name, ""), 400)
+    return None
+
+
+def _replication_minutes_xml(parent, name: str, value: dict) -> None:
+    SubElement(SubElement(parent, name), "Minutes").text = str(value["Minutes"])
+
+
+def _replication_ssc_xml(rule_el, rule: dict) -> None:
+    if "SourceSelectionCriteria" not in rule:
+        return
+    ssc_el = SubElement(rule_el, "SourceSelectionCriteria")
+    for name in ("SseKmsEncryptedObjects", "ReplicaModifications"):
+        if name in rule["SourceSelectionCriteria"]:
+            SubElement(SubElement(ssc_el, name), "Status").text = rule["SourceSelectionCriteria"][name]["Status"]
+
+
+def _replication_eor_xml(rule_el, rule: dict) -> None:
+    if "ExistingObjectReplication" in rule:
+        SubElement(SubElement(rule_el, "ExistingObjectReplication"), "Status").text = (
+            rule["ExistingObjectReplication"]["Status"])
+
+
+def _replication_destination_options_xml(dest_el, dest: dict) -> None:
+    """In AWS's order: EncryptionConfiguration, Metrics, ReplicationTime."""
+    if "EncryptionConfiguration" in dest:
+        enc_el = SubElement(dest_el, "EncryptionConfiguration")
+        SubElement(enc_el, "ReplicaKmsKeyID").text = dest["EncryptionConfiguration"]["ReplicaKmsKeyID"]
+    if "Metrics" in dest:
+        metrics_el = SubElement(dest_el, "Metrics")
+        SubElement(metrics_el, "Status").text = dest["Metrics"]["Status"]
+        if "EventThreshold" in dest["Metrics"]:
+            _replication_minutes_xml(metrics_el, "EventThreshold", dest["Metrics"]["EventThreshold"])
+    if "ReplicationTime" in dest:
+        rtc_el = SubElement(dest_el, "ReplicationTime")
+        SubElement(rtc_el, "Status").text = dest["ReplicationTime"]["Status"]
+        _replication_minutes_xml(rtc_el, "Time", dest["ReplicationTime"]["Time"])
 
 
 def _put_bucket_replication(bucket_name: str, body: bytes):
@@ -2631,54 +8304,80 @@ def _put_bucket_replication(bucket_name: str, body: bytes):
     try:
         xml_root = fromstring(body)
     except Exception:
-        return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+        return _error("MalformedXML", _MALFORMED_XML, 400)
 
     role_el = _find_xml_tag(xml_root, "Role")
     role = role_el.text if role_el is not None and role_el.text else ""
 
+    rule_els = list(xml_root.findall("{%s}Rule" % S3_NS)) or list(xml_root.findall("Rule"))
+    try:
+        options = [_parse_replication_options(rule_el) for rule_el in rule_els]
+    except _MalformedReplication:
+        return _error("MalformedXML", _MALFORMED_XML, 400)
+
     rules = []
-    for rule_el in list(xml_root.findall("{%s}Rule" % S3_NS)) or list(
-        xml_root.findall("Rule")
-    ):
+    for rule_el, (rule_opts, dest_opts) in zip(rule_els, options):
         rule: dict = {}
         id_el = _find_xml_tag(rule_el, "ID")
         rule["ID"] = id_el.text if id_el is not None and id_el.text else new_uuid()[:8]
         status_el = _find_xml_tag(rule_el, "Status")
-        rule["Status"] = (
-            status_el.text if status_el is not None and status_el.text else "Enabled"
-        )
+        rule["Status"] = status_el.text if status_el is not None and status_el.text else "Enabled"
         prefix_el = _find_xml_tag(rule_el, "Prefix")
         if prefix_el is not None and prefix_el.text is not None:
             rule["Prefix"] = prefix_el.text
+        filter_el = _find_xml_tag(rule_el, "Filter")
+        if filter_el is not None:
+            rule["Filter"] = _parse_replication_filter(filter_el)
+        priority_el = _find_xml_tag(rule_el, "Priority")
+        if priority_el is not None and priority_el.text and priority_el.text.isdigit():
+            rule["Priority"] = int(priority_el.text)
+        dmr_el = _find_xml_tag(rule_el, "DeleteMarkerReplication")
+        if dmr_el is not None:
+            dmr_status = _find_xml_tag(dmr_el, "Status")
+            rule["DeleteMarkerReplication"] = {
+                "Status": dmr_status.text if dmr_status is not None and dmr_status.text else "Disabled"
+            }
         dest_el = _find_xml_tag(rule_el, "Destination")
         if dest_el is not None:
             dest: dict = {}
             bucket_el = _find_xml_tag(dest_el, "Bucket")
             if bucket_el is not None and bucket_el.text:
                 dest["Bucket"] = bucket_el.text
-                # Validate destination bucket
-                dest_name = (
-                    bucket_el.text.split(":::")[-1]
-                    if ":::" in bucket_el.text
-                    else bucket_el.text
-                )
-                dest_bucket = _ensure_bucket(dest_name)
-                if dest_bucket is not None:
-                    dest_versioning = _bucket_versioning.get(dest_name, "")
+                # Validate destination bucket — the name identifies one bucket
+                # whoever owns it, so the check spans accounts, as on AWS.
+                dest_name = bucket_el.text.split(":::")[-1] if ":::" in bucket_el.text else bucket_el.text
+                dest_owner = _bucket_owner_account(dest_name)
+                if dest_owner is not None:
+                    dest_versioning = _bucket_versioning.get_scoped(dest_owner, None, dest_name, "")
                     if dest_versioning != "Enabled":
                         return _error(
                             "InvalidRequest",
                             "Destination bucket must have versioning enabled.",
                             400,
                         )
+            account_el = _find_xml_tag(dest_el, "Account")
+            if account_el is not None and account_el.text:
+                dest["Account"] = account_el.text
+            act_el = _find_xml_tag(dest_el, "AccessControlTranslation")
+            if act_el is not None:
+                owner_el = _find_xml_tag(act_el, "Owner")
+                if owner_el is not None and owner_el.text:
+                    dest["AccessControlTranslation"] = {"Owner": owner_el.text}
             sc_el = _find_xml_tag(dest_el, "StorageClass")
             if sc_el is not None and sc_el.text:
                 dest["StorageClass"] = sc_el.text
-            rule["Destination"] = dest
+            rule["Destination"] = {**dest, **dest_opts}
+        rule.update(rule_opts)
+        options_error = _replication_options_error(rule)
+        if options_error is not None:
+            return options_error
         rules.append(rule)
 
     if not rules:
-        return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+        return _error("MalformedXML", _MALFORMED_XML, 400)
+    v1_error = _replication_v1_options_error(rules)
+    if v1_error is not None:
+        return v1_error
 
     _bucket_replication[bucket_name] = {"Role": role, "Rules": rules}
     return 200, {"Content-Type": "application/xml"}, b""
@@ -2704,15 +8403,32 @@ def _get_bucket_replication(bucket_name: str):
         rule_el = SubElement(root, "Rule")
         SubElement(rule_el, "ID").text = rule.get("ID", "")
         SubElement(rule_el, "Status").text = rule.get("Status", "Enabled")
+        if "Priority" in rule:
+            SubElement(rule_el, "Priority").text = str(rule["Priority"])
         if "Prefix" in rule:
             SubElement(rule_el, "Prefix").text = rule["Prefix"]
+        if "Filter" in rule:
+            _replication_filter_xml(SubElement(rule_el, "Filter"), rule["Filter"] or {})
+        if "DeleteMarkerReplication" in rule:
+            dmr_el = SubElement(rule_el, "DeleteMarkerReplication")
+            SubElement(dmr_el, "Status").text = (rule["DeleteMarkerReplication"] or {}).get(
+                "Status", "Disabled")
+        _replication_ssc_xml(rule_el, rule)
+        _replication_eor_xml(rule_el, rule)
         dest = rule.get("Destination", {})
         if dest:
             dest_el = SubElement(rule_el, "Destination")
+            if "Account" in dest:
+                SubElement(dest_el, "Account").text = dest["Account"]
+            if "AccessControlTranslation" in dest:
+                act_el = SubElement(dest_el, "AccessControlTranslation")
+                SubElement(act_el, "Owner").text = (dest["AccessControlTranslation"] or {}).get(
+                    "Owner", "")
             if "Bucket" in dest:
                 SubElement(dest_el, "Bucket").text = dest["Bucket"]
             if "StorageClass" in dest:
                 SubElement(dest_el, "StorageClass").text = dest["StorageClass"]
+            _replication_destination_options_xml(dest_el, dest)
     return 200, {"Content-Type": "application/xml"}, _xml_body(root)
 
 
@@ -2729,57 +8445,48 @@ def _delete_bucket_replication(bucket_name: str):
 # ---------------------------------------------------------------------------
 
 
-def _collect_list_entries(
-    bucket_objects: dict, prefix: str, delimiter: str, max_keys: int, start_after: str
-):
-    """Walk sorted keys, collecting contents and common prefixes with correct
-    pagination.  When a key falls under a common-prefix group the iterator
-    advances past *all* remaining keys in that group so the next page's
-    marker cleanly skips the entire prefix.
+def _collect_list_entries(bucket_objects: dict, prefix: str, delimiter: str, max_keys: int, start_after: str):
+    """Collect contents and common prefixes with pagination as an ordered list of
+    "rows": a delimiter-collapsed key becomes a single common-prefix row (value =
+    the prefix), any other key is its own contents row (value = the key). Rows are
+    globally sorted, ``marker`` excludes rows at or before it, and ``next_marker``
+    is the value of the LAST row emitted — so when a page ends on a collapsed group
+    the continuation marker is the prefix (e.g. ``boo/``), not an underlying key
+    (``boo/baz/xyzzy``), and resuming from it skips the whole group instead of
+    re-walking it. (#1322, defect 5)
 
     Returns (contents, common_prefixes, is_truncated, next_marker).
     """
-    all_keys = sorted(
-        k for k in bucket_objects if k.startswith(prefix) and k > start_after
-    )
-    contents: list[str] = []
-    common_prefixes: set[str] = set()
-    is_truncated = False
-    count = 0
-    next_marker = ""
-
-    i = 0
-    while i < len(all_keys):
-        k = all_keys[i]
-
+    rows: list[tuple[str, bool]] = []  # (value, is_common_prefix)
+    seen_prefixes: set[str] = set()
+    for k in sorted(k for k in bucket_objects if k.startswith(prefix)):
         if delimiter:
             suffix = k[len(prefix) :]
             delim_idx = suffix.find(delimiter)
             if delim_idx >= 0:
                 cp = prefix + suffix[: delim_idx + len(delimiter)]
-                is_new_prefix = cp not in common_prefixes
-                if is_new_prefix:
-                    if count >= max_keys:
-                        is_truncated = True
-                        break
-                    common_prefixes.add(cp)
-                    count += 1
-                # Advance past every remaining key belonging to this prefix
-                # group so the marker lands after the whole group.
-                next_marker = k
-                i += 1
-                while i < len(all_keys) and all_keys[i].startswith(cp):
-                    next_marker = all_keys[i]
-                    i += 1
+                if cp not in seen_prefixes:
+                    seen_prefixes.add(cp)
+                    rows.append((cp, True))
                 continue
+        rows.append((k, False))
 
-        if count >= max_keys:
+    if start_after:
+        rows = [row for row in rows if row[0] > start_after]
+
+    contents: list[str] = []
+    common_prefixes: list[str] = []
+    is_truncated = False
+    next_marker = ""
+    for i, (value, is_prefix) in enumerate(rows):
+        if i >= max_keys:
             is_truncated = True
             break
-        contents.append(k)
-        count += 1
-        next_marker = k
-        i += 1
+        if is_prefix:
+            common_prefixes.append(value)
+        else:
+            contents.append(value)
+        next_marker = value
 
     return contents, common_prefixes, is_truncated, next_marker
 
@@ -2806,16 +8513,10 @@ def _list_objects_v1(bucket_name: str, query_params: dict):
 
     root = Element("ListBucketResult", xmlns=S3_NS)
     SubElement(root, "Name").text = bucket_name
-    SubElement(root, "Prefix").text = (
-        _url_encode(prefix) if encode and prefix else prefix
-    )
-    SubElement(root, "Marker").text = (
-        _url_encode(marker) if encode and marker else marker
-    )
+    SubElement(root, "Prefix").text = _url_encode(prefix) if encode and prefix else prefix
+    SubElement(root, "Marker").text = _url_encode(marker) if encode and marker else marker
     if delimiter:
-        SubElement(root, "Delimiter").text = (
-            _url_encode(delimiter) if encode else delimiter
-        )
+        SubElement(root, "Delimiter").text = _url_encode(delimiter) if encode else delimiter
     if encoding_type:
         SubElement(root, "EncodingType").text = encoding_type
     SubElement(root, "MaxKeys").text = str(max_keys)
@@ -2823,9 +8524,7 @@ def _list_objects_v1(bucket_name: str, query_params: dict):
 
     # AWS only returns NextMarker when delimiter is specified.
     if is_truncated and next_marker and delimiter:
-        SubElement(root, "NextMarker").text = (
-            _url_encode(next_marker) if encode else next_marker
-        )
+        SubElement(root, "NextMarker").text = _url_encode(next_marker) if encode else next_marker
 
     for k in contents:
         obj = bucket["objects"][k]
@@ -2836,7 +8535,7 @@ def _list_objects_v1(bucket_name: str, query_params: dict):
         SubElement(c, "Size").text = str(obj["size"])
         SubElement(c, "StorageClass").text = obj.get("storage_class") or "STANDARD"
         owner = SubElement(c, "Owner")
-        SubElement(owner, "ID").text = "owner-id"
+        SubElement(owner, "ID").text = _canonical_owner_id()
         SubElement(owner, "DisplayName").text = "ministack"
 
     for cp in sorted(common_prefixes):
@@ -2878,13 +8577,9 @@ def _list_objects_v2(bucket_name: str, query_params: dict):
 
     root = Element("ListBucketResult", xmlns=S3_NS)
     SubElement(root, "Name").text = bucket_name
-    SubElement(root, "Prefix").text = (
-        _url_encode(prefix) if encode and prefix else prefix
-    )
+    SubElement(root, "Prefix").text = _url_encode(prefix) if encode and prefix else prefix
     if delimiter:
-        SubElement(root, "Delimiter").text = (
-            _url_encode(delimiter) if encode else delimiter
-        )
+        SubElement(root, "Delimiter").text = _url_encode(delimiter) if encode else delimiter
     if encoding_type:
         SubElement(root, "EncodingType").text = encoding_type
     SubElement(root, "MaxKeys").text = str(max_keys)
@@ -2894,9 +8589,7 @@ def _list_objects_v2(bucket_name: str, query_params: dict):
     if continuation:
         SubElement(root, "ContinuationToken").text = continuation
     if start_after:
-        SubElement(root, "StartAfter").text = (
-            _url_encode(start_after) if encode else start_after
-        )
+        SubElement(root, "StartAfter").text = _url_encode(start_after) if encode else start_after
 
     if is_truncated and next_marker:
         token = base64.b64encode(next_marker.encode("utf-8")).decode("utf-8")
@@ -2912,7 +8605,7 @@ def _list_objects_v2(bucket_name: str, query_params: dict):
         SubElement(c, "StorageClass").text = obj.get("storage_class") or "STANDARD"
         if fetch_owner:
             owner = SubElement(c, "Owner")
-            SubElement(owner, "ID").text = "owner-id"
+            SubElement(owner, "ID").text = _canonical_owner_id()
             SubElement(owner, "DisplayName").text = "ministack"
 
     for cp in sorted(common_prefixes):
@@ -2936,48 +8629,146 @@ def _delete_objects(bucket_name: str, body: bytes, headers: dict = None):
     try:
         xml_root = fromstring(body)
     except Exception:
-        return _error("MalformedXML", "The XML you provided was not well-formed", 400)
+        return _error("MalformedXML", _MALFORMED_XML, 400)
 
     quiet = False
     quiet_el = _find_xml_tag(xml_root, "Quiet")
     if quiet_el is not None and quiet_el.text and quiet_el.text.lower() == "true":
         quiet = True
 
-    deleted_keys: list[str] = []
-    errors: list[tuple] = []
-    for obj_el in list(xml_root.findall("{%s}Object" % S3_NS)) or list(
-        xml_root.findall("Object")
-    ):
+    deleted: list[dict] = []
+    errors: list[dict] = []
+    for obj_el in list(xml_root.findall("{%s}Object" % S3_NS)) or list(xml_root.findall("Object")):
         key_el = _find_xml_tag(obj_el, "Key")
-        if key_el is not None and key_el.text:
-            k = key_el.text
-            if k in bucket["objects"]:
-                lock_err = _check_object_lock(bucket_name, k, headers)
-                if lock_err:
-                    errors.append(
-                        (
-                            k,
-                            "AccessDenied",
-                            "Access Denied because object protected by object lock.",
-                        )
-                    )
-                    continue
+        if key_el is None or not key_el.text:
+            continue
+        k = key_el.text
+        vid_el = _find_xml_tag(obj_el, "VersionId")
+        version_id = vid_el.text if (vid_el is not None and vid_el.text) else ""
+
+        if version_id:
+            lock_err = _check_object_lock(bucket_name, k, headers, None if version_id == "null" else version_id)
+            if lock_err:
+                errors.append(
+                    {
+                        "key": k,
+                        "version_id": version_id,
+                        "code": "AccessDenied",
+                        "msg": "Access Denied because object protected by object lock.",
+                    }
+                )
+                continue
+
+        # Conditional delete: an ObjectIdentifier carrying an ETag deletes only if it
+        # matches the current object, and `*` asks only that a current object exist.
+        # The condition is evaluated against the current version alone, so a key
+        # hidden by a delete marker does not exist for this purpose. A failed
+        # condition is reported under Error, not Deleted, and the object survives:
+        # "If the precondition fails then the response for that object will be
+        # captured in the <Error> element", and "If the object doesn't exist when
+        # evaluating either of the preconditions, S3 rejects the request and returns
+        # a Not Found error response."
+        # Size and LastModifiedTime are directory-bucket features. General-
+        # purpose buckets refuse them per object with NotImplemented.
+        size_el = _find_xml_tag(obj_el, "Size")
+        mtime_el = _find_xml_tag(obj_el, "LastModifiedTime")
+        if (size_el is not None and size_el.text) or (mtime_el is not None and mtime_el.text):
+            errors.append(
+                {
+                    "key": k,
+                    "version_id": version_id,
+                    "code": "NotImplemented",
+                    "msg": "A header you provided implies functionality that is not implemented",
+                }
+            )
+            continue
+
+        etag_el = _find_xml_tag(obj_el, "ETag")
+        cond_etag = etag_el.text if (etag_el is not None and etag_el.text) else ""
+        if cond_etag:
+            _cur = bucket["objects"].get(k)
+            if _cur is None:
+                errors.append(
+                    {
+                        "key": k,
+                        "version_id": version_id,
+                        "code": "NoSuchKey",
+                        "msg": "The specified key does not exist.",
+                    }
+                )
+                continue
+            if cond_etag != "*" and cond_etag.strip('"') != _cur["etag"].strip('"'):
+                errors.append(
+                    {
+                        "key": k,
+                        "version_id": version_id,
+                        "code": "PreconditionFailed",
+                        "msg": "At least one of the preconditions you specified did not hold.",
+                    }
+                )
+                continue
+
+        if version_id:
+            # Explicit VersionId → permanently purge that exact version/marker.
+            # S3 reports the delete as successful even if the version was absent.
+            _found, was_marker = _delete_object_version(bucket, bucket_name, k, version_id)
+            deleted.append({"key": k, "version_id": version_id, "was_marker": was_marker})
+            # Each entry sends the single-object DELETE's event.
+            if _found:
+                _fire_s3_event_async(bucket_name, k, "s3:ObjectRemoved:Delete", version_id=version_id)
+        elif _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
+            # No VersionId on a versioned bucket: create a delete marker —
+            # even for a key that never existed — exactly as the single-object
+            # DELETE does, and report it on the Deleted entry.
+            existed = k in bucket["objects"]
+            marker_id = _record_delete_marker(bucket_name, k, bucket["objects"].get(k))
             bucket["objects"].pop(k, None)
-            _object_tags.pop((bucket_name, k), None)
-            _object_retention.pop((bucket_name, k), None)
-            _object_legal_hold.pop((bucket_name, k), None)
-            deleted_keys.append(k)
+            _maybe_replicate_delete_marker(bucket_name, k)
+            deleted.append({"key": k, "version_id": "", "was_marker": False, "marker_created": marker_id})
+            if existed:
+                _fire_s3_event_async(
+                    bucket_name,
+                    k,
+                    "s3:ObjectRemoved:DeleteMarkerCreated",
+                    deletion_type="Delete Marker Created",
+                    version_id=marker_id,
+                )
+        else:
+            # No VersionId → plain delete of the current object.
+            existed = k in bucket["objects"]
+            if existed:
+                _fire_s3_event_async(bucket_name, k, "s3:ObjectRemoved:Delete")
+            bucket["objects"].pop(k, None)
+            _object_tags.pop((bucket_name, k, None), None)
+            _object_annotations.pop((bucket_name, k, None), None)
+            _object_retention.pop((bucket_name, k, None), None)
+            _object_legal_hold.pop((bucket_name, k, None), None)
+            _object_acl.pop((bucket_name, k, None), None)
+            _delete_persisted_object(bucket_name, k)
+            deleted.append({"key": k, "version_id": "", "was_marker": False})
 
     resp = Element("DeleteResult", xmlns=S3_NS)
     if not quiet:
-        for k in deleted_keys:
-            d = SubElement(resp, "Deleted")
-            SubElement(d, "Key").text = k
-    for k, code, msg in errors:
-        e = SubElement(resp, "Error")
-        SubElement(e, "Key").text = k
-        SubElement(e, "Code").text = code
-        SubElement(e, "Message").text = msg
+        for d in deleted:
+            el = SubElement(resp, "Deleted")
+            SubElement(el, "Key").text = d["key"]
+            if d["version_id"]:
+                SubElement(el, "VersionId").text = d["version_id"]
+                # AWS echoes the delete-marker flag when the purged entry was one.
+                if d["was_marker"]:
+                    SubElement(el, "DeleteMarker").text = "true"
+                    SubElement(el, "DeleteMarkerVersionId").text = d["version_id"]
+            elif d.get("marker_created"):
+                # A versionless delete on a versioned bucket minted a marker.
+                SubElement(el, "DeleteMarker").text = "true"
+                SubElement(el, "DeleteMarkerVersionId").text = d["marker_created"]
+    for e in errors:
+        el = SubElement(resp, "Error")
+        SubElement(el, "Key").text = e["key"]
+        if e["version_id"]:
+            SubElement(el, "VersionId").text = e["version_id"]
+        SubElement(el, "Code").text = e["code"]
+        SubElement(el, "Message").text = e["msg"]
 
     return 200, {"Content-Type": "application/xml"}, _xml_body(resp)
 
@@ -2991,10 +8782,35 @@ def _create_multipart_upload(bucket_name: str, key: str, headers: dict):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
+    lock_err = _object_lock_header_error(bucket_name, headers)
+    if lock_err:
+        return lock_err
+    if _bucket_owner_enforced(bucket) and (err := _acls_disabled_error(headers)):
+        return err
+    refused = _public_acl_refused(bucket_name, headers)
+    if refused:
+        return refused
 
     storage_class, sc_err = _resolve_storage_class(headers)
     if sc_err:
         return sc_err
+
+    sse_headers, sse_err = _resolve_sse_write_headers(headers, bucket_name, reject_orphan_key=True)
+    if sse_err:
+        return sse_err
+
+    checksum_algorithm, csum_err = _resolve_multipart_checksum_algorithm(headers)
+    if csum_err:
+        return csum_err
+
+    # x-amz-tagging is validated here, as PutObject does, and stored on the
+    # upload until CompleteMultipartUpload cuts the object's version.
+    tags = None
+    tagging_header = headers.get("x-amz-tagging", "")
+    if tagging_header:
+        tags = {k: v[0] for k, v in _parse_qs(tagging_header, keep_blank_values=True).items()}
+        if len(tags) > 10:
+            return _error("BadRequest", "Object tags cannot be greater than 10", 400)
 
     upload_id = new_uuid()
     content_type = headers.get("content-type", "application/octet-stream")
@@ -3005,6 +8821,7 @@ def _create_multipart_upload(bucket_name: str, key: str, headers: dict):
         val = headers.get(h)
         if val is not None:
             preserved[h] = val
+    preserved.update(sse_headers)
 
     _multipart_uploads[upload_id] = {
         "bucket": bucket_name,
@@ -3014,7 +8831,11 @@ def _create_multipart_upload(bucket_name: str, key: str, headers: dict):
         "content_type": content_type,
         "content_encoding": content_encoding,
         "preserved_headers": preserved,
+        "requested_sse": headers.get("x-amz-server-side-encryption"),
+        "kms_key": sse_headers.get(_SSE_KMS_KEY_HEADER),
         "storage_class": storage_class,
+        "checksum_algorithm": checksum_algorithm,
+        "tags": tags,
         "created": now_iso(),
     }
 
@@ -3022,12 +8843,16 @@ def _create_multipart_upload(bucket_name: str, key: str, headers: dict):
     SubElement(root, "Bucket").text = bucket_name
     SubElement(root, "Key").text = key
     SubElement(root, "UploadId").text = upload_id
-    return 200, {"Content-Type": "application/xml"}, _xml_body(root)
+    # AWS echoes the upload's encryption on the initiate response, and the
+    # checksum algorithm the parts are expected to carry.
+    csum_headers = {}
+    if checksum_algorithm:
+        csum_headers["x-amz-checksum-algorithm"] = checksum_algorithm
+        csum_headers["x-amz-checksum-type"] = "COMPOSITE"
+    return (200, {"Content-Type": "application/xml", **sse_headers, **csum_headers}, _xml_body(root))
 
 
-def _upload_part(
-    bucket_name: str, key: str, body: bytes, query_params: dict, headers: dict
-):
+def _upload_part(bucket_name: str, key: str, body: bytes, query_params: dict, headers: dict):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
@@ -3036,21 +8861,15 @@ def _upload_part(
     part_number = _qp(query_params, "partNumber")
 
     if upload_id not in _multipart_uploads:
-        return _error(
-            "NoSuchUpload",
-            "The specified multipart upload does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
+        return _no_such_upload(upload_id)
 
     upload = _multipart_uploads[upload_id]
     if upload["bucket"] != bucket_name or upload["key"] != key:
-        return _error(
-            "NoSuchUpload",
-            "The specified multipart upload does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
+        return _no_such_upload(upload_id)
+
+    sse_part_err = _check_sse_c_part(headers, upload)
+    if sse_part_err is not None:
+        return sse_part_err
 
     try:
         pn = int(part_number)
@@ -3071,14 +8890,22 @@ def _upload_part(
     if md5_err:
         return md5_err
 
+    part_checksums, csum_err = _resolve_part_checksums(body, headers, upload)
+    if csum_err:
+        return csum_err
+
     etag = f'"{md5_hash(body)}"'
     upload["parts"][pn] = {
         "body": body,
         "etag": etag,
         "size": len(body),
         "last_modified": now_iso(),
+        "checksums": part_checksums,
     }
-    return 200, {"ETag": etag}, b""
+    # AWS returns the part's checksum so the caller can name it again on the
+    # completion, which is where the composite is built from.
+    csum_headers = {f"x-amz-checksum-{alg.lower()}": val for alg, val in part_checksums.items()}
+    return (200, {"ETag": etag, **_stored_sse_headers(upload), **csum_headers}, b"")
 
 
 def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, headers: dict):
@@ -3087,10 +8914,18 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
     part_number = int(_qp(query_params, "partNumber", "1"))
 
     if upload_id not in _multipart_uploads:
-        return _error("NoSuchUpload", "The specified multipart upload does not exist.", 404)
+        return _no_such_upload(upload_id)
 
-    source = url_unquote(headers.get("x-amz-copy-source", "").lstrip("/"))
-    src_parts = source.split("?", 1)[0].split("/", 1)
+    sse_part_err = _check_sse_c_part(headers, _multipart_uploads[upload_id])
+    if sse_part_err is not None:
+        return sse_part_err
+
+    # Split the raw header at "?" before percent-decoding, exactly as
+    # CopyObject does: a key containing "?versionId" arrives encoded and must
+    # stay part of the key, while a real versionId qualifier is a bare "?".
+    raw_source = headers.get("x-amz-copy-source", "").lstrip("/")
+    raw_path, _, src_query = raw_source.partition("?")
+    src_parts = url_unquote(raw_path).split("/", 1)
     if len(src_parts) < 2:
         return _error("InvalidArgument", "Copy Source must mention the source bucket and key", 400)
 
@@ -3098,11 +8933,45 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
     src_bucket = _ensure_bucket(src_bucket_name)
     if src_bucket is None:
         return _no_such_bucket(src_bucket_name)
-    if src_key not in src_bucket["objects"]:
-        return _error("NoSuchKey", "The specified key does not exist.", 404)
 
-    src_obj = src_bucket["objects"][src_key]
-    src_body = _read_body(src_bucket_name, src_key, src_obj)
+    # A `?versionId=` on the copy source selects the exact version to copy the
+    # range from, not the current object.
+    src_version_id = None
+    if src_query:
+        src_version_id = _parse_qs(src_query, keep_blank_values=True).get("versionId", [None])[0]
+
+    if src_version_id:
+        ventry = next(
+            (v for v in _object_versions.get((src_bucket_name, src_key), []) if v["version_id"] == src_version_id),
+            None,
+        )
+        src_body = None
+        if ventry is not None and not ventry.get("is_delete_marker"):
+            src_body = _version_body(src_bucket, src_bucket_name, src_key, ventry)
+        if src_body is None:
+            return _error(
+                "NoSuchVersion",
+                "The specified version does not exist.",
+                404,
+                f"/{src_bucket_name}/{src_key}",
+            )
+    else:
+        if src_key not in src_bucket["objects"]:
+            return _error("NoSuchKey", "The specified key does not exist.", 404)
+        src_obj = src_bucket["objects"][src_key]
+        src_version_id = src_obj.get("version_id")
+        src_body = _read_body(src_bucket_name, src_key, src_obj)
+        ventry = src_obj
+
+    # An SSE-C source must be addressed with its create-time key, whichever
+    # version the range is copied from.
+    sse_src_err = _check_sse_c_copy_source(headers, ventry)
+    if sse_src_err is not None:
+        return sse_src_err
+
+    precond_err = _check_copy_source_preconditions(headers, ventry)
+    if precond_err is not None:
+        return precond_err
 
     # Handle x-amz-copy-source-range
     copy_range = headers.get("x-amz-copy-source-range", "")
@@ -3116,7 +8985,7 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
         )
         if not copy_range.startswith("bytes=") or "," in copy_range:
             return _malformed
-        rng = copy_range[len("bytes="):]
+        rng = copy_range[len("bytes=") :]
         parts = rng.split("-")
         if len(parts) != 2 or parts[0] == "" or parts[1] == "":
             return _malformed
@@ -3133,7 +9002,7 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
                 f"Range specified is not valid for source object of size: {object_size}",
                 400,
             )
-        src_body = src_body[start:end + 1]
+        src_body = src_body[start : end + 1]
 
     etag = f'"{md5_hash(src_body)}"'
     _multipart_uploads[upload_id]["parts"][part_number] = {
@@ -3146,56 +9015,93 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
     root = Element("CopyPartResult", xmlns=S3_NS)
     SubElement(root, "ETag").text = etag
     SubElement(root, "LastModified").text = now_iso()
-    return 200, {"Content-Type": "application/xml"}, _xml_body(root)
+    resp_headers = {"Content-Type": "application/xml", **_stored_sse_headers(_multipart_uploads[upload_id])}
+    if src_version_id:
+        # AWS echoes the copied source version on a versioned source.
+        resp_headers["x-amz-copy-source-version-id"] = src_version_id
+    return 200, resp_headers, _xml_body(root)
 
 
 def _complete_multipart_upload(
-    bucket_name: str, key: str, body: bytes, query_params: dict
+    bucket_name: str, key: str, body: bytes, query_params: dict, headers: dict | None = None
 ):
     bucket = _ensure_bucket(bucket_name)
     if bucket is None:
         return _no_such_bucket(bucket_name)
 
     upload_id = _qp(query_params, "uploadId")
+    # Idempotent retry: if the upload already completed, replay its response
+    # instead of returning NoSuchUpload (real S3 stays 200 until the id is GC'd).
+    cached = _completed_multipart_uploads.get(upload_id)
+    if cached is not None and cached.get("key") == key:
+        return cached["response"]
     if upload_id not in _multipart_uploads:
-        return _error(
-            "NoSuchUpload",
-            "The specified multipart upload does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
+        return _no_such_upload(upload_id)
 
     upload = _multipart_uploads[upload_id]
     if upload["bucket"] != bucket_name or upload["key"] != key:
+        return _no_such_upload(upload_id)
+
+    # An SSE-C upload's completion must present the create-time key again, as
+    # every part did; a plain upload's completion must present none. (The
+    # idempotent replay above deliberately skips this — the original request
+    # already presented the key when it committed.)
+    sse_part_err = _check_sse_c_part(headers or {}, upload)
+    if sse_part_err is not None:
+        return sse_part_err
+
+    # CompleteMultipartUpload takes the same If-Match / If-None-Match
+    # preconditions PutObject does, evaluated against the current object at
+    # complete time.  (The idempotent replay above deliberately skips them —
+    # the original request already passed its conditions when it committed.)
+    precondition_err = _check_put_preconditions(headers or {}, bucket.get("objects", {}).get(key))
+    if precondition_err:
+        return precondition_err
+
+    try:
+        xml_root = fromstring(body)
+    except ParseError:
         return _error(
-            "NoSuchUpload",
-            "The specified multipart upload does not exist.",
-            404,
+            "MalformedXML",
+            "The XML you provided was not well-formed or did not validate " "against our published schema.",
+            400,
             f"/{bucket_name}/{key}",
         )
-
-    xml_root = fromstring(body)
-    ordered_parts: list[tuple[int, str | None]] = []
+    ordered_parts: list[tuple[int, str | None, dict]] = []
     for part_el in xml_root.iter():
         local = part_el.tag.split("}")[-1] if "}" in part_el.tag else part_el.tag
         if local == "Part":
             pn_text = etag_text = None
+            part_checksums = {}
             for child in part_el:
-                child_local = (
-                    child.tag.split("}")[-1] if "}" in child.tag else child.tag
-                )
+                child_local = child.tag.split("}")[-1] if "}" in child.tag else child.tag
                 if child_local == "PartNumber":
                     pn_text = child.text
                 elif child_local == "ETag":
                     etag_text = child.text
+                elif child_local.startswith("Checksum"):
+                    part_checksums[child_local[len("Checksum") :].upper()] = child.text
             if pn_text is not None:
-                ordered_parts.append((int(pn_text), etag_text))
+                ordered_parts.append((int(pn_text), etag_text, part_checksums))
 
-    ordered_parts.sort(key=lambda x: x[0])
+    if not ordered_parts:
+        return _error("MalformedXML", _MALFORMED_XML, 400, f"/{bucket_name}/{key}")
+    if any(b[0] <= a[0] for a, b in zip(ordered_parts, ordered_parts[1:])):
+        return _error(
+            "InvalidPartOrder",
+            "The list of parts was not in ascending order. The parts list must be specified in order by part number.",
+            400,
+        )
 
     md5_digests = b""
-    combined = b""
-    for pn, req_etag in ordered_parts:
+    # Part bodies are joined once at the end: appending each 5 MB+ part to a
+    # growing bytes object re-copies the whole object per part, which is
+    # quadratic in object size across up to 10,000 parts.
+    combined_parts = []
+    part_records = []
+    checksum_algorithm = upload.get("checksum_algorithm")
+    part_digests = []
+    for pn, req_etag, req_checksums in ordered_parts:
         if pn not in upload["parts"]:
             return _error(
                 "InvalidPart",
@@ -3203,19 +9109,66 @@ def _complete_multipart_upload(
                 400,
             )
         stored = upload["parts"][pn]
-        if req_etag and req_etag.strip('"') != stored["etag"].strip('"'):
+        if not req_etag or req_etag.strip('"') != stored["etag"].strip('"'):
             return _error(
                 "InvalidPart",
                 "One or more of the specified parts could not be found. "
                 "The following part numbers are invalid: " + str(pn),
                 400,
             )
+        # A part checksum named here must be the one the part was stored
+        # with: the composite is built from what ministack holds, so a caller
+        # naming a different value would get a composite it cannot reproduce.
+        stored_checksums = stored.get("checksums") or {}
+        for alg, value in req_checksums.items():
+            if value and stored_checksums.get(alg) != value:
+                return _error(
+                    "InvalidPart",
+                    "One or more of the specified parts could not be found. "
+                    "The following part numbers are invalid: " + str(pn),
+                    400,
+                )
+        if checksum_algorithm:
+            part_digests.append(stored_checksums.get(checksum_algorithm))
         md5_digests += hashlib.md5(stored["body"]).digest()
-        combined += stored["body"]
+        combined_parts.append(stored["body"])
+        # Retained so GetObjectAttributes can report ObjectParts (ListParts
+        # functionality) for the completed multipart object.
+        part_records.append({"PartNumber": pn, "Size": len(stored["body"])})
+
+    # A declared x-amz-mp-object-size that differs from the parts' total is refused.
+    declared_size = (headers or {}).get("x-amz-mp-object-size")
+    if declared_size is not None:
+        try:
+            declared = int(declared_size)
+        except ValueError:
+            return _error("InvalidRequest", f"Value for x-amz-mp-object-size header is invalid: '{declared_size}'",
+                          400, f"/{bucket_name}/{key}")
+        actual_size = sum(len(part_body) for part_body in combined_parts)
+        if declared != actual_size:
+            return _error(
+                "InvalidRequest",
+                f"The provided 'x-amz-mp-object-size' header value {declared_size} does not match "
+                f"what was computed: {actual_size}",
+                400,
+                f"/{bucket_name}/{key}",
+            )
+
+    composite = _composite_checksum(checksum_algorithm, part_digests)
+    if checksum_algorithm:
+        requested = (headers or {}).get(f"x-amz-checksum-{checksum_algorithm.lower()}")
+        if requested and requested != composite:
+            return _error(
+                "BadDigest",
+                f"The {checksum_algorithm} you specified did not match the " f"calculated checksum.",
+                400,
+                f"/{bucket_name}/{key}",
+            )
 
     final_md5 = hashlib.md5(md5_digests).hexdigest()
     final_etag = f'"{final_md5}-{len(ordered_parts)}"'
 
+    combined = b"".join(combined_parts)
     obj = {
         "body": combined,
         "content_type": upload["content_type"],
@@ -3226,48 +9179,70 @@ def _complete_multipart_upload(
         "metadata": upload["metadata"],
         "preserved_headers": upload.get("preserved_headers", {}),
         "storage_class": upload.get("storage_class") or "STANDARD",
+        "parts": part_records,
+        "checksums": {checksum_algorithm: composite} if composite else {},
+        "checksum_type": "COMPOSITE" if composite else None,
     }
+    prior_obj = bucket["objects"].get(key)
     bucket["objects"][key] = obj
-
-    if S3_PERSIST:
-        _persist_object(bucket_name, key, obj)
 
     del _multipart_uploads[upload_id]
 
+    resp_headers = {"Content-Type": "application/xml"}
+    resp_headers.update(_stored_sse_headers(obj))
+    tags = upload.get("tags")
+    _maybe_replicate(bucket_name, key, obj, combined, tags)
+    version_id = _record_object_version(bucket_name, key, prior_obj, obj, combined)
+    if version_id:
+        resp_headers["x-amz-version-id"] = version_id
     _fire_s3_event_async(
         bucket_name,
         key,
         "s3:ObjectCreated:CompleteMultipartUpload",
         size=obj["size"],
         etag=final_etag,
+        version_id=version_id,
     )
 
-    resp_headers = {"Content-Type": "application/xml"}
-    if _bucket_versioning.get(bucket_name) in ("Enabled", "Suspended"):
-        version_id = new_uuid()
-        obj["version_id"] = version_id
-        resp_headers["x-amz-version-id"] = version_id
-        vkey = (bucket_name, key)
-        if vkey not in _object_versions:
-            _object_versions[vkey] = []
-        _object_versions[vkey].append({
-            "version_id": version_id,
-            "last_modified": obj["last_modified"],
-            "etag": obj["etag"],
-            "size": obj["size"],
-            "is_latest": True,
-            "data": combined,
-        })
-        for v in _object_versions[vkey][:-1]:
-            v["is_latest"] = False
+    # The tags given at create time replace any the overwritten object had.
+    if tags:
+        _object_tags[(bucket_name, key, obj.get("version_id"))] = dict(tags)
+        if obj.get("_replica"):
+            dest_name, replica_version, dest_account = obj["_replica"]
+            with _in_account(dest_account):
+                _object_tags[(dest_name, key, replica_version)] = dict(tags)
+                _persist_version_state(dest_name, key, _buckets[dest_name])
+    else:
+        _object_tags.pop((bucket_name, key, obj.get("version_id")), None)
+
+    # Persist only after the versioning block: the .meta.json sidecar must
+    # carry the version_id assigned above (#1058), and the tags.
+    if S3_PERSIST:
+        _persist_object(bucket_name, key, obj)
 
     root = Element("CompleteMultipartUploadResult", xmlns=S3_NS)
-    s3_host = os.environ.get("MINISTACK_HOST", os.environ.get("AWS_ENDPOINT_URL", "http://localhost:4566"))
+    # Location echoes the endpoint the client actually reached (real S3 returns the
+    # request host), so it is correct on any port/host — not a hard-coded 4566. Falls
+    # back to the configured host only when the request carried no Host header. (#1322)
+    request_host = (headers or {}).get("host")
+    if request_host:
+        scheme = (headers or {}).get("x-forwarded-proto") or "http"
+        s3_host = f"{scheme}://{request_host}"
+    else:
+        s3_host = os.environ.get("MINISTACK_HOST", os.environ.get("AWS_ENDPOINT_URL", "http://localhost:4566"))
     SubElement(root, "Location").text = f"{s3_host}/{bucket_name}/{key}"
     SubElement(root, "Bucket").text = bucket_name
     SubElement(root, "Key").text = key
     SubElement(root, "ETag").text = final_etag
-    return 200, resp_headers, _xml_body(root)
+    if composite:
+        SubElement(root, f"Checksum{checksum_algorithm}").text = composite
+        SubElement(root, "ChecksumType").text = "COMPOSITE"
+    response = (200, resp_headers, _xml_body(root))
+    # Retain the response so an idempotent retry (same upload id) replays it
+    # rather than 404ing; the versioning block above is NOT re-run on replay,
+    # so a retry never mints a second object version.
+    _completed_multipart_uploads[upload_id] = {"key": key, "response": response}
+    return response
 
 
 def _abort_multipart_upload(bucket_name: str, key: str, query_params: dict):
@@ -3277,21 +9252,11 @@ def _abort_multipart_upload(bucket_name: str, key: str, query_params: dict):
 
     upload_id = _qp(query_params, "uploadId")
     if upload_id not in _multipart_uploads:
-        return _error(
-            "NoSuchUpload",
-            "The specified multipart upload does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
+        return _no_such_upload(upload_id)
 
     upload = _multipart_uploads[upload_id]
     if upload["bucket"] != bucket_name or upload["key"] != key:
-        return _error(
-            "NoSuchUpload",
-            "The specified multipart upload does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
+        return _no_such_upload(upload_id)
 
     del _multipart_uploads[upload_id]
     return 204, {}, b""
@@ -3326,12 +9291,7 @@ def _list_multipart_uploads(bucket_name: str, query_params: dict):
             continue
         if key_marker and upload["key"] < key_marker:
             continue
-        if (
-            key_marker
-            and upload["key"] == key_marker
-            and upload_id_marker
-            and uid <= upload_id_marker
-        ):
+        if key_marker and upload["key"] == key_marker and upload_id_marker and uid <= upload_id_marker:
             continue
         uploads.append((uid, upload))
 
@@ -3345,10 +9305,10 @@ def _list_multipart_uploads(bucket_name: str, query_params: dict):
         SubElement(u, "Key").text = upload["key"]
         SubElement(u, "UploadId").text = uid
         initiator = SubElement(u, "Initiator")
-        SubElement(initiator, "ID").text = "owner-id"
+        SubElement(initiator, "ID").text = get_account_id()
         SubElement(initiator, "DisplayName").text = "ministack"
         owner = SubElement(u, "Owner")
-        SubElement(owner, "ID").text = "owner-id"
+        SubElement(owner, "ID").text = _canonical_owner_id()
         SubElement(owner, "DisplayName").text = "ministack"
         SubElement(u, "StorageClass").text = upload.get("storage_class") or "STANDARD"
         SubElement(u, "Initiated").text = upload["created"]
@@ -3368,21 +9328,11 @@ def _list_parts(bucket_name: str, key: str, query_params: dict):
 
     upload_id = _qp(query_params, "uploadId")
     if upload_id not in _multipart_uploads:
-        return _error(
-            "NoSuchUpload",
-            "The specified multipart upload does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
+        return _no_such_upload(upload_id)
 
     upload = _multipart_uploads[upload_id]
     if upload["bucket"] != bucket_name or upload["key"] != key:
-        return _error(
-            "NoSuchUpload",
-            "The specified multipart upload does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
+        return _no_such_upload(upload_id)
 
     max_parts = int(_qp(query_params, "max-parts", "1000"))
     part_marker = int(_qp(query_params, "part-number-marker", "0"))
@@ -3393,10 +9343,10 @@ def _list_parts(bucket_name: str, key: str, query_params: dict):
     SubElement(root, "UploadId").text = upload_id
 
     initiator = SubElement(root, "Initiator")
-    SubElement(initiator, "ID").text = "owner-id"
+    SubElement(initiator, "ID").text = get_account_id()
     SubElement(initiator, "DisplayName").text = "ministack"
     owner = SubElement(root, "Owner")
-    SubElement(owner, "ID").text = "owner-id"
+    SubElement(owner, "ID").text = _canonical_owner_id()
     SubElement(owner, "DisplayName").text = "ministack"
     SubElement(root, "StorageClass").text = upload.get("storage_class") or "STANDARD"
     SubElement(root, "PartNumberMarker").text = str(part_marker)
@@ -3413,6 +9363,8 @@ def _list_parts(bucket_name: str, key: str, query_params: dict):
         SubElement(p, "LastModified").text = part.get("last_modified", now_iso())
         SubElement(p, "ETag").text = part["etag"]
         SubElement(p, "Size").text = str(part["size"])
+        for alg, value in (part.get("checksums") or {}).items():
+            SubElement(p, f"Checksum{alg}").text = value
 
     if is_truncated and sorted_parts:
         SubElement(root, "NextPartNumberMarker").text = str(sorted_parts[max_parts - 1])
@@ -3425,25 +9377,79 @@ def _list_parts(bucket_name: str, key: str, query_params: dict):
 # ---------------------------------------------------------------------------
 
 
-def _object_disk_path(bucket: str, key: str, account_id: str = None) -> str | None:
-    """Resolve the on-disk path for an object and verify it lives under DATA_DIR.
+# A key is stored at its own path (so Athena and Glue can read the bytes) when a
+# file can hold it there; otherwise under this reserved directory, by an encoded
+# name. Keys a path cannot hold: a trailing or doubled slash, "." or ".."
+# segments, a key under another key's file or a file over another key's folder.
+_ENCODED_KEYS_DIR = ".ministack-keys"
 
-    Returns None if the resolved path escapes DATA_DIR (e.g. key contains `..`
-    or absolute path). Callers must treat None as "skip operation".
-    """
-    if account_id is None:
-        account_id = get_account_id()
-    root = os.path.realpath(DATA_DIR)
-    candidate = os.path.realpath(os.path.join(DATA_DIR, account_id, bucket, key))
+
+def _plain_path_key(key: str) -> bool:
+    if not key or "\x00" in key:
+        return False
+    parts = key.split("/")
+    return (parts[0] != _ENCODED_KEYS_DIR
+            and all(p not in ("", ".", "..") and len(p.encode()) <= 200
+                    and not p.endswith((".meta.json", ".tmp")) for p in parts))
+
+
+def _encoded_key_name(key: str) -> str:
+    # No "/" or "." survives, so the name is one path component and never a sidecar or temp name.
+    name = url_quote(key, safe="").replace(".", "%2E")
+    return name if len(name) <= 200 else "sha256-" + hashlib.sha256(key.encode()).hexdigest()
+
+
+def _under(root: str, candidate: str) -> bool:
     try:
-        if os.path.commonpath([root, candidate]) != root:
-            logger.warning("S3 persist: path traversal blocked for %s/%s", bucket, key)
-            return None
+        return candidate != root and os.path.commonpath([root, candidate]) == root
     except ValueError:
         # commonpath raises on mixed drives / unrelated paths — treat as escape.
-        logger.warning("S3 persist: path traversal blocked for %s/%s", bucket, key)
-        return None
-    return candidate
+        return False
+
+
+def _key_disk_path(base: str, key: str) -> str | None:
+    """Where ``key`` lives under ``base``: its own path, or its encoded name when
+    a file cannot hold it there (or it is already stored that way)."""
+    root = os.path.realpath(base)
+    encoded = os.path.join(root, _ENCODED_KEYS_DIR, _encoded_key_name(key))
+    if not _plain_path_key(key):
+        return encoded
+    plain = os.path.join(root, key)
+    if not _under(root, os.path.realpath(plain)):
+        return encoded
+    if os.path.isfile(plain) or os.path.isfile(plain + ".meta.json"):
+        return plain
+    if os.path.isfile(encoded) or os.path.isfile(encoded + ".meta.json"):
+        return encoded
+    parent = os.path.dirname(plain)
+    while parent != root:
+        if os.path.isfile(parent):
+            return encoded
+        parent = os.path.dirname(parent)
+    return encoded if os.path.isdir(plain) else plain
+
+
+def _other_key_disk_path(base: str, key: str, fpath: str) -> str | None:
+    """The key's other possible location, so a write to one clears a stale copy in the other."""
+    root = os.path.realpath(base)
+    encoded = os.path.join(root, _ENCODED_KEYS_DIR, _encoded_key_name(key))
+    if fpath != encoded:
+        return encoded
+    plain = os.path.join(root, key)
+    return plain if _plain_path_key(key) and _under(root, os.path.realpath(plain)) else None
+
+
+def _remove_key_files(fpath: str | None):
+    for path in (fpath, fpath and fpath + ".meta.json"):
+        if path and os.path.isfile(path):
+            os.remove(path)
+
+
+def _object_disk_path(bucket: str, key: str, account_id: str = None) -> str | None:
+    """The on-disk path of an object, always under DATA_DIR."""
+    if account_id is None:
+        account_id = get_account_id()
+    return _key_disk_path(os.path.join(DATA_DIR, account_id, bucket), key)
 
 
 def _atomic_write(fpath: str, data: bytes, *, text: bool = False):
@@ -3463,31 +9469,171 @@ def _atomic_write(fpath: str, data: bytes, *, text: bool = False):
     os.replace(tmp, fpath)
 
 
+def _object_meta_from_record(obj: dict) -> dict:
+    """The metadata snapshot stored in an object's .meta.json sidecar."""
+    return {
+        "content_type": obj.get("content_type", "application/octet-stream"),
+        "content_encoding": obj.get("content_encoding"),
+        "etag": obj.get("etag", ""),
+        "last_modified": obj.get("last_modified", ""),
+        "size": obj.get("size", 0),
+        "metadata": obj.get("metadata", {}),
+        "preserved_headers": obj.get("preserved_headers", {}),
+        "storage_class": obj.get("storage_class", "STANDARD"),
+        "checksums": obj.get("checksums", {}),
+        "version_id": obj.get("version_id"),
+    }
+
+
 def _persist_object(bucket: str, key: str, obj):
     try:
         fpath = _object_disk_path(bucket, key)
         if fpath is None:
             return
         os.makedirs(os.path.dirname(fpath), mode=0o700, exist_ok=True)
-        data = obj["body"] if isinstance(obj, dict) else obj
-        _atomic_write(fpath, data)
         if isinstance(obj, dict):
-            meta = {
-                "content_type": obj.get("content_type", "application/octet-stream"),
-                "content_encoding": obj.get("content_encoding"),
-                "etag": obj.get("etag", ""),
-                "last_modified": obj.get("last_modified", ""),
-                "size": obj.get("size", 0),
-                "metadata": obj.get("metadata", {}),
-                "preserved_headers": obj.get("preserved_headers", {}),
-                "storage_class": obj.get("storage_class", "STANDARD"),
-            }
+            # A record rebuilt from a version entry may carry no body; the
+            # data file already on disk then stands, and only the sidecar is
+            # refreshed.
+            data = obj.get("body")
+            if data is not None:
+                _atomic_write(fpath, data)
+            meta = {**_object_meta_from_record(obj), **_key_history_meta(bucket, key), "key": key}
             _atomic_write(fpath + ".meta.json", json.dumps(meta), text=True)
-        # Drop body from in-memory record to save RAM
-        if isinstance(obj, dict):
+            # Drop body from in-memory record to save RAM
             obj["body"] = None
+        else:
+            _atomic_write(fpath, obj)
+            _atomic_write(fpath + ".meta.json", json.dumps({"key": key}), text=True)
+        _remove_key_files(_other_key_disk_path(os.path.join(DATA_DIR, get_account_id(), bucket), key, fpath))
     except Exception as e:
         logger.warning("Failed to persist S3 object %s/%s: %s", bucket, key, e)
+
+
+def _persist_delete_marker(bucket_name: str, key: str, marker: dict):
+    """Record a delete marker in the key's .meta.json sidecar.
+
+    A marker has no body, so it cannot ride the data file the way a version
+    does — the sidecar is its only on-disk record. Without it a restart finds
+    the hidden object's data file, reloads it as current, and the deleted
+    object reappears."""
+    if not S3_PERSIST:
+        return
+    try:
+        fpath = _object_disk_path(bucket_name, key)
+        if fpath is None:
+            return
+        os.makedirs(os.path.dirname(fpath), mode=0o700, exist_ok=True)
+        meta = {
+            "is_delete_marker": True,
+            "version_id": marker.get("version_id"),
+            "last_modified": marker.get("last_modified", ""),
+            **_key_history_meta(bucket_name, key),
+            "key": key,
+        }
+        _atomic_write(fpath + ".meta.json", json.dumps(meta), text=True)
+    except Exception as e:
+        logger.warning("Failed to persist S3 delete marker %s/%s: %s", bucket_name, key, e)
+
+
+def _persist_version_state(bucket_name: str, key: str, bucket: dict):
+    """Rewrite a key's on-disk state after a version operation.
+
+    Purging a version can change what the key resolves to — a removed delete
+    marker may expose an older version, or promote another marker — and the
+    sidecar must agree with that, or a restart restores the pre-delete view."""
+    if not S3_PERSIST:
+        return
+    versions = _object_versions.get((bucket_name, key)) or []
+    latest = versions[-1] if versions else None
+    if latest is not None and latest.get("is_delete_marker"):
+        _persist_delete_marker(bucket_name, key, latest)
+    elif key in bucket["objects"]:
+        _persist_object(bucket_name, key, bucket["objects"][key])
+    else:
+        _delete_persisted_object(bucket_name, key)
+
+
+def _key_sidecar_stores():
+    return (("tags", _object_tags), ("acl", _object_acl), ("annotations", _object_annotations),
+            ("retention", _object_retention), ("legal_hold", _object_legal_hold))
+
+
+def _key_history_meta(bucket_name: str, key: str) -> dict:
+    versions = _object_versions.get((bucket_name, key)) or []
+    extra = {}
+    if versions:
+        extra["versions"] = [{k: v for k, v in e.items() if k != "data"} for e in versions]
+    vids = [None] + [v["version_id"] for v in versions if v["version_id"] != "null" and not v.get("is_delete_marker")]
+    for field, store in _key_sidecar_stores():
+        found = {vid or "null": store.get((bucket_name, key, vid)) for vid in vids}
+        found = {vid: value for vid, value in found.items() if value is not None}
+        if found:
+            extra[field] = found
+    return extra
+
+
+_VERSIONS_DIR = ".versions"
+
+
+def _version_disk_path(bucket: str, key: str, version_id: str, account_id: str = None) -> str | None:
+    if account_id is None:
+        account_id = get_account_id()
+    base = os.path.join(DATA_DIR, _VERSIONS_DIR, account_id, bucket, version_id)
+    if not _under(os.path.realpath(os.path.join(DATA_DIR, _VERSIONS_DIR, account_id, bucket)), os.path.realpath(base)):
+        return None
+    return _key_disk_path(base, key)
+
+
+def _version_file_exists(bucket_name: str, key: str, version_id: str, account_id: str = None) -> bool:
+    fpath = _version_disk_path(bucket_name, key, version_id, account_id)
+    return fpath is not None and os.path.isfile(fpath)
+
+
+def _persist_displaced_version(bucket_name: str, key: str, prior_obj: dict | None, versioning: str):
+    if not S3_PERSIST:
+        return
+    try:
+        if versioning == "Suspended":
+            _delete_version_file(bucket_name, key, "null")
+        if prior_obj is None:
+            return
+        prior_vid = prior_obj.get("version_id") or "null"
+        if versioning == "Suspended" and prior_vid == "null":
+            return
+        fpath = _version_disk_path(bucket_name, key, prior_vid)
+        if fpath is None:
+            return
+        os.makedirs(os.path.dirname(fpath), mode=0o700, exist_ok=True)
+        _atomic_write(fpath, _read_body(bucket_name, key, prior_obj))
+    except Exception as e:
+        logger.warning("Failed to persist S3 object version %s/%s: %s", bucket_name, key, e)
+
+
+def _delete_version_file(bucket_name: str, key: str, version_id: str):
+    if not S3_PERSIST:
+        return
+    try:
+        fpath = _version_disk_path(bucket_name, key, version_id)
+        if fpath is not None and os.path.exists(fpath):
+            os.remove(fpath)
+    except Exception as e:
+        logger.warning("Failed to delete persisted S3 object version %s/%s: %s", bucket_name, key, e)
+
+
+def _version_body(bucket: dict, bucket_name: str, key: str, v: dict) -> bytes | None:
+    if v.get("data") is not None:
+        return v["data"]
+    if S3_PERSIST and _version_file_exists(bucket_name, key, v["version_id"]):
+        try:
+            with open(_version_disk_path(bucket_name, key, v["version_id"]), "rb") as f:
+                return f.read()
+        except Exception as e:
+            logger.warning("Failed to read persisted S3 object version %s/%s: %s", bucket_name, key, e)
+    current = bucket["objects"].get(key)
+    if current is not None and (current.get("version_id") or "null") == v["version_id"]:
+        return _read_body(bucket_name, key, current)
+    return None
 
 
 def _read_body(bucket_name: str, key: str, obj: dict) -> bytes:
@@ -3516,13 +9662,42 @@ def _delete_persisted_object(bucket_name: str, key: str):
         fpath = _object_disk_path(bucket_name, key)
         if fpath is None:
             return
-        if os.path.exists(fpath):
-            os.remove(fpath)
-        meta_path = fpath + ".meta.json"
-        if os.path.exists(meta_path):
-            os.remove(meta_path)
+        _remove_key_files(fpath)
+        _remove_key_files(_other_key_disk_path(os.path.join(DATA_DIR, get_account_id(), bucket_name), key, fpath))
     except Exception as e:
         logger.warning("Failed to delete persisted S3 object %s/%s: %s", bucket_name, key, e)
+
+
+def _delete_persisted_bucket(name: str):
+    """Remove a bucket's account-scoped on-disk directory when the bucket is deleted.
+
+    Mirrors the account scoping in _object_disk_path so we clean up exactly the
+    directory _create_bucket / _persist_object create. Without this the bucket
+    folder is orphaned on disk after DeleteBucket (#824).
+
+    Only the new account-scoped layout (DATA_DIR/<account>/<bucket>) is removed;
+    legacy unscoped data (DATA_DIR/<bucket>) from pre-account-scoping versions is
+    left in place — same as _delete_persisted_object, which only touches the
+    account-scoped path."""
+    if not S3_PERSIST or not name:
+        return
+    try:
+        account_id = get_account_id()
+        root = os.path.realpath(DATA_DIR)
+        account_root = os.path.realpath(os.path.join(DATA_DIR, account_id))
+        bucket_dir = os.path.realpath(os.path.join(DATA_DIR, account_id, name))
+        # Never remove DATA_DIR, the account directory itself, or anything that
+        # escapes DATA_DIR — only the one bucket's subtree. rmtree is destructive,
+        # so guard the primitive rather than relying solely on the validated caller.
+        if bucket_dir in (root, account_root) or os.path.commonpath([root, bucket_dir]) != root:
+            logger.warning("S3 persist: refusing to delete bucket dir %s (outside its bucket scope)", name)
+            return
+        if os.path.isdir(bucket_dir):
+            # No ignore_errors: let a partial-failure OSError reach the except
+            # below so cleanup failures are logged instead of silently leaking.
+            shutil.rmtree(bucket_dir)
+    except (ValueError, OSError) as e:
+        logger.warning("Failed to delete persisted S3 bucket dir %s: %s", name, e)
 
 
 def _load_persisted_data():
@@ -3535,6 +9710,8 @@ def _load_persisted_data():
         for entry in os.listdir(DATA_DIR):
             entry_path = os.path.join(DATA_DIR, entry)
             if not os.path.isdir(entry_path):
+                continue
+            if entry == _VERSIONS_DIR:
                 continue
             # Detect if this entry is an account ID directory (12-digit or has bucket subdirs)
             if entry.isdigit() and len(entry) == 12:
@@ -3559,9 +9736,7 @@ def _load_persisted_account(account_id, account_path):
 def _load_persisted_bucket(account_id, bucket_name, bucket_path):
     """Load a single bucket's objects from disk into the correct account scope."""
     # Skip empty directories (may be leftover from layout migration)
-    has_files = any(
-        not f.endswith(".meta.json") for _, _, files in os.walk(bucket_path) for f in files
-    )
+    has_files = any(not f.endswith(".meta.json") for _, _, files in os.walk(bucket_path) for f in files)
     if not has_files and not os.listdir(bucket_path):
         return
     scoped_key = (account_id, bucket_name)
@@ -3572,44 +9747,1008 @@ def _load_persisted_bucket(account_id, bucket_name, bucket_path):
             "region": None,
         }
     bucket = _buckets._data[scoped_key]
-    for dirpath, _dirnames, filenames in os.walk(bucket_path):
+    for abs_path, key in _persisted_key_files(bucket_path, sidecars=False):
+        meta_path = abs_path + ".meta.json"
+        meta = {}
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path) as mf:
+                    meta = json.load(mf)
+            except Exception:
+                pass
+        # A delete marker's sidecar stands in for the object it hides: the
+        # data file belongs to the version underneath, not to the current
+        # key. Rebuild the marker (and the version it covers) instead of
+        # resurrecting the object as current.
+        if meta.get("is_delete_marker"):
+            _load_persisted_delete_marker(account_id, bucket, bucket_name, key, meta)
+            continue
+        # Body stays on disk — only load metadata into memory.
+        # Compute size/etag from meta sidecar; fall back to reading
+        # the file only when the sidecar is missing or incomplete.
+        size = meta.get("size")
+        etag = meta.get("etag")
+        if size is None or not etag:
+            with open(abs_path, "rb") as f:
+                data = f.read()
+            size = len(data)
+            etag = etag or f'"{md5_hash(data)}"'
+        bucket["objects"][key] = {
+            "body": None,
+            "content_type": meta.get("content_type", "application/octet-stream"),
+            "content_encoding": meta.get("content_encoding"),
+            "etag": etag,
+            "last_modified": meta.get("last_modified") or now_iso(),
+            "size": size,
+            "metadata": meta.get("metadata", {}),
+            "preserved_headers": meta.get("preserved_headers", {}),
+            "storage_class": meta.get("storage_class", "STANDARD"),
+            "checksums": meta.get("checksums", {}),
+        }
+        if meta.get("version_id"):
+            bucket["objects"][key]["version_id"] = meta["version_id"]
+        if "versions" in meta or any(field in meta for field, _ in _key_sidecar_stores()):
+            _load_persisted_history(account_id, bucket, bucket_name, key, meta)
+        elif meta.get("version_id"):
+            vkey = (bucket_name, key)
+            scoped_vkey = (account_id, vkey)
+            if scoped_vkey not in _object_versions._data:
+                _object_versions._data[scoped_vkey] = []
+            _object_versions._data[scoped_vkey].append(
+                {
+                    "version_id": meta["version_id"],
+                    "last_modified": meta.get("last_modified") or now_iso(),
+                    "etag": etag,
+                    "size": size,
+                    "is_latest": True,
+                    "data": None,
+                    "content_type": meta.get("content_type", "application/octet-stream"),
+                    "content_encoding": meta.get("content_encoding"),
+                    "metadata": meta.get("metadata", {}),
+                    "preserved_headers": meta.get("preserved_headers", {}),
+                    "storage_class": meta.get("storage_class", "STANDARD"),
+                    "checksums": meta.get("checksums", {}),
+                }
+            )
+    # Delete markers whose data file is gone (a key that never held a body, or
+    # whose version was purged) live on as a lone sidecar.
+    for meta_path, key in _persisted_key_files(bucket_path, sidecars=True):
+        data_path = meta_path[: -len(".meta.json")]
+        if os.path.exists(data_path):
+            continue  # handled with its data file above
+        try:
+            with open(meta_path) as mf:
+                meta = json.load(mf)
+        except Exception:
+            continue
+        if meta.get("is_delete_marker"):
+            _load_persisted_delete_marker(account_id, bucket, bucket_name, meta.get("key") or key, meta)
+
+
+def _persisted_key_files(bucket_path, sidecars):
+    """(file, key) for a bucket's data files, or sidecars: plain paths first, then encoded names."""
+    for dirpath, dirnames, filenames in os.walk(bucket_path):
+        if dirpath == bucket_path and _ENCODED_KEYS_DIR in dirnames:
+            dirnames.remove(_ENCODED_KEYS_DIR)
         for fname in filenames:
-            if fname.endswith(".meta.json"):
-                continue
-            abs_path = os.path.join(dirpath, fname)
-            key = os.path.relpath(abs_path, bucket_path)
-            meta_path = abs_path + ".meta.json"
-            meta = {}
-            if os.path.exists(meta_path):
-                try:
-                    with open(meta_path) as mf:
-                        meta = json.load(mf)
-                except Exception:
-                    pass
-            # Body stays on disk — only load metadata into memory.
-            # Compute size/etag from meta sidecar; fall back to reading
-            # the file only when the sidecar is missing or incomplete.
-            size = meta.get("size")
-            etag = meta.get("etag")
-            if size is None or not etag:
-                with open(abs_path, "rb") as f:
-                    data = f.read()
-                size = len(data)
-                etag = etag or f'"{md5_hash(data)}"'
-            bucket["objects"][key] = {
-                "body": None,
-                "content_type": meta.get("content_type", "application/octet-stream"),
-                "content_encoding": meta.get("content_encoding"),
-                "etag": etag,
-                "last_modified": meta.get("last_modified") or now_iso(),
-                "size": size,
-                "metadata": meta.get("metadata", {}),
-                "preserved_headers": meta.get("preserved_headers", {}),
-                "storage_class": meta.get("storage_class", "STANDARD"),
-            }
+            if fname.endswith(".meta.json") == sidecars and not fname.endswith(".tmp"):
+                path = os.path.join(dirpath, fname)
+                key = os.path.relpath(path[: -len(".meta.json")] if sidecars else path, bucket_path)
+                yield path, key
+    encoded_dir = os.path.join(bucket_path, _ENCODED_KEYS_DIR)
+    for fname in sorted(os.listdir(encoded_dir)) if os.path.isdir(encoded_dir) else []:
+        if fname.endswith(".meta.json") != sidecars or fname.endswith(".tmp"):
+            continue
+        path = os.path.join(encoded_dir, fname)
+        meta_path = path if sidecars else path + ".meta.json"
+        try:
+            with open(meta_path) as mf:
+                key = json.load(mf).get("key")
+        except Exception:
+            key = None
+        yield path, key or url_unquote(fname[: -len(".meta.json")] if sidecars else fname)
+
+
+def _load_persisted_delete_marker(account_id, bucket, bucket_name, key, meta):
+    """Rebuild a persisted delete marker and hide the key."""
+    bucket["objects"].pop(key, None)
+    if "versions" in meta:
+        _load_persisted_history(account_id, bucket, bucket_name, key, meta)
+        return
+    _object_versions._data[(account_id, (bucket_name, key))] = [
+        {
+            "version_id": meta.get("version_id") or "null",
+            "last_modified": meta.get("last_modified") or now_iso(),
+            "etag": "",
+            "size": 0,
+            "is_latest": True,
+            "is_delete_marker": True,
+        }
+    ]
+
+
+def _load_persisted_history(account_id, bucket, bucket_name, key, meta):
+    """Rebuild a key's version history, tags and ACLs from its sidecar. A real
+    version comes back only when its bytes did."""
+    current = bucket["objects"].get(key)
+    current_vid = (current.get("version_id") or "null") if current is not None else None
+    versions = [
+        dict(v, data=None)
+        for v in meta.get("versions", [])
+        if v.get("is_delete_marker")
+        or v["version_id"] == current_vid
+        or _version_file_exists(bucket_name, key, v["version_id"], account_id)
+    ]
+    scoped_vkey = (account_id, (bucket_name, key))
+    if versions:
+        for v in versions:
+            v["is_latest"] = False
+        versions[-1]["is_latest"] = True
+        _object_versions._data[scoped_vkey] = versions
+    else:
+        _object_versions._data.pop(scoped_vkey, None)
+    live = {v["version_id"] for v in versions if not v.get("is_delete_marker")}
+    if current is not None and not current.get("version_id"):
+        live.add("null")
+    for field, store in _key_sidecar_stores():
+        for vid, value in (meta.get(field) or {}).items():
+            if vid in live:
+                store._data[(account_id, (bucket_name, key, None if vid == "null" else vid))] = value
 
 
 _load_persisted_data()
+
+
+# ---------------------------------------------------------------------------
+# S3 Control: Multi-Region Access Points
+# ---------------------------------------------------------------------------
+
+S3CONTROL_NS = "https://awss3control.amazonaws.com/doc/2018-08-20/"
+_MRAP_ASYNC_PREFIX = "/v20180820/async-requests/mrap/"
+_MRAP_INSTANCES_PREFIX = "/v20180820/mrap/instances"
+# Where AWS serves the MRAP control plane (observed 2026-10-12). Route
+# operations are listed in the order AWS's redirect message names them.
+_MRAP_MANAGEMENT_REGION = "us-west-2"
+_MRAP_ROUTE_REGIONS = ("us-west-2", "ap-southeast-2", "ap-northeast-1", "eu-west-1", "us-east-1")
+_MRAP_ASYNC_OPERATIONS = {
+    "create": "CreateMultiRegionAccessPoint",
+    "delete": "DeleteMultiRegionAccessPoint",
+    "put-policy": "PutMultiRegionAccessPointPolicy",
+}
+
+
+def s3control_error(code: str, message: str, status: int, extra: dict[str, str] | None = None) -> tuple:
+    """An S3 Control error, ``<ErrorResponse>``-wrapped as S3 Control answers."""
+    root = Element("ErrorResponse")
+    err = SubElement(root, "Error")
+    SubElement(err, "Code").text = code
+    SubElement(err, "Message").text = message
+    for tag, text in (extra or {}).items():
+        SubElement(err, tag).text = text
+    SubElement(root, "RequestId").text = new_uuid()
+    SubElement(root, "HostId").text = base64.b64encode(os.urandom(48)).decode()
+    return status, {"Content-Type": "application/xml"}, _xml_body(root)
+
+
+def s3control_account_error(headers: dict) -> tuple | None:
+    """S3 Control names the account in ``x-amz-account-id``; a caller may only
+    address its own."""
+    if headers.get("x-amz-account-id", "") != get_account_id():
+        return s3control_error("AccessDenied", "Access Denied", 403)
+    return None
+
+
+def _s3control_response(root: Element) -> tuple:
+    return 200, {"Content-Type": "application/xml"}, _xml_body(root)
+
+
+def _local_tag(el) -> str:
+    return el.tag.split("}")[-1]
+
+
+def _child(el, name: str):
+    return next((c for c in el if _local_tag(c) == name), None) if el is not None else None
+
+
+def _child_text(el, name: str, default: str = "") -> str:
+    found = _child(el, name)
+    return found.text or default if found is not None else default
+
+
+def _mrap_region_error(path: str, routes: bool) -> tuple:
+    regions = (", ".join(_MRAP_ROUTE_REGIONS[:-1]) + f" and {_MRAP_ROUTE_REGIONS[-1]}") if routes \
+        else _MRAP_MANAGEMENT_REGION
+    return s3control_error(
+        "PermanentRedirect",
+        f"This API operation is only available in the following Regions: {regions}. "
+        "Make sure to send all future requests to a supported Region.",
+        301,
+        extra={"Endpoint": f"https://s3-control.{_MRAP_MANAGEMENT_REGION}.amazonaws.com{path}"},
+    )
+
+
+def _no_such_mrap(name: str) -> tuple:
+    return s3control_error("NoSuchMultiRegionAccessPoint",
+                           "The specified Multi-Region Access Point does not exist.", 404,
+                           extra={"MultiRegionAccessPointName": name, "AccountId": get_account_id()})
+
+
+def _pab_xml(parent, pab: dict | None) -> None:
+    el = SubElement(parent, "PublicAccessBlock")
+    for field in ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets"):
+        value = (pab or {}).get(field, True)
+        SubElement(el, field).text = str(value).lower() if isinstance(value, bool) else str(value or "true").lower()
+
+
+def _mrap_report_xml(parent, record: dict, tag: str = "AccessPoint") -> None:
+    ap = SubElement(parent, tag)
+    SubElement(ap, "Name").text = record["Name"]
+    SubElement(ap, "Alias").text = record["Alias"]
+    SubElement(ap, "CreatedAt").text = record["CreatedAt"]
+    _pab_xml(ap, record.get("PublicAccessBlockConfiguration"))
+    # AWS reports CREATING for about a minute; MiniStack creates synchronously.
+    SubElement(ap, "Status").text = "READY"
+    regions = SubElement(ap, "Regions")
+    for bucket in record.get("Regions") or []:
+        region_el = SubElement(regions, "Region")
+        SubElement(region_el, "Bucket").text = bucket
+        SubElement(region_el, "Region").text = bucket_region(bucket) or get_region()
+        SubElement(region_el, "BucketAccountId").text = get_account_id()
+
+
+def _parse_pab(el) -> dict:
+    if el is None:
+        return {}
+    return {_local_tag(c): (c.text or "").strip().lower() == "true" for c in el}
+
+
+def _mrap_async(op_segment: str, body: bytes, signed_region: str | None) -> tuple:
+    """Create, Delete and PutPolicy. AWS runs them asynchronously, walking NEW
+    -> INPROGRESS -> SUCCEEDED/FAILED over about a minute; MiniStack applies
+    them at once and records the final status for Describe."""
+    operation = _MRAP_ASYNC_OPERATIONS[op_segment]
+    try:
+        root = fromstring(body)
+    except Exception:
+        return s3control_error("MalformedXML", _MALFORMED_XML, 400)
+    details = _child(root, "Details")
+    name = _child_text(details, "Name")
+    token_arn = (f"arn:aws:s3:{signed_region or get_region()}:{get_account_id()}:async-request/mrap/"
+                 f"{op_segment}/{new_uuid()}")
+    region_results: list[dict] = []
+    if operation == "CreateMultiRegionAccessPoint":
+        regions_el = _child(details, "Regions")
+        buckets = [_child_text(r, "Bucket") for r in regions_el] if regions_el is not None else []
+        params = {"Name": name, "PublicAccessBlock": _parse_pab(_child(details, "PublicAccessBlock")),
+                  "Regions": buckets}
+    elif operation == "PutMultiRegionAccessPointPolicy":
+        params = {"Name": name, "Policy": _child_text(details, "Policy")}
+    else:
+        params = {"Name": name}
+
+    error = None
+    try:
+        if operation == "CreateMultiRegionAccessPoint":
+            record = create_mrap(name, params["Regions"], params["PublicAccessBlock"])
+            region_results = [{"Name": bucket_region(b), "RequestStatus": "SUCCEEDED"} for b in record["Regions"]]
+        elif operation == "DeleteMultiRegionAccessPoint":
+            record = find_mrap(name)
+            if record is None:
+                raise MrapError("NoSuchMultiRegionAccessPoint",
+                                "The specified Multi-Region Access Point does not exist.")
+            region_results = [{"Name": bucket_region(b) or get_region(), "RequestStatus": "SUCCEEDED"}
+                              for b in record["Regions"]]
+            delete_mrap(name)
+        else:
+            record = find_mrap(name)
+            if record is None:
+                raise MrapError("NoSuchMultiRegionAccessPoint",
+                                "The specified Multi-Region Access Point does not exist.")
+            record["Policy"] = params["Policy"]
+    except MrapError as exc:
+        error = {"Code": exc.code, "Message": exc.message, "Resource": name, "RequestId": new_uuid()}
+        region_results = []
+
+    _mrap_operations[token_arn] = {
+        "RequestTokenARN": token_arn,
+        "Operation": operation,
+        "RequestParameters": params,
+        "RequestStatus": "FAILED" if error else "SUCCEEDED",
+        "CreationTime": now_iso(),
+        "Regions": region_results,
+        "ErrorDetails": error,
+    }
+    out = Element(f"{operation}Result", xmlns=S3CONTROL_NS)
+    SubElement(out, "RequestTokenARN").text = token_arn
+    return _s3control_response(out)
+
+
+def _mrap_describe(token_arn: str) -> tuple:
+    op = _mrap_operations.get(token_arn)
+    if op is None:
+        return s3control_error("NoSuchAsyncRequest", "The specified async request does not exist.", 404)
+    out = Element("DescribeMultiRegionAccessPointOperationResult", xmlns=S3CONTROL_NS)
+    async_op = SubElement(out, "AsyncOperation")
+    SubElement(async_op, "CreationTime").text = op["CreationTime"]
+    SubElement(async_op, "Operation").text = op["Operation"]
+    SubElement(async_op, "RequestTokenARN").text = op["RequestTokenARN"]
+    params_el = SubElement(SubElement(async_op, "RequestParameters"), f"{op['Operation']}Request")
+    params = op["RequestParameters"]
+    SubElement(params_el, "Name").text = params.get("Name", "")
+    if "Policy" in params:
+        SubElement(params_el, "Policy").text = params["Policy"]
+    if "Regions" in params:
+        _pab_xml(params_el, params.get("PublicAccessBlock"))
+        regions = SubElement(params_el, "Regions")
+        for bucket in params["Regions"]:
+            SubElement(SubElement(regions, "Region"), "Bucket").text = bucket
+    SubElement(async_op, "RequestStatus").text = op["RequestStatus"]
+    details = SubElement(async_op, "ResponseDetails")
+    regions = SubElement(SubElement(details, "MultiRegionAccessPointDetails"), "Regions")
+    for result in op["Regions"]:
+        region_el = SubElement(regions, "Region")
+        SubElement(region_el, "Name").text = result["Name"]
+        SubElement(region_el, "RequestStatus").text = result["RequestStatus"]
+    if op["ErrorDetails"]:
+        err_el = SubElement(details, "ErrorDetails")
+        for field in ("Code", "Message", "Resource", "RequestId"):
+            SubElement(err_el, field).text = op["ErrorDetails"][field]
+    return _s3control_response(out)
+
+
+def _mrap_list(query_params: dict) -> tuple:
+    # The token names the last access point returned, not a position, so a create or delete between pages skips
+    # nothing.
+    records = sorted(_mraps.values(), key=lambda r: (str(r["CreatedAt"]), r["Name"]))
+    token = _qp(query_params, "nextToken", "")
+    if token:
+        try:
+            after = tuple(json.loads(base64.urlsafe_b64decode(token.encode())))
+        except (ValueError, TypeError):
+            after = None
+        if after is not None:
+            records = [r for r in records if (str(r["CreatedAt"]), r["Name"]) > after]
+    max_results = int(_qp(query_params, "maxResults", "1000") or "1000")
+    page = records[:max_results]
+    out = Element("ListMultiRegionAccessPointsResult", xmlns=S3CONTROL_NS)
+    aps = SubElement(out, "AccessPoints")
+    for record in page:
+        _mrap_report_xml(aps, record)
+    if page and len(records) > max_results:
+        last = page[-1]
+        SubElement(out, "NextToken").text = base64.urlsafe_b64encode(
+            json.dumps([str(last["CreatedAt"]), last["Name"]]).encode()).decode()
+    return _s3control_response(out)
+
+
+def _mrap_policy(record: dict) -> tuple:
+    out = Element("GetMultiRegionAccessPointPolicyResult", xmlns=S3CONTROL_NS)
+    policy_el = SubElement(out, "Policy")
+    if record.get("Policy"):
+        # AWS keeps the proposed policy until it propagates; MiniStack applies at once.
+        for state in ("Established", "Proposed"):
+            SubElement(SubElement(policy_el, state), "Policy").text = record["Policy"]
+    return _s3control_response(out)
+
+
+def _mrap_get_routes(arn: str, record: dict) -> tuple:
+    out = Element("GetMultiRegionAccessPointRoutesResult", xmlns=S3CONTROL_NS)
+    SubElement(out, "Mrap").text = arn
+    routes_el = SubElement(out, "Routes")
+    for bucket, dial in mrap_routes(record).items():
+        route = SubElement(routes_el, "Route")
+        SubElement(route, "Bucket").text = bucket
+        SubElement(route, "Region").text = bucket_region(bucket) or get_region()
+        SubElement(route, "TrafficDialPercentage").text = str(dial)
+    return _s3control_response(out)
+
+
+def _mrap_submit_routes(record: dict, body: bytes) -> tuple:
+    """Traffic dials are 0 or 100, only for members, and at least one member
+    must stay active (observed); a refused update leaves the routes as they were."""
+    try:
+        root = fromstring(body)
+    except Exception:
+        return s3control_error("MalformedXML", _MALFORMED_XML, 400)
+    routes = mrap_routes(record)
+    by_region = {bucket_region(b): b for b in routes}
+    updated = dict(routes)
+    updates_el = _child(root, "RouteUpdates")
+    for route in updates_el if updates_el is not None else []:
+        dial = _child_text(route, "TrafficDialPercentage")
+        if dial not in ("0", "100"):
+            return s3control_error("InvalidRequest", "Request invalid", 400)
+        bucket = _child_text(route, "Bucket") or by_region.get(_child_text(route, "Region"))
+        if bucket not in routes:
+            return s3control_error("InvalidRequest",
+                                   "The provided Region or bucket is not part of the Multi-Region Access Point.",
+                                   400)
+        updated[bucket] = int(dial)
+    if not any(updated.values()):
+        return s3control_error(
+            "InvalidRequest",
+            "At least one Region or bucket in the Multi-Region Access Point must be configured to receive "
+            "traffic. Set at least one Region or bucket to Active, and then try again.",
+            400,
+        )
+    record["Routes"] = updated
+    return 200, {"Content-Type": "application/xml"}, b""
+
+
+# Each Multi-Region Access Point instance resource, by the segment after the
+# reference (None for the collection): its ResourceType and the IAM action per
+# method. A documented resource MiniStack does not emulate has no ResourceType.
+_MRAP_RESOURCES = {
+    None: ("MULTI_REGION_ACCESS_POINTS", {"GET": "s3:ListMultiRegionAccessPoints"}),
+    "": ("MULTI_REGION_ACCESS_POINT", {"GET": "s3:GetMultiRegionAccessPoint"}),
+    "policy": ("GET_MULTI_REGION_ACCESS_POINT_POLICY", {"GET": "s3:GetMultiRegionAccessPointPolicy"}),
+    "policystatus": (None, {"GET": "s3:GetMultiRegionAccessPointPolicyStatus"}),
+    "routes": ("MULTI_REGION_ACCESS_POINT_ROUTES", {"GET": "s3:GetMultiRegionAccessPointRoutes",
+                                                    "PATCH": "s3:SubmitMultiRegionAccessPointRoutes"}),
+}
+
+
+def mrap_control_route(path: str) -> tuple | None:
+    """``(reference, sub-resource, resource type, IAM actions by method)`` of an MRAP instances path, or None."""
+    rest = url_unquote(path)[len(_MRAP_INSTANCES_PREFIX):]
+    if not rest:
+        ref, sub = "", None
+    elif not rest.startswith("/") or not all(segments := rest[1:].split("/")):
+        return None
+    elif len(segments) > 1 and segments[-1] == "routes":  # routes take the MRAP's ARN, which holds a slash
+        ref, sub = "/".join(segments[:-1]), "routes"
+    elif len(segments) == 1:
+        ref, sub = segments[0], ""
+    elif len(segments) == 2 and segments[1] in ("policy", "policystatus"):
+        ref, sub = segments
+    else:
+        return None
+    return ref, sub, *_MRAP_RESOURCES[sub]
+
+
+def handle_mrap_control(method: str, path: str, headers: dict, body: bytes, query_params: dict) -> tuple:
+    """S3 Control's Multi-Region Access Point operations (``/v20180820/mrap/``
+    and ``/v20180820/async-requests/mrap/``). Management is served from
+    us-west-2 and route operations from five regions, as on AWS; a request
+    without a signing region is let through, as S3's own region check does."""
+    signed = _signed_region(headers, query_params)
+    decoded = url_unquote(path)
+    is_instances = decoded == _MRAP_INSTANCES_PREFIX or decoded.startswith(_MRAP_INSTANCES_PREFIX + "/")
+    route = mrap_control_route(path) if is_instances else None
+    is_routes = route is not None and route[1] == "routes"
+    if signed is not None:
+        if is_routes and signed not in _MRAP_ROUTE_REGIONS:
+            return _mrap_region_error(path, routes=True)
+        if not is_routes and signed != _MRAP_MANAGEMENT_REGION:
+            return _mrap_region_error(path, routes=False)
+
+    if decoded.startswith(_MRAP_ASYNC_PREFIX):
+        tail = decoded[len(_MRAP_ASYNC_PREFIX):]
+        if method == "POST" and tail in _MRAP_ASYNC_OPERATIONS:
+            return _mrap_async(tail, body, signed)
+        if method == "GET":
+            return _mrap_describe(tail)
+    elif is_instances:
+        if route is None or method not in route[3]:
+            return _control_route_error(method, path, route)
+        ref, sub = route[0], route[1]
+        if sub is None:
+            return _mrap_list(query_params)
+        if sub == "routes":
+            if not ref.startswith("arn:"):
+                return s3control_error("InvalidRequest", "Request invalid", 400)
+            record = find_mrap(ref)
+            if record is None:
+                return _no_such_mrap(ref.rsplit("/", 1)[-1])
+            if method == "GET":
+                return _mrap_get_routes(ref, record)
+            return _mrap_submit_routes(record, body)
+        if route[2] is None:
+            return _no_such_mrap(f"{ref}/{sub}")
+        record = find_mrap(ref)
+        if record is None:
+            return _no_such_mrap(ref)
+        if sub == "policy":
+            return _mrap_policy(record)
+        out = Element("GetMultiRegionAccessPointResult", xmlns=S3CONTROL_NS)
+        _mrap_report_xml(out, record)
+        return _s3control_response(out)
+    return s3control_error("MethodNotAllowed", "The specified method is not allowed against this resource.", 405)
+
+
+# ---------------------------------------------------------------------------
+# S3 Control: regional access points
+# ---------------------------------------------------------------------------
+
+_ACCESS_POINT_PREFIX = "/v20180820/accesspoint"
+_PAB_FIELDS = ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets")
+
+
+class AccessPointError(Exception):
+    def __init__(self, code: str, message: str, status: int, extra: dict[str, str] | None = None):
+        super().__init__(message)
+        self.code, self.message, self.status, self.extra = code, message, status, extra
+
+    def response(self) -> tuple:
+        return s3control_error(self.code, self.message, self.status, self.extra)
+
+
+def _no_such_access_point(name: str) -> AccessPointError:
+    return AccessPointError("NoSuchAccessPoint", "The specified accesspoint does not exist", 404,
+                            {"AccessPointName": name})
+
+
+def create_access_point(name: str, bucket: str, vpc_configuration: dict | None = None,
+                        public_access_block: dict | None = None, policy: str | None = None,
+                        tags: dict | None = None) -> dict:
+    """Create an access point in the current account and region (observed
+    rules: the bucket must be in that region, the name unique there)."""
+    if not _ACCESS_POINT_NAME_RE.match(name or "") or "--" in name:
+        raise AccessPointError("InvalidAccessPoint", "The specified access point name or account is not valid.", 400)
+    region = bucket_region(bucket)
+    if region is None:
+        raise AccessPointError("NoSuchBucket", "The specified bucket does not exist", 404, {"BucketName": bucket})
+    if region != get_region():
+        raise AccessPointError("InvalidRequest",
+                               "Amazon S3 AccessPoint can only be created for bucket in the same region", 400)
+    if _access_points.get(name) is not None:
+        raise AccessPointError("AccessPointAlreadyOwnedByYou",
+                               "Your previous request to create the named accesspoint succeeded and you already "
+                               "own it.", 409)
+    pab = {field: True for field in _PAB_FIELDS}
+    pab.update({k: bool(v) for k, v in (public_access_block or {}).items() if k in _PAB_FIELDS})
+    record = {
+        "Name": name,
+        "Bucket": bucket,
+        "BucketAccountId": get_account_id(),
+        "Alias": new_access_point_alias(name, region),
+        "CreationDate": now_iso(),
+        "NetworkOrigin": "VPC" if (vpc_configuration or {}).get("VpcId") else "Internet",
+        "VpcConfiguration": vpc_configuration or None,
+        "PublicAccessBlockConfiguration": pab,
+        "Policy": policy,
+        "Tags": tags or {},
+    }
+    _access_points[name] = record
+    return record
+
+
+def delete_access_point(name: str) -> None:
+    if _access_points.pop(name, None) is None:
+        raise _no_such_access_point(name)
+
+
+def _access_point_xml(parent, record: dict, full: bool) -> None:
+    SubElement(parent, "Name").text = record["Name"]
+    SubElement(parent, "NetworkOrigin").text = record["NetworkOrigin"]
+    if record.get("VpcConfiguration"):
+        SubElement(SubElement(parent, "VpcConfiguration"), "VpcId").text = record["VpcConfiguration"]["VpcId"]
+    SubElement(parent, "Bucket").text = record["Bucket"]
+    if full:
+        pab = SubElement(parent, "PublicAccessBlockConfiguration")
+        for field in _PAB_FIELDS:
+            SubElement(pab, field).text = str(record["PublicAccessBlockConfiguration"].get(field, True)).lower()
+        SubElement(parent, "CreationDate").text = record["CreationDate"]
+    SubElement(parent, "AccessPointArn").text = access_point_arn(record["Name"])
+    SubElement(parent, "Alias").text = record["Alias"]
+    if full:
+        region = get_region()
+        endpoints = SubElement(parent, "Endpoints")
+        for key, host in (("ipv4", f"s3-accesspoint.{region}.amazonaws.com"),
+                          ("fips", f"s3-accesspoint-fips.{region}.amazonaws.com"),
+                          ("dualstack", f"s3-accesspoint.dualstack.{region}.amazonaws.com"),
+                          ("fips_dualstack", f"s3-accesspoint-fips.dualstack.{region}.amazonaws.com")):
+            entry = SubElement(endpoints, "entry")
+            SubElement(entry, "key").text = key
+            SubElement(entry, "value").text = host
+    SubElement(parent, "BucketAccountId").text = record["BucketAccountId"]
+
+
+def _access_point_create_request(name: str, body: bytes) -> tuple:
+    try:
+        root = fromstring(body) if body else Element("CreateAccessPointRequest")
+    except Exception:
+        return s3control_error("MalformedXML", _MALFORMED_XML, 400)
+    vpc_el = _child(root, "VpcConfiguration")
+    tags_el = _child(root, "Tags")
+    try:
+        record = create_access_point(
+            name, _child_text(root, "Bucket"),
+            vpc_configuration={"VpcId": _child_text(vpc_el, "VpcId")} if vpc_el is not None else None,
+            public_access_block=_parse_pab(_child(root, "PublicAccessBlockConfiguration")),
+            tags={_child_text(t, "Key"): _child_text(t, "Value") for t in tags_el} if tags_el is not None else None,
+        )
+    except AccessPointError as exc:
+        return exc.response()
+    out = Element("CreateAccessPointResult", xmlns=S3CONTROL_NS)
+    SubElement(out, "AccessPointArn").text = access_point_arn(name)
+    SubElement(out, "Alias").text = record["Alias"]
+    return _s3control_response(out)
+
+
+def _access_point_list(query_params: dict) -> tuple:
+    bucket = _qp(query_params, "bucket", "")
+    records = sorted((r for r in _access_points.values() if not bucket or r["Bucket"] == bucket),
+                     key=lambda r: r["Name"])
+    start = int(_qp(query_params, "nextToken", "0") or "0")
+    max_results = int(_qp(query_params, "maxResults", "1000") or "1000")
+    out = Element("ListAccessPointsResult", xmlns=S3CONTROL_NS)
+    aps = SubElement(out, "AccessPointList")
+    for record in records[start:start + max_results]:
+        _access_point_xml(SubElement(aps, "AccessPoint"), record, full=False)
+    if start + max_results < len(records):
+        SubElement(out, "NextToken").text = str(start + max_results)
+    return _s3control_response(out)
+
+
+def _access_point_policy(name: str, method: str, body: bytes) -> tuple:
+    record = _access_points.get(name)
+    if record is None:
+        return _no_such_access_point(name).response()
+    if method == "PUT":
+        try:
+            record["Policy"] = _child_text(fromstring(body), "Policy")
+        except Exception:
+            return s3control_error("MalformedXML", _MALFORMED_XML, 400)
+        return 200, {"Content-Type": "application/xml"}, b""
+    if method == "DELETE":
+        record["Policy"] = None
+        return 204, {}, b""
+    if not record.get("Policy"):
+        # The code and message are inferred from the other S3 policy errors.
+        return s3control_error("NoSuchAccessPointPolicy", "The specified accesspoint policy does not exist", 404,
+                               {"AccessPointName": name})
+    out = Element("GetAccessPointPolicyResult", xmlns=S3CONTROL_NS)
+    SubElement(out, "Policy").text = record["Policy"]
+    return _s3control_response(out)
+
+
+def is_access_point_control_path(path: str) -> bool:
+    return path.rstrip("/") == _ACCESS_POINT_PREFIX or path.startswith(_ACCESS_POINT_PREFIX + "/")
+
+
+# Each resource under an S3 Control prefix, by the segment after the name (None
+# for the collection): its ResourceType and the IAM action per method. A
+# documented resource MiniStack does not emulate has no ResourceType.
+_ACCESS_POINT_RESOURCES = {
+    None: ("ACCESSPOINTS", {"GET": "s3:ListAccessPoints"}),
+    "": ("ACCESSPOINT", {"PUT": "s3:CreateAccessPoint", "GET": "s3:GetAccessPoint", "DELETE": "s3:DeleteAccessPoint"}),
+    "policy": ("ACCESSPOINTPOLICY", {"PUT": "s3:PutAccessPointPolicy", "GET": "s3:GetAccessPointPolicy",
+                                     "DELETE": "s3:DeleteAccessPointPolicy"}),
+    "policyStatus": (None, {"GET": "s3:GetAccessPointPolicyStatus"}),
+    "scope": (None, {"PUT": "s3express:PutAccessPointScope", "GET": "s3express:GetAccessPointScope",
+                     "DELETE": "s3express:DeleteAccessPointScope"}),
+}
+
+
+def _control_route(path: str, prefix: str, resources: dict) -> tuple | None:
+    """``(name, sub-resource, resource type, IAM actions by method)`` of a path under ``prefix``, or None."""
+    parts = url_unquote(path)[len(prefix):].split("/")
+    if parts == [""]:
+        name, sub = "", None
+    elif len(parts) in (2, 3) and not parts[0] and all(parts[1:]):
+        name, sub = parts[1], parts[2] if len(parts) == 3 else ""
+    else:
+        return None
+    if sub not in resources:
+        return None
+    return name, sub, *resources[sub]
+
+
+def access_point_control_route(path: str) -> tuple | None:
+    """The route of an access point control request, as ``_control_route``."""
+    return _control_route(path, _ACCESS_POINT_PREFIX, _ACCESS_POINT_RESOURCES)
+
+
+def _control_route_error(method: str, path: str, route: tuple | None) -> tuple:
+    if route is None:
+        return s3control_error("InvalidURI", "Couldn't parse the specified URI.", 400,
+                               {"URI": path.split("/v20180820/", 1)[-1]})
+    extra = {"Method": method, "ResourceType": route[2]} if route[2] else {"Method": method}
+    return s3control_error("MethodNotAllowed", "The specified method is not allowed against this resource.", 405,
+                           extra)
+
+
+def handle_access_point_control(method: str, path: str, headers: dict, body: bytes, query_params: dict) -> tuple:
+    """S3 Control access point operations in the request's region."""
+    route = access_point_control_route(path)
+    if route is None or method not in route[3]:
+        return _control_route_error(method, path, route)
+    name, sub = route[0], route[1]
+    if route[2] is None:
+        return _no_such_access_point(f"{name}/{sub}").response()
+    if sub is None:
+        return _access_point_list(query_params)
+    if sub == "policy":
+        return _access_point_policy(name, method, body)
+    if method == "PUT":
+        return _access_point_create_request(name, body)
+    if method == "GET":
+        record = _access_points.get(name)
+        if record is None:
+            return _no_such_access_point(name).response()
+        out = Element("GetAccessPointResult", xmlns=S3CONTROL_NS)
+        _access_point_xml(out, record, full=True)
+        return _s3control_response(out)
+    try:
+        delete_access_point(name)
+    except AccessPointError as exc:
+        return exc.response()
+    return 204, {}, b""
+
+
+# ---------------------------------------------------------------------------
+# S3 Control: account-level public access block
+# ---------------------------------------------------------------------------
+_ACCOUNT_PAB_PATH = "/v20180820/configuration/publicAccessBlock"
+
+_ACCOUNT_PAB_ACTIONS = {
+    "PUT": "s3:PutAccountPublicAccessBlock",
+    "GET": "s3:GetAccountPublicAccessBlock",
+    "DELETE": "s3:PutAccountPublicAccessBlock",
+}
+
+_ACCOUNT_PAB_FIELDS = ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets")
+
+
+def is_account_public_access_block_path(path: str) -> bool:
+    return path.rstrip("/") == _ACCOUNT_PAB_PATH
+
+
+def handle_account_public_access_block(method: str, path: str, body: bytes) -> tuple:
+    """The request account's public access block."""
+    if method == "PUT":
+        root = None
+        if body:
+            try:
+                raw = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else body
+                root = fromstring(raw)
+            except ParseError:
+                root = None
+        _account_public_access_block["config"] = {
+            field: _child_text(root, field, "false").lower() == "true" for field in _ACCOUNT_PAB_FIELDS}
+        return 200, {}, b""
+    if method == "GET":
+        cfg = _account_public_access_block.get("config")
+        if cfg is None:
+            return s3control_error(
+                "NoSuchPublicAccessBlockConfiguration",
+                "The public access block configuration was not found", 404,
+                {"AccountId": get_account_id()})
+        # The real wire xmlns is http://, not https:// (observed us-east-2 2026-10-30).
+        out = Element("PublicAccessBlockConfiguration", xmlns="http://awss3control.amazonaws.com/doc/2018-08-20/")
+        for field in _ACCOUNT_PAB_FIELDS:
+            SubElement(out, field).text = str(bool(cfg.get(field))).lower()
+        return _s3control_response(out)
+    if method == "DELETE":
+        _account_public_access_block.pop("config", None)
+        return 204, {}, b""
+    return s3control_error("MethodNotAllowed", "The specified method is not allowed against this resource.", 405,
+                           {"Method": method, "ResourceType": "ACCOUNT_PUBLIC_ACCESS_BLOCK"})
+
+
+# ---------------------------------------------------------------------------
+# S3 Control: Object Lambda Access Points
+# ---------------------------------------------------------------------------
+
+_OBJECT_LAMBDA_PREFIX = "/v20180820/accesspointforobjectlambda"
+OBJECT_LAMBDA_ACTIONS = ("GetObject", "HeadObject", "ListObjects", "ListObjectsV2")
+OBJECT_LAMBDA_FEATURES = ("GetObject-Range", "GetObject-PartNumber", "HeadObject-Range", "HeadObject-PartNumber")
+
+
+def _no_such_object_lambda(name: str) -> AccessPointError:
+    # Object Lambda shares the access point error (inference).
+    return _no_such_access_point(name)
+
+
+def _parse_object_lambda_configuration(el) -> dict:
+    transformations = []
+    for tc in _child(el, "TransformationConfigurations") or []:
+        actions_el = _child(tc, "Actions")
+        aws_lambda = _child(_child(tc, "ContentTransformation"), "AwsLambda")
+        transformation = {
+            "Actions": [a.text or "" for a in actions_el] if actions_el is not None else [],
+            "FunctionArn": _child_text(aws_lambda, "FunctionArn"),
+        }
+        if _child(aws_lambda, "FunctionPayload") is not None:
+            transformation["FunctionPayload"] = _child_text(aws_lambda, "FunctionPayload")
+        transformations.append(transformation)
+    features_el = _child(el, "AllowedFeatures")
+    return {
+        "SupportingAccessPoint": _child_text(el, "SupportingAccessPoint"),
+        "CloudWatchMetricsEnabled": _child_text(el, "CloudWatchMetricsEnabled").lower() == "true",
+        "AllowedFeatures": [f.text or "" for f in features_el] if features_el is not None else [],
+        "TransformationConfigurations": transformations,
+    }
+
+
+def _object_lambda_configuration_xml(parent, config: dict) -> None:
+    el = SubElement(parent, "Configuration")
+    SubElement(el, "SupportingAccessPoint").text = config["SupportingAccessPoint"]
+    SubElement(el, "CloudWatchMetricsEnabled").text = str(config.get("CloudWatchMetricsEnabled", False)).lower()
+    features = SubElement(el, "AllowedFeatures")
+    for feature in config.get("AllowedFeatures") or []:
+        SubElement(features, "AllowedFeature").text = feature
+    tcs = SubElement(el, "TransformationConfigurations")
+    for transformation in config.get("TransformationConfigurations") or []:
+        tc = SubElement(tcs, "TransformationConfiguration")
+        actions = SubElement(tc, "Actions")
+        for action in transformation["Actions"]:
+            SubElement(actions, "Action").text = action
+        aws_lambda = SubElement(SubElement(tc, "ContentTransformation"), "AwsLambda")
+        SubElement(aws_lambda, "FunctionArn").text = transformation["FunctionArn"]
+        if "FunctionPayload" in transformation:
+            SubElement(aws_lambda, "FunctionPayload").text = transformation["FunctionPayload"]
+
+
+def supporting_access_point(config: dict, region: str | None = None):
+    """``(name, record)`` of the access point an Object Lambda Access Point in
+    ``region`` (default: the request's) sits on, or None."""
+    region = region or get_region()
+    try:
+        arn = parse_arn(config.get("SupportingAccessPoint", ""))
+    except ArnParseError:
+        return None
+    if (arn.service, arn.account_id, arn.region) != ("s3", get_account_id(), region):
+        return None
+    name = arn.resource.split("/", 1)[-1]
+    record = _access_points.get_scoped(get_account_id(), region, name)
+    return (name, record) if record is not None else None
+
+
+def validate_object_lambda_configuration(config: dict) -> None:
+    """The supporting access point and every Lambda share the access point's
+    account and region (S3 user guide); actions and features come from the
+    documented sets. The error code and messages are inferred."""
+    def invalid(message):
+        raise AccessPointError("InvalidRequest", message, 400)
+
+    if supporting_access_point(config) is None:
+        invalid("The supporting access point must be an existing access point in the same account and Region.")
+    for feature in config.get("AllowedFeatures") or []:
+        if feature not in OBJECT_LAMBDA_FEATURES:
+            invalid(f"Invalid AllowedFeature: {feature}")
+    if not config.get("TransformationConfigurations"):
+        invalid("At least one TransformationConfiguration is required.")
+    for transformation in config["TransformationConfigurations"]:
+        if not transformation["Actions"] or any(a not in OBJECT_LAMBDA_ACTIONS for a in transformation["Actions"]):
+            invalid("Invalid transformation configuration action.")
+        try:
+            fn = parse_arn(transformation["FunctionArn"])
+        except ArnParseError:
+            invalid("The Lambda function ARN is invalid.")
+        if (fn.service, fn.account_id, fn.region) != ("lambda", get_account_id(), get_region()):
+            invalid("The Lambda function must be in the same account and Region as the Object Lambda Access Point.")
+
+
+def create_object_lambda_access_point(name: str, config: dict, policy: str | None = None) -> dict:
+    if not _OBJECT_LAMBDA_NAME_RE.match(name or ""):
+        raise AccessPointError("InvalidAccessPoint", "The specified access point name or account is not valid.", 400)
+    validate_object_lambda_configuration(config)
+    if _object_lambda_access_points.get(name) is not None:
+        raise AccessPointError("AccessPointAlreadyOwnedByYou",
+                               "Your previous request to create the named accesspoint succeeded and you already "
+                               "own it.", 409)
+    record = {
+        "Name": name,
+        "Alias": {"Value": new_object_lambda_alias(name, get_region()), "Status": "READY"},
+        "CreationDate": now_iso(),
+        "Configuration": config,
+        "Policy": policy,
+        "PublicAccessBlockConfiguration": {field: True for field in _PAB_FIELDS},
+    }
+    _object_lambda_access_points[name] = record
+    return record
+
+
+def _object_lambda_alias_xml(parent, record: dict) -> None:
+    alias = SubElement(parent, "Alias")
+    SubElement(alias, "Value").text = record["Alias"]["Value"]
+    SubElement(alias, "Status").text = record["Alias"]["Status"]
+
+
+def is_object_lambda_control_path(path: str) -> bool:
+    return path.rstrip("/") == _OBJECT_LAMBDA_PREFIX or path.startswith(_OBJECT_LAMBDA_PREFIX + "/")
+
+
+_OBJECT_LAMBDA_RESOURCES = {
+    None: ("OBJECT_LAMBDA_ACCESS_POINTS", {"GET": "s3:ListAccessPointsForObjectLambda"}),
+    "": ("OBJECT_LAMBDA_ACCESS_POINT", {"PUT": "s3:CreateAccessPointForObjectLambda",
+                                        "GET": "s3:GetAccessPointForObjectLambda",
+                                        "DELETE": "s3:DeleteAccessPointForObjectLambda"}),
+    "configuration": ("OBJECT_LAMBDA_ACCESS_POINT_CONFIGURATION", {
+        "PUT": "s3:PutAccessPointConfigurationForObjectLambda",
+        "GET": "s3:GetAccessPointConfigurationForObjectLambda"}),
+    "policy": ("OBJECT_LAMBDA_ACCESS_POINT_POLICY", {"PUT": "s3:PutAccessPointPolicyForObjectLambda",
+                                                     "GET": "s3:GetAccessPointPolicyForObjectLambda",
+                                                     "DELETE": "s3:DeleteAccessPointPolicyForObjectLambda"}),
+    "policyStatus": (None, {"GET": "s3:GetAccessPointPolicyStatusForObjectLambda"}),
+}
+
+
+def object_lambda_control_route(path: str) -> tuple | None:
+    """The route of an Object Lambda Access Point control request, as ``_control_route``."""
+    return _control_route(path, _OBJECT_LAMBDA_PREFIX, _OBJECT_LAMBDA_RESOURCES)
+
+
+def _object_lambda_request(name: str, method: str, body: bytes, sub: str) -> tuple:
+    record = _object_lambda_access_points.get(name)
+    if method == "PUT" and not sub:
+        try:
+            root = fromstring(body)
+            config = _parse_object_lambda_configuration(_child(root, "Configuration"))
+            record = create_object_lambda_access_point(name, config)
+        except AccessPointError as exc:
+            return exc.response()
+        except Exception:
+            return s3control_error("MalformedXML", _MALFORMED_XML, 400)
+        out = Element("CreateAccessPointForObjectLambdaResult", xmlns=S3CONTROL_NS)
+        SubElement(out, "ObjectLambdaAccessPointArn").text = object_lambda_arn(name)
+        _object_lambda_alias_xml(out, record)
+        return _s3control_response(out)
+    if record is None:
+        return _no_such_object_lambda(name).response()
+    if sub == "configuration":
+        if method == "PUT":
+            try:
+                config = _parse_object_lambda_configuration(_child(fromstring(body), "Configuration"))
+                validate_object_lambda_configuration(config)
+            except AccessPointError as exc:
+                return exc.response()
+            record["Configuration"] = config
+            return 200, {"Content-Type": "application/xml"}, b""
+        out = Element("GetAccessPointConfigurationForObjectLambdaResult", xmlns=S3CONTROL_NS)
+        _object_lambda_configuration_xml(out, record["Configuration"])
+        return _s3control_response(out)
+    if sub == "policy":
+        if method == "PUT":
+            record["Policy"] = _child_text(fromstring(body), "Policy")
+            return 200, {"Content-Type": "application/xml"}, b""
+        if method == "DELETE":
+            record["Policy"] = None
+            return 204, {}, b""
+        if not record.get("Policy"):
+            return s3control_error("NoSuchAccessPointPolicy", "The specified accesspoint policy does not exist",
+                                   404, {"AccessPointName": name})
+        out = Element("GetAccessPointPolicyForObjectLambdaResult", xmlns=S3CONTROL_NS)
+        SubElement(out, "Policy").text = record["Policy"]
+        return _s3control_response(out)
+    if method == "DELETE":
+        _object_lambda_access_points.pop(name, None)
+        return 204, {}, b""
+    out = Element("GetAccessPointForObjectLambdaResult", xmlns=S3CONTROL_NS)
+    SubElement(out, "Name").text = name
+    pab = SubElement(out, "PublicAccessBlockConfiguration")
+    for field in _PAB_FIELDS:
+        SubElement(pab, field).text = "true"
+    SubElement(out, "CreationDate").text = record["CreationDate"]
+    _object_lambda_alias_xml(out, record)
+    return _s3control_response(out)
+
+
+def handle_object_lambda_control(method: str, path: str, headers: dict, body: bytes, query_params: dict) -> tuple:
+    """S3 Control Object Lambda Access Point operations in the request's region."""
+    route = object_lambda_control_route(path)
+    if route is None or method not in route[3]:
+        return _control_route_error(method, path, route)
+    name, sub = route[0], route[1]
+    if route[2] is None:
+        return _no_such_object_lambda(f"{name}/{sub}").response()
+    if sub is None:
+        records = sorted(_object_lambda_access_points.values(), key=lambda r: r["Name"])
+        start = int(_qp(query_params, "nextToken", "0") or "0")
+        max_results = int(_qp(query_params, "maxResults", "1000") or "1000")
+        out = Element("ListAccessPointsForObjectLambdaResult", xmlns=S3CONTROL_NS)
+        listed = SubElement(out, "ObjectLambdaAccessPointList")
+        for record in records[start:start + max_results]:
+            entry = SubElement(listed, "ObjectLambdaAccessPoint")
+            SubElement(entry, "Name").text = record["Name"]
+            SubElement(entry, "ObjectLambdaAccessPointArn").text = object_lambda_arn(record["Name"])
+            _object_lambda_alias_xml(entry, record)
+        if start + max_results < len(records):
+            SubElement(out, "NextToken").text = str(start + max_results)
+        return _s3control_response(out)
+    return _object_lambda_request(name, method, body, sub)
 
 
 def reset():
@@ -3618,12 +10757,8 @@ def reset():
     global _bucket_versioning, _bucket_encryption, _bucket_lifecycle, _bucket_cors
     global _bucket_acl, _bucket_websites, _bucket_logging_config
     global _bucket_accelerate_config, _bucket_request_payment_config
-    global _object_tags, _multipart_uploads, _object_versions
-    global \
-        _bucket_object_lock, \
-        _bucket_replication, \
-        _object_retention, \
-        _object_legal_hold
+    global _object_tags, _multipart_uploads, _object_versions, _object_acl, _object_annotations
+    global _bucket_object_lock, _bucket_replication, _object_retention, _object_legal_hold
     for d in (
         _buckets,
         _bucket_policies,
@@ -3639,11 +10774,25 @@ def reset():
         _bucket_accelerate_config,
         _bucket_request_payment_config,
         _object_tags,
+        _object_acl,
+        _object_annotations,
         _multipart_uploads,
+        _completed_multipart_uploads,
         _bucket_object_lock,
         _bucket_replication,
         _object_retention,
         _object_legal_hold,
         _object_versions,
+        _mraps,
+        _mrap_operations,
+        _access_points,
+        _object_lambda_access_points,
+        _account_public_access_block,
+        _olap_requests,
     ):
         d.clear()
+
+
+# Re-arm restore-completion timers for state loaded from disk. Must run after
+# every function above is defined: the workers resolve _fire_s3_event by name.
+_reschedule_restores()

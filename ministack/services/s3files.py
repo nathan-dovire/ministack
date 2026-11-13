@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 Amazon S3 Files Service Emulator (s3files-2025-05-05).
 REST/JSON API. Routes, payloads, and response shapes match the AWS spec.
@@ -20,8 +22,9 @@ import re
 import time
 from urllib.parse import unquote
 
-from ministack.core.persistence import load_state
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -42,12 +45,21 @@ def _empty_200():
 
 logger = logging.getLogger("s3files")
 
-_file_systems = AccountScopedDict()
-_mount_targets = AccountScopedDict()
-_access_points = AccountScopedDict()
-_policies = AccountScopedDict()
-_sync_configs = AccountScopedDict()
-_tags = AccountScopedDict()
+_file_systems = AccountRegionScopedDict()
+_mount_targets = AccountRegionScopedDict()
+_access_points = AccountRegionScopedDict()
+_policies = AccountRegionScopedDict()
+_sync_configs = AccountRegionScopedDict()
+_tags = AccountRegionScopedDict()
+
+
+def _clear_state():
+    _file_systems.clear()
+    _mount_targets.clear()
+    _access_points.clear()
+    _policies.clear()
+    _sync_configs.clear()
+    _tags.clear()
 
 
 def get_state():
@@ -61,32 +73,81 @@ def get_state():
     })
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     if not data:
         return
+    _clear_state()
     _file_systems.update(data.get("file_systems", {}))
-    _mount_targets.update(data.get("mount_targets", {}))
     _access_points.update(data.get("access_points", {}))
-    _policies.update(data.get("policies", {}))
-    _sync_configs.update(data.get("sync_configs", {}))
-    _tags.update(data.get("tags", {}))
+
+    resource_regions = {
+        (account_id, resource_id): region
+        for store in (_file_systems, _access_points)
+        for (account_id, region, resource_id), _resource in store.all_items()
+    }
+    _restore_child_store(
+        _mount_targets,
+        data.get("mount_targets", {}),
+        resource_regions,
+        lambda key, value: value.get("fileSystemId", key),
+        _mount_target_legacy_region,
+    )
+    for store, key in (
+        (_policies, "policies"),
+        (_sync_configs, "sync_configs"),
+        (_tags, "tags"),
+    ):
+        _restore_child_store(
+            store,
+            data.get(key, {}),
+            resource_regions,
+            lambda resource_id, _value: resource_id,
+        )
 
 
-try:
-    _restored = load_state("s3files")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted state; continuing with fresh store")
+def _mount_target_legacy_region(key, value):
+    availability_zone_id = value.get("availabilityZoneId", "")
+    region, separator, zone_id = availability_zone_id.rpartition("-az")
+    if separator and region and zone_id.isdigit():
+        return region
+    return _mount_targets._region_for_legacy_value(key, value)
+
+
+def _restore_child_store(
+    store, restored, resource_regions, parent_id, legacy_region=None
+):
+    """Adopt legacy child state into its file system or access point region."""
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return
+
+    if isinstance(restored, AccountScopedDict):
+        items = restored._data.items()
+    else:
+        account_id = get_account_id()
+        items = (((account_id, key), value) for key, value in restored.items())
+
+    for (account_id, key), value in items:
+        fallback_region = (
+            legacy_region(key, value)
+            if legacy_region is not None
+            else store._region_for_legacy_value(key, value)
+        )
+        region = resource_regions.get(
+            (account_id, parent_id(key, value)),
+            fallback_region,
+        )
+        store.set_scoped(account_id, region, key, value)
+
+
 
 
 def reset():
-    _file_systems.clear()
-    _mount_targets.clear()
-    _access_points.clear()
-    _policies.clear()
-    _sync_configs.clear()
-    _tags.clear()
+    _clear_state()
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +155,8 @@ def reset():
 # ---------------------------------------------------------------------------
 
 _FS_ARN_RE = re.compile(r"^arn:aws[-a-z]*:s3files:[^:]*:[^:]*:file-system/(fs-[0-9a-f]{17,40})(?:/access-point/(fsap-[0-9a-f]{17,40}))?$")
+_FS_ID_RE = re.compile(r"^fs-[0-9a-f]{17,40}$")
+_AP_ID_RE = re.compile(r"^fsap-[0-9a-f]{17,40}$")
 
 
 def _hex_id(prefix):
@@ -116,6 +179,39 @@ def _resolve_id(value, prefer="fs"):
     if prefer == "ap":
         return m.group(2) or m.group(1)
     return m.group(2) or m.group(1)
+
+
+def _resolve_tag_resource_id(value):
+    if not value:
+        return "", _VALIDATION("resourceId is required")
+    if not value.startswith("arn:"):
+        return _resolve_id(value, prefer="any"), None
+
+    try:
+        spec = parse_arn(value)
+    except ArnParseError:
+        return "", _VALIDATION(f"Invalid resource ARN: {value}")
+
+    if (
+        spec.partition != "aws"
+        or spec.service != "s3files"
+        or spec.region != get_region()
+        or spec.account_id != get_account_id()
+    ):
+        return "", _VALIDATION(f"Invalid resource ARN: {value}")
+
+    parts = spec.resource.split("/")
+    if len(parts) == 2 and parts[0] == "file-system" and _FS_ID_RE.fullmatch(parts[1]):
+        return parts[1], None
+    if (
+        len(parts) == 4
+        and parts[0] == "file-system"
+        and _FS_ID_RE.fullmatch(parts[1])
+        and parts[2] == "access-point"
+        and _AP_ID_RE.fullmatch(parts[3])
+    ):
+        return parts[3], None
+    return "", _VALIDATION(f"Invalid resource ARN: {value}")
 
 
 def _fs_arn(fs_id):
@@ -275,7 +371,9 @@ async def handle_request(method, path, headers, body, query_params):
 
     # /resource-tags/{resourceId}
     if parts and parts[0] == "resource-tags" and len(parts) >= 2:
-        resource_id = _resolve_id("/".join(parts[1:]), prefer="any")
+        resource_id, err = _resolve_tag_resource_id("/".join(parts[1:]))
+        if err:
+            return err
         if method == "POST":
             return _tag_resource(resource_id, data)
         if method == "DELETE":
@@ -456,7 +554,7 @@ def _list_mount_targets(query_params):
         else:
             items = []
 
-    summaries = [_mt_response(mt) for mt in items]
+    summaries = [{k: v for k, v in _mt_response(mt).items() if k != "securityGroups"} for mt in items]
     page, nxt = _paginate(summaries, max_results, next_token)
     out = {"mountTargets": page}
     if nxt:

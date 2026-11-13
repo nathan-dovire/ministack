@@ -3,19 +3,14 @@ Regression tests for the persistence-symmetry architectural bug.
 
 Background
 ----------
-When PERSIST_STATE=1, every service that participates in `_state_map`
-(see `ministack/app.py`) is saved on shutdown via `save_all()`. State is
-restored on startup either by a service's own `load_state()` call at
-module import time, OR by `_load_persisted_state()` which calls a
-`load_persisted_state()` method on the service module.
+When PERSIST_STATE=1, the registry-derived `_state_map` in
+`ministack/app.py` supplies each loaded service's `get_state()` function
+to `save_all()` at shutdown. Startup restores saved snapshots centrally
+through each service's `load_persisted_state()` method.
 
-For five services (autoscaling, backup, eks, scheduler, pipes), the
-shutdown path persists the state to disk but no restore path runs at
-startup, so the next boot starts with an empty store. `pipes` is
-additionally missing from `_state_map`, so its state is never even saved.
-
-These tests assert the round-trip works for every persisted service.
+These tests protect persistence round trips and the registry contract.
 """
+import ast
 import importlib
 from pathlib import Path
 
@@ -24,55 +19,468 @@ import pytest
 from ministack.app import _state_map  # noqa: E402  (intentional internal import)
 from ministack.core import persistence
 
-# Services that MUST be persistence-round-trippable. Every entry of
-# `_state_map` qualifies. The set is materialised here so an addition to
-# `_state_map` automatically gets coverage.
-ALL_PERSISTED_SERVICES = sorted(_state_map.items())
-
 
 def _module(mod_name):
     return importlib.import_module(f"ministack.services.{mod_name}")
 
 
-@pytest.mark.parametrize("svc_key,mod_name", ALL_PERSISTED_SERVICES)
+def _registered_service_modules():
+    """Return all modules that participate in the service-state contract.
+
+    The optional sub_modules registry field is included before Phase 2 adds
+    it, so adding one automatically extends this contract test.
+    """
+    from ministack.app import SERVICE_REGISTRY
+
+    return sorted(
+        {
+            module
+            for config in SERVICE_REGISTRY.values()
+            for module in (config["module"], *config.get("sub_modules", ()))
+        }
+    )
+
+
+@pytest.mark.parametrize("mod_name", _registered_service_modules())
+def test_registered_service_defines_state_contract(mod_name):
+    """Every registered service exposes the uniform persistence API."""
+    spec = importlib.util.find_spec(f"ministack.services.{mod_name}")
+    assert spec and spec.origin, f"Cannot find service module {mod_name}"
+    module_ast = ast.parse(Path(spec.origin).read_text())
+    functions = {
+        node.name
+        for node in module_ast.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    assert {"get_state", "load_persisted_state", "reset"} <= functions, (
+        f"Service module {mod_name} must define get_state(), "
+        "load_persisted_state(data), and reset()."
+    )
+    assert "restore_state" not in functions, (
+        f"Service module {mod_name} exposes restore_state(); use the public "
+        "load_persisted_state(data) contract instead."
+    )
+
+
+def test_tests_restore_state_only_through_the_public_contract():
+    """Tests must not couple themselves to service implementation helpers."""
+    private_calls = []
+    for path in Path(__file__).parent.glob("test_*.py"):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr == "_restore_state":
+                private_calls.append(f"{path.name}:{node.lineno}")
+            elif isinstance(node, ast.Name) and node.id == "_restore_state":
+                private_calls.append(f"{path.name}:{node.lineno}")
+
+    assert not private_calls, (
+        "Tests must restore state through load_persisted_state(), not private "
+        f"helpers: {', '.join(private_calls)}"
+    )
+
+
+@pytest.mark.parametrize("svc_key,mod_name", sorted(_state_map.items()))
 def test_service_has_restore_path(svc_key, mod_name):
     """Every service in `_state_map` must expose a way to restore its own state.
 
-    Either:
-      (a) the module calls `load_state()` itself at import time, OR
-      (b) the module exposes `load_persisted_state(data)` AND is wired into
-          `_load_persisted_state()` in app.py.
+    The registry-driven app loader dispatches each saved snapshot through the
+    module's `load_persisted_state(data)` contract. Without that method its
+    state is written on shutdown and dropped on the next boot, silently.
     """
     mod = _module(mod_name)
-    src = Path(mod.__file__).read_text()
-
-    # (a) self-restore at import: must import load_state AND call it.
-    self_restoring = (
-        "from ministack.core.persistence import" in src
-        and "load_state" in src
-        and "load_state(" in src
+    if not mod.get_state():
+        pytest.skip(f"{mod_name} holds no state to restore")
+    assert callable(getattr(mod, "load_persisted_state", None)), (
+        f"Service `{svc_key}` (module `{mod_name}`) is in `_state_map` and will "
+        f"be saved on shutdown, but has no restore path on startup."
     )
 
-    # (b) centrally restored: must define load_persisted_state and be in
-    # the explicit allow-list in app.py's `_load_persisted_state()`.
-    has_central_method = hasattr(mod, "load_persisted_state")
-    centrally_restored = has_central_method and svc_key in {
-        "apigateway", "apigateway_v1", "servicediscovery",
+
+def test_account_region_scoped_dict_isolates_account_and_region():
+    """Account+region scoped stores keep same-name resources independent."""
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    original_account = get_account_id()
+    original_region = get_region()
+
+    try:
+        store = AccountRegionScopedDict()
+        set_request_account_id("111111111111")
+        set_request_region("us-east-1")
+        store["same-name"] = {"scope": "111/east"}
+
+        set_request_region("us-west-2")
+        store["same-name"] = {"scope": "111/west"}
+
+        set_request_account_id("222222222222")
+        set_request_region("us-east-1")
+        store["same-name"] = {"scope": "222/east"}
+
+        assert len(store) == 1
+        assert store["same-name"] == {"scope": "222/east"}
+
+        set_request_account_id("111111111111")
+        assert store["same-name"] == {"scope": "111/east"}
+        set_request_region("us-west-2")
+        assert store["same-name"] == {"scope": "111/west"}
+    finally:
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_account_region_scoped_dict_persistence_round_trip(monkeypatch, tmp_path):
+    """Account+region scoped stores must survive the JSON persistence path."""
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    original_account = get_account_id()
+    original_region = get_region()
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    try:
+        store = AccountRegionScopedDict()
+        set_request_account_id("111111111111")
+        set_request_region("us-east-1")
+        store["same-name"] = {"region": "us-east-1"}
+        store[("compound", "key")] = {"region": "us-east-1"}
+        set_request_region("us-west-2")
+        store["same-name"] = {"region": "us-west-2"}
+
+        persistence.save_state("account-region-scoped", {"store": store})
+        loaded = persistence.load_state("account-region-scoped")
+        assert loaded is not None
+
+        restored = loaded["store"]
+        set_request_region("us-east-1")
+        assert restored["same-name"] == {"region": "us-east-1"}
+        assert restored[("compound", "key")] == {"region": "us-east-1"}
+        set_request_region("us-west-2")
+        assert restored["same-name"] == {"region": "us-west-2"}
+    finally:
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_account_region_scoped_dict_adopts_legacy_values_to_arn_region():
+    """Legacy account-scoped stores should migrate into the region in the value ARN."""
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    original_account = get_account_id()
+    original_region = get_region()
+
+    try:
+        legacy = AccountScopedDict()
+        legacy._data[("111111111111", "west-sm")] = {
+            "stateMachineArn": "arn:aws:states:us-west-2:111111111111:stateMachine:west-sm",
+        }
+        legacy._data[("111111111111", "no-arn")] = {"name": "no-arn"}
+
+        restored = AccountRegionScopedDict()
+        set_request_account_id("111111111111")
+        set_request_region("us-east-1")
+        restored.update(legacy)
+
+        assert restored.get_scoped("111111111111", "us-west-2", "west-sm") == {
+            "stateMachineArn": "arn:aws:states:us-west-2:111111111111:stateMachine:west-sm",
+        }
+        assert restored.get_scoped("111111111111", "us-east-1", "west-sm") is None
+        assert restored.get_scoped("111111111111", "us-east-1", "no-arn") == {"name": "no-arn"}
+    finally:
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_account_region_scoped_dict_update_preserves_tuple_resource_keys():
+    """Plain dict updates should treat tuple keys as normal resource keys."""
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    original_account = get_account_id()
+    original_region = get_region()
+
+    try:
+        store = AccountRegionScopedDict()
+        set_request_account_id("111111111111")
+        set_request_region("us-east-1")
+        store.update({("bucket", "object-key"): {"value": "east"}})
+
+        assert store[("bucket", "object-key")] == {"value": "east"}
+        assert store.get_scoped("111111111111", "us-east-1", ("bucket", "object-key")) == {"value": "east"}
+        assert store.get_scoped("bucket", "us-east-1", "object-key") is None
+    finally:
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_account_region_scoped_dict_update_adopts_plain_values_to_arn_region():
+    """Plain legacy dict restores should use the resource ARN region when present."""
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    original_account = get_account_id()
+    original_region = get_region()
+
+    try:
+        store = AccountRegionScopedDict()
+        set_request_account_id("111111111111")
+        set_request_region("us-east-1")
+        store.update({
+            "west-sm": {
+                "stateMachineArn": "arn:aws:states:us-west-2:111111111111:stateMachine:west-sm",
+            },
+        })
+
+        assert store.get_scoped("111111111111", "us-west-2", "west-sm") == {
+            "stateMachineArn": "arn:aws:states:us-west-2:111111111111:stateMachine:west-sm",
+        }
+        assert store.get_scoped("111111111111", "us-east-1", "west-sm") is None
+    finally:
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_account_region_scoped_dict_update_prefers_key_arn_region():
+    """Legacy ARN-keyed stores should not be scoped by unrelated value ARNs."""
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    original_account = get_account_id()
+    original_region = get_region()
+    east_arn = "arn:aws:states:us-east-1:111111111111:stateMachine:east-sm"
+    west_role_arn = "arn:aws:iam:us-west-2:111111111111:role/west-role"
+
+    try:
+        store = AccountRegionScopedDict()
+        set_request_account_id("111111111111")
+        set_request_region("us-west-2")
+        store.update({east_arn: {"RoleArn": west_role_arn}})
+
+        assert store.get_scoped("111111111111", "us-east-1", east_arn) == {"RoleArn": west_role_arn}
+        assert store.get_scoped("111111111111", "us-west-2", east_arn) is None
+    finally:
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_account_scoped_dict_helpers_remain_account_only():
+    """Scoped helper methods on AccountScopedDict continue to ignore region."""
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        set_request_account_id,
+    )
+
+    original_account = get_account_id()
+
+    try:
+        store = AccountScopedDict()
+        store.set_scoped("111111111111", "us-west-2", "same-name", {"value": "helper"})
+        set_request_account_id("111111111111")
+
+        assert store["same-name"] == {"value": "helper"}
+        store["normal"] = {"value": "normal"}
+        assert store.get_scoped("111111111111", "us-east-1", "normal") == {"value": "normal"}
+        assert store.contains_scoped("111111111111", "us-west-2", "normal")
+        assert store.pop_scoped("111111111111", "us-west-2", "normal") == {"value": "normal"}
+        assert "normal" not in store
+    finally:
+        set_request_account_id(original_account)
+
+
+def test_appsync_events_legacy_children_follow_parent_api_region():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import appsync_events as service
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    api_region = "us-west-2"
+    api_id = "legacy-regional-api"
+    orphan_api_id = "legacy-orphan-api"
+
+    apis = AccountScopedDict()
+    apis._data[(account_id, api_id)] = {
+        "name": "legacy-api",
+        "apiArn": f"arn:aws:appsync:{api_region}:{account_id}:apis/{api_id}",
+    }
+    namespaces = AccountScopedDict()
+    namespaces._data[(account_id, api_id)] = {
+        "default": {"created": 1},
+    }
+    namespaces._data[(account_id, orphan_api_id)] = {
+        "orphan": {"created": 2},
+    }
+    api_keys = AccountScopedDict()
+    api_keys._data[(account_id, api_id)] = {
+        "da2-legacy": {"description": "legacy"},
     }
 
-    assert self_restoring or centrally_restored, (
-        f"Service `{svc_key}` (module `{mod_name}`) is in `_state_map` and "
-        f"will be saved on shutdown, but has no restore path on startup. "
-        f"Either add `load_state()` at module top, or define "
-        f"`load_persisted_state(data)` and add it to "
-        f"`_load_persisted_state()` in app.py."
+    service.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        service.load_persisted_state(
+            {
+                "apis": apis,
+                "channel_namespaces": namespaces,
+                "api_keys": api_keys,
+            }
+        )
+
+        assert service._apis.get_scoped(account_id, api_region, api_id)[
+            "apiArn"
+        ].startswith(f"arn:aws:appsync:{api_region}:")
+        assert service._channel_namespaces.get_scoped(
+            account_id, api_region, api_id
+        ) == {"default": {"created": 1}}
+        assert service._api_keys.get_scoped(account_id, api_region, api_id) == {
+            "da2-legacy": {"description": "legacy"},
+        }
+        assert (
+            service._channel_namespaces.get_scoped(
+                account_id, boot_region, api_id
+            )
+            is None
+        )
+        assert (
+            service._api_keys.get_scoped(account_id, boot_region, api_id) is None
+        )
+        assert service._channel_namespaces.get_scoped(
+            account_id, boot_region, orphan_api_id
+        ) == {"orphan": {"created": 2}}
+    finally:
+        service.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_appsync_events_v2_region_scoped_state_round_trip(monkeypatch, tmp_path):
+    import json as _json
+
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
     )
+    from ministack.services import appsync_events as service
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    api_region = "us-west-2"
+    api_id = "current-regional-api"
+
+    apis = AccountRegionScopedDict()
+    apis.set_scoped(
+        account_id,
+        api_region,
+        api_id,
+        {
+            "name": "current-api",
+            "apiArn": f"arn:aws:appsync:{api_region}:{account_id}:apis/{api_id}",
+        },
+    )
+    namespaces = AccountRegionScopedDict()
+    namespaces.set_scoped(
+        account_id,
+        api_region,
+        api_id,
+        {"default": {"created": 1}},
+    )
+    api_keys = AccountRegionScopedDict()
+    api_keys.set_scoped(
+        account_id,
+        api_region,
+        api_id,
+        {"da2-current": {"description": "current"}},
+    )
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+    (tmp_path / "appsync_events.json").write_text(
+        _json.dumps(
+            {
+                "__ministack_format__": 2,
+                "payload": {
+                    "apis": apis,
+                    "channel_namespaces": namespaces,
+                    "api_keys": api_keys,
+                },
+            },
+            default=persistence._json_default,
+        )
+    )
+
+    loaded = persistence.load_state("appsync_events")
+    service.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        service.load_persisted_state(loaded)
+
+        assert service._apis.get_scoped(account_id, api_region, api_id)[
+            "apiArn"
+        ].startswith(f"arn:aws:appsync:{api_region}:")
+        assert service._channel_namespaces.get_scoped(
+            account_id, api_region, api_id
+        ) == {"default": {"created": 1}}
+        assert service._api_keys.get_scoped(account_id, api_region, api_id) == {
+            "da2-current": {"description": "current"},
+        }
+        assert service._apis.get_scoped(account_id, boot_region, api_id) is None
+    finally:
+        service.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
 
 
 def test_pipes_is_in_state_map():
-    """`pipes` defines `get_state()` so it expects to be persisted, but it
-    is missing from `_state_map`. Without this, pipe definitions evaporate
-    on every restart even before considering restore-path coverage."""
+    """The registry-derived map includes the Pipes service contract."""
     pipes = _module("pipes")
     assert hasattr(pipes, "get_state"), "pipes module no longer has get_state — update this test"
     assert "pipes" in _state_map, (
@@ -81,50 +489,95 @@ def test_pipes_is_in_state_map():
     )
 
 
-def test_state_map_services_without_endpoint_are_eagerly_imported():
-    """Services in `_state_map` but NOT in `SERVICE_REGISTRY` have no
-    AWS endpoint, so the lazy router never imports them. Their
-    import-time `load_state()` block therefore never fires unless
-    `_load_persisted_state()` eagerly imports them at startup.
+def test_state_map_is_derived_from_service_registry():
+    """The registry is the only declaration point for persisted modules."""
+    from ministack.app import SERVICE_REGISTRY, _registry_module_names, _registry_state_map
 
-    Without this, persisted RUNNING pipes don't resume their poller
-    after warm-boot until something else happens to import the
-    module (e.g. a new CFN pipe registration) — silently breaking
-    event forwarding for the entire window between restart and the
-    next pipe-related API call."""
-    import inspect
+    expected = {}
+    for config in SERVICE_REGISTRY.values():
+        module = config["module"]
+        expected[config.get("state_key", module)] = module
+        expected.update({sub_module: sub_module for sub_module in config.get("sub_modules", ())})
 
-    from ministack.app import SERVICE_REGISTRY, _load_persisted_state
+    assert _state_map == expected
+    assert _registry_state_map() == expected
+    assert _registry_module_names() == set(expected.values())
 
-    # Find services that need eager import.
-    routable_modules = {cfg["module"] for cfg in SERVICE_REGISTRY.values()}
-    needs_eager_import = [
-        mod_name for _, mod_name in _state_map.items()
-        if mod_name not in routable_modules
-    ]
-    assert needs_eager_import, (
-        "Test premise broken: every persisted module is now also routable, "
-        "so this test would never catch the bug it's guarding against. "
-        "Update it or delete it."
-    )
 
-    # The eager-import section in _load_persisted_state must reference each
-    # such module by name, otherwise it stays unimported and its restore
-    # never runs.
-    src = inspect.getsource(_load_persisted_state)
-    for mod_name in needs_eager_import:
-        assert f'"{mod_name}"' in src or f"'{mod_name}'" in src, (
-            f"Service `{mod_name}` is in `_state_map` but not in "
-            f"`SERVICE_REGISTRY`, and `_load_persisted_state()` doesn't "
-            f"eagerly import it. With PERSIST_STATE=1, its persisted "
-            f"state will be silently ignored on warm-boot."
+def test_save_dict_includes_sibling_imported_modules():
+    """Regression for #704. `appsync_events` is reached only via sibling
+    import from `appsync.py` for REST traffic — the routed handler for
+    `appsync-events` never fires (Event API traffic arrives under the
+    `appsync` credential scope). Same shape: `apigateway_v1` is reached
+    via sibling import from `apigateway.py`. If the shutdown save loop
+    only consults `_loaded_modules` (populated by `_get_module`), those
+    sibling-imported modules are silently skipped and their state is
+    dropped. The fallback through `sys.modules` is the fix."""
+    import sys as _sys
+
+    # Force-import appsync_events the way appsync.py does it — a plain
+    # sibling import that bypasses `_get_module` and therefore does NOT
+    # populate `_loaded_modules`.
+    import ministack.services.appsync_events  # noqa: F401
+    from ministack.app import _build_persistence_save_dict, _loaded_modules
+
+    # Simulate the bug condition: module is in sys.modules but absent
+    # from _loaded_modules.
+    saved = _loaded_modules.pop("appsync_events", None)
+    try:
+        assert "ministack.services.appsync_events" in _sys.modules, (
+            "test premise broken — module isn't in sys.modules"
         )
+        assert "appsync_events" not in _loaded_modules, (
+            "test premise broken — module is still in _loaded_modules"
+        )
+
+        save_dict = _build_persistence_save_dict()
+
+        assert "appsync_events" in save_dict, (
+            "shutdown save loop dropped appsync_events even though the "
+            "module was imported via a sibling import. The sys.modules "
+            "fallback in `_build_persistence_save_dict` is missing or broken."
+        )
+        # The value must be the bound get_state method, not the result.
+        assert callable(save_dict["appsync_events"]), (
+            "save_dict should map to a callable (get_state method ref) — "
+            "save_all invokes it. Got %r" % (save_dict["appsync_events"],)
+        )
+    finally:
+        if saved is not None:
+            _loaded_modules["appsync_events"] = saved
+
+
+def test_save_dict_skips_modules_never_imported(monkeypatch):
+    """The sys.modules fallback must NOT save state for modules that
+    were never imported at all — there's no state to capture and any
+    `get_state()` call on a non-imported module would attribute-error.
+    Defensive guard: ensure the fallback path's `hasattr` check works."""
+
+    import sys
+
+    from ministack.app import _build_persistence_save_dict, _loaded_modules, _state_map
+
+    # Every registered module is now represented in `_state_map`, so force a
+    # known entry absent from both sources instead of relying on an exclusion.
+    target = "account"
+    assert target in _state_map.values(), "test premise broken — account must be registry-derived"
+    monkeypatch.delitem(_loaded_modules, target, raising=False)
+    monkeypatch.delitem(sys.modules, f"ministack.services.{target}", raising=False)
+
+    # Even after the fallback path runs, an unloaded module must not appear.
+    save_dict = _build_persistence_save_dict()
+    assert target not in save_dict, (
+        "save_dict picked up a module that was absent from both module caches — "
+        "the fallback's unloaded-module guard is broken."
+    )
 
 
 # ── Functional round-trip tests ────────────────────────────────────────
 
 def _round_trip(mod_name, svc_key, populate_fn, observe_fn):
-    """Helper: populate -> save -> reset -> restore -> observe."""
+    """Helper: populate -> save -> reset -> registry-style restore -> observe."""
     mod = _module(mod_name)
     mod.reset()
     populate_fn(mod)
@@ -136,22 +589,14 @@ def _round_trip(mod_name, svc_key, populate_fn, observe_fn):
     # Wipe in-memory state — this simulates a process restart.
     mod.reset()
 
-    # Restore via the same code path the module would use at import.
+    # Restore via the same uniform contract used by the registry loader.
     loaded = persistence.load_state(svc_key)
     assert loaded is not None, (
         f"persistence.load_state({svc_key!r}) returned None — state file "
         "was not written by save_state(). Check `_state_map` membership "
         "and `get_state()` correctness."
     )
-    if hasattr(mod, "restore_state"):
-        mod.restore_state(loaded)
-    elif hasattr(mod, "load_persisted_state"):
-        mod.load_persisted_state(loaded)
-    else:
-        pytest.fail(
-            f"Module {mod_name} has neither restore_state nor "
-            "load_persisted_state — cannot restore."
-        )
+    mod.load_persisted_state(loaded)
 
     # Cleanup state file before observation, so a failure doesn't pollute
     # the next test run.
@@ -194,6 +639,695 @@ def test_backup_round_trip():
     _round_trip("backup", "backup", populate, observe)
 
 
+def test_route53_private_zone_vpcs_round_trip():
+    vpc = {"VPCRegion": "us-west-2", "VPCId": "vpc-0123456789abcdef0"}
+    body = (
+        '<CreateHostedZoneRequest xmlns="https://route53.amazonaws.com/doc/2013-04-01/">'
+        "<Name>persisted.example.internal</Name><CallerReference>persist-1</CallerReference>"
+        f"<VPC><VPCRegion>{vpc['VPCRegion']}</VPCRegion><VPCId>{vpc['VPCId']}</VPCId></VPC>"
+        "</CreateHostedZoneRequest>"
+    ).encode()
+    zone_ids = []
+
+    def populate(mod):
+        status, _, _ = mod._create_hosted_zone(body, {})
+        assert status == 201
+        zone_ids.extend(mod._zones.keys())
+        # A zone persisted before VPC associations existed has no "vpcs" key.
+        mod._zones["ZLEGACYPRIVATE1"] = {
+            "id": "ZLEGACYPRIVATE1", "name": "legacy.example.internal.",
+            "caller_reference": "legacy", "comment": "", "private": True,
+        }
+
+    def observe(mod):
+        assert mod._zones[zone_ids[0]]["vpcs"] == [vpc]
+        status, _, out = mod._list_hosted_zones_by_vpc({"vpcid": vpc["VPCId"], "vpcregion": vpc["VPCRegion"]})
+        assert status == 200 and zone_ids[0].encode() in out
+        status, _, out = mod._get_hosted_zone("ZLEGACYPRIVATE1")
+        assert status == 200 and b"<VPCs />" in out
+
+    _round_trip("route53", "route53", populate, observe)
+
+
+def test_s3_mrap_round_trip():
+    """A multi-region access point outlives a restart. Its alias is baked into
+    client configuration, so member buckets coming back without the alias
+    fronting them fails where a missing bucket would not."""
+    def populate(mod):
+        mod._mraps["ea0672af90364.mrap"] = {
+            "Name": "app-release",
+            "Alias": "ea0672af90364.mrap",
+            "Regions": ["app-us-east-1-release", "app-eu-west-1-release"],
+            "CreatedAt": "2026-01-01T00:00:00Z",
+        }
+
+    def observe(mod):
+        mrap = mod._mraps["ea0672af90364.mrap"]
+        assert mrap["Name"] == "app-release"
+        assert mrap["Regions"] == ["app-us-east-1-release", "app-eu-west-1-release"]
+
+    _round_trip("s3", "s3", populate, observe)
+
+
+def test_s3_access_points_round_trip_every_tenant():
+    """Access points are scoped by account and region; a restart keeps all of
+    them, not only the tenant that saved."""
+    record = {"Name": "ap", "Bucket": "data", "Alias": "ap-abc-s3alias", "NetworkOrigin": "Internet"}
+
+    def populate(mod):
+        mod._access_points.set_scoped("111111111111", "us-east-1", "ap", dict(record))
+        mod._access_points.set_scoped("222222222222", "eu-west-1", "ap", {**record, "Bucket": "other"})
+
+    def observe(mod):
+        assert mod._access_points.get_scoped("111111111111", "us-east-1", "ap")["Bucket"] == "data"
+        assert mod._access_points.get_scoped("222222222222", "eu-west-1", "ap")["Bucket"] == "other"
+
+    _round_trip("s3", "s3", populate, observe)
+
+
+def test_s3_object_lambda_access_points_round_trip_without_pending_requests():
+    """Object Lambda Access Points outlive a restart; requests waiting for a
+    WriteGetObjectResponse are in flight only and are never saved."""
+    def populate(mod):
+        mod._object_lambda_access_points.set_scoped("111111111111", "us-east-1", "olap", {
+            "Name": "olap", "Alias": {"Value": "olap-abc--ol-s3", "Status": "READY"}})
+        mod._olap_requests[("route", "token")] = {"done": False}
+
+    def observe(mod):
+        assert mod._object_lambda_access_points.get_scoped(
+            "111111111111", "us-east-1", "olap")["Alias"]["Value"] == "olap-abc--ol-s3"
+        assert "olap_requests" not in mod.get_state()
+
+    _round_trip("s3", "s3", populate, observe)
+
+
+def test_cloudfront_vpc_origins_round_trip_every_account():
+    """CloudFront VPC origins are account-scoped; a restart keeps every account's."""
+    def record(account, vo_id, version):
+        return {"Id": vo_id, "Arn": f"arn:aws:cloudfront::{account}:vpcorigin/{vo_id}", "AccountId": account,
+                "Status": "Deployed", "Version": version, "VpcOriginEndpointConfig": {"Name": "api"}}
+
+    def populate(mod):
+        mod._vpc_origins.set_scoped("111111111111", "us-east-1", "vo_a", record("111111111111", "vo_a", 4))
+        mod._vpc_origins.set_scoped("222222222222", "us-east-1", "vo_b", record("222222222222", "vo_b", 6))
+        # A deleted origin had reached version 8: its ETags must stay valid too (R1 U10/delete-C-after-gone).
+        for version in range(1, 9):
+            mod._vpc_origin_etag(version)
+
+    def observe(mod):
+        assert mod._vpc_origins.get_scoped("111111111111", "us-east-1", "vo_a")["AccountId"] == "111111111111"
+        assert mod._vpc_origins.get_scoped("222222222222", "us-east-1", "vo_b")["Version"] == 6
+        assert not mod._vpc_origins.contains_scoped("111111111111", "us-east-1", "vo_b")
+        # Every version's ETag issued before the restart is valid again for If-Match.
+        assert sorted(set(mod._vpc_origin_etags_issued.values())) == list(range(1, 9))
+
+    _round_trip("cloudfront", "cloudfront", populate, observe)
+
+
+def test_transcribe_round_trip():
+    import time as _time
+
+    def populate(mod):
+        mod._jobs["job-test"] = {
+            "TranscriptionJobName": "job-test",
+            "TranscriptionJobStatus": "COMPLETED",
+            "LanguageCode": "en-US",
+            "Media": {"MediaFileUri": "s3://media/call.mp3"},
+            "Transcript": {
+                "TranscriptFileUri": "http://localhost:4566/out/job-test.json"
+            },
+            "CreationTime": _time.time(),
+            "StartTime": _time.time(),
+            "CompletionTime": _time.time(),
+            "OutputLocationType": "SERVICE_BUCKET",
+            "_run_id": "run-1",
+            "_output_bucket": "out",
+            "_output_key": "job-test.json",
+        }
+
+    def observe(mod):
+        job = mod._jobs.get("job-test")
+        assert job is not None
+        assert job["TranscriptionJobStatus"] == "COMPLETED"
+        # A completed job's transcript pointer and media reference are what
+        # callers read after a warm boot; losing either leaves GetTranscriptionJob
+        # reporting COMPLETED with nothing to fetch.
+        assert job["Transcript"]["TranscriptFileUri"].endswith("job-test.json")
+        assert job["Media"]["MediaFileUri"] == "s3://media/call.mp3"
+        assert job["_output_bucket"] == "out"
+
+    _round_trip("transcribe", "transcribe", populate, observe)
+
+
+def test_transcribe_jobs_round_trip_outside_boot_region():
+    """Transcribe jobs are region-scoped. `AccountRegionScopedDict.__bool__`
+    is scope-relative, so a snapshot holding jobs only in regions other than
+    the one restore runs in must not be treated as empty."""
+    import time as _time
+
+    from ministack.core.responses import request_scope
+
+    def populate(mod):
+        with request_scope("000000000000", "eu-west-1"):
+            mod._jobs["eu-job"] = {
+                "TranscriptionJobName": "eu-job",
+                "TranscriptionJobStatus": "COMPLETED",
+                "CreationTime": _time.time(),
+                "CompletionTime": _time.time(),
+                "Media": {"MediaFileUri": "s3://b/a.mp3"},
+                "OutputLocationType": "SERVICE_BUCKET",
+                "_output_bucket": "b",
+                "_output_key": "k.json",
+            }
+
+    def observe(mod):
+        with request_scope("000000000000", "eu-west-1"):
+            job = mod._jobs.get("eu-job")
+            assert job is not None, "a job outside the restoring region was dropped"
+            assert job["TranscriptionJobStatus"] == "COMPLETED"
+
+    _round_trip("transcribe", "transcribe", populate, observe)
+
+
+def test_transcribe_round_trip_fails_a_job_left_mid_flight():
+    """A restart leaves no worker behind, so a job restored as QUEUED or
+    IN_PROGRESS would strand every caller polling GetTranscriptionJob."""
+    import time as _time
+
+    def populate(mod):
+        mod._jobs["stuck-job"] = {
+            "TranscriptionJobName": "stuck-job",
+            "TranscriptionJobStatus": "IN_PROGRESS",
+            "CreationTime": _time.time(),
+            "Media": {"MediaFileUri": "s3://b/a.mp3"},
+            "OutputLocationType": "SERVICE_BUCKET",
+            "_output_bucket": "b",
+            "_output_key": "k.json",
+        }
+
+    def observe(mod):
+        job = mod._jobs.get("stuck-job")
+        assert job is not None
+        assert job["TranscriptionJobStatus"] == "FAILED"
+        assert job["CompletionTime"] is not None
+        assert "restart" in job["FailureReason"]
+
+    _round_trip("transcribe", "transcribe", populate, observe)
+
+
+def test_translate_round_trip():
+    import time as _time
+
+    def populate(mod):
+        mod._jobs["1c1838f470806ab9c3e0057f14717bed"] = {
+            "JobId": "1c1838f470806ab9c3e0057f14717bed",
+            "JobName": "nightly-transcript-translation",
+            "JobStatus": "COMPLETED",
+            "JobDetails": {
+                "TranslatedDocumentsCount": 2,
+                "DocumentsWithErrorsCount": 0,
+                "InputDocumentsCount": 2,
+            },
+            "SourceLanguageCode": "en",
+            "TargetLanguageCodes": ["fr"],
+            "SubmittedTime": _time.time(),
+            "EndTime": _time.time(),
+            "InputDataConfig": {
+                "S3Uri": "s3://corpus/input/",
+                "ContentType": "application/x-xliff+xml",
+            },
+            "OutputDataConfig": {
+                "S3Uri": (
+                    "s3://corpus/output/000000000000-TranslateText-"
+                    "1c1838f470806ab9c3e0057f14717bed/"
+                )
+            },
+            "DataAccessRoleArn": "arn:aws:iam::000000000000:role/TranslateBatchRole",
+            "_run_id": "run-1",
+            "_client_token": "token-1",
+            "_output_bucket": "corpus",
+            "_output_prefix": "output/000000000000-TranslateText-1c1838f470806ab9c3e0057f14717bed/",
+        }
+        mod._client_tokens["token-1"] = "1c1838f470806ab9c3e0057f14717bed"
+
+    def observe(mod):
+        job = mod._jobs.get("1c1838f470806ab9c3e0057f14717bed")
+        assert job is not None
+        assert job["JobStatus"] == "COMPLETED"
+        # The rewritten output location is the only pointer a caller has to the
+        # translated documents; losing it leaves Describe reporting COMPLETED
+        # with nothing to fetch.
+        assert job["OutputDataConfig"]["S3Uri"].endswith(
+            "000000000000-TranslateText-1c1838f470806ab9c3e0057f14717bed/"
+        )
+        assert job["JobDetails"]["TranslatedDocumentsCount"] == 2
+        # The idempotency map has to survive too, or a client retrying with the
+        # same token after a restart starts a duplicate job.
+        assert mod._client_tokens.get("token-1") == "1c1838f470806ab9c3e0057f14717bed"
+
+    _round_trip("translate", "translate", populate, observe)
+
+
+def test_translate_jobs_round_trip_outside_boot_region():
+    """Translate jobs are region-scoped. `AccountRegionScopedDict.__bool__` is
+    scope-relative, so a snapshot holding jobs only in regions other than the
+    one restore runs in must not be treated as empty."""
+    import time as _time
+
+    from ministack.core.responses import request_scope
+
+    def populate(mod):
+        with request_scope("000000000000", "eu-west-1"):
+            mod._jobs["eu-job"] = {
+                "JobId": "eu-job",
+                "JobStatus": "COMPLETED",
+                "SourceLanguageCode": "en",
+                "TargetLanguageCodes": ["de"],
+                "SubmittedTime": _time.time(),
+                "EndTime": _time.time(),
+                "InputDataConfig": {"S3Uri": "s3://b/in/", "ContentType": "text/plain"},
+                "OutputDataConfig": {"S3Uri": "s3://b/out/"},
+                "_output_bucket": "b",
+                "_output_prefix": "out/",
+            }
+
+    def observe(mod):
+        with request_scope("000000000000", "eu-west-1"):
+            job = mod._jobs.get("eu-job")
+            assert job is not None, "a job outside the restoring region was dropped"
+            assert job["JobStatus"] == "COMPLETED"
+
+    _round_trip("translate", "translate", populate, observe)
+
+
+def test_translate_round_trip_fails_a_job_left_mid_flight():
+    """A restart leaves no worker behind, so a job restored as SUBMITTED,
+    IN_PROGRESS or STOP_REQUESTED would strand every caller polling
+    DescribeTextTranslationJob."""
+    import time as _time
+
+    def populate(mod):
+        mod._jobs["stuck-job"] = {
+            "JobId": "stuck-job",
+            "JobStatus": "IN_PROGRESS",
+            "SourceLanguageCode": "en",
+            "TargetLanguageCodes": ["fr"],
+            "SubmittedTime": _time.time(),
+            "InputDataConfig": {"S3Uri": "s3://b/in/", "ContentType": "text/plain"},
+            "OutputDataConfig": {"S3Uri": "s3://b/out/"},
+            "_output_bucket": "b",
+            "_output_prefix": "out/",
+        }
+
+    def observe(mod):
+        job = mod._jobs.get("stuck-job")
+        assert job is not None
+        assert job["JobStatus"] == "FAILED"
+        assert job["EndTime"] is not None
+        assert "restart" in job["Message"]
+
+    _round_trip("translate", "translate", populate, observe)
+
+
+def test_location_round_trip():
+    def populate(mod):
+        mod._trackers["trk-test"] = {
+            "TrackerName": "trk-test",
+            "TrackerArn": "arn:aws:geo:us-east-1:000000000000:tracker/trk-test",
+            "CreateTime": 1000.0,
+            "UpdateTime": 1000.0,
+            "positions": {
+                "dev-1": {
+                    "latest": {"DeviceId": "dev-1", "SampleTime": 1000.0,
+                               "ReceivedTime": 1000.5, "Position": [11.0, 48.0]},
+                    "history": [{"DeviceId": "dev-1", "SampleTime": 1000.0,
+                                 "ReceivedTime": 1000.5, "Position": [11.0, 48.0]}],
+                },
+            },
+        }
+
+    def observe(mod):
+        rec = mod._trackers["trk-test"]
+        assert rec["TrackerArn"].endswith(":tracker/trk-test")
+        assert rec["positions"]["dev-1"]["latest"]["Position"] == [11.0, 48.0]
+
+    _round_trip("location", "location", populate, observe)
+
+
+def test_cloudformation_round_trip():
+    """CloudFormation stack metadata (stacks, events, exports, change sets)
+    survives a PERSIST_STATE stop/restore cycle — otherwise ListStacks /
+    DescribeStacks / ListExports come back empty after a warm boot even though
+    the provisioned resources persist. (#1345, item 8)"""
+    def populate(mod):
+        mod._stacks["stk-rt"] = {
+            "StackName": "stk-rt",
+            "StackId": "arn:aws:cloudformation:us-east-1:000000000000:stack/stk-rt/rt",
+            "StackStatus": "CREATE_COMPLETE",
+            "Outputs": [{"OutputKey": "K", "OutputValue": "V"}],
+        }
+        mod._stack_events["arn:aws:cloudformation:us-east-1:000000000000:stack/stk-rt/rt"] = [
+            {"ResourceStatus": "CREATE_COMPLETE"},
+        ]
+        mod._exports["exp-rt"] = {"Name": "exp-rt", "Value": "V", "ExportingStackId": "stk-rt"}
+        mod._change_sets["cs-rt"] = {"ChangeSetName": "cs-rt", "Status": "CREATE_COMPLETE"}
+
+    def observe(mod):
+        stack = mod._stacks.get("stk-rt")
+        assert stack is not None and stack["StackStatus"] == "CREATE_COMPLETE"
+        assert stack["Outputs"] == [{"OutputKey": "K", "OutputValue": "V"}]
+        assert mod._stack_events.get(
+            "arn:aws:cloudformation:us-east-1:000000000000:stack/stk-rt/rt") is not None
+        assert mod._exports.get("exp-rt") is not None
+        assert mod._change_sets.get("cs-rt") is not None
+
+    _round_trip("cloudformation", "cloudformation", populate, observe)
+
+
+def test_cloudformation_drift_and_failed_operation_round_trip():
+    """Drift results and the failed operation RollbackStack needs live on the
+    stack record, so they survive a PERSIST_STATE stop/restore cycle."""
+    stack_id = "arn:aws:cloudformation:us-east-1:000000000000:stack/stk-drift/rt"
+
+    def populate(mod):
+        drift = {"StackId": stack_id, "LogicalResourceId": "Q", "ResourceType": "AWS::SQS::Queue",
+                 "StackResourceDriftStatus": "MODIFIED", "Timestamp": "2026-09-30T00:00:00.000Z",
+                 "PropertyDifferences": [{"PropertyPath": "/VisibilityTimeout",
+                                          "ExpectedValue": "30", "ActualValue": "60",
+                                          "DifferenceType": "NOT_EQUAL"}]}
+        mod._stacks["stk-drift"] = {
+            "StackName": "stk-drift",
+            "StackId": stack_id,
+            "StackStatus": "UPDATE_FAILED",
+            "DriftInformation": {"StackDriftStatus": "DRIFTED",
+                                 "LastCheckTimestamp": "2026-09-30T00:00:00.000Z"},
+            "_drift_detections": {"det-1": {"StackId": stack_id,
+                                            "StackDriftDetectionId": "det-1",
+                                            "StackDriftStatus": "DRIFTED",
+                                            "DetectionStatus": "DETECTION_COMPLETE",
+                                            "DriftedStackResourceCount": 1,
+                                            "Timestamp": "2026-09-30T00:00:00.000Z"}},
+            "_resources": {"Q": {"ResourceType": "AWS::SQS::Queue", "_drift": drift,
+                                 "DriftInformation": {"StackResourceDriftStatus": "MODIFIED"}}},
+            "_failed_operation": {"is_update": True, "created": ["Q"],
+                                  "failed_update": ["Q", "AWS::SQS::Queue", "url", None, None, None],
+                                  "replaced_ids": [], "previous_stack": {"_resources": {}}},
+        }
+
+    def observe(mod):
+        stack = mod._stacks.get("stk-drift")
+        assert stack["DriftInformation"]["StackDriftStatus"] == "DRIFTED"
+        assert stack["_drift_detections"]["det-1"]["DriftedStackResourceCount"] == 1
+        assert stack["_resources"]["Q"]["_drift"]["PropertyDifferences"][0]["ActualValue"] == "60"
+        assert stack["_failed_operation"]["failed_update"][0] == "Q"
+        assert stack["_failed_operation"]["created"] == ["Q"]
+
+    _round_trip("cloudformation", "cloudformation", populate, observe)
+
+
+def test_backup_region_scoped_v3_state_is_idempotent(monkeypatch, tmp_path):
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    account_id = "123456789012"
+    region = "us-west-2"
+    vault_name = "regional-vault"
+    plan_id = "regional-plan"
+    selection_id = "regional-selection"
+    job_id = "regional-job"
+
+    def regional_store(key, value):
+        store = AccountRegionScopedDict()
+        store.set_scoped(account_id, region, key, value)
+        return store
+
+    state = {
+        "vaults": regional_store(
+            vault_name,
+            {
+                "BackupVaultName": vault_name,
+                "BackupVaultArn": f"arn:aws:backup:{region}:{account_id}:backup-vault:{vault_name}",
+            },
+        ),
+        "plans": regional_store(
+            plan_id,
+            {
+                "BackupPlanId": plan_id,
+                "BackupPlanArn": f"arn:aws:backup:{region}:{account_id}:backup-plan:{plan_id}",
+            },
+        ),
+        "selections": regional_store(
+            selection_id,
+            {
+                "SelectionId": selection_id,
+                "BackupPlanId": plan_id,
+                "Resources": [f"arn:aws:dynamodb:{region}:{account_id}:table/MyTable"],
+            },
+        ),
+        "jobs": regional_store(
+            job_id,
+            {
+                "BackupJobId": job_id,
+                "BackupJobArn": f"arn:aws:backup:{region}:{account_id}:backup-job:{job_id}",
+            },
+        ),
+    }
+
+    persistence.save_state("backup", state)
+    first_snapshot = _json.loads((tmp_path / "backup.json").read_text())
+    assert first_snapshot["__ministack_format__"] == 3
+
+    loaded = persistence.load_state("backup")
+    assert loaded is not None
+    persistence.save_state("backup", loaded)
+    second_snapshot = _json.loads((tmp_path / "backup.json").read_text())
+
+    assert second_snapshot == first_snapshot
+
+
+def test_backup_legacy_selection_migration_colocates_with_parent_plan():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import backup
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "123456789012"
+    boot_region = "us-east-1"
+    plan_region = "us-west-2"
+    plan_id = "legacy-plan"
+    colocated_selection_id = "legacy-selection"
+    orphan_selection_id = "orphan-selection"
+    vault_name = "legacy-vault"
+    job_id = "legacy-job"
+
+    def scoped_store(key, value):
+        store = AccountScopedDict()
+        store._data[(account_id, key)] = value
+        return store
+
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        backup.reset()
+
+        legacy_state = {
+            "vaults": scoped_store(
+                vault_name,
+                {
+                    "BackupVaultName": vault_name,
+                    "BackupVaultArn": f"arn:aws:backup:{plan_region}:{account_id}:backup-vault:{vault_name}",
+                },
+            ),
+            "plans": scoped_store(
+                plan_id,
+                {
+                    "BackupPlanId": plan_id,
+                    "BackupPlanArn": f"arn:aws:backup:{plan_region}:{account_id}:backup-plan:{plan_id}",
+                },
+            ),
+            "selections": AccountScopedDict(),
+            "jobs": scoped_store(
+                job_id,
+                {
+                    "BackupJobId": job_id,
+                    "BackupJobArn": f"arn:aws:backup:{plan_region}:{account_id}:backup-job:{job_id}",
+                },
+            ),
+        }
+        legacy_state["selections"]._data[(account_id, colocated_selection_id)] = {
+            "SelectionId": colocated_selection_id,
+            "BackupPlanId": plan_id,
+            "Resources": [f"arn:aws:dynamodb:{boot_region}:{account_id}:table/EastTable"],
+        }
+        legacy_state["selections"]._data[(account_id, orphan_selection_id)] = {
+            "SelectionId": orphan_selection_id,
+            "BackupPlanId": "missing-plan",
+            "Resources": [f"arn:aws:dynamodb:{plan_region}:{account_id}:table/WestTable"],
+        }
+
+        backup.load_persisted_state(legacy_state)
+
+        assert backup._vaults.get_scoped(account_id, plan_region, vault_name) is not None
+        assert backup._plans.get_scoped(account_id, plan_region, plan_id) is not None
+        assert backup._jobs.get_scoped(account_id, plan_region, job_id) is not None
+        assert backup._selections.get_scoped(
+            account_id, plan_region, colocated_selection_id
+        )["BackupPlanId"] == plan_id
+        assert backup._selections.get_scoped(
+            account_id, boot_region, colocated_selection_id
+        ) is None
+        assert backup._selections.get_scoped(
+            account_id, boot_region, orphan_selection_id
+        )["BackupPlanId"] == "missing-plan"
+        assert backup._selections.get_scoped(
+            account_id, plan_region, orphan_selection_id
+        ) is None
+    finally:
+        backup.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_backup_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    vaults = AccountRegionScopedDict()
+    vaults.set_scoped(
+        "123456789012",
+        "us-west-2",
+        "regional-vault",
+        {
+            "BackupVaultName": "regional-vault",
+            "BackupVaultArn": "arn:aws:backup:us-west-2:123456789012:backup-vault:regional-vault",
+        },
+    )
+    persistence.save_state("backup", {"vaults": vaults})
+
+    raw = _json.loads((tmp_path / "backup.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_vaults = persistence.load_state("backup")["vaults"]
+    assert loaded_vaults.get_scoped(
+        "123456789012", "us-west-2", "regional-vault"
+    )["BackupVaultName"] == "regional-vault"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("backup") is None
+
+
+@pytest.mark.parametrize(
+    "legacy_account_scoped",
+    [True, False],
+    ids=["account-scoped", "plain-dict"],
+)
+def test_ecr_legacy_state_uses_parent_repository_region(
+    legacy_account_scoped,
+):
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import ecr as mod
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "000000000000"
+    boot_region = "us-east-1"
+    repository_region = "eu-west-1"
+    name = "legacy-repository"
+    orphan = "orphan-repository"
+
+    def legacy_store(values):
+        if not legacy_account_scoped:
+            return values
+        store = AccountScopedDict()
+        store._data.update(
+            {(account_id, key): value for key, value in values.items()}
+        )
+        return store
+
+    repositories = legacy_store(
+        {
+            name: {
+                "repositoryArn": (
+                    f"arn:aws:ecr:{repository_region}:{account_id}:repository/{name}"
+                ),
+                "repositoryName": name,
+            }
+        }
+    )
+    images = legacy_store(
+        {
+            name: [{"imageDigest": "sha256:image"}],
+            orphan: [{"imageDigest": "sha256:orphan"}],
+        }
+    )
+    lifecycle_policies = legacy_store({name: "legacy-lifecycle"})
+    repo_policies = legacy_store({name: "legacy-repository-policy"})
+    layer_blobs = legacy_store({name: {"sha256:layer": b"layer"}})
+    manifest_blobs = legacy_store(
+        {name: {"sha256:manifest": b"manifest"}}
+    )
+
+    mod.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        mod.load_persisted_state(
+            {
+                "repositories": repositories,
+                "images": images,
+                "lifecycle_policies": lifecycle_policies,
+                "repo_policies": repo_policies,
+                "layer_blobs": layer_blobs,
+                "manifest_blobs": manifest_blobs,
+            }
+        )
+
+        assert mod._repositories.get_scoped(
+            account_id, repository_region, name
+        )["repositoryName"] == name
+        assert mod._images.get_scoped(account_id, repository_region, name) == [
+            {"imageDigest": "sha256:image"}
+        ]
+        assert mod._lifecycle_policies.get_scoped(
+            account_id, repository_region, name
+        ) == "legacy-lifecycle"
+        assert mod._repo_policies.get_scoped(
+            account_id, repository_region, name
+        ) == "legacy-repository-policy"
+        assert mod._layer_blobs.get_scoped(
+            account_id, repository_region, name
+        ) == {"sha256:layer": b"layer"}
+        assert mod._manifest_blobs.get_scoped(
+            account_id, repository_region, name
+        ) == {"sha256:manifest": b"manifest"}
+        assert mod._images.get_scoped(account_id, boot_region, orphan) == [
+            {"imageDigest": "sha256:orphan"}
+        ]
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 def test_eks_round_trip():
     def populate(mod):
         mod._clusters["cluster-test"] = {"name": "cluster-test", "status": "ACTIVE"}
@@ -204,21 +1338,485 @@ def test_eks_round_trip():
     _round_trip("eks", "eks", populate, observe)
 
 
+def test_eks_access_policies_round_trip_outside_boot_region():
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "000000000000"
+    boot_region = "us-east-1"
+    resource_region = "us-west-2"
+    cluster_name = "regional-cluster"
+    principal_arn = f"arn:aws:iam::{account_id}:role/regional-role"
+    entry_key = f"{cluster_name}\x00{principal_arn}"
+    policy_arn = (
+        "arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy"
+    )
+    policy_key = f"{entry_key}\x00{policy_arn}"
+    mod = _module("eks")
+
+    def populate(mod):
+        mod._access_entries.set_scoped(
+            account_id,
+            resource_region,
+            entry_key,
+            {
+                "clusterName": cluster_name,
+                "principalArn": principal_arn,
+                "accessEntryArn": (
+                    f"arn:aws:eks:{resource_region}:{account_id}:"
+                    f"access-entry/{cluster_name}/role/{account_id}/"
+                    "regional-role/id"
+                ),
+            },
+        )
+        mod._access_policies.set_scoped(
+            account_id,
+            resource_region,
+            policy_key,
+            {
+                "policyArn": policy_arn,
+                "accessScope": {"type": "cluster", "namespaces": []},
+            },
+        )
+        # Restore below runs in the boot scope, where this west-only store is
+        # false even though it contains persisted data in another region.
+        set_request_region(boot_region)
+
+    def observe(mod):
+        assert mod._access_policies.contains_scoped(
+            account_id, resource_region, policy_key
+        )
+        assert not mod._access_policies.contains_scoped(
+            account_id, boot_region, policy_key
+        )
+
+    try:
+        set_request_account_id(account_id)
+        set_request_region(resource_region)
+        _round_trip("eks", "eks", populate, observe)
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_eks_legacy_state_uses_arn_and_parent_regions():
+    import json as _json
+
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import eks as mod
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "000000000000"
+    boot_region = "us-east-1"
+    parent_region = "us-west-2"
+    child_arn_region = "eu-west-1"
+    cluster_name = "legacy-cluster"
+    principal_arn = f"arn:aws:iam::{account_id}:role/legacy-role"
+    entry_key = f"{cluster_name}\x00{principal_arn}"
+    policy_arn = (
+        "arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy"
+    )
+    policy_key = f"{entry_key}\x00{policy_arn}"
+    orphan_key = f"orphan-cluster\x00{principal_arn}\x00{policy_arn}"
+
+    legacy_clusters = AccountScopedDict()
+    legacy_clusters._data[(account_id, cluster_name)] = {
+        "name": cluster_name,
+        "arn": (
+            f"arn:aws:eks:{parent_region}:{account_id}:"
+            f"cluster/{cluster_name}"
+        ),
+        "status": "ACTIVE",
+        "_port": 16443,
+        "_docker_id": "stale-container",
+    }
+    legacy_entries = AccountScopedDict()
+    legacy_entries._data[(account_id, entry_key)] = {
+        "clusterName": cluster_name,
+        "principalArn": principal_arn,
+        "accessEntryArn": (
+            f"arn:aws:eks:{child_arn_region}:{account_id}:"
+            f"access-entry/{cluster_name}/legacy-entry-id"
+        ),
+    }
+    nodegroup_key = f"{cluster_name}/legacy-workers"
+    legacy_nodegroups = AccountScopedDict()
+    legacy_nodegroups._data[(account_id, nodegroup_key)] = {
+        "clusterName": cluster_name,
+        "nodegroupName": "legacy-workers",
+        "nodegroupArn": (
+            f"arn:aws:eks:{child_arn_region}:{account_id}:"
+            f"nodegroup/{cluster_name}/legacy-workers/id"
+        ),
+    }
+    addon_key = f"{cluster_name}/vpc-cni"
+    legacy_addons = AccountScopedDict()
+    legacy_addons._data[(account_id, addon_key)] = {
+        "clusterName": cluster_name,
+        "addonName": "vpc-cni",
+        "addonArn": (
+            f"arn:aws:eks:{child_arn_region}:{account_id}:"
+            f"addon/{cluster_name}/vpc-cni/id"
+        ),
+    }
+    legacy_policies = AccountScopedDict()
+    legacy_policies._data[(account_id, policy_key)] = {
+        "policyArn": policy_arn,
+        "accessScope": {"type": "cluster", "namespaces": []},
+    }
+    legacy_policies._data[(account_id, orphan_key)] = {
+        "policyArn": policy_arn,
+        "accessScope": {"type": "cluster", "namespaces": []},
+    }
+    idp_key = f"{cluster_name}\x00legacy-idp"
+    legacy_idp_configs = AccountScopedDict()
+    legacy_idp_configs._data[(account_id, idp_key)] = {
+        "clusterName": cluster_name,
+        "name": "legacy-idp",
+        "oidc": {
+            "clientId": "legacy-client",
+            "issuerUrl": "https://legacy.example.test",
+        },
+        "arn": (
+            f"arn:aws:eks:{child_arn_region}:{account_id}:"
+            f"identityproviderconfig/{cluster_name}/oidc/legacy-idp/id"
+        ),
+    }
+    child_arns = (
+        legacy_nodegroups._data[(account_id, nodegroup_key)]["nodegroupArn"],
+        legacy_addons._data[(account_id, addon_key)]["addonArn"],
+        legacy_entries._data[(account_id, entry_key)]["accessEntryArn"],
+        legacy_idp_configs._data[(account_id, idp_key)]["arn"],
+    )
+    legacy_tags = AccountScopedDict()
+    for child_arn in child_arns:
+        legacy_tags._data[(account_id, child_arn)] = {"legacy": "true"}
+
+    mod.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        mod.load_persisted_state(
+            {
+                "clusters": legacy_clusters,
+                "nodegroups": legacy_nodegroups,
+                "addons": legacy_addons,
+                "access_entries": legacy_entries,
+                "access_policies": legacy_policies,
+                "idp_configs": legacy_idp_configs,
+                "tags": legacy_tags,
+            }
+        )
+
+        cluster = mod._clusters.get_scoped(
+            account_id, parent_region, cluster_name
+        )
+        assert cluster["_docker_id"] is None
+        assert cluster["endpoint"] == "https://localhost:16443"
+        assert mod._access_entries.contains_scoped(
+            account_id, parent_region, entry_key
+        )
+        assert mod._nodegroups.contains_scoped(
+            account_id, parent_region, nodegroup_key
+        )
+        assert mod._addons.contains_scoped(
+            account_id, parent_region, addon_key
+        )
+        assert mod._access_policies.contains_scoped(
+            account_id, parent_region, policy_key
+        )
+        assert not mod._access_policies.contains_scoped(
+            account_id, boot_region, policy_key
+        )
+        assert mod._access_policies.contains_scoped(
+            account_id, boot_region, orphan_key
+        )
+        assert mod._idp_configs.contains_scoped(
+            account_id, parent_region, idp_key
+        )
+        for store, key in (
+            (mod._nodegroups, nodegroup_key),
+            (mod._addons, addon_key),
+            (mod._access_entries, entry_key),
+            (mod._access_policies, policy_key),
+            (mod._idp_configs, idp_key),
+        ):
+            assert not store.contains_scoped(account_id, child_arn_region, key)
+
+        # The legacy child records remain reachable through their normal API
+        # paths in the restored parent region even though their persisted ARNs
+        # were minted by cross-region legacy requests.
+        set_request_region(parent_region)
+        status, _, body = mod._list_nodegroups(cluster_name, {})
+        assert status == 200
+        assert _json.loads(body)["nodegroups"] == ["legacy-workers"]
+        status, _, body = mod._describe_nodegroup(
+            cluster_name, "legacy-workers"
+        )
+        assert status == 200
+        assert _json.loads(body)["nodegroup"]["nodegroupName"] == "legacy-workers"
+
+        status, _, body = mod._list_addons(cluster_name, {})
+        assert status == 200
+        assert _json.loads(body)["addons"] == ["vpc-cni"]
+        status, _, body = mod._describe_addon(cluster_name, "vpc-cni")
+        assert status == 200
+        assert _json.loads(body)["addon"]["addonName"] == "vpc-cni"
+
+        status, _, body = mod._list_access_entries(cluster_name, {})
+        assert status == 200
+        assert _json.loads(body)["accessEntries"] == [principal_arn]
+        status, _, body = mod._list_associated_access_policies(
+            cluster_name, principal_arn, {}
+        )
+        assert status == 200
+        assert _json.loads(body)["associatedAccessPolicies"][0][
+            "policyArn"
+        ] == policy_arn
+
+        status, _, body = mod._describe_identity_provider_config(
+            cluster_name,
+            {
+                "identityProviderConfig": {
+                    "type": "oidc",
+                    "name": "legacy-idp",
+                }
+            },
+        )
+        assert status == 200
+        assert _json.loads(body)["identityProviderConfig"]["oidc"][
+            "identityProviderConfigName"
+        ] == "legacy-idp"
+
+        # Tag APIs accept the original child ARN in the region where migration
+        # co-located the child with its parent. Keep that persisted ARN as the
+        # tag-store key so legacy tags survive the round trip.
+        for child_arn in child_arns:
+            status, _, body = mod._list_tags(child_arn)
+            assert status == 200
+            assert _json.loads(body)["tags"] == {"legacy": "true"}
+
+        nodegroup_arn = child_arns[0]
+        status, _, _body = mod._tag_resource(
+            nodegroup_arn, {"tags": {"owner": "platform"}}
+        )
+        assert status == 200
+        status, _, _body = mod._untag_resource(
+            nodegroup_arn, {"tagKeys": ["legacy"]}
+        )
+        assert status == 200
+        status, _, body = mod._list_tags(nodegroup_arn)
+        assert status == 200
+        assert _json.loads(body)["tags"] == {"owner": "platform"}
+        assert mod._tags.get(nodegroup_arn) == {"owner": "platform"}
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 def test_scheduler_round_trip():
     # Production code keys _schedules by `f"{group}/{name}"` strings (see
     # scheduler.py CreateSchedule etc.), not tuples — even though the
     # pre-existing inline comment on the dict mis-describes the shape. Use
     # the real production key shape so this test catches a regression that
     # broke string-key serialisation.
+    from ministack.core.responses import get_region, set_request_region
+
+    original_region = get_region()
+
     def populate(mod):
-        mod._schedule_groups["default"] = {"Name": "default"}
-        mod._schedules["default/sched-test"] = {"Name": "sched-test"}
+        set_request_region("us-east-1")
+        mod._schedule_groups["default"] = {
+            "Arn": "arn:aws:scheduler:us-east-1:000000000000:schedule-group/default",
+            "Name": "default",
+        }
+        mod._schedules["default/sched-test"] = {
+            "Arn": "arn:aws:scheduler:us-east-1:000000000000:schedule/default/sched-test",
+            "Name": "sched-test",
+            "ScheduleExpression": "rate(1 hour)",
+        }
+        set_request_region("us-west-2")
+        mod._schedule_groups["default"] = {
+            "Arn": "arn:aws:scheduler:us-west-2:000000000000:schedule-group/default",
+            "Name": "default",
+        }
+        mod._schedules["default/sched-test"] = {
+            "Arn": "arn:aws:scheduler:us-west-2:000000000000:schedule/default/sched-test",
+            "Name": "sched-test",
+            "ScheduleExpression": "rate(2 hours)",
+        }
 
     def observe(mod):
-        assert "default" in mod._schedule_groups
-        assert "default/sched-test" in mod._schedules
+        set_request_region("us-east-1")
+        assert mod._schedules["default/sched-test"]["ScheduleExpression"] == "rate(1 hour)"
+        set_request_region("us-west-2")
+        assert mod._schedules["default/sched-test"]["ScheduleExpression"] == "rate(2 hours)"
 
-    _round_trip("scheduler", "scheduler", populate, observe)
+    try:
+        _round_trip("scheduler", "scheduler", populate, observe)
+    finally:
+        set_request_region(original_region)
+
+
+def test_scheduler_legacy_account_scoped_state_uses_resource_arn_region():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import scheduler as mod
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "000000000000"
+    region = "us-west-2"
+    group = "legacy-group"
+    schedule_key = f"{group}/legacy-schedule"
+    legacy_groups = AccountScopedDict()
+    legacy_groups._data[(account_id, group)] = {
+        "Arn": f"arn:aws:scheduler:{region}:{account_id}:schedule-group/{group}",
+        "Name": group,
+    }
+    legacy_schedules = AccountScopedDict()
+    legacy_schedules._data[(account_id, schedule_key)] = {
+        "Arn": f"arn:aws:scheduler:{region}:{account_id}:schedule/{schedule_key}",
+        "Name": "legacy-schedule",
+        "GroupName": group,
+    }
+
+    mod.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region("us-east-1")
+        mod.load_persisted_state(
+            {"schedule_groups": legacy_groups, "schedules": legacy_schedules}
+        )
+
+        assert mod._schedule_groups.get_scoped(account_id, "us-east-1", group) is None
+        assert mod._schedules.get_scoped(account_id, "us-east-1", schedule_key) is None
+        assert mod._schedule_groups.get_scoped(account_id, region, group)["Name"] == group
+        assert mod._schedules.get_scoped(account_id, region, schedule_key)["Name"] == (
+            "legacy-schedule"
+        )
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+@pytest.mark.parametrize(
+    "legacy_account_scoped",
+    [True, False],
+    ids=["legacy-account-scope", "current-region-scope"],
+)
+def test_mwaa_restore_preserves_resource_region_outside_boot_scope(
+    monkeypatch,
+    legacy_account_scoped,
+):
+    from types import SimpleNamespace
+
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import mwaa as mod
+
+    class ImmediateThread:
+        def __init__(self, target, args, daemon):
+            self.target = target
+            self.args = args
+            self.daemon = daemon
+
+        def start(self):
+            self.target(*self.args)
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    resource_region = "us-west-2"
+    env_name = "warm-boot-environment"
+    env = {
+        "Name": env_name,
+        "Arn": f"arn:aws:airflow:{resource_region}:{account_id}:environment/{env_name}",
+        "Status": "AVAILABLE",
+        "_docker_container_id": "stale-container",
+    }
+    restored = (
+        AccountScopedDict()
+        if legacy_account_scoped
+        else AccountRegionScopedDict()
+    )
+    if legacy_account_scoped:
+        restored._data[(account_id, env_name)] = env
+        persistence.save_state("mwaa", {"environments": restored})
+        loaded = persistence.load_state("mwaa")
+        assert isinstance(loaded["environments"], AccountScopedDict)
+        restored = loaded["environments"]
+    else:
+        restored._data[(account_id, resource_region, env_name)] = env
+
+    restart_args = []
+    monkeypatch.setattr(mod, "_get_docker", lambda: None)
+    monkeypatch.setattr(mod, "_start_airflow_container", lambda *args: restart_args.append(args))
+    monkeypatch.setattr(mod, "threading", SimpleNamespace(Thread=ImmediateThread))
+    mod.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        mod.load_persisted_state({"environments": restored})
+
+        assert mod._environments.get_scoped(account_id, boot_region, env_name) is None
+        restored_env = mod._environments.get_scoped(
+            account_id,
+            resource_region,
+            env_name,
+        )
+        assert restored_env["Status"] == "CREATING"
+        assert restored_env["_docker_container_id"] is None
+        expected_volume_prefix = (
+            f"ministack-mwaa-{env_name}"
+            if legacy_account_scoped
+            else f"ministack-mwaa-{resource_region}-{env_name}"
+        )
+        if legacy_account_scoped:
+            assert restored_env["_docker_dags_volume_name"] == (
+                f"{expected_volume_prefix}-dags"
+            )
+            assert restored_env["_docker_db_volume_name"] == (
+                f"{expected_volume_prefix}-db"
+            )
+        else:
+            assert "_docker_dags_volume_name" not in restored_env
+            assert "_docker_db_volume_name" not in restored_env
+        assert restart_args == [
+            (account_id, resource_region, env_name, restored_env)
+        ]
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
 
 
 def test_pipes_round_trip():
@@ -251,7 +1849,7 @@ def test_pipes_round_trip():
 
 
 def test_pipes_restore_starts_poller_for_running_pipes(monkeypatch):
-    """When `restore_state` reloads pipes that are RUNNING, the background
+    """When `load_persisted_state` reloads RUNNING pipes, the background
     poller must be (re)started so events keep flowing after warm-boot."""
     mod = _module("pipes")
     mod.reset()
@@ -259,7 +1857,7 @@ def test_pipes_restore_starts_poller_for_running_pipes(monkeypatch):
     monkeypatch.setattr(mod, "_poller_started", False)
 
     pipe_arn = "arn:aws:pipes:us-east-1:000000000000:pipe/poller-test"
-    mod.restore_state({
+    result = mod.load_persisted_state({
         "pipes": {
             "poller-test": {
                 "Name": "poller-test",
@@ -278,10 +1876,104 @@ def test_pipes_restore_starts_poller_for_running_pipes(monkeypatch):
     })
 
     assert mod._poller_started, (
-        "restore_state() did not start the pipes poller for a RUNNING pipe — "
+        "load_persisted_state() did not start the pipes poller for a RUNNING pipe — "
         "warm-booted pipes would silently stop forwarding events."
     )
+    assert result is None
     mod.reset()
+
+
+def test_lambda_load_starts_event_source_mapping_poller(monkeypatch):
+    """Warm boot resumes the Lambda poller only through the loader API."""
+    mod = _module("lambda_svc")
+    mod.reset()
+    calls = []
+    monkeypatch.setattr(mod, "_ensure_poller", lambda: calls.append(None))
+
+    mod.load_persisted_state({
+        "esms": {
+            "warm-boot-esm": {
+                "UUID": "warm-boot-esm",
+                "FunctionArn": (
+                    "arn:aws:lambda:us-east-1:000000000000:function:warm-boot"
+                ),
+            },
+        },
+    })
+
+    assert calls == [None]
+    assert mod._esms.has_any()
+    mod.reset()
+
+
+def test_registry_loader_dispatches_saved_state_to_the_declared_module(monkeypatch):
+    """The central loader imports only saved modules and calls their contract."""
+    import ministack.app as app
+
+    class Module:
+        def __init__(self):
+            self.loaded = []
+
+        def load_persisted_state(self, data):
+            self.loaded.append(data)
+
+    module = Module()
+    monkeypatch.setattr(app, "_state_map", {"saved": "module", "empty": "other"})
+    monkeypatch.setattr(app, "load_state", lambda key: {"value": key} if key == "saved" else None)
+    monkeypatch.setattr(app, "_get_module", lambda name: module if name == "module" else pytest.fail(name))
+
+    app._load_persisted_state()
+
+    assert module.loaded == [{"value": "saved"}]
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("objects_first", [False, True])
+def test_s3_central_restore_preserves_metadata_and_objects(monkeypatch, tmp_path, legacy, objects_first):
+    """Object loading and central metadata restoration work in either order."""
+    import ministack.app as app
+    from ministack.core.responses import AccountScopedDict, request_scope
+    from ministack.services import s3
+
+    monkeypatch.setattr(s3, "_buckets", AccountScopedDict())
+    monkeypatch.setattr(s3, "DATA_DIR", str(tmp_path / "objects"))
+    monkeypatch.setattr(s3, "S3_PERSIST", True)
+    monkeypatch.setattr(app, "_state_map", {"s3": "s3"})
+    monkeypatch.setattr(app, "_loaded_modules", {})
+    accounts = ["111111111111"] if legacy else ["111111111111", "222222222222"]
+    metadata = {} if legacy else AccountScopedDict()
+    for account in accounts:
+        bucket_meta = {
+            "created": "2020-01-01T00:00:00Z",
+            "region": "eu-west-1",
+            "_ownership_controls": "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+            "_public_access_block": "<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls></PublicAccessBlockConfiguration>",
+        }
+        for name in ("bucket", "empty-bucket"):
+            if legacy:
+                metadata[name] = dict(bucket_meta)
+            else:
+                metadata._data[(account, name)] = dict(bucket_meta)
+        object_path = tmp_path / "objects" / account / "bucket" / "key"
+        object_path.parent.mkdir(parents=True)
+        object_path.write_bytes(account.encode())
+    persistence.save_state("s3", {"buckets_meta": metadata})
+
+    with request_scope(accounts[0], "us-east-1"):
+        if objects_first:
+            s3._load_persisted_data()
+        app._load_persisted_state()
+        if not objects_first:
+            s3._load_persisted_data()
+
+    for account in accounts:
+        with request_scope(account, "us-east-1"):
+            for name in ("bucket", "empty-bucket"):
+                bucket = s3._buckets[name]
+                assert {key: value for key, value in bucket.items() if key != "objects"} == bucket_meta
+            obj = s3._buckets["bucket"]["objects"]["key"]
+            assert s3._read_body("bucket", "key", obj) == account.encode()
+            assert s3._buckets["empty-bucket"]["objects"] == {}
 
 
 # ── PERSIST_STATE gating ──────────────────────────────────────────────
@@ -291,8 +1983,8 @@ def test_pipes_restore_starts_poller_for_running_pipes(monkeypatch):
 ])
 def test_load_state_is_noop_when_persist_state_disabled(monkeypatch, svc_key, tmp_path):
     """When PERSIST_STATE=0, load_state() must return None without touching
-    disk and without invoking restore_state(). Catches a regression where
-    a service module accidentally calls restore_state() unconditionally."""
+    disk and without invoking load_persisted_state(). Catches a regression
+    where a service module accidentally loads state unconditionally."""
     monkeypatch.setattr(persistence, "PERSIST_STATE", False)
     # Pre-write a state file that *would* succeed if persistence were on,
     # so we can assert that it is NOT consumed.
@@ -348,7 +2040,7 @@ def _round_trip_dict(mod, svc_key):
         f"persistence.load_state({svc_key!r}) returned None — state "
         "file was not written by save_state()."
     )
-    mod.restore_state(loaded)
+    mod.load_persisted_state(loaded)
 
 
 # ── secretsmanager._resource_policies ──────────────────────────────────
@@ -369,6 +2061,55 @@ def test_secretsmanager_resource_policies_survive_warm_boot():
         "_resource_policies must be in both."
     )
     mod.reset()
+
+
+def test_secretsmanager_replication_changes_survive_warm_boot():
+    """RemoveRegionsFromReplication and StopReplicationToReplica change a primary and its replica in two
+    regions. Both must come back from disk as they were left, not as the replication they replaced."""
+    import json as _json
+
+    from ministack.core.responses import get_region, set_request_region
+
+    mod = _get_module("secretsmanager")
+    original_region = get_region()
+
+    def call(region, fn, **data):
+        set_request_region(region)
+        status, _, body = fn(data)
+        return status, _json.loads(body)
+
+    mod.reset()
+    try:
+        for name in ("kept", "removed", "stopped"):
+            call("us-east-1", mod._create_secret, Name=name, SecretString="v1")
+            call("us-east-1", mod._replicate_secret_to_regions, SecretId=name,
+                 AddReplicaRegions=[{"Region": "us-west-2"}])
+        call("us-east-1", mod._remove_regions_from_replication, SecretId="removed",
+             RemoveReplicaRegions=["us-west-2"])
+        call("us-west-2", mod._stop_replication_to_replica, SecretId="stopped")
+
+        _round_trip_dict(mod, "secretsmanager")
+
+        _, kept = call("us-east-1", mod._describe_secret, SecretId="kept")
+        assert [s["Region"] for s in kept["ReplicationStatus"]] == ["us-west-2"]
+        assert call("us-west-2", mod._describe_secret, SecretId="kept")[1]["PrimaryRegion"] == "us-east-1"
+
+        _, removed = call("us-east-1", mod._describe_secret, SecretId="removed")
+        assert "ReplicationStatus" not in removed
+        assert call("us-west-2", mod._describe_secret, SecretId="removed")[0] == 400
+
+        _, stopped = call("us-east-1", mod._describe_secret, SecretId="stopped")
+        assert "ReplicationStatus" not in stopped
+        status, west = call("us-west-2", mod._describe_secret, SecretId="stopped")
+        assert status == 200 and "PrimaryRegion" not in west
+        # The restored replica is standalone and writable, and the restored link still holds for the other.
+        assert call("us-west-2", mod._put_secret_value, SecretId="stopped", SecretString="v2")[0] == 200
+        assert call("us-west-2", mod._put_secret_value, SecretId="kept", SecretString="v2")[0] == 400
+        assert call("us-east-1", mod._delete_secret, SecretId="kept", ForceDeleteWithoutRecovery=True)[0] == 400
+        assert call("us-east-1", mod._delete_secret, SecretId="removed", ForceDeleteWithoutRecovery=True)[0] == 200
+    finally:
+        mod.reset()
+        set_request_region(original_region)
 
 
 # ── kinesis._consumers ─────────────────────────────────────────────────
@@ -399,6 +2140,91 @@ def test_kinesis_consumers_survive_warm_boot():
     mod.reset()
 
 
+def test_kinesis_shard_iterators_survive_warm_boot_in_original_scope():
+    """Live shard iterators must round-trip through JSON persistence without
+    becoming visible to other accounts or regions."""
+    import json
+    import time
+
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    mod = _get_module("kinesis")
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    region = "us-west-2"
+    stream_name = "warm-boot-stream"
+    stream_arn = f"arn:aws:kinesis:{region}:{account_id}:stream/{stream_name}"
+    shard_id = "shardId-000000000000"
+    token = "live-iterator-token"
+    now = time.time()
+
+    mod.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(region)
+        mod._streams[stream_name] = {
+            "StreamName": stream_name,
+            "StreamARN": stream_arn,
+            "StreamStatus": "ACTIVE",
+            "StreamModeDetails": {"StreamMode": "PROVISIONED"},
+            "RetentionPeriodHours": 24,
+            "shards": {
+                shard_id: {
+                    "records": [{
+                        "SequenceNumber": "1",
+                        "ApproximateArrivalTimestamp": now,
+                        "Data": b"warm-boot-record",
+                        "PartitionKey": "pk1",
+                    }],
+                    "starting_hash_key": "0",
+                    "ending_hash_key": str(2**128 - 1),
+                    "starting_sequence_number": "1",
+                    "parent_shard_id": None,
+                    "adjacent_parent_shard_id": None,
+                },
+            },
+            "tags": {},
+            "CreationTimestamp": now,
+            "EncryptionType": "NONE",
+        }
+        mod._shard_iterators[token] = {
+            "stream": stream_name,
+            "stream_arn": stream_arn,
+            "shard_id": shard_id,
+            "position": 0,
+            "created_at": now,
+        }
+
+        _round_trip_dict(mod, "kinesis")
+
+        assert token in mod._shard_iterators
+        status, _, body = mod._get_records({"ShardIterator": token, "Limit": 1})
+        assert status == 200
+        payload = json.loads(body)
+        assert payload["Records"][0]["PartitionKey"] == "pk1"
+        assert payload["NextShardIterator"] in mod._shard_iterators
+
+        set_request_region("us-east-1")
+        assert token not in mod._shard_iterators
+        status, _, body = mod._get_records({"ShardIterator": token})
+        assert status == 400
+        assert json.loads(body)["__type"] == "ExpiredIteratorException"
+
+        set_request_account_id("222222222222")
+        set_request_region(region)
+        assert token not in mod._shard_iterators
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
 # ── ecs._attributes ────────────────────────────────────────────────────
 
 def test_ecs_attributes_survive_warm_boot():
@@ -420,6 +2246,364 @@ def test_ecs_attributes_survive_warm_boot():
         "_attributes must be in both."
     )
     mod.reset()
+
+
+def test_ecs_region_scoped_state_survives_warm_boot(monkeypatch):
+    """ECS v2 persistence retains every resource's account and region scope."""
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    mod = _get_module("ecs")
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    cluster_name = "warm-boot-cluster"
+    family = "warm-boot-family"
+
+    monkeypatch.setattr(mod, "_get_docker", lambda: None)
+    mod.reset()
+    try:
+        set_request_account_id(account_id)
+        for region, revision in (("us-east-1", 2), ("us-west-2", 1)):
+            set_request_region(region)
+            cluster_arn = f"arn:aws:ecs:{region}:{account_id}:cluster/{cluster_name}"
+            td_key = f"{family}:{revision}"
+            td_arn = f"arn:aws:ecs:{region}:{account_id}:task-definition/{td_key}"
+            service_key = f"{cluster_name}/warm-boot-service"
+            service_arn = (
+                f"arn:aws:ecs:{region}:{account_id}:service/"
+                f"{cluster_name}/warm-boot-service"
+            )
+            task_arn = f"arn:aws:ecs:{region}:{account_id}:task/{cluster_name}/{region}"
+            cp_arn = f"arn:aws:ecs:{region}:{account_id}:capacity-provider/warm-boot-cp"
+
+            mod._clusters[cluster_name] = {
+                "clusterArn": cluster_arn,
+                "clusterName": cluster_name,
+                "status": "ACTIVE",
+            }
+            mod._task_defs[td_key] = {
+                "taskDefinitionArn": td_arn,
+                "family": family,
+                "revision": revision,
+            }
+            mod._task_def_latest[family] = revision
+            mod._services[service_key] = {
+                "serviceArn": service_arn,
+                "serviceName": "warm-boot-service",
+                "clusterArn": cluster_arn,
+            }
+            mod._tasks[task_arn] = {
+                "taskArn": task_arn,
+                "clusterArn": cluster_arn,
+                "lastStatus": "RUNNING",
+                "_docker_ids": [f"stale-{region}"],
+            }
+            mod._capacity_providers["warm-boot-cp"] = {
+                "capacityProviderArn": cp_arn,
+                "name": "warm-boot-cp",
+            }
+            mod._attributes["i-warm:zone"] = {
+                "targetId": "i-warm",
+                "name": "zone",
+                "value": region,
+            }
+            mod._account_settings["containerInsights"] = region
+            mod._tags[cluster_arn] = [{"key": "region", "value": region}]
+
+        _round_trip_dict(mod, "ecs")
+
+        for region, revision in (("us-east-1", 2), ("us-west-2", 1)):
+            cluster_arn = f"arn:aws:ecs:{region}:{account_id}:cluster/{cluster_name}"
+            task_arn = f"arn:aws:ecs:{region}:{account_id}:task/{cluster_name}/{region}"
+            assert mod._clusters.get_scoped(account_id, region, cluster_name)["clusterArn"] == (
+                cluster_arn
+            )
+            assert mod._task_def_latest.get_scoped(account_id, region, family) == revision
+            assert mod._account_settings.get_scoped(
+                account_id, region, "containerInsights"
+            ) == region
+            assert mod._attributes.get_scoped(account_id, region, "i-warm:zone")["value"] == (
+                region
+            )
+            restored_task = mod._tasks.get_scoped(account_id, region, task_arn)
+            assert restored_task["lastStatus"] == "STOPPED"
+            assert restored_task["_docker_ids"] == []
+            assert mod._tags.get_scoped(account_id, region, cluster_arn) == [
+                {"key": "region", "value": region}
+            ]
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_ecs_legacy_account_scoped_state_migrates_by_arn(monkeypatch, tmp_path):
+    """Legacy ECS state adopts ARN regions and boot-scopes ARN-less stores."""
+    import json as _json
+
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    mod = _get_module("ecs")
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    resource_region = "us-west-2"
+    cluster_name = "legacy-cluster"
+    family = "legacy-family"
+    cluster_arn = f"arn:aws:ecs:{resource_region}:{account_id}:cluster/{cluster_name}"
+    service_key = f"{cluster_name}/legacy-service"
+    service_arn = (
+        f"arn:aws:ecs:{resource_region}:{account_id}:service/"
+        f"{cluster_name}/legacy-service"
+    )
+    task_arn = (
+        f"arn:aws:ecs:{resource_region}:{account_id}:task/"
+        f"{cluster_name}/legacy-task"
+    )
+
+    def scoped(key, value):
+        store = AccountScopedDict()
+        store._data[(account_id, key)] = value
+        return store
+
+    legacy_payload = {
+        "clusters": scoped(cluster_name, {
+            "clusterArn": cluster_arn,
+            "clusterName": cluster_name,
+            "status": "ACTIVE",
+        }),
+        "task_defs": scoped(family + ":3", {
+            "taskDefinitionArn": (
+                f"arn:aws:ecs:{resource_region}:{account_id}:"
+                f"task-definition/{family}:3"
+            ),
+            "family": family,
+            "revision": 3,
+        }),
+        "task_def_latest": scoped(family, 3),
+        "services": scoped(service_key, {
+            "serviceArn": service_arn,
+            "serviceName": "legacy-service",
+            "clusterArn": cluster_arn,
+        }),
+        "tasks": scoped(task_arn, {
+            "taskArn": task_arn,
+            "clusterArn": cluster_arn,
+            "lastStatus": "RUNNING",
+            "_docker_ids": ["stale-container"],
+        }),
+        "account_settings": scoped("containerInsights", "enabled"),
+        "attributes": scoped("i-legacy:zone", {
+            "targetId": "i-legacy",
+            "name": "zone",
+            "value": "legacy",
+        }),
+    }
+
+    monkeypatch.setattr(mod, "_get_docker", lambda: None)
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+    mod.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        with open(tmp_path / "ecs.json", "w") as f:
+            _json.dump(legacy_payload, f, default=persistence._json_default)
+
+        loaded = persistence.load_state("ecs")
+        assert isinstance(loaded["tasks"], AccountScopedDict)
+        mod.load_persisted_state(loaded)
+
+        assert mod._clusters.get_scoped(account_id, resource_region, cluster_name)[
+            "clusterArn"
+        ] == cluster_arn
+        assert mod._services.get_scoped(account_id, resource_region, service_key)[
+            "serviceArn"
+        ] == service_arn
+        restored_task = mod._tasks.get_scoped(account_id, resource_region, task_arn)
+        assert restored_task["lastStatus"] == "STOPPED"
+        assert restored_task["_docker_ids"] == []
+
+        assert mod._task_def_latest.get_scoped(account_id, boot_region, family) is None
+        assert mod._task_def_latest.get_scoped(account_id, resource_region, family) == 3
+
+        set_request_region(resource_region)
+        described = _json.loads(
+            mod._describe_task_definition({"taskDefinition": family})[2]
+        )["taskDefinition"]
+        assert described["taskDefinitionArn"].endswith(
+            f"task-definition/{family}:3"
+        )
+
+        registered = _json.loads(mod._register_task_definition({
+            "family": family,
+            "containerDefinitions": [{"name": "app", "image": "busybox"}],
+        })[2])["taskDefinition"]
+        assert registered["revision"] == 4
+        assert mod._task_defs.get_scoped(
+            account_id, resource_region, family + ":3"
+        )["taskDefinitionArn"] == described["taskDefinitionArn"]
+        assert mod._task_defs.get_scoped(
+            account_id, resource_region, family + ":4"
+        )["taskDefinitionArn"] == registered["taskDefinitionArn"]
+
+        # Other ARN-less legacy stores intentionally adopt the boot region.
+        assert mod._account_settings.get_scoped(
+            account_id, boot_region, "containerInsights"
+        ) == "enabled"
+        assert mod._attributes.get_scoped(account_id, boot_region, "i-legacy:zone")[
+            "value"
+        ] == "legacy"
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_ecs_legacy_task_revision_migration_reconstructs_each_region(monkeypatch):
+    """Legacy shared counters do not reset revisions in other ARN regions."""
+    import json as _json
+
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    mod = _get_module("ecs")
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    other_region = "us-west-2"
+    family = "multi-region-legacy-family"
+
+    legacy_task_defs = AccountScopedDict()
+    for region, revision, marker in (
+        (boot_region, 1, "east-original"),
+        (other_region, 2, "west-original"),
+    ):
+        key = f"{family}:{revision}"
+        legacy_task_defs._data[(account_id, key)] = {
+            "taskDefinitionArn": (
+                f"arn:aws:ecs:{region}:{account_id}:task-definition/{key}"
+            ),
+            "family": family,
+            "revision": revision,
+            "status": "ACTIVE",
+            "marker": marker,
+        }
+
+    legacy_latest = AccountScopedDict()
+    legacy_latest._data[(account_id, family)] = 2
+
+    monkeypatch.setattr(mod, "_get_docker", lambda: None)
+    mod.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        mod.load_persisted_state({
+            "task_defs": legacy_task_defs,
+            "task_def_latest": legacy_latest,
+        })
+
+        assert mod._task_def_latest.get_scoped(
+            account_id, boot_region, family
+        ) == 1
+        assert mod._task_def_latest.get_scoped(
+            account_id, other_region, family
+        ) == 2
+
+        for region, restored_revision, next_revision in (
+            (boot_region, 1, 2),
+            (other_region, 2, 3),
+        ):
+            set_request_region(region)
+            status, _, body = mod._describe_task_definition({
+                "taskDefinition": family,
+            })
+            assert status == 200
+            described = _json.loads(body)["taskDefinition"]
+            assert described["revision"] == restored_revision
+            assert described["taskDefinitionArn"].startswith(
+                f"arn:aws:ecs:{region}:{account_id}:"
+            )
+
+            status, _, body = mod._register_task_definition({
+                "family": family,
+                "containerDefinitions": [{"name": "app", "image": "busybox"}],
+            })
+            assert status == 200
+            assert _json.loads(body)["taskDefinition"]["revision"] == next_revision
+
+        assert mod._task_defs.get_scoped(
+            account_id, boot_region, f"{family}:1"
+        )["marker"] == "east-original"
+        assert mod._task_defs.get_scoped(
+            account_id, other_region, f"{family}:2"
+        )["marker"] == "west-original"
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_ecs_plain_dict_tasks_migrate_to_arn_region(monkeypatch):
+    """Oldest bare-dict task state restores under the task ARN region."""
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    mod = _get_module("ecs")
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    resource_region = "us-west-2"
+    task_arn = f"arn:aws:ecs:{resource_region}:{account_id}:task/legacy-cluster/legacy-task"
+
+    monkeypatch.setattr(mod, "_get_docker", lambda: None)
+    mod.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        mod.load_persisted_state(
+            {
+                "tasks": {
+                    task_arn: {
+                        "taskArn": task_arn,
+                        "lastStatus": "RUNNING",
+                        "_docker_ids": ["stale-container"],
+                    },
+                },
+            }
+        )
+
+        restored_task = mod._tasks.get_scoped(account_id, resource_region, task_arn)
+        assert restored_task["lastStatus"] == "STOPPED"
+        assert restored_task["_docker_ids"] == []
+        assert mod._tasks.get_scoped(account_id, boot_region, task_arn) is None
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
 
 
 # ── sns._platform_applications + sns._platform_endpoints ──────────────
@@ -464,20 +2648,405 @@ def test_sns_platform_endpoints_survive_warm_boot():
     mod.reset()
 
 
-# ── Import-order regression for the ECS NameError trap ───────────────
+def test_sns_region_scoped_stores_survive_warm_boot_in_original_scope():
+    """SNS topic, subscription, application, and endpoint stores stay scoped
+    after the real JSON persistence path."""
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
 
-def test_ecs_module_reload_with_persisted_attributes_does_not_namerror():
-    """Regression for the import-order trap: `restore_state()` runs at
-    module import time (via the `try: load_state("ecs")` block at the
-    bottom of services/ecs.py). If `_attributes` is declared AFTER that
-    block, the restore call NameErrors and the surrounding try/except
-    silently swallows it — wiping all ECS state on warm-boot.
+    mod = _get_module("sns")
+    mod.reset()
+    original_account = get_account_id()
+    original_region = get_region()
+    try:
+        set_request_account_id("111111111111")
+        set_request_region("us-west-2")
 
-    This test simulates a real warm-boot: write a populated `ecs.json`
-    to STATE_DIR, then `importlib.reload()` the module so the load_state
-    block runs against the file. If `_attributes` (or any other
-    referenced symbol) is declared too late, the restored state will
-    be missing because the entire restore_state body crashed."""
+        topic_arn = "arn:aws:sns:us-west-2:111111111111:persisted-topic"
+        sub_arn = f"{topic_arn}:sub-1"
+        app_arn = "arn:aws:sns:us-west-2:111111111111:app/GCM/PersistedApp"
+        endpoint_arn = f"{app_arn}/endpoint-1"
+        subscription = {
+            "arn": sub_arn,
+            "protocol": "email",
+            "endpoint": "persisted@example.com",
+            "confirmed": True,
+            "topic_arn": topic_arn,
+            "owner": "111111111111",
+            "attributes": {"SubscriptionArn": sub_arn, "TopicArn": topic_arn},
+        }
+        mod._topics[topic_arn] = {
+            "name": "persisted-topic",
+            "arn": topic_arn,
+            "attributes": {"TopicArn": topic_arn, "Owner": "111111111111"},
+            "subscriptions": [subscription],
+            "messages": [],
+            "tags": {},
+        }
+        mod._sub_arn_to_topic[sub_arn] = topic_arn
+        mod._platform_applications[app_arn] = {
+            "arn": app_arn,
+            "name": "PersistedApp",
+            "platform": "GCM",
+            "attributes": {},
+        }
+        mod._platform_endpoints[endpoint_arn] = {
+            "arn": endpoint_arn,
+            "application_arn": app_arn,
+            "attributes": {"Token": "persisted-token", "Enabled": "true"},
+        }
+
+        _round_trip_dict(mod, "sns")
+
+        assert mod._topics[topic_arn]["subscriptions"][0]["arn"] == sub_arn
+        assert mod._sub_arn_to_topic[sub_arn] == topic_arn
+        assert mod._platform_applications[app_arn]["arn"] == app_arn
+        assert mod._platform_endpoints[endpoint_arn]["attributes"]["Token"] == "persisted-token"
+
+        set_request_region("us-east-1")
+        assert mod._topics.get(topic_arn) is None
+        assert mod._sub_arn_to_topic.get(sub_arn) is None
+        assert mod._platform_applications.get(app_arn) is None
+        assert mod._platform_endpoints.get(endpoint_arn) is None
+
+        set_request_account_id("222222222222")
+        set_request_region("us-west-2")
+        assert mod._topics.get(topic_arn) is None
+        assert mod._sub_arn_to_topic.get(sub_arn) is None
+        assert mod._platform_applications.get(app_arn) is None
+        assert mod._platform_endpoints.get(endpoint_arn) is None
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_eventbridge_region_scoped_stores_survive_warm_boot_in_original_scope():
+    """EventBridge regional stores remain in their original account/region
+    after the real JSON persistence path."""
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    mod = _get_module("eventbridge")
+    mod.reset()
+    original_account = get_account_id()
+    original_region = get_region()
+    try:
+        set_request_account_id("111111111111")
+        set_request_region("us-west-2")
+
+        now = mod._now_ts()
+        bus_name = "persisted-bus"
+        rule_name = "persisted-rule"
+        archive_name = "persisted-archive"
+        replay_name = "persisted-replay"
+        endpoint_name = "persisted-endpoint"
+        connection_name = "persisted-connection"
+        api_destination_name = "persisted-api"
+        partner_name = "persisted-partner"
+        bus_arn = f"arn:aws:events:us-west-2:111111111111:event-bus/{bus_name}"
+        rule_key = mod._rule_key(rule_name, bus_name)
+        rule_arn = f"arn:aws:events:us-west-2:111111111111:rule/{bus_name}/{rule_name}"
+        archive_arn = f"arn:aws:events:us-west-2:111111111111:archive/{archive_name}"
+        replay_arn = f"arn:aws:events:us-west-2:111111111111:replay/{replay_name}"
+        endpoint_arn = f"arn:aws:events:us-west-2:111111111111:endpoint/{endpoint_name}"
+        connection_arn = f"arn:aws:events:us-west-2:111111111111:connection/{connection_name}"
+        api_destination_arn = (
+            f"arn:aws:events:us-west-2:111111111111:api-destination/{api_destination_name}"
+        )
+        partner_arn = f"arn:aws:events:us-west-2:222222222222:event-source/{partner_name}"
+
+        mod._event_buses[bus_name] = {
+            "Name": bus_name,
+            "Arn": bus_arn,
+            "CreationTime": now,
+            "LastModifiedTime": now,
+        }
+        mod._rules[rule_key] = {
+            "Name": rule_name,
+            "Arn": rule_arn,
+            "EventBusName": bus_name,
+            "ScheduleExpression": "rate(5 minutes)",
+            "State": "ENABLED",
+            "CreationTime": now,
+        }
+        mod._targets[rule_key] = [
+            {
+                "Id": "persisted-target",
+                "Arn": "arn:aws:sqs:us-west-2:111111111111:persisted-queue",
+            }
+        ]
+        mod._tags[rule_arn] = {"env": "test"}
+        mod._archives[archive_name] = {
+            "ArchiveName": archive_name,
+            "ArchiveArn": archive_arn,
+            "EventSourceArn": bus_arn,
+            "State": "ENABLED",
+            "CreationTime": now,
+            "EventCount": 0,
+            "Events": [],
+        }
+        mod._replays[replay_name] = {
+            "ReplayName": replay_name,
+            "ReplayArn": replay_arn,
+            "EventSourceArn": archive_arn,
+            "Destination": {"Arn": bus_arn},
+            "State": "COMPLETED",
+            "ReplayStartTime": now,
+            "ReplayEndTime": now,
+        }
+        mod._endpoints[endpoint_name] = {
+            "Name": endpoint_name,
+            "Arn": endpoint_arn,
+            "EndpointUrl": f"https://{endpoint_name}.global-events.us-west-2.amazonaws.com",
+            "State": "ACTIVE",
+            "CreationTime": now,
+            "LastModifiedTime": now,
+        }
+        mod._event_bus_policies[bus_name] = {
+            "Version": "2012-10-17",
+            "Statement": [{"Sid": "Allow", "Resource": bus_arn}],
+        }
+        mod._connections[connection_name] = {
+            "Name": connection_name,
+            "ConnectionArn": connection_arn,
+            "ConnectionState": "AUTHORIZED",
+            "AuthorizationType": "API_KEY",
+            "CreationTime": now,
+            "LastModifiedTime": now,
+        }
+        mod._api_destinations[api_destination_name] = {
+            "Name": api_destination_name,
+            "ApiDestinationArn": api_destination_arn,
+            "ApiDestinationState": "ACTIVE",
+            "ConnectionArn": connection_arn,
+            "InvocationEndpoint": "https://example.com",
+            "HttpMethod": "POST",
+            "CreationTime": now,
+            "LastModifiedTime": now,
+        }
+        mod._partner_event_sources[mod._partner_key("222222222222", partner_name)] = {
+            "Name": partner_name,
+            "Account": "222222222222",
+            "EventSourceArn": partner_arn,
+        }
+
+        _round_trip_dict(mod, "eventbridge")
+
+        assert mod._event_buses[bus_name]["Arn"] == bus_arn
+        assert mod._rules[rule_key]["Arn"] == rule_arn
+        assert mod._targets[rule_key][0]["Id"] == "persisted-target"
+        assert mod._tags[rule_arn]["env"] == "test"
+        assert mod._archives[archive_name]["ArchiveArn"] == archive_arn
+        assert mod._replays[replay_name]["ReplayArn"] == replay_arn
+        assert mod._endpoints[endpoint_name]["Arn"] == endpoint_arn
+        assert mod._event_bus_policies[bus_name]["Statement"][0]["Resource"] == bus_arn
+        assert mod._connections[connection_name]["ConnectionArn"] == connection_arn
+        assert mod._api_destinations[api_destination_name]["ApiDestinationArn"] == api_destination_arn
+        partner_key = mod._partner_key("222222222222", partner_name)
+        assert mod._partner_event_sources[partner_key]["EventSourceArn"] == partner_arn
+
+        set_request_region("us-east-1")
+        assert mod._event_buses.get(bus_name) is None
+        assert mod._rules.get(rule_key) is None
+        assert mod._targets.get(rule_key) is None
+        assert mod._tags.get(rule_arn) is None
+        assert mod._archives.get(archive_name) is None
+        assert mod._replays.get(replay_name) is None
+        assert mod._endpoints.get(endpoint_name) is None
+        assert mod._event_bus_policies.get(bus_name) is None
+        assert mod._connections.get(connection_name) is None
+        assert mod._api_destinations.get(api_destination_name) is None
+        assert mod._partner_event_sources.get(partner_key) is None
+
+        set_request_account_id("222222222222")
+        set_request_region("us-west-2")
+        assert mod._event_buses.get(bus_name) is None
+        assert mod._rules.get(rule_key) is None
+        assert mod._targets.get(rule_key) is None
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+# ── iot._jobs / iot._job_executions (tuple execution keys) ─────────────
+
+def test_iot_jobs_and_executions_survive_warm_boot():
+    """Jobs are keyed by jobId but executions by a (thingName, jobId) TUPLE —
+    the on-disk JSON path must round-trip both (tuple keys ride the
+    repr()/literal_eval leg of the scoped-dict encoder). A drop here would
+    silently orphan every in-flight OTA rollout on restart."""
+    mod = _get_module("iot")
+    mod.reset()
+    job_id = "persisted-job"
+    thing = "persisted-thing"
+    now_ms = 1700000000000
+    mod._jobs[job_id] = {
+        "jobId": job_id,
+        "jobArn": f"arn:aws:iot:us-east-1:000000000000:job/{job_id}",
+        "description": None,
+        "targets": [f"arn:aws:iot:us-east-1:000000000000:thing/{thing}"],
+        "targetSelection": "SNAPSHOT",
+        "document": "{\"operation\": \"reboot\"}",
+        "documentSource": None,
+        "status": "IN_PROGRESS",
+        "createdAt": now_ms,
+        "lastUpdatedAt": now_ms,
+        "completedAt": None,
+        "presignedUrlConfig": {},
+        "jobExecutionsRolloutConfig": {},
+        "snapshotted": True,
+    }
+    mod._job_executions[(thing, job_id)] = {
+        "jobId": job_id,
+        "thingName": thing,
+        "status": "IN_PROGRESS",
+        "statusDetails": {"progress": "42"},
+        "queuedAt": now_ms,
+        "startedAt": now_ms,
+        "lastUpdatedAt": now_ms,
+        "executionNumber": 1,
+        "versionNumber": 2,
+    }
+
+    _round_trip_dict(mod, "iot")
+
+    job = mod._jobs.get(job_id)
+    assert job is not None, "_jobs lost across save_state -> load_state"
+    assert job["status"] == "IN_PROGRESS"
+    execution = mod._job_executions.get((thing, job_id))
+    assert execution is not None, (
+        "_job_executions lost across save_state -> load_state — the "
+        "(thingName, jobId) tuple key must survive JSON persistence."
+    )
+    assert execution["versionNumber"] == 2
+    assert execution["statusDetails"] == {"progress": "42"}
+    mod.reset()
+
+
+def test_eventbridge_legacy_account_scoped_targets_restore_to_rule_region():
+    """Legacy target stores are scoped to the EventBridge rule region, not the
+    target ARN region, when migrating from account-only persistence."""
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+
+    mod = _get_module("eventbridge")
+    mod.reset()
+    original_account = get_account_id()
+    original_region = get_region()
+    try:
+        set_request_account_id("111111111111")
+        set_request_region("us-east-1")
+        rule_key = mod._rule_key("legacy-rule", "default")
+        legacy_rules = AccountScopedDict()
+        legacy_targets = AccountScopedDict()
+        legacy_rules[rule_key] = {
+            "Name": "legacy-rule",
+            "Arn": "arn:aws:events:us-west-2:111111111111:rule/legacy-rule",
+            "EventBusName": "default",
+            "ScheduleExpression": "rate(5 minutes)",
+            "State": "ENABLED",
+        }
+        legacy_targets[rule_key] = [
+            {
+                "Id": "foreign-sns",
+                "Arn": "arn:aws:sns:eu-central-1:111111111111:legacy-topic",
+            }
+        ]
+
+        mod.load_persisted_state({"rules": legacy_rules, "targets": legacy_targets})
+
+        set_request_region("us-west-2")
+        assert mod._rules[rule_key]["Name"] == "legacy-rule"
+        assert mod._targets[rule_key][0]["Id"] == "foreign-sns"
+
+        set_request_region("eu-central-1")
+        assert mod._targets.get(rule_key) is None
+    finally:
+        mod.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+# ── iot._ca_certificates + iot._registration_codes ────────────────────
+
+def test_iot_ca_registry_and_registration_code_survive_warm_boot():
+    """`RegisterCACertificate` writes `_ca_certificates` and
+    `GetRegistrationCode` writes `_registration_codes`. If either dict is
+    dropped from get_state()/restore_state(), registered JITR CAs and the
+    account registration code silently vanish on restart.
+
+    The warm boot is spelled out rather than taken from `_round_trip_dict` so
+    the state is also checked *between* reset() and restore_state(): a dict
+    missing from reset() survives the round trip untouched, which would satisfy
+    an after-restore assertion alone while restore_state never restored
+    anything."""
+    mod = _get_module("iot")
+    mod.reset()
+    ca_id = "c" * 64
+    ca_arn = f"arn:aws:iot:us-east-1:000000000000:cacert/{ca_id}"
+    try:
+        mod._ca_certificates[ca_id] = {
+            "certificateId": ca_id,
+            "certificateArn": ca_arn,
+            "certificatePem": (
+                "-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n"
+            ),
+            "status": "ACTIVE",
+            "autoRegistrationStatus": "ENABLE",
+            "creationDate": 1700000000,
+        }
+        mod._registration_codes["code"] = "d" * 64
+
+        persistence.save_state("iot", mod.get_state())
+        mod.reset()
+        assert mod._ca_certificates.get(ca_id) is None, (
+            "_ca_certificates survived reset() — the CA registry must be "
+            "cleared there, or a restart leaks the previous run's CAs."
+        )
+        assert mod._registration_codes.get("code") is None, (
+            "_registration_codes survived reset() — the registration code must "
+            "be cleared there."
+        )
+        loaded = persistence.load_state("iot")
+        assert loaded is not None, (
+            "persistence.load_state('iot') returned None — state file was not "
+            "written by save_state()."
+        )
+        mod.load_persisted_state(loaded)
+
+        restored = mod._ca_certificates.get(ca_id)
+        assert restored is not None, (
+            "_ca_certificates lost across save_state → load_state — the CA "
+            "registry must be in both get_state and restore_state."
+        )
+        assert restored["certificateArn"] == ca_arn
+        assert restored["autoRegistrationStatus"] == "ENABLE"
+        assert mod._registration_codes.get("code") == "d" * 64, (
+            "_registration_codes lost across save_state → load_state."
+        )
+    finally:
+        mod.reset()
+
+
+# ── ECS restore-contract regression ──────────────────────────────────
+
+def test_ecs_load_persisted_state_restores_attributes():
+    """ECS restores every store through the central loader contract."""
     mod = _get_module("ecs")
     mod.reset()
     arn = "arn:aws:ecs:us-east-1:000000000000:cluster/reload-canary"
@@ -492,17 +3061,14 @@ def test_ecs_module_reload_with_persisted_attributes_does_not_namerror():
     # Persist via the same path save_all uses on shutdown.
     persistence.save_state("ecs", mod.get_state())
 
-    # Force a full reload so the module-level try/load_state/restore_state
-    # block at the bottom of ecs.py executes against the on-disk JSON.
-    importlib.reload(mod)
+    mod.reset()
+    mod.load_persisted_state(persistence.load_state("ecs"))
 
     assert arn in mod._clusters, (
-        "Cluster lost after reload — likely NameError in restore_state "
-        "swallowed by the try/except. Check that every referenced state "
-        "dict (_attributes etc.) is declared BEFORE the load_state block."
+        "Cluster lost through the ECS load_persisted_state contract."
     )
     assert "i-canary:reload-attr" in mod._attributes, (
-        "ECS _attributes lost after reload — same root cause."
+        "ECS _attributes lost through the load_persisted_state contract."
     )
     mod.reset()
 
@@ -522,80 +3088,2851 @@ def _persisted_services():
 
 
 @pytest.mark.parametrize("svc_key,mod_name", _persisted_services())
-def test_module_cold_import_with_typical_snapshot_does_not_log_restore_failure(
-    svc_key, mod_name, caplog,
-):
-    """Generic regression for the NameError-at-import pattern that hit
-    `ecs._attributes` (#492) and `acm._synthetic_pem` (#494).
+def test_service_defers_persistence_restore_until_registry_loader(svc_key, mod_name):
+    """Services must not restore from disk merely because they are imported.
 
-    The bug shape: `restore_state(data)` references a module-level
-    symbol declared further down the file. The import-time `try:
-    load_state(...)` block calls `restore_state()` BEFORE Python
-    evaluates the later definition, so the lookup NameErrors. The
-    surrounding try/except logs `Failed to restore persisted state` and
-    swallows the exception, so the module appears to import cleanly
-    while ALL its persisted state silently disappears.
-
-    The test:
-      1. Captures the module's current `get_state()` snapshot (a
-         non-empty dict-of-empty-dicts — important so `restore_state`
-         doesn't early-return on truthy emptiness checks).
-      2. Persists that to disk via the production `save_state` path.
-      3. **Removes the module from `sys.modules` and re-imports it
-         fresh** — `importlib.reload()` would NOT catch the bug
-         because it merges new definitions into the existing
-         namespace, leaving any late-declared symbol bound from the
-         previous import.
-      4. Asserts no WARNING+ log record mentioning "restore" / "failed"
-         / "continuing fresh" was emitted during the cold import.
-
-    Catches: unconditional symbol references in restore_state
-    (ECS-style). Does NOT catch: conditional references inside loops
-    over restored data when the data is empty (ACM-style needs
-    populated state — see the per-service tests above).
+    The registry loader is the sole startup restore path. This keeps module
+    imports lazy and ensures every saved snapshot goes through the uniform
+    ``load_persisted_state(data)`` contract.
     """
-    import sys
-
-    # Persistence is already enabled and STATE_DIR is already pointed at
-    # a per-test tmp by the autouse `_enable_persistence_dict` fixture.
-
-    # Step 1+2: produce + persist a snapshot using the already-loaded
-    # module (so we get a valid get_state() shape).
-    mod = _get_module(mod_name)
-    if hasattr(mod, "reset"):
-        mod.reset()
-    persistence.save_state(svc_key, mod.get_state())
-
-    # Step 3: cold-import — wipe sys.modules and re-import.
-    # importlib.reload() won't work because it merges into the
-    # existing namespace; the late-declared symbol stays bound from
-    # the prior import.
-    full_name = f"ministack.services.{mod_name}"
-    sys.modules.pop(full_name, None)
-
-    caplog.clear()
-    with caplog.at_level("WARNING"):
-        mod = importlib.import_module(full_name)
-
-    bad = [
-        r for r in caplog.records
-        if r.levelno >= 30  # WARNING+
-        and any(needle in r.getMessage().lower()
-                for needle in ("failed to restore", "restore failed",
-                               "continuing fresh", "continuing with fresh"))
+    spec = importlib.util.find_spec(f"ministack.services.{mod_name}")
+    assert spec and spec.origin
+    source = Path(spec.origin).read_text()
+    tree = ast.parse(source)
+    import_time_restores = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.Try, ast.If))
+        and "load_state(" in (ast.get_source_segment(source, node) or "")
     ]
-    if hasattr(mod, "reset"):
+
+    assert not import_time_restores, (
+        f"{mod_name} restores state at import time; restore {svc_key!r} "
+        "through ministack.app._load_persisted_state instead."
+    )
+    assert "from ministack.core.persistence import load_state" not in source
+
+
+def test_legacy_unwrapped_state_file_loads_and_migrates_region(monkeypatch, tmp_path):
+    """U4: a pre-version-stamp on-disk file (no wrapper, account-scoped) must
+    load through the real load_state() disk path and migrate into a region-
+    scoped store, recovering region from a value ARN. Prior tests only seeded
+    dicts in memory, so this disk->migrate path was never exercised."""
+    import json as _json
+
+    from ministack.core.responses import (
+        AccountRegionScopedDict,
+        AccountScopedDict,
+        set_request_region,
+    )
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    legacy = AccountScopedDict()
+    legacy._data[("000000000000", "res-1")] = {
+        "Arn": "arn:aws:appconfig:eu-west-1:000000000000:application/res-1",
+    }
+    # Write a legacy (unwrapped, implicit-v1) file exactly as old MiniStack did.
+    with open(tmp_path / "demo.json", "w") as f:
+        _json.dump({"store": legacy}, f, default=persistence._json_default)
+
+    loaded = persistence.load_state("demo")
+    assert isinstance(loaded["store"], AccountScopedDict)
+
+    region_store = AccountRegionScopedDict()
+    region_store.update(loaded["store"])
+    set_request_region("eu-west-1")
+    assert region_store["res-1"]["Arn"].startswith("arn:aws:appconfig:eu-west-1")
+
+
+def test_default_state_format_version_stays_v2_and_refuses_newer(monkeypatch, tmp_path):
+    """U4: unchanged services stay on v2 and refuse newer state files."""
+    import json as _json
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    persistence.save_state("sqs", {"k": "v"})
+    raw = _json.loads((tmp_path / "sqs.json").read_text())
+    assert raw["__ministack_format__"] == persistence.STATE_FORMAT_VERSION == 2
+    assert raw["payload"] == {"k": "v"}
+    assert persistence.load_state("sqs") == {"k": "v"}
+
+    (tmp_path / "future.json").write_text(_json.dumps({
+        "__ministack_format__": persistence.STATE_FORMAT_VERSION + 1,
+        "payload": {"k": "v"},
+    }))
+    assert persistence.load_state("future") is None
+
+
+@pytest.mark.parametrize(
+    "service",
+    [
+        "elasticache",
+        "eventbridge",
+        "firehose",
+        "kinesis",
+        "kms",
+        "mediaconnect",
+        "pipes",
+        "scheduler",
+        "sns",
+    ],
+)
+def test_region_scoped_backfill_services_stamp_v3_and_reject_v2_reader(
+    service, monkeypatch, tmp_path
+):
+    """Services regionalized after v2 must stamp v3 for rollback safety."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    account_id = "123456789012"
+    region = "us-west-2"
+    resource_name = f"{service}-regional-resource"
+    regional_store = AccountRegionScopedDict()
+    regional_store.set_scoped(
+        account_id,
+        region,
+        resource_name,
+        {
+            "Arn": (
+                f"arn:aws:{service}:{region}:{account_id}:"
+                f"resource/{resource_name}"
+            ),
+            "Name": resource_name,
+        },
+    )
+
+    assert persistence._state_format_version(service) == 3
+
+    persistence.save_state(service, {"resources": regional_store})
+    first_snapshot = _json.loads((tmp_path / f"{service}.json").read_text())
+    assert first_snapshot["__ministack_format__"] == 3
+
+    loaded = persistence.load_state(service)
+    assert loaded["resources"].get_scoped(
+        account_id, region, resource_name
+    )["Name"] == resource_name
+
+    persistence.save_state(service, loaded)
+    second_snapshot = _json.loads((tmp_path / f"{service}.json").read_text())
+    assert second_snapshot == first_snapshot
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state(service) is None
+
+
+def test_mediaconnect_is_registered_for_persistence_save():
+    from ministack.app import _build_persistence_save_dict, _state_map
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import mediaconnect
+
+    assert _state_map["mediaconnect"] == "mediaconnect"
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "123456789012"
+    region = "us-west-2"
+    flow_arn = (
+        f"arn:aws:mediaconnect:{region}:{account_id}:"
+        "flow:flow-1234:regional-flow"
+    )
+
+    mediaconnect.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(region)
+        mediaconnect._flows[flow_arn] = {
+            "flowArn": flow_arn,
+            "name": "regional-flow",
+        }
+        mediaconnect._tags[flow_arn] = {"Env": "west"}
+
+        save_dict = _build_persistence_save_dict()
+
+        assert "mediaconnect" in save_dict
+        state = save_dict["mediaconnect"]()
+        assert state["flows"].get_scoped(account_id, region, flow_arn)[
+            "name"
+        ] == "regional-flow"
+        assert state["tags"][flow_arn] == {"Env": "west"}
+    finally:
+        mediaconnect.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_mediaconnect_region_scoped_v3_state_round_trips(monkeypatch, tmp_path):
+    import json as _json
+
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import mediaconnect
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "123456789012"
+    region = "us-west-2"
+    other_region = "us-east-1"
+    flow_arn = (
+        f"arn:aws:mediaconnect:{region}:{account_id}:"
+        "flow:flow-1234:regional-flow"
+    )
+
+    mediaconnect.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(region)
+        mediaconnect._flows[flow_arn] = {
+            "flowArn": flow_arn,
+            "name": "regional-flow",
+        }
+        mediaconnect._tags[flow_arn] = {"Env": "west"}
+
+        persistence.save_state("mediaconnect", mediaconnect.get_state())
+        first_snapshot = _json.loads(
+            (tmp_path / "mediaconnect.json").read_text()
+        )
+        assert first_snapshot["__ministack_format__"] == 3
+
+        mediaconnect.reset()
+        loaded = persistence.load_state("mediaconnect")
+        assert loaded is not None
+        mediaconnect.load_persisted_state(loaded)
+
+        set_request_region(region)
+        assert mediaconnect._flows[flow_arn]["name"] == "regional-flow"
+        assert mediaconnect._tags[flow_arn] == {"Env": "west"}
+
+        set_request_region(other_region)
+        assert flow_arn not in mediaconnect._flows
+
+        persistence.save_state("mediaconnect", mediaconnect.get_state())
+        second_snapshot = _json.loads(
+            (tmp_path / "mediaconnect.json").read_text()
+        )
+        assert second_snapshot == first_snapshot
+    finally:
+        mediaconnect.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_iot_legacy_state_migrates_resource_and_retained_regions():
+    import base64
+
+    from ministack.core.responses import (
+        AccountScopedDict,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import iot
+
+    account_id = "123456789012"
+    boot_region = "us-east-1"
+    resource_region = "us-west-2"
+    resource_name = "legacy-regional"
+
+    def legacy_store(value):
+        store = AccountScopedDict()
+        store._data[(account_id, resource_name)] = value
+        return store
+
+    legacy_state = {
+        "things": legacy_store({
+            "thingName": resource_name,
+            "thingArn": (
+                f"arn:aws:iot:{resource_region}:{account_id}:"
+                f"thing/{resource_name}"
+            ),
+        }),
+        "certificates": legacy_store({
+            "certificateId": resource_name,
+            "certificateArn": (
+                f"arn:aws:iot:{resource_region}:{account_id}:"
+                f"cert/{resource_name}"
+            ),
+        }),
+        "policies": legacy_store({
+            "policyName": resource_name,
+            "policyArn": (
+                f"arn:aws:iot:{resource_region}:{account_id}:"
+                f"policy/{resource_name}"
+            ),
+        }),
+        "topic_rules": legacy_store({
+            "ruleName": resource_name,
+            "ruleArn": (
+                f"arn:aws:iot:{resource_region}:{account_id}:"
+                f"rule/{resource_name}"
+            ),
+        }),
+        "mqtt_broker": {
+            "retained": [{
+                "topic": f"{account_id}/sensors/temperature",
+                "payload": base64.b64encode(b"21C").decode("ascii"),
+                "qos": 1,
+            }],
+        },
+    }
+
+    set_request_account_id(account_id)
+    set_request_region(boot_region)
+    iot.reset()
+    iot.broker_reset()
+    try:
+        iot.load_persisted_state(legacy_state)
+
+        for store in (
+            iot._things,
+            iot._certificates,
+            iot._policies,
+            iot._topic_rules,
+        ):
+            assert store.get_scoped(
+                account_id, resource_region, resource_name
+            ) is not None
+            assert store.get_scoped(
+                account_id, boot_region, resource_name
+            ) is None
+
+        retained_key = (
+            f"{account_id}/{boot_region}/sensors/temperature"
+        )
+        assert iot._retained[retained_key].payload == b"21C"
+        assert (
+            f"{account_id}/{resource_region}/sensors/temperature"
+            not in iot._retained
+        )
+    finally:
+        iot.reset()
+        iot.broker_reset()
+
+
+def test_iot_region_scoped_v3_state_is_idempotent(monkeypatch, tmp_path):
+    import base64
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    account_id = "123456789012"
+    region = "us-west-2"
+    resource_name = "regional-resource"
+
+    def regional_store(value):
+        store = AccountRegionScopedDict()
+        store.set_scoped(account_id, region, resource_name, value)
+        return store
+
+    state = {
+        "things": regional_store({
+            "thingName": resource_name,
+            "thingArn": (
+                f"arn:aws:iot:{region}:{account_id}:thing/{resource_name}"
+            ),
+        }),
+        "certificates": regional_store({
+            "certificateId": resource_name,
+            "certificateArn": (
+                f"arn:aws:iot:{region}:{account_id}:cert/{resource_name}"
+            ),
+        }),
+        "policies": regional_store({
+            "policyName": resource_name,
+            "policyArn": (
+                f"arn:aws:iot:{region}:{account_id}:policy/{resource_name}"
+            ),
+        }),
+        "topic_rules": regional_store({
+            "ruleName": resource_name,
+            "ruleArn": (
+                f"arn:aws:iot:{region}:{account_id}:rule/{resource_name}"
+            ),
+        }),
+        "mqtt_broker": {
+            "region_scoped": True,
+            "retained": [{
+                "topic": f"{account_id}/{region}/sensors/temperature",
+                "payload": base64.b64encode(b"21C").decode("ascii"),
+                "qos": 1,
+            }],
+        },
+    }
+
+    persistence.save_state("iot", state)
+    first_snapshot = _json.loads((tmp_path / "iot.json").read_text())
+    assert first_snapshot["__ministack_format__"] == 3
+
+    loaded = persistence.load_state("iot")
+    assert loaded is not None
+    persistence.save_state("iot", loaded)
+    second_snapshot = _json.loads((tmp_path / "iot.json").read_text())
+
+    assert second_snapshot == first_snapshot
+
+
+def test_iot_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    things = AccountRegionScopedDict()
+    things.set_scoped(
+        "123456789012",
+        "us-west-2",
+        "regional-thing",
+        {
+            "thingName": "regional-thing",
+            "thingArn": (
+                "arn:aws:iot:us-west-2:123456789012:"
+                "thing/regional-thing"
+            ),
+        },
+    )
+    persistence.save_state("iot", {"things": things})
+
+    raw = _json.loads((tmp_path / "iot.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded = persistence.load_state("iot")["things"]
+    assert loaded.get_scoped(
+        "123456789012", "us-west-2", "regional-thing"
+    )["thingName"] == "regional-thing"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("iot") is None
+
+
+def test_cloudtrail_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject CloudTrail's regional schema instead of
+    accepting it as v2 and dropping non-boot-region trails."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    trails = AccountRegionScopedDict()
+    trails.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-trail",
+        {
+            "Name": "regional-trail",
+            "HomeRegion": "us-west-2",
+            "TrailARN": "arn:aws:cloudtrail:us-west-2:000000000000:trail/regional-trail",
+        },
+    )
+    persistence.save_state("cloudtrail", {"trails": trails})
+
+    raw = _json.loads((tmp_path / "cloudtrail.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_trails = persistence.load_state("cloudtrail")["trails"]
+    assert loaded_trails.get_scoped(
+        "000000000000", "us-west-2", "regional-trail"
+    )["HomeRegion"] == "us-west-2"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("cloudtrail") is None
+
+
+def test_cloudtrail_region_scoped_v3_state_round_trips_idempotently(
+    monkeypatch, tmp_path
+):
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    trails = AccountRegionScopedDict()
+    trails.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-trail",
+        {
+            "Name": "regional-trail",
+            "HomeRegion": "us-west-2",
+            "TrailARN": "arn:aws:cloudtrail:us-west-2:000000000000:trail/regional-trail",
+        },
+    )
+    selectors = AccountRegionScopedDict()
+    selectors.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-trail",
+        [{"ReadWriteType": "All", "IncludeManagementEvents": True}],
+    )
+
+    persistence.save_state(
+        "cloudtrail",
+        {"trails": trails, "event_selectors": selectors},
+    )
+    first_snapshot = _json.loads((tmp_path / "cloudtrail.json").read_text())
+    loaded = persistence.load_state("cloudtrail")
+    assert loaded["trails"].get_scoped(
+        "000000000000", "us-west-2", "regional-trail"
+    )["TrailARN"].endswith("trail/regional-trail")
+    assert loaded["event_selectors"].get_scoped(
+        "000000000000", "us-west-2", "regional-trail"
+    )[0]["ReadWriteType"] == "All"
+
+    persistence.save_state("cloudtrail", loaded)
+    second_snapshot = _json.loads((tmp_path / "cloudtrail.json").read_text())
+    assert second_snapshot == first_snapshot
+
+
+def test_cloudtrail_legacy_state_restores_trails_by_home_region():
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import cloudtrail
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    west_region = "us-west-2"
+    west_name = "legacy-west-trail"
+    east_name = "legacy-east-trail"
+    orphan_name = "legacy-orphan-trail"
+    west_arn = f"arn:aws:cloudtrail:{west_region}:{account_id}:trail/{west_name}"
+
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        cloudtrail.reset()
+        cloudtrail.load_persisted_state(
+            {
+                "trails": {
+                    west_name: {
+                        "Name": west_name,
+                        "HomeRegion": west_region,
+                        "TrailARN": west_arn,
+                    },
+                    east_name: {
+                        "Name": east_name,
+                        "HomeRegion": boot_region,
+                        "TrailARN": (
+                            f"arn:aws:cloudtrail:{boot_region}:{account_id}:"
+                            f"trail/{east_name}"
+                        ),
+                    },
+                },
+                "event_selectors": {
+                    west_name: [{"ReadWriteType": "All"}],
+                    orphan_name: [{"ReadWriteType": "WriteOnly"}],
+                },
+                "trail_tags": {west_arn: {"env": "legacy"}},
+            }
+        )
+
+        assert cloudtrail._trails.get_scoped(account_id, west_region, west_name)[
+            "HomeRegion"
+        ] == west_region
+        assert cloudtrail._event_selectors.get_scoped(
+            account_id, west_region, west_name
+        ) == [{"ReadWriteType": "All"}]
+        assert cloudtrail._trails.get_scoped(account_id, boot_region, west_name) is None
+        assert cloudtrail._event_selectors.get_scoped(
+            account_id, boot_region, orphan_name
+        ) == [{"ReadWriteType": "WriteOnly"}]
+        assert cloudtrail._trail_tags.get_scoped(
+            account_id, boot_region, west_arn
+        ) == {"env": "legacy"}
+    finally:
+        cloudtrail.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_cloudtrail_persistence_lifecycle_restores_all_regional_accounts(
+    monkeypatch, tmp_path
+):
+    from ministack.app import _build_persistence_save_dict, _state_map
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import cloudtrail
+
+    boot_region = "us-east-1"
+    west_region = "us-west-2"
+    first_account = "111111111111"
+    second_account = "222222222222"
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+    set_request_account_id(first_account)
+    set_request_region(boot_region)
+    cloudtrail.reset()
+    try:
+        cloudtrail._trails.set_scoped(
+            first_account,
+            west_region,
+            "acct-one-west",
+            {
+                "Name": "acct-one-west",
+                "HomeRegion": west_region,
+                "TrailARN": (
+                    f"arn:aws:cloudtrail:{west_region}:{first_account}:"
+                    "trail/acct-one-west"
+                ),
+            },
+        )
+        cloudtrail._trails.set_scoped(
+            second_account,
+            boot_region,
+            "acct-two-east",
+            {
+                "Name": "acct-two-east",
+                "HomeRegion": boot_region,
+                "TrailARN": (
+                    f"arn:aws:cloudtrail:{boot_region}:{second_account}:"
+                    "trail/acct-two-east"
+                ),
+            },
+        )
+
+        assert _state_map["cloudtrail"] == "cloudtrail"
+        save_dict = _build_persistence_save_dict()
+        persistence.save_all({"cloudtrail": save_dict["cloudtrail"]})
+
+        cloudtrail.reset()
+        cloudtrail.load_persisted_state(persistence.load_state("cloudtrail"))
+
+        assert cloudtrail._trails.get_scoped(
+            first_account, west_region, "acct-one-west"
+        )["HomeRegion"] == west_region
+        assert cloudtrail._trails.get_scoped(
+            second_account, boot_region, "acct-two-east"
+        )["HomeRegion"] == boot_region
+        assert cloudtrail._trails.get_scoped(
+            first_account, boot_region, "acct-one-west"
+        ) is None
+    finally:
+        cloudtrail.reset()
+
+
+def test_ecs_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject ECS's regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    clusters = AccountRegionScopedDict()
+    clusters.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-cluster",
+        {"clusterArn": "arn:aws:ecs:us-west-2:000000000000:cluster/regional-cluster"},
+    )
+    persistence.save_state("ecs", {"clusters": clusters})
+
+    raw = _json.loads((tmp_path / "ecs.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_clusters = persistence.load_state("ecs")["clusters"]
+    assert loaded_clusters.get_scoped(
+        "000000000000", "us-west-2", "regional-cluster"
+    )["clusterArn"].endswith("cluster/regional-cluster")
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("ecs") is None
+
+
+def test_ecr_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject ECR's regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    repositories = AccountRegionScopedDict()
+    repositories.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-repository",
+        {
+            "repositoryArn": (
+                "arn:aws:ecr:us-west-2:000000000000:"
+                "repository/regional-repository"
+            )
+        },
+    )
+    persistence.save_state("ecr", {"repositories": repositories})
+
+    raw = _json.loads((tmp_path / "ecr.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_repositories = persistence.load_state("ecr")["repositories"]
+    assert loaded_repositories.get_scoped(
+        "000000000000", "us-west-2", "regional-repository"
+    )["repositoryArn"].endswith("repository/regional-repository")
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("ecr") is None
+
+
+def test_appsync_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject AppSync's regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    apis = AccountRegionScopedDict()
+    apis.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-api",
+        {
+            "apiId": "regional-api",
+            "arn": "arn:aws:appsync:us-west-2:000000000000:apis/regional-api",
+        },
+    )
+    persistence.save_state("appsync", {"apis": apis})
+
+    raw = _json.loads((tmp_path / "appsync.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_apis = persistence.load_state("appsync")["apis"]
+    assert loaded_apis.get_scoped(
+        "000000000000", "us-west-2", "regional-api"
+    )["apiId"] == "regional-api"
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("appsync") is None
+
+
+def test_appsync_events_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject AppSync Events' regional schema instead
+    of accepting it as v2 and silently dropping APIs, namespaces, and keys."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    apis = AccountRegionScopedDict()
+    apis.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-events-api",
+        {
+            "apiArn": (
+                "arn:aws:appsync:us-west-2:000000000000:"
+                "apis/regional-events-api"
+            ),
+        },
+    )
+    persistence.save_state("appsync_events", {"apis": apis})
+
+    raw = _json.loads((tmp_path / "appsync_events.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_apis = persistence.load_state("appsync_events")["apis"]
+    assert loaded_apis.get_scoped(
+        "000000000000", "us-west-2", "regional-events-api"
+    )["apiArn"].endswith("apis/regional-events-api")
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("appsync_events") is None
+
+
+def test_eks_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject EKS regional state instead of dropping it."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    clusters = AccountRegionScopedDict()
+    clusters.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-cluster",
+        {
+            "name": "regional-cluster",
+            "arn": (
+                "arn:aws:eks:us-west-2:000000000000:"
+                "cluster/regional-cluster"
+            ),
+        },
+    )
+    persistence.save_state("eks", {"clusters": clusters})
+
+    raw = _json.loads((tmp_path / "eks.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_clusters = persistence.load_state("eks")["clusters"]
+    assert loaded_clusters.get_scoped(
+        "000000000000", "us-west-2", "regional-cluster"
+    )["arn"].endswith("cluster/regional-cluster")
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("eks") is None
+
+
+def test_emr_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject EMR regional state instead of dropping it."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    clusters = AccountRegionScopedDict()
+    clusters.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "j-LEGACYCLUSTER",
+        {
+            "Id": "j-LEGACYCLUSTER",
+            "ClusterArn": (
+                "arn:aws:elasticmapreduce:us-west-2:000000000000:"
+                "cluster/j-LEGACYCLUSTER"
+            ),
+        },
+    )
+    persistence.save_state("emr", {"_clusters": clusters})
+
+    raw = _json.loads((tmp_path / "emr.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded = persistence.load_state("emr")["_clusters"]
+    assert loaded.get_scoped(
+        "000000000000", "us-west-2", "j-LEGACYCLUSTER"
+    )["Id"] == "j-LEGACYCLUSTER"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("emr") is None
+
+
+def test_transfer_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject Transfer's regional schema instead of
+    accepting it as v2 and silently dropping regional servers and users."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    servers = AccountRegionScopedDict()
+    servers.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "s-regionalserver01",
+        {
+            "ServerId": "s-regionalserver01",
+            "Arn": (
+                "arn:aws:transfer:us-west-2:000000000000:"
+                "server/s-regionalserver01"
+            ),
+        },
+    )
+    users = AccountRegionScopedDict()
+    users.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "s-regionalserver01/regional-user",
+        {
+            "ServerId": "s-regionalserver01",
+            "UserName": "regional-user",
+            "Arn": (
+                "arn:aws:transfer:us-west-2:000000000000:"
+                "user/s-regionalserver01/regional-user"
+            ),
+        },
+    )
+    persistence.save_state("transfer", {"servers": servers, "users": users})
+
+    raw = _json.loads((tmp_path / "transfer.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_servers = persistence.load_state("transfer")["servers"]
+    assert loaded_servers.get_scoped(
+        "000000000000", "us-west-2", "s-regionalserver01"
+    )["ServerId"] == "s-regionalserver01"
+    loaded_users = persistence.load_state("transfer")["users"]
+    assert loaded_users.get_scoped(
+        "000000000000",
+        "us-west-2",
+        "s-regionalserver01/regional-user",
+    )["UserName"] == "regional-user"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("transfer") is None
+
+
+def test_resource_groups_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject Resource Groups' regional schema instead
+    of accepting it as v2 and silently dropping every regional store."""
+
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    groups = AccountRegionScopedDict()
+    groups.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-group",
+        {
+            "GroupArn": (
+                "arn:aws:resource-groups:us-west-2:000000000000:"
+                "group/regional-group"
+            )
+        },
+    )
+    persistence.save_state("resource_groups", {"groups": groups})
+
+    raw = _json.loads((tmp_path / "resource_groups.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_groups = persistence.load_state("resource_groups")["groups"]
+    assert loaded_groups.get_scoped(
+        "000000000000", "us-west-2", "regional-group"
+    )["GroupArn"].endswith("group/regional-group")
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("resource_groups") is None
+
+
+def test_codebuild_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject CodeBuild's regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    projects = AccountRegionScopedDict()
+    projects.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-project",
+        {
+            "arn": (
+                "arn:aws:codebuild:us-west-2:000000000000:"
+                "project/regional-project"
+            )
+        },
+    )
+    persistence.save_state("codebuild", {"projects": projects})
+
+    raw = _json.loads((tmp_path / "codebuild.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_projects = persistence.load_state("codebuild")["projects"]
+    assert loaded_projects.get_scoped(
+        "000000000000", "us-west-2", "regional-project"
+    )["arn"].endswith("project/regional-project")
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("codebuild") is None
+
+
+def test_mq_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject MQ's regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    brokers = AccountRegionScopedDict()
+    brokers.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-broker",
+        {
+            "brokerArn": (
+                "arn:aws:mq:us-west-2:000000000000:broker:regional-broker"
+            )
+        },
+    )
+    persistence.save_state("mq", {"brokers": brokers})
+
+    raw = _json.loads((tmp_path / "mq.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_brokers = persistence.load_state("mq")["brokers"]
+    assert loaded_brokers.get_scoped(
+        "000000000000", "us-west-2", "regional-broker"
+    )["brokerArn"].endswith("broker:regional-broker")
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("mq") is None
+
+
+def test_mwaa_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject MWAA's regional schema instead of
+    accepting it as v2 and silently dropping every regional environment."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    environments = AccountRegionScopedDict()
+    environments.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-environment",
+        {
+            "Name": "regional-environment",
+            "Arn": (
+                "arn:aws:airflow:us-west-2:000000000000:"
+                "environment/regional-environment"
+            ),
+        },
+    )
+    persistence.save_state("mwaa", {"environments": environments})
+
+    raw = _json.loads((tmp_path / "mwaa.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_environments = persistence.load_state("mwaa")["environments"]
+    assert loaded_environments.get_scoped(
+        "000000000000", "us-west-2", "regional-environment"
+    )["Name"] == "regional-environment"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("mwaa") is None
+
+
+def test_ses_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject both SES persistence files after their
+    stores become regional instead of accepting v2 and restoring them empty."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    for service in ("ses", "ses_v2"):
+        identities = AccountRegionScopedDict()
+        identities.set_scoped(
+            "000000000000",
+            "us-west-2",
+            "regional@example.com",
+            {"VerificationStatus": "Success"},
+        )
+        persistence.save_state(service, {"_identities": identities})
+
+        raw = _json.loads((tmp_path / f"{service}.json").read_text())
+        assert raw["__ministack_format__"] == 3
+        loaded_identities = persistence.load_state(service)["_identities"]
+        assert loaded_identities.get_scoped(
+            "000000000000", "us-west-2", "regional@example.com"
+        )["VerificationStatus"] == "Success"
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("ses") is None
+    assert persistence.load_state("ses_v2") is None
+
+
+def test_batch_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject Batch's regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    jobs = AccountRegionScopedDict()
+    jobs.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-job",
+        {"jobArn": "arn:aws:batch:us-west-2:000000000000:job/regional-job"},
+    )
+    persistence.save_state("batch", {"jobs": jobs})
+
+    raw = _json.loads((tmp_path / "batch.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_jobs = persistence.load_state("batch")["jobs"]
+    assert loaded_jobs.get_scoped(
+        "000000000000", "us-west-2", "regional-job"
+    )["jobArn"].endswith("job/regional-job")
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("batch") is None
+
+
+def test_autoscaling_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject Auto Scaling's regional schema instead
+    of accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    asgs = AccountRegionScopedDict()
+    asgs.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-asg",
+        {
+            "AutoScalingGroupARN": (
+                "arn:aws:autoscaling:us-west-2:000000000000:"
+                "autoScalingGroup:regional:autoScalingGroupName/regional-asg"
+            )
+        },
+    )
+    persistence.save_state("autoscaling", {"asgs": asgs})
+
+    raw = _json.loads((tmp_path / "autoscaling.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_asgs = persistence.load_state("autoscaling")["asgs"]
+    assert loaded_asgs.get_scoped(
+        "000000000000", "us-west-2", "regional-asg"
+    )["AutoScalingGroupARN"].endswith("autoScalingGroupName/regional-asg")
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("autoscaling") is None
+
+
+def test_athena_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject Athena's regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    workgroups = AccountRegionScopedDict()
+    workgroups.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-workgroup",
+        {"Name": "regional-workgroup", "Description": "west"},
+    )
+    persistence.save_state("athena", {"_workgroups": workgroups})
+
+    raw = _json.loads((tmp_path / "athena.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_workgroups = persistence.load_state("athena")["_workgroups"]
+    assert loaded_workgroups.get_scoped(
+        "000000000000", "us-west-2", "regional-workgroup"
+    )["Description"] == "west"
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("athena") is None
+
+
+def test_acm_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject ACM's regional schema instead of accepting
+    it as v2 and silently dropping every regional certificate store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    certificates = AccountRegionScopedDict()
+    arn = "arn:aws:acm:us-west-2:000000000000:certificate/regional-cert"
+    certificates.set_scoped(
+        "000000000000", "us-west-2", arn,
+        {"CertificateArn": arn, "DomainName": "west.example.com"},
+    )
+    persistence.save_state("acm", {"_certificates": certificates})
+
+    raw = _json.loads((tmp_path / "acm.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded = persistence.load_state("acm")["_certificates"]
+    assert loaded.get_scoped(
+        "000000000000", "us-west-2", arn
+    )["DomainName"] == "west.example.com"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("acm") is None
+
+
+def test_alb_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject ALB's regional schema instead of accepting
+    it as v2 and silently dropping every regional load-balancer store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    lbs = AccountRegionScopedDict()
+    arn = "arn:aws:elasticloadbalancing:us-west-2:000000000000:loadbalancer/app/west/1"
+    lbs.set_scoped(
+        "000000000000", "us-west-2", arn,
+        {"LoadBalancerArn": arn, "LoadBalancerName": "west"},
+    )
+    persistence.save_state("alb", {"_lbs": lbs})
+
+    raw = _json.loads((tmp_path / "alb.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded = persistence.load_state("alb")["_lbs"]
+    assert loaded.get_scoped(
+        "000000000000", "us-west-2", arn
+    )["LoadBalancerName"] == "west"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("alb") is None
+
+
+def test_bedrock_agentcore_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject AgentCore's regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    runtimes = AccountRegionScopedDict()
+    runtimes.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-runtime",
+        {
+            "agentRuntimeId": "regional-runtime",
+            "agentRuntimeArn": (
+                "arn:aws:bedrock-agentcore:us-west-2:000000000000:"
+                "agent/11111111-1111-1111-1111-111111111111:1"
+            ),
+        },
+    )
+    persistence.save_state(
+        "bedrock_agentcore",
+        {"runtimes": runtimes, "endpoints": AccountRegionScopedDict()},
+    )
+
+    raw = _json.loads((tmp_path / "bedrock_agentcore.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded = persistence.load_state("bedrock_agentcore")["runtimes"]
+    assert loaded.get_scoped(
+        "000000000000", "us-west-2", "regional-runtime"
+    )["agentRuntimeArn"].endswith(":1")
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("bedrock_agentcore") is None
+
+
+def test_inspector2_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject Inspector2 regional account buckets."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    configs = AccountRegionScopedDict()
+    configs.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "000000000000",
+        {"ecr": {"status": "ENABLED"}},
+    )
+    persistence.save_state("inspector2", {"account_config": configs})
+
+    raw = _json.loads((tmp_path / "inspector2.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded = persistence.load_state("inspector2")["account_config"]
+    assert loaded.get_scoped(
+        "000000000000", "us-west-2", "000000000000"
+    ) == {"ecr": {"status": "ENABLED"}}
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("inspector2") is None
+
+
+def test_efs_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject EFS regional state instead of dropping it."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    file_systems = AccountRegionScopedDict()
+    file_systems.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "fs-11111111111111111",
+        {
+            "FileSystemId": "fs-11111111111111111",
+            "FileSystemArn": (
+                "arn:aws:elasticfilesystem:us-west-2:000000000000:"
+                "file-system/fs-11111111111111111"
+            ),
+        },
+    )
+    persistence.save_state("efs", {"file_systems": file_systems})
+
+    raw = _json.loads((tmp_path / "efs.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded = persistence.load_state("efs")["file_systems"]
+    assert loaded.get_scoped(
+        "000000000000", "us-west-2", "fs-11111111111111111"
+    )["FileSystemId"] == "fs-11111111111111111"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("efs") is None
+
+
+def test_s3files_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject S3 Files' regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    file_systems = AccountRegionScopedDict()
+    file_systems.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "fs-11111111111111111",
+        {
+            "fileSystemId": "fs-11111111111111111",
+            "fileSystemArn": (
+                "arn:aws:s3files:us-west-2:000000000000:"
+                "file-system/fs-11111111111111111"
+            ),
+        },
+    )
+    persistence.save_state("s3files", {"file_systems": file_systems})
+
+    raw = _json.loads((tmp_path / "s3files.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_file_systems = persistence.load_state("s3files")["file_systems"]
+    assert loaded_file_systems.get_scoped(
+        "000000000000", "us-west-2", "fs-11111111111111111"
+    )["fileSystemId"] == "fs-11111111111111111"
+
+    # Simulate the previous binary, whose highest understood format is v2.
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("s3files") is None
+
+
+def test_ec2_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject EC2 regional state instead of accepting
+    account-only stores that would collapse same-name resources across regions."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    key_pairs = AccountRegionScopedDict()
+    key_pairs.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "same-key",
+        {"KeyName": "same-key", "KeyPairId": "key-west"},
+    )
+    persistence.save_state("ec2", {"key_pairs": key_pairs})
+
+    raw = _json.loads((tmp_path / "ec2.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_key_pairs = persistence.load_state("ec2")["key_pairs"]
+    assert loaded_key_pairs.get_scoped(
+        "000000000000", "us-west-2", "same-key"
+    )["KeyPairId"] == "key-west"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("ec2") is None
+
+
+def test_waf_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    """A rollback binary must reject WAF's regional schema instead of accepting
+    account-only stores that would collapse REGIONAL and CLOUDFRONT scopes."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    web_acls = AccountRegionScopedDict()
+    web_acls.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-acl",
+        {
+            "ARN": (
+                "arn:aws:wafv2:us-west-2:000000000000:"
+                "regional/webacl/regional-acl/regional-acl"
+            ),
+            "Id": "regional-acl",
+            "Name": "regional-acl",
+            "Scope": "REGIONAL",
+        },
+    )
+    persistence.save_state("waf", {"_web_acls": web_acls})
+
+    raw = _json.loads((tmp_path / "waf.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_web_acls = persistence.load_state("waf")["_web_acls"]
+    assert loaded_web_acls.get_scoped(
+        "000000000000",
+        "us-west-2",
+        "regional-acl",
+    )["Name"] == "regional-acl"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("waf") is None
+
+
+def test_cognito_region_scoped_state_round_trips_and_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    import json as _json
+
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import cognito
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account = "111111111111"
+    pool_id = "us-west-2_roundtrip"
+    identity_pool_id = "us-west-2:00000000-0000-4000-8000-000000000002"
+
+    def _legacy_store(key, value):
+        store = AccountScopedDict()
+        store._data[(account, key)] = value
+        return store
+
+    legacy_payload = {
+        "user_pools": _legacy_store(
+            pool_id, {"Id": pool_id, "Name": "roundtrip"}
+        ),
+        "pool_domain_map": _legacy_store("roundtrip-domain", pool_id),
+        "identity_pools": _legacy_store(
+            identity_pool_id,
+            {
+                "IdentityPoolId": identity_pool_id,
+                "IdentityPoolName": "roundtrip",
+            },
+        ),
+        "identity_tags": _legacy_store(identity_pool_id, {"scope": "west"}),
+    }
+    (tmp_path / "cognito.json").write_text(
+        _json.dumps(
+            {"__ministack_format__": 2, "payload": legacy_payload},
+            default=persistence._json_default,
+        )
+    )
+
+    try:
+        set_request_account_id(account)
+        set_request_region("us-east-1")
+        cognito.reset()
+        cognito.load_persisted_state(persistence.load_state("cognito"))
+
+        assert cognito._user_pools.get_scoped(
+            account, "us-west-2", pool_id
+        )["Name"] == "roundtrip"
+        assert cognito._user_pools.get_scoped(
+            account, "us-east-1", pool_id
+        ) is None
+        assert cognito._pool_domain_map.get_scoped(
+            account, "us-west-2", "roundtrip-domain"
+        ) == pool_id
+        assert cognito._identity_pools.get_scoped(
+            account, "us-west-2", identity_pool_id
+        )["IdentityPoolName"] == "roundtrip"
+        assert cognito._identity_tags.get_scoped(
+            account, "us-west-2", identity_pool_id
+        ) == {"scope": "west"}
+
+        persistence.save_state("cognito", cognito.get_state())
+        raw = _json.loads((tmp_path / "cognito.json").read_text())
+        assert raw["__ministack_format__"] == 3
+        loaded = persistence.load_state("cognito")["user_pools"]
+        assert loaded.get_scoped(account, "us-west-2", pool_id)[
+            "Name"
+        ] == "roundtrip"
+
+        monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+        assert persistence.load_state("cognito") is None
+    finally:
+        cognito.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_cognito_restore_rebuilds_schema_attributes_from_legacy_snapshot(monkeypatch):
+    """A pool snapshotted before SchemaAttributes existed still describes fully."""
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import cognito
+
+    original_account = get_account_id()
+    original_region = get_region()
+    pool_id = "us-west-2_legacyschema"
+    try:
+        set_request_account_id("000000000000")
+        set_request_region("us-west-2")
+        cognito.reset()
+        cognito.load_persisted_state({
+            "user_pools": {
+                pool_id: {
+                    "Id": pool_id,
+                    "Name": "legacy",
+                    "Schema": [{"Name": "tenant", "AttributeDataType": "String"}],
+                }
+            }
+        })
+        pool = cognito._pool_out(cognito._user_pools[pool_id])
+        names = [a["Name"] for a in pool["SchemaAttributes"]]
+        assert "sub" in names and "email" in names
+        assert "custom:tenant" in names
+        # The request-shaped key does not survive into the response shape.
+        assert "Schema" not in pool
+    finally:
+        cognito.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_waf_region_scoped_v3_state_round_trips_idempotently(monkeypatch, tmp_path):
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    web_acls = AccountRegionScopedDict()
+    web_acls.set_scoped(
+        "000000000000",
+        "us-east-1",
+        "global-acl",
+        {
+            "ARN": (
+                "arn:aws:wafv2:us-east-1:000000000000:"
+                "global/webacl/global-acl/global-acl"
+            ),
+            "Id": "global-acl",
+            "Name": "global-acl",
+            "Scope": "CLOUDFRONT",
+        },
+    )
+    associations = AccountRegionScopedDict()
+    associations.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "arn:aws:elasticloadbalancing:us-west-2:000000000000:loadbalancer/app/app/id",
+        (
+            "arn:aws:wafv2:us-east-1:000000000000:"
+            "global/webacl/global-acl/global-acl"
+        ),
+    )
+    tags = AccountScopedDict()
+    tags.set_scoped(
+        "000000000000",
+        "us-west-2",
+        (
+            "arn:aws:wafv2:us-east-1:000000000000:"
+            "global/webacl/global-acl/global-acl"
+        ),
+        [{"Key": "scope", "Value": "global"}],
+    )
+
+    persistence.save_state(
+        "waf",
+        {
+            "_web_acls": web_acls,
+            "_associations": associations,
+            "_waf_tags": tags,
+        },
+    )
+    first_snapshot = _json.loads((tmp_path / "waf.json").read_text())
+    loaded = persistence.load_state("waf")
+    assert loaded["_web_acls"].get_scoped(
+        "000000000000",
+        "us-east-1",
+        "global-acl",
+    )["Scope"] == "CLOUDFRONT"
+    assert loaded["_associations"].get_scoped(
+        "000000000000",
+        "us-west-2",
+        "arn:aws:elasticloadbalancing:us-west-2:000000000000:loadbalancer/app/app/id",
+    ).endswith("global/webacl/global-acl/global-acl")
+
+    persistence.save_state("waf", loaded)
+    second_snapshot = _json.loads((tmp_path / "waf.json").read_text())
+    assert second_snapshot == first_snapshot
+
+
+def test_ec2_legacy_state_restores_to_boot_region_without_arn_mining():
+    """Legacy EC2 state is one coherent graph even when records embed foreign ARNs."""
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import ec2
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "123456789012"
+    boot_region = "us-east-1"
+    foreign_region = "us-west-2"
+
+    vpcs = AccountScopedDict()
+    flow_logs = AccountScopedDict()
+
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        ec2.reset()
+
+        vpcs["vpc-legacy"] = {
+            "VpcId": "vpc-legacy",
+            "CidrBlock": "10.70.0.0/16",
+            "OwnerId": account_id,
+        }
+        flow_logs["fl-legacy"] = {
+            "FlowLogId": "fl-legacy",
+            "ResourceId": "vpc-legacy",
+            "DeliverLogsPermissionArn": (
+                f"arn:aws:logs:{foreign_region}:{account_id}:log-group:foreign"
+            ),
+            "LogDestination": f"arn:aws:logs:{foreign_region}:{account_id}:log-group:foreign",
+        }
+
+        ec2.load_persisted_state({"vpcs": vpcs, "flow_logs": flow_logs})
+
+        assert ec2._vpcs.get_scoped(account_id, boot_region, "vpc-legacy")["VpcId"] == "vpc-legacy"
+        assert ec2._flow_logs.get_scoped(account_id, boot_region, "fl-legacy")["ResourceId"] == "vpc-legacy"
+        assert ec2._flow_logs.get_scoped(account_id, foreign_region, "fl-legacy") is None
+    finally:
+        ec2.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_ec2_legacy_vpc_peering_restores_to_boot_region_graph():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import ec2
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "123456789012"
+    boot_region = "us-east-1"
+    peer_region = "us-west-2"
+    pcx_id = "pcx-legacy000000001"
+
+    vpcs = AccountScopedDict()
+    peerings = AccountScopedDict()
+    tags = AccountScopedDict()
+
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        ec2.reset()
+
+        vpcs["vpc-east"] = {
+            "VpcId": "vpc-east",
+            "CidrBlock": "10.0.0.0/16",
+            "State": "available",
+            "IsDefault": False,
+            "OwnerId": account_id,
+        }
+        vpcs["vpc-west"] = {
+            "VpcId": "vpc-west",
+            "CidrBlock": "10.1.0.0/16",
+            "State": "available",
+            "IsDefault": False,
+            "OwnerId": account_id,
+        }
+        peerings[pcx_id] = {
+            "VpcPeeringConnectionId": pcx_id,
+            "RequesterVpcInfo": {
+                "VpcId": "vpc-east",
+                "OwnerId": account_id,
+                "Region": boot_region,
+            },
+            "AccepterVpcInfo": {
+                "VpcId": "vpc-west",
+                "OwnerId": account_id,
+                "Region": peer_region,
+            },
+            "Status": {
+                "Code": "pending-acceptance",
+                "Message": "Pending Acceptance",
+            },
+        }
+        tags[pcx_id] = [{"Key": "Scope", "Value": "legacy"}]
+
+        ec2.load_persisted_state({"vpcs": vpcs, "vpc_peering": peerings, "tags": tags})
+
+        boot_record = ec2._vpc_peering.get_scoped(account_id, boot_region, pcx_id)
+        peer_record = ec2._vpc_peering.get_scoped(account_id, peer_region, pcx_id)
+        assert boot_record["VpcPeeringConnectionId"] == pcx_id
+        assert boot_record["RequesterVpcInfo"]["Region"] == boot_region
+        assert boot_record["AccepterVpcInfo"]["Region"] == boot_region
+        assert peer_record is None
+        assert ec2._vpcs.get_scoped(account_id, boot_region, "vpc-east") is not None
+        assert ec2._vpcs.get_scoped(account_id, boot_region, "vpc-west") is not None
+        assert ec2._vpcs.get_scoped(account_id, peer_region, "vpc-west") is None
+        assert ec2._tags.get_scoped(account_id, boot_region, pcx_id) == tags[pcx_id]
+        assert ec2._tags.get_scoped(account_id, peer_region, pcx_id) is None
+        assert (account_id, peer_region) not in ec2._default_initialized_scopes
+
+        set_request_region(peer_region)
+        ec2._ensure_defaults_initialized()
+        assert (
+            ec2._vpcs.get_scoped(account_id, peer_region, ec2._DEFAULT_VPC_ID)
+            is not None
+        )
+        ec2._set_vpc_peering_status(boot_record, "active", "Active")
+        assert (
+            ec2._vpc_peering.get_scoped(account_id, boot_region, pcx_id)["Status"]["Code"]
+            == "active"
+        )
+        assert ec2._vpc_peering.get_scoped(account_id, peer_region, pcx_id) is None
+    finally:
+        ec2.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_ec2_restore_preserves_deleted_default_resource_scope():
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import ec2
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "123456789012"
+    region = "us-west-2"
+
+    try:
+        set_request_account_id(account_id)
+        set_request_region(region)
+        ec2.reset()
+
+        for store in (
+            ec2._vpcs,
+            ec2._subnets,
+            ec2._security_groups,
+            ec2._network_acls,
+            ec2._internet_gateways,
+            ec2._route_tables,
+        ):
+            store.clear()
+
+        state = ec2.get_state()
+        assert {"AccountId": account_id, "Region": region} in state[
+            "default_initialized_scopes"
+        ]
+
+        ec2.load_persisted_state(state)
+        ec2._ensure_defaults_initialized()
+
+        assert ec2._vpcs.get_scoped(account_id, region, ec2._DEFAULT_VPC_ID) is None
+        assert (
+            ec2._subnets.get_scoped(account_id, region, ec2._DEFAULT_SUBNET_ID)
+            is None
+        )
+        assert (
+            ec2._security_groups.get_scoped(account_id, region, ec2._DEFAULT_SG_ID)
+            is None
+        )
+    finally:
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+        ec2.reset()
+
+
+def test_ec2_legacy_generated_default_vpc_marks_scope_initialized():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import ec2
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "123456789012"
+    region = "us-west-2"
+    generated_default_vpc_id = "vpc-0abc1234def567890"
+
+    vpcs = AccountScopedDict()
+
+    try:
+        set_request_account_id(account_id)
+        set_request_region(region)
+        ec2.reset()
+
+        vpcs[generated_default_vpc_id] = {
+            "VpcId": generated_default_vpc_id,
+            "CidrBlock": "172.31.0.0/16",
+            "State": "available",
+            "IsDefault": True,
+            "DhcpOptionsId": "dopt-00000001",
+            "InstanceTenancy": "default",
+            "OwnerId": account_id,
+            "DefaultNetworkAclId": "acl-0abc1234def567890",
+            "DefaultSecurityGroupId": "sg-0abc1234def567890",
+            "MainRouteTableId": "rtb-0abc1234def567890",
+        }
+
+        ec2.load_persisted_state({"vpcs": vpcs})
+        ec2._ensure_defaults_initialized()
+
+        assert (
+            ec2._vpcs.get_scoped(account_id, region, generated_default_vpc_id)
+            is not None
+        )
+        assert ec2._vpcs.get_scoped(account_id, region, ec2._DEFAULT_VPC_ID) is None
+    finally:
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+        ec2.reset()
+
+
+def test_ec2_region_scoped_v3_state_is_idempotent(monkeypatch, tmp_path):
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    account_id = "123456789012"
+    region = "us-west-2"
+
+    key_pairs = AccountRegionScopedDict()
+    key_pairs.set_scoped(
+        account_id,
+        region,
+        "regional-key",
+        {"KeyName": "regional-key", "KeyPairId": "key-west"},
+    )
+    flow_logs = AccountRegionScopedDict()
+    flow_logs.set_scoped(
+        account_id,
+        region,
+        "fl-regional",
+        {
+            "FlowLogId": "fl-regional",
+            "ResourceId": "vpc-regional",
+            "LogDestination": f"arn:aws:logs:{region}:{account_id}:log-group:regional",
+        },
+    )
+
+    persistence.save_state("ec2", {"key_pairs": key_pairs, "flow_logs": flow_logs})
+    first_snapshot = _json.loads((tmp_path / "ec2.json").read_text())
+    assert first_snapshot["__ministack_format__"] == 3
+    assert f"{account_id}\x00{region}\x00'regional-key'" in first_snapshot["payload"]["key_pairs"]["data"]
+
+    loaded = persistence.load_state("ec2")
+    assert loaded["key_pairs"].get_scoped(account_id, region, "regional-key")["KeyPairId"] == "key-west"
+    persistence.save_state("ec2", loaded)
+    second_snapshot = _json.loads((tmp_path / "ec2.json").read_text())
+
+    assert second_snapshot == first_snapshot
+
+
+def test_opensearch_region_scoped_v3_state_is_idempotent(monkeypatch, tmp_path):
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    account_id = "123456789012"
+    region = "us-west-2"
+    domain_name = "regional-domain"
+    package_id = "FPKG123456"
+    association_key = f"{package_id}:{domain_name}"
+    domain_arn = f"arn:aws:es:{region}:{account_id}:domain/{domain_name}"
+
+    def regional_store(key, value):
+        store = AccountRegionScopedDict()
+        store.set_scoped(account_id, region, key, value)
+        return store
+
+    tags = AccountScopedDict()
+    tags._data[(account_id, domain_arn)] = [{"Key": "Env", "Value": "west"}]
+    state = {
+        "domains": regional_store(
+            domain_name,
+            {"DomainName": domain_name, "ARN": domain_arn},
+        ),
+        "tags": tags,
+        "change_progress": regional_store(
+            domain_name,
+            {"ChangeId": "change-1", "Status": "COMPLETED"},
+        ),
+        "packages": regional_store(
+            package_id,
+            {"PackageID": package_id, "PackageName": "synonyms"},
+        ),
+        "domain_packages": regional_store(
+            association_key,
+            {"PackageID": package_id, "DomainName": domain_name},
+        ),
+    }
+
+    persistence.save_state("opensearch", state)
+    first_snapshot = _json.loads((tmp_path / "opensearch.json").read_text())
+    assert first_snapshot["__ministack_format__"] == 3
+
+    loaded = persistence.load_state("opensearch")
+    assert loaded is not None
+    persistence.save_state("opensearch", loaded)
+    second_snapshot = _json.loads((tmp_path / "opensearch.json").read_text())
+
+    assert second_snapshot == first_snapshot
+
+
+def test_opensearch_region_scoped_state_is_rejected_by_v2_reader(monkeypatch, tmp_path):
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    domains = AccountRegionScopedDict()
+    domains.set_scoped(
+        "123456789012",
+        "us-west-2",
+        "regional-domain",
+        {
+            "DomainName": "regional-domain",
+            "ARN": "arn:aws:es:us-west-2:123456789012:domain/regional-domain",
+        },
+    )
+    persistence.save_state("opensearch", {"domains": domains})
+
+    raw = _json.loads((tmp_path / "opensearch.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_domains = persistence.load_state("opensearch")["domains"]
+    assert loaded_domains.get_scoped(
+        "123456789012", "us-west-2", "regional-domain"
+    )["DomainName"] == "regional-domain"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("opensearch") is None
+
+
+def test_apigateway_v2_legacy_state_uses_api_region_sidecar_and_tag_arns(
+    monkeypatch, tmp_path
+):
+    import json as _json
+
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import apigateway as service
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "000000000000"
+    boot_region = "us-east-1"
+    api_region = "us-west-2"
+    api_id = "legacy-http-api"
+    fallback_api_id = "legacy-fallback-api"
+
+    def scoped(value_by_api):
+        store = AccountScopedDict()
+        for key, value in value_by_api.items():
+            store.set_scoped(account_id, None, key, value)
+        return store
+
+    payload = {
+        "apis": scoped(
+            {
+                api_id: {"apiId": api_id, "name": "west-api"},
+                fallback_api_id: {
+                    "apiId": fallback_api_id,
+                    "name": "fallback-api",
+                },
+            }
+        ),
+        "api_regions": scoped({api_id: api_region}),
+        "routes": scoped({api_id: {"route-1": {"routeId": "route-1"}}}),
+        "integrations": scoped(
+            {api_id: {"int-1": {"integrationId": "int-1"}}}
+        ),
+        "stages": scoped({api_id: {"prod": {"stageName": "prod"}}}),
+        "deployments": scoped({api_id: {"dep-1": {"deploymentId": "dep-1"}}}),
+        "authorizers": scoped(
+            {api_id: {"auth-1": {"authorizerId": "auth-1"}}}
+        ),
+        "route_responses": scoped(
+            {api_id: {"route-1": {"rr-1": {"routeResponseId": "rr-1"}}}}
+        ),
+        "integration_responses": scoped(
+            {
+                api_id: {
+                    "int-1": {
+                        "ir-1": {"integrationResponseId": "ir-1"}
+                    }
+                }
+            }
+        ),
+        "api_tags": scoped(
+            {
+                f"arn:aws:apigateway:{api_region}::/apis/{api_id}": {
+                    "env": "west"
+                }
+            }
+        ),
+    }
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+    (tmp_path / "apigateway.json").write_text(
+        _json.dumps(
+            {"__ministack_format__": 2, "payload": payload},
+            default=persistence._json_default,
+        )
+    )
+
+    loaded = persistence.load_state("apigateway")
+    service.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        service.load_persisted_state(loaded)
+
+        assert service._apis.get_scoped(account_id, api_region, api_id)[
+            "name"
+        ] == "west-api"
+        assert service._routes.get_scoped(account_id, api_region, api_id) == {
+            "route-1": {"routeId": "route-1"}
+        }
+        assert service._integrations.get_scoped(
+            account_id, api_region, api_id
+        ) == {"int-1": {"integrationId": "int-1"}}
+        assert service._stages.get_scoped(account_id, api_region, api_id) == {
+            "prod": {"stageName": "prod"}
+        }
+        assert service._deployments.get_scoped(
+            account_id, api_region, api_id
+        ) == {"dep-1": {"deploymentId": "dep-1"}}
+        assert service._authorizers.get_scoped(
+            account_id, api_region, api_id
+        ) == {"auth-1": {"authorizerId": "auth-1"}}
+        assert service._route_responses.get_scoped(
+            account_id, api_region, api_id
+        ) == {"route-1": {"rr-1": {"routeResponseId": "rr-1"}}}
+        assert service._integration_responses.get_scoped(
+            account_id, api_region, api_id
+        ) == {
+            "int-1": {"ir-1": {"integrationResponseId": "ir-1"}}
+        }
+        assert service._api_tags.get_scoped(
+            account_id,
+            api_region,
+            f"arn:aws:apigateway:{api_region}::/apis/{api_id}",
+        ) == {"env": "west"}
+        assert (
+            service._apis.get_scoped(account_id, boot_region, fallback_api_id)[
+                "name"
+            ]
+            == "fallback-api"
+        )
+        assert service._apis.get_scoped(account_id, boot_region, api_id) is None
+    finally:
+        service.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_apigateway_v2_region_scoped_state_round_trips_and_rejects_v2_reader(
+    monkeypatch, tmp_path
+):
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+    from ministack.services import apigateway as service
+
+    account_id = "000000000000"
+    api_id = "regional-http-api"
+    api_region = "us-west-2"
+    apis = AccountRegionScopedDict()
+    apis.set_scoped(
+        account_id,
+        api_region,
+        api_id,
+        {"apiId": api_id, "name": "regional API"},
+    )
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    persistence.save_state("apigateway", {"apis": apis})
+    raw = _json.loads((tmp_path / "apigateway.json").read_text())
+    assert raw["__ministack_format__"] == 3
+
+    loaded = persistence.load_state("apigateway")
+    service.reset()
+    try:
+        service.load_persisted_state(loaded)
+        assert service._apis.get_scoped(account_id, api_region, api_id)[
+            "name"
+        ] == "regional API"
+    finally:
+        service.reset()
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("apigateway") is None
+
+
+def test_apigateway_v1_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject REST API regional state instead of
+    accepting it as v2 and silently dropping non-boot-region APIs."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    rest_apis = AccountRegionScopedDict()
+    rest_apis.set_scoped(
+        "123456789012",
+        "us-west-2",
+        "regionalapi",
+        {"id": "regionalapi", "name": "regional API"},
+    )
+    persistence.save_state("apigateway_v1", {"rest_apis": rest_apis})
+
+    raw = _json.loads((tmp_path / "apigateway_v1.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded = persistence.load_state("apigateway_v1")["rest_apis"]
+    assert loaded.get_scoped("123456789012", "us-west-2", "regionalapi")[
+        "name"
+    ] == "regional API"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("apigateway_v1") is None
+
+
+def test_opensearch_is_registered_for_persistence_save():
+    from ministack.app import _build_persistence_save_dict, _state_map
+    from ministack.services import opensearch
+
+    assert _state_map["opensearch"] == "opensearch"
+
+    opensearch.reset()
+    try:
+        opensearch._domains["persisted-domain"] = {
+            "DomainName": "persisted-domain",
+            "ARN": "arn:aws:es:us-east-1:000000000000:domain/persisted-domain",
+        }
+        save_dict = _build_persistence_save_dict()
+
+        assert "opensearch" in save_dict
+        assert save_dict["opensearch"]()["domains"]["persisted-domain"][
+            "DomainName"
+        ] == "persisted-domain"
+    finally:
+        opensearch.reset()
+
+
+def test_opensearch_legacy_state_migrates_domain_children_to_parent_region():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import opensearch
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "123456789012"
+    other_account = "210987654321"
+    boot_region = "us-east-1"
+    domain_region = "eu-west-1"
+    other_region = "us-west-2"
+    domain_name = "legacy-domain"
+    peer_domain_name = "peer-domain"
+    other_domain_name = "other-domain"
+    package_id = "FPKGDOMAIN1"
+    orphan_package_id = "FPKGBOOT001"
+    domain_package_key = f"{package_id}:{domain_name}"
+    peer_domain_package_key = f"{package_id}:{peer_domain_name}"
+    orphan_key = "FPKGORPHAN:missing-domain"
+    other_key = f"FPKGOTHER:{other_domain_name}"
+
+    def legacy_store(*entries):
+        store = AccountScopedDict()
+        for account, key, value in entries:
+            store._data[(account, key)] = value
+        return store
+
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        opensearch.reset()
+
+        opensearch.load_persisted_state({
+            "domains": legacy_store(
+                (
+                    account_id,
+                    peer_domain_name,
+                    {
+                        "DomainName": peer_domain_name,
+                        "ARN": f"arn:aws:es:{other_region}:{account_id}:domain/{peer_domain_name}",
+                    },
+                ),
+                (
+                    account_id,
+                    domain_name,
+                    {
+                        "DomainName": domain_name,
+                        "ARN": f"arn:aws:es:{domain_region}:{account_id}:domain/{domain_name}",
+                    },
+                ),
+                (
+                    other_account,
+                    other_domain_name,
+                    {
+                        "DomainName": other_domain_name,
+                        "ARN": f"arn:aws:es:{other_region}:{other_account}:domain/{other_domain_name}",
+                    },
+                ),
+            ),
+            "change_progress": legacy_store(
+                (account_id, domain_name, {"ChangeId": "change-1"}),
+                (other_account, other_domain_name, {"ChangeId": "change-2"}),
+                (account_id, "missing-domain", {"ChangeId": "orphan-change"}),
+            ),
+            "packages": legacy_store(
+                (
+                    account_id,
+                    package_id,
+                    {
+                        "PackageID": package_id,
+                        "PackageName": "associated-package",
+                        "PackageOptions": {"analysis": {"enabled": True}},
+                    },
+                ),
+                (
+                    account_id,
+                    orphan_package_id,
+                    {
+                        "PackageID": orphan_package_id,
+                        "PackageName": "boot-package",
+                        "PackageDescription": (
+                            "user text arn:aws:lambda:us-west-2:123456789012:function:nope"
+                        ),
+                    },
+                ),
+            ),
+            "domain_packages": legacy_store(
+                (
+                    account_id,
+                    domain_package_key,
+                    {"PackageID": package_id, "DomainName": domain_name},
+                ),
+                (
+                    account_id,
+                    peer_domain_package_key,
+                    {"PackageID": package_id, "DomainName": peer_domain_name},
+                ),
+                (
+                    account_id,
+                    orphan_key,
+                    {"PackageID": "FPKGORPHAN", "DomainName": "missing-domain"},
+                ),
+                (
+                    other_account,
+                    other_key,
+                    {"PackageID": "FPKGOTHER", "DomainName": other_domain_name},
+                ),
+            ),
+        })
+
+        assert opensearch._domains.get_scoped(
+            account_id, domain_region, domain_name
+        )["DomainName"] == domain_name
+        assert opensearch._change_progress.get_scoped(
+            account_id, domain_region, domain_name
+        )["ChangeId"] == "change-1"
+        assert opensearch._domain_packages.get_scoped(
+            account_id, domain_region, domain_package_key
+        )["DomainName"] == domain_name
+        assert opensearch._domain_packages.get_scoped(
+            account_id, boot_region, domain_package_key
+        ) is None
+
+        assert opensearch._packages.get_scoped(
+            account_id, domain_region, package_id
+        )["PackageName"] == "associated-package"
+        peer_package = opensearch._packages.get_scoped(
+            account_id, other_region, package_id
+        )
+        assert peer_package["PackageName"] == "associated-package"
+        assert opensearch._domain_packages.get_scoped(
+            account_id, other_region, peer_domain_package_key
+        )["DomainName"] == peer_domain_name
+        package = opensearch._packages.get_scoped(
+            account_id, domain_region, package_id
+        )
+        assert package is not peer_package
+        package["PackageOptions"]["analysis"]["enabled"] = False
+        assert peer_package["PackageOptions"]["analysis"]["enabled"] is True
+        assert opensearch._packages.get_scoped(
+            account_id, boot_region, package_id
+        ) is None
+        assert opensearch._packages.get_scoped(
+            account_id, boot_region, orphan_package_id
+        )["PackageName"] == "boot-package"
+        assert opensearch._change_progress.get_scoped(
+            account_id, boot_region, "missing-domain"
+        )["ChangeId"] == "orphan-change"
+        assert opensearch._domain_packages.get_scoped(
+            account_id, boot_region, orphan_key
+        )["DomainName"] == "missing-domain"
+
+        assert opensearch._change_progress.get_scoped(
+            other_account, other_region, other_domain_name
+        )["ChangeId"] == "change-2"
+        assert opensearch._domain_packages.get_scoped(
+            other_account, other_region, other_key
+        )["DomainName"] == other_domain_name
+    finally:
+        opensearch.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_opensearch_load_recreates_dataplane_in_domain_region(monkeypatch):
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import opensearch
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "123456789012"
+    boot_region = "us-east-1"
+    domain_region = "us-west-2"
+    domain_name = "restored-domain"
+    calls = []
+
+    def legacy_store(*entries):
+        store = AccountScopedDict()
+        for account, key, value in entries:
+            store._data[(account, key)] = value
+        return store
+
+    def fake_spawn(domain, engine_version):
+        calls.append((get_account_id(), get_region(), domain, engine_version))
+        return (
+            f"{domain}.{get_region()}.ministack.local",
+            9200,
+            f"new-{get_region()}",
+            f"{domain}.{get_region()}.dashboards.local:5601",
+            f"dash-{get_region()}",
+        )
+
+    def fake_teardown_dataplane(rec):
+        calls.append(
+            (
+                "teardown_ids",
+                get_account_id(),
+                get_region(),
+                rec.get("_ContainerId"),
+                rec.get("_DashboardsContainerId"),
+            )
+        )
+
+    def fake_teardown_named_dataplane(domain):
+        calls.append(("teardown_name", get_account_id(), get_region(), domain))
+
+    monkeypatch.setattr(opensearch, "_spawn_dataplane", fake_spawn)
+    monkeypatch.setattr(opensearch, "_teardown_dataplane", fake_teardown_dataplane)
+    monkeypatch.setattr(
+        opensearch, "_teardown_named_dataplane", fake_teardown_named_dataplane
+    )
+
+    try:
+        set_request_account_id(account_id)
+        set_request_region(boot_region)
+        opensearch.reset()
+
+        opensearch.load_persisted_state({
+            "domains": legacy_store(
+                (
+                    account_id,
+                    domain_name,
+                    {
+                        "DomainName": domain_name,
+                        "ARN": f"arn:aws:es:{domain_region}:{account_id}:domain/{domain_name}",
+                        "EngineVersion": "OpenSearch_2.11",
+                        "Endpoint": "stale.local:9200",
+                        "_Endpoint": "stale.local:9200",
+                        "_ContainerId": "stale-container",
+                        "_DashboardsContainerId": "stale-dashboard",
+                        "DashboardEndpoint": "stale-dashboard.local:5601",
+                    },
+                ),
+            ),
+        })
+
+        assert calls == [
+            (
+                "teardown_ids",
+                account_id,
+                domain_region,
+                "stale-container",
+                "stale-dashboard",
+            ),
+            ("teardown_name", account_id, domain_region, domain_name),
+            (account_id, domain_region, domain_name, "OpenSearch_2.11"),
+        ]
+        assert get_account_id() == account_id
+        assert get_region() == boot_region
+        restored = opensearch._domains.get_scoped(
+            account_id, domain_region, domain_name
+        )
+        assert restored["Endpoint"] == (
+            f"{domain_name}.{domain_region}.ministack.local:9200"
+        )
+        assert restored["_Endpoint"] == restored["Endpoint"]
+        assert restored["_ContainerId"] == f"new-{domain_region}"
+        assert restored["_DashboardsContainerId"] == f"dash-{domain_region}"
+        assert restored["DashboardEndpoint"] == (
+            f"{domain_name}.{domain_region}.dashboards.local:5601"
+        )
+    finally:
+        opensearch.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_servicediscovery_region_scoped_state_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """A rollback binary must reject Cloud Map's regional schema instead of
+    accepting it as v2 and silently dropping every regional store."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    namespaces = AccountRegionScopedDict()
+    namespaces.set_scoped(
+        "000000000000",
+        "us-west-2",
+        "ns-regional",
+        {
+            "Arn": (
+                "arn:aws:servicediscovery:us-west-2:000000000000:"
+                "namespace/ns-regional"
+            )
+        },
+    )
+    persistence.save_state("servicediscovery", {"namespaces": namespaces})
+
+    raw = _json.loads((tmp_path / "servicediscovery.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded_namespaces = persistence.load_state("servicediscovery")["namespaces"]
+    assert loaded_namespaces.get_scoped(
+        "000000000000", "us-west-2", "ns-regional"
+    )["Arn"].endswith("namespace/ns-regional")
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("servicediscovery") is None
+
+
+def test_glue_region_scoped_state_round_trips_and_is_rejected_by_v2_reader(
+    monkeypatch, tmp_path
+):
+    """Glue's same-key regional state must round-trip, while a v2 rollback
+    refuses the regional schema instead of silently collapsing partitions."""
+    import json as _json
+
+    from ministack.core.responses import AccountRegionScopedDict
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+
+    account = "000000000000"
+    databases = AccountRegionScopedDict()
+    job_runs = AccountRegionScopedDict()
+    databases.set_scoped(
+        account,
+        "us-east-1",
+        "same-name",
+        {"Name": "same-name", "Description": "east"},
+    )
+    databases.set_scoped(
+        account,
+        "us-west-2",
+        "same-name",
+        {"Name": "same-name", "Description": "west"},
+    )
+    job_runs.set_scoped(
+        account,
+        "us-east-1",
+        "same-job",
+        [{"Id": "east-run", "JobName": "same-job"}],
+    )
+    job_runs.set_scoped(
+        account,
+        "us-west-2",
+        "same-job",
+        [{"Id": "west-run", "JobName": "same-job"}],
+    )
+
+    persistence.save_state(
+        "glue", {"databases": databases, "job_runs": job_runs}
+    )
+
+    raw = _json.loads((tmp_path / "glue.json").read_text())
+    assert raw["__ministack_format__"] == 3
+    loaded = persistence.load_state("glue")
+    assert loaded["databases"].get_scoped(
+        account, "us-east-1", "same-name"
+    )["Description"] == "east"
+    assert loaded["databases"].get_scoped(
+        account, "us-west-2", "same-name"
+    )["Description"] == "west"
+    assert loaded["job_runs"].get_scoped(
+        account, "us-east-1", "same-job"
+    )[0]["Id"] == "east-run"
+    assert loaded["job_runs"].get_scoped(
+        account, "us-west-2", "same-job"
+    )[0]["Id"] == "west-run"
+
+    monkeypatch.setattr(persistence, "SERVICE_STATE_FORMAT_VERSIONS", {})
+    assert persistence.load_state("glue") is None
+
+
+def test_batch_persistence_lifecycle_restores_regional_state(monkeypatch, tmp_path):
+    """The registry loader preserves state outside the ambient boot region."""
+
+    from ministack.app import _build_persistence_save_dict, _state_map
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import batch as service
+
+    account_id = "111111111111"
+    boot_region = "us-east-1"
+    resource_region = "us-west-2"
+    job_id = "regional-job"
+    job = {
+        "jobArn": f"arn:aws:batch:{resource_region}:{account_id}:job/{job_id}",
+        "status": "SUCCEEDED",
+    }
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+    set_request_account_id(account_id)
+    set_request_region(boot_region)
+    service.reset()
+    try:
+        service._jobs.set_scoped(account_id, resource_region, job_id, job)
+
+        assert _state_map["batch"] == "batch"
+        save_dict = _build_persistence_save_dict()
+        assert "batch" in save_dict
+        persistence.save_all({"batch": save_dict["batch"]})
+
+        service.reset()
+        service.load_persisted_state(persistence.load_state("batch"))
+
+        assert service._jobs.get_scoped(
+            account_id, resource_region, job_id
+        ) == job
+        assert service._jobs.get_scoped(account_id, boot_region, job_id) is None
+    finally:
+        service.reset()
+
+
+# ── signer._jobs / signer._profiles / signer._tokens ───────────────────
+
+def test_signer_jobs_profiles_and_tokens_survive_warm_boot():
+    """A restored signer job must keep its signedObject reference: a caller
+    whose contract is the signed object at `prefix + jobId` reads that key,
+    and a job record that forgets where its marker lives can no longer
+    answer DescribeSigningJob for it after a restart. The idempotency map
+    must survive too, or a retried Start after a restart would sign twice."""
+    mod = _get_module("signer")
+    mod.reset()
+    job_id = "persisted-signing-job"
+    now = 1700000000
+    try:
+        mod._profiles["persisted_profile"] = {
+            "profileName": "persisted_profile",
+            "profileVersion": "abc123def4",
+            "profileVersionArn": (
+                "arn:aws:signer:us-east-1:000000000000:"
+                "/signing-profiles/persisted_profile/abc123def4"
+            ),
+            "arn": (
+                "arn:aws:signer:us-east-1:000000000000:"
+                "/signing-profiles/persisted_profile"
+            ),
+            "platformId": "AWSIoTDeviceManagement-SHA256-ECDSA",
+            "status": "Active",
+        }
+        mod._jobs[job_id] = {
+            "jobId": job_id,
+            "source": {"s3": {"bucketName": "src-bkt", "key": "fw.bin",
+                              "version": "null"}},
+            "signedObject": {"s3": {"bucketName": "dst-bkt",
+                                    "key": f"signed/{job_id}"}},
+            "profileName": "persisted_profile",
+            "profileVersion": "abc123def4",
+            "platformId": "AWSIoTDeviceManagement-SHA256-ECDSA",
+            "status": "Succeeded",
+            "createdAt": now,
+            "completedAt": now,
+            "requestedBy": "arn:aws:iam::000000000000:root",
+            "jobOwner": "000000000000",
+            "jobInvoker": "000000000000",
+        }
+        mod._tokens["token-1"] = {"jobId": job_id, "jobOwner": "000000000000"}
+
+        _round_trip_dict(mod, "signer")
+
+        job = mod._jobs.get(job_id)
+        assert job is not None, "_jobs lost across save_state -> load_state"
+        assert job["status"] == "Succeeded"
+        assert job["signedObject"]["s3"]["key"] == f"signed/{job_id}"
+        profile = mod._profiles.get("persisted_profile")
+        assert profile is not None, (
+            "_profiles lost across save_state -> load_state"
+        )
+        assert profile["profileVersion"] == "abc123def4"
+        assert mod._tokens.get("token-1") == {
+            "jobId": job_id, "jobOwner": "000000000000",
+        }
+    finally:
         mod.reset()
 
-    assert not bad, (
-        f"Cold import of `{mod_name}` (state-key `{svc_key}`) emitted "
-        f"a restore-failure log:\n  "
-        + "\n  ".join(r.getMessage() for r in bad)
-        + "\n\nThis usually means `restore_state` references a "
-        "module-level symbol that's declared further down the file. "
-        "The import-time `try: load_state()` block runs before the "
-        "later definition, so the symbol lookup NameErrors and the "
-        "surrounding try/except swallows it. Hoist the symbol above "
-        "the import-time `load_state` block (see ECS `_attributes` "
-        "or ACM `_synthetic_pem` for the canonical fix)."
-    )
+
+def _ec2_va_populate(mod, account_id, region, label):
+    """Create one of each Verified Access resource through the handlers, in one scope."""
+    import json
+
+    from ministack.core.responses import request_scope
+    from ministack.services import acm
+
+    oidc = {"Issuer": "https://idp.example.com", "AuthorizationEndpoint": "https://idp.example.com/a",
+            "TokenEndpoint": "https://idp.example.com/t", "UserInfoEndpoint": "https://idp.example.com/u",
+            "ClientId": "c", "ClientSecret": "s", "Scope": "openid"}
+    with request_scope(account_id, region):
+        mod._ensure_defaults_initialized()
+        status, _, body = mod._create_verified_access_trust_provider({
+            "TrustProviderType": "user", "UserTrustProviderType": "oidc", "PolicyReferenceName": label,
+            **{f"OidcOptions.{k}": v for k, v in oidc.items()},
+            "TagSpecification.1.ResourceType": "verified-access-trust-provider",
+            "TagSpecification.1.Tag.1.Key": "owner", "TagSpecification.1.Tag.1.Value": label,
+        })
+        assert status == 200, body
+        tp_id = next(iter(mod._va_trust_providers))
+        status, _, body = mod._create_verified_access_instance({
+            "Description": label,
+            "TagSpecification.1.ResourceType": "verified-access-instance",
+            "TagSpecification.1.Tag.1.Key": "owner", "TagSpecification.1.Tag.1.Value": label,
+        })
+        assert status == 200, body
+        inst_id = next(iter(mod._va_instances))
+        assert mod._attach_verified_access_trust_provider({
+            "VerifiedAccessInstanceId": inst_id, "VerifiedAccessTrustProviderId": tp_id})[0] == 200
+        assert mod._modify_verified_access_instance_logging_configuration({
+            "VerifiedAccessInstanceId": inst_id, "AccessLogs.IncludeTrustContext": "true"})[0] == 200
+        assert mod._create_verified_access_group({
+            "VerifiedAccessInstanceId": inst_id, "PolicyDocument": f"permit-{label}"})[0] == 200
+        group_id = next(iter(mod._va_groups))
+        enis = set(mod._network_interfaces)
+        assert mod._create_network_interface({"SubnetId": mod._DEFAULT_SUBNET_ID})[0] == 200
+        eni_id = next(iter(set(mod._network_interfaces) - enis))
+        cert_arn = json.loads(acm._request_certificate({"DomainName": f"{label}.example.com"})[2])["CertificateArn"]
+        groups = set(mod._security_groups)
+        assert mod._create_security_group({"GroupName": f"va-{label}", "GroupDescription": "va",
+                                           "VpcId": mod._DEFAULT_VPC_ID})[0] == 200
+        sg_id = next(iter(set(mod._security_groups) - groups))
+        status, _, body = mod._create_verified_access_endpoint({
+            "VerifiedAccessGroupId": group_id, "EndpointType": "network-interface", "AttachmentType": "vpc",
+            "DomainCertificateArn": cert_arn, "ApplicationDomain": f"{label}.example.com", "EndpointDomainPrefix": label,
+            "NetworkInterfaceOptions.NetworkInterfaceId": eni_id, "NetworkInterfaceOptions.Port": "443",
+            "NetworkInterfaceOptions.Protocol": "https", "SecurityGroupId.1": sg_id,
+        })
+        assert status == 200, body
+        ep_id = next(iter(mod._va_endpoints))
+    return {"tp": tp_id, "inst": inst_id, "group": group_id, "ep": ep_id}
+
+
+def test_ec2_verified_access_round_trip_across_accounts():
+    from ministack.core.responses import request_scope
+
+    scopes = (("111111111111", "us-east-1", "a"), ("222222222222", "eu-west-1", "b"))
+    ids = {}
+
+    def populate(mod):
+        for account_id, region, label in scopes:
+            ids[label] = _ec2_va_populate(mod, account_id, region, label)
+
+    def observe(mod):
+        for account_id, region, label in scopes:
+            got = ids[label]
+            with request_scope(account_id, region):
+                tp = mod._va_trust_providers.get(got["tp"])
+                assert tp["PolicyReferenceName"] == label
+                assert tp["OidcOptions"]["ClientSecret"] == "s"
+                inst = mod._va_instances.get(got["inst"])
+                assert inst["Description"] == label
+                assert inst["TrustProviderIds"] == [got["tp"]]
+                assert inst["AccessLogs"]["IncludeTrustContext"] is True
+                assert mod._va_groups.get(got["group"])["PolicyDocument"] == f"permit-{label}"
+                assert mod._va_endpoints.get(got["ep"])["VerifiedAccessGroupId"] == got["group"]
+                for resource_id in (got["tp"], got["inst"]):
+                    assert mod._tags.get(resource_id) == [{"Key": "owner", "Value": label}]
+            # The other tenant's resources stay invisible from this scope.
+            other = ids["b" if label == "a" else "a"]
+            with request_scope(account_id, region):
+                assert other["inst"] not in mod._va_instances
+
+    _round_trip("ec2", "ec2", populate, observe)
+
+
+def test_ec2_verified_access_reset_clears_stores():
+    from ministack.core.responses import request_scope
+
+    mod = _module("ec2")
+    mod.reset()
+    got = _ec2_va_populate(mod, "111111111111", "us-east-1", "r")
+    mod.reset()
+    with request_scope("111111111111", "us-east-1"):
+        assert got["inst"] not in mod._va_instances
+        assert got["tp"] not in mod._va_trust_providers
+        assert got["group"] not in mod._va_groups
+        assert got["ep"] not in mod._va_endpoints
+        assert mod._tags.get(got["inst"]) is None

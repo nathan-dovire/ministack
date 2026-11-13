@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 AWS AppSync Events emulator.
 
@@ -13,7 +15,8 @@ trailing ``*`` single-level wildcard. Connection-scoped authorization is
 declared via a second ``header-<base64url(json)>`` Sec-WebSocket-Protocol
 entry. Set ``APPSYNC_EVENTS_ENFORCE_AUTH=1`` for strict mode (registered
 x-api-key required, or AWS_LAMBDA authorizer Lambda invoked when configured
-in the API ``eventConfig``).
+in the API ``eventConfig``). Under ``AUTH=true`` the check is on and follows the
+authorization modes of the API and the channel namespace.
 """
 
 import asyncio
@@ -26,34 +29,53 @@ import os
 import re
 import time
 
-from ministack.core.persistence import load_state
+from ministack.core.concurrency import run_reentrant
 from ministack.core.responses import (
+    REST_JSON_CONTENT_TYPE,
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
     get_region,
-    json_response,
     new_uuid,
+)
+from ministack.core.responses import (
+    json_response as _core_json_response,
 )
 
 logger = logging.getLogger("appsync_events")
+
+_MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 
 # ---------------------------------------------------------------------------
 # In-memory state
 # ---------------------------------------------------------------------------
 
 # apiId -> api record
-_apis = AccountScopedDict()
+_apis = AccountRegionScopedDict()
 # apiId -> {name -> channel namespace record}
-_channel_namespaces = AccountScopedDict()
+_channel_namespaces = AccountRegionScopedDict()
 # apiId -> {keyId -> api key record}
-_api_keys = AccountScopedDict()
+_api_keys = AccountRegionScopedDict()
 
 # Active realtime connections, keyed by opaque connection id assigned on accept.
-# {connection_id -> {"api_id": str, "account_id": str, "outbox": asyncio.Queue,
-#                     "subscriptions": {sub_id -> pattern}}}
+# {connection_id -> {"api_id": str, "account_id": str, "region": str,
+#                     "outbox": asyncio.Queue, "subscriptions": {sub_id -> pattern}}}
 _connections: dict[str, dict] = {}
 _connections_lock: asyncio.Lock | None = None
+
+
+def _drop_none(value):
+    """AWS omits unset members; it never sends null."""
+    if isinstance(value, dict):
+        return {k: _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
+def json_response(data, status=200, **kwargs):
+    return _core_json_response(_drop_none(data), status, **kwargs)
 
 
 def _get_connections_lock() -> asyncio.Lock:
@@ -61,6 +83,13 @@ def _get_connections_lock() -> asyncio.Lock:
     if _connections_lock is None:
         _connections_lock = asyncio.Lock()
     return _connections_lock
+
+
+def _discover_api_scope(api_id: str, account_id: str) -> tuple[str, str] | None:
+    """Return the API's account/region scope, *account_id* first: API-key requests carry no signed scope."""
+    matches = [(scoped_account_id, region) for (scoped_account_id, region, scoped_api_id), _api in _apis.all_items()
+               if scoped_api_id == api_id]
+    return next((m for m in matches if m[0] == account_id), matches[0] if matches else None)
 
 
 # ---------------------------------------------------------------------------
@@ -77,24 +106,43 @@ def get_state():
     }
 
 
-def restore_state(data):
+def _restore_api_child_store(
+    store: AccountRegionScopedDict,
+    restored: AccountRegionScopedDict | AccountScopedDict | dict,
+) -> None:
+    """Adopt legacy namespace/key records into their parent API's region."""
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return
+    if not restored:
+        return
+
+    if isinstance(restored, AccountScopedDict):
+        items = restored._data.items()
+    else:
+        account_id = get_account_id()
+        items = (((account_id, api_id), value) for api_id, value in restored.items())
+
+    for (account_id, api_id), value in items:
+        api_scope = _discover_api_scope(api_id, account_id)
+        region = api_scope[1] if api_scope else get_region()
+        store.set_scoped(account_id, region, api_id, value)
+
+
+def _restore_state(data):
     if not data:
         return
     _apis.update(data.get("apis", {}))
-    _channel_namespaces.update(data.get("channel_namespaces", {}))
-    _api_keys.update(data.get("api_keys", {}))
+    _restore_api_child_store(
+        _channel_namespaces, data.get("channel_namespaces", {})
+    )
+    _restore_api_child_store(_api_keys, data.get("api_keys", {}))
 
 
-# Same contract as apigateway.py (used by app.py persistence loader)
-load_persisted_state = restore_state
+def load_persisted_state(data):
+    return _restore_state(data)
 
 
-try:
-    _restored = load_state("appsync_events")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore AppSync Events state")
 
 
 def reset():
@@ -108,7 +156,15 @@ def reset():
 # Helpers
 # ---------------------------------------------------------------------------
 
-_APPSYNC_API_HOST_RE = re.compile(r"^([a-z0-9]+)\.appsync-api\.")
+_AWS_REGION_HOST_SEGMENT = r"[a-z0-9]+(?:-[a-z0-9]+)+-\d+"
+_APPSYNC_API_HOST_RE = re.compile(
+    rf"^([a-z0-9]+)\.appsync-api"
+    rf"(?:\.({_AWS_REGION_HOST_SEGMENT}))?(?:[.:]|$)"
+)
+_APPSYNC_REALTIME_HOST_RE = re.compile(
+    rf"^([a-z0-9]+)\.appsync-realtime-api"
+    rf"(?:\.({_AWS_REGION_HOST_SEGMENT}))?(?:[.:]|$)"
+)
 
 
 def _now() -> int:
@@ -133,7 +189,7 @@ def _default_dns_for_api(api_id: str) -> dict[str, str]:
     """
     region = get_region()
     port = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
-    mini_host = os.environ.get("MINISTACK_HOST", "localhost")
+    mini_host = _MINISTACK_HOST
     host_t = os.environ.get("APPSYNC_EVENTS_HTTP_HOST_TEMPLATE", "").strip()
     rt_t = os.environ.get("APPSYNC_EVENTS_REALTIME_HOST_TEMPLATE", "").strip()
     if host_t and rt_t:
@@ -151,6 +207,18 @@ def _default_dns_for_api(api_id: str) -> dict[str, str]:
             f"{api_id}.appsync-realtime-api.{region}.{mini_host}:{port}"
         ),
     }
+
+
+def _is_advertised_dns_host(
+    api_id: str, host: str, dns_kind: str
+) -> bool:
+    """Return whether ``host`` is the stored endpoint for the scoped API."""
+    api = _apis.get(api_id)
+    advertised_host = api.get("dns", {}).get(dns_kind) if api else None
+    return (
+        isinstance(advertised_host, str)
+        and host.lower() == advertised_host.lower()
+    )
 
 
 def _default_event_config(requested: dict | None) -> dict:
@@ -243,6 +311,17 @@ def _parse_json_body(body: bytes) -> tuple[dict, object]:
 
 def _not_found(msg: str):
     return error_response_json("NotFoundException", msg, 404)
+
+
+def _publish_error(status: int, error_type: str, message: str | None = None):
+    """An HTTP publish refusal in the data plane's ``errors`` envelope."""
+    error = {"errorType": error_type, **({"message": message} if message else {})}
+    headers = {"Content-Type": REST_JSON_CONTENT_TYPE, "x-amzn-errortype": error_type}
+    return status, headers, json.dumps({"errors": [error]}).encode("utf-8")
+
+
+def _publish_api_not_found():
+    return _publish_error(404, "ResourceNotFoundException", "Unable to find the Api.")
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +445,34 @@ def _auth_has_known_api_key(api_id: str, auth: dict | None) -> bool:
     return provided in _api_keys.get(api_id, {})
 
 
+def _operation_auth_modes(api_id: str, channel: str | None, operation: str) -> set:
+    """The authorization types the API, or the channel's namespace, accepts for ``operation``."""
+    if operation == EVENT_CONNECT:
+        modes = ((_apis.get(api_id) or {}).get("eventConfig") or {}).get("connectionAuthModes")
+    else:
+        namespace = _channel_namespaces.get(api_id, {}).get(_channel_namespace_for(channel or "")) or {}
+        modes = namespace.get("publishAuthModes" if operation == EVENT_PUBLISH else "subscribeAuthModes")
+    return {mode.get("authType") for mode in modes or [] if isinstance(mode, dict)}
+
+
+def _modes_accept(api_id: str, modes: set, auth: dict | None) -> tuple[bool, str | None]:
+    """Whether ``auth`` satisfies one of ``modes``, and AppSync's message when an API key is refused."""
+    auth = auth if isinstance(auth, dict) else {}
+    authorization = str(auth.get("Authorization") or auth.get("authorization") or "")
+    refused = None
+    if "API_KEY" in modes and (auth.get("x-api-key") or auth.get("X-Api-Key")):
+        if _auth_has_known_api_key(api_id, auth):
+            return True, None
+        refused = "You are not authorized to make this call."
+    # The gateway has checked an HTTP request's signature by now; a WebSocket's is taken as sent.
+    if "AWS_IAM" in modes and authorization.startswith("AWS4-HMAC-SHA256"):
+        return True, None
+    if {"AMAZON_COGNITO_USER_POOLS", "OPENID_CONNECT"} & modes and authorization and not authorization.startswith(
+            "AWS4-"):
+        return True, None
+    return False, refused
+
+
 def _find_lambda_authorizer_arn(api_id: str) -> str | None:
     ev = (_apis.get(api_id) or {}).get("eventConfig") or {}
     for p in ev.get("authProviders") or ev.get("auth_providers") or []:
@@ -448,16 +555,16 @@ def _events_authorizer_invoke(
     }
     try:
         from ministack.services import lambda_svc
-        name, q = lambda_svc._resolve_name_and_qualifier(arn)  # noqa: SLF001
-        fn, _cfg = lambda_svc._get_func_record_for_qualifier(name, q)  # noqa: SLF001
+        fn, cfg, _name = lambda_svc._get_func_record_for_ref(arn)  # noqa: SLF001
     except Exception as e:
         logger.error("AppSync Events authorizer resolve %s: %s", arn, e)
         return False, None
-    if not fn:
+    if not fn or not cfg:
         logger.error("AppSync Events authorizer Lambda not registered: %s", arn)
         return False, None
     try:
-        res = lambda_svc._execute_function(fn, payload)  # noqa: SLF001
+        exec_record = lambda_svc._execution_record_for_config(fn, cfg)  # noqa: SLF001
+        res = lambda_svc._execute_function_with_config_scope(exec_record, payload)  # noqa: SLF001
     except Exception as e:
         logger.error("AppSync Events authorizer invoke: %s", e)
         return False, None
@@ -489,7 +596,7 @@ async def _authorize_event_op(
         if not token:
             return False, f"{operation} rejected: no Authorization token"
         namespace = _channel_namespace_for(channel) if channel else None
-        ok, _ctx = await asyncio.to_thread(
+        ok, _ctx = await run_reentrant(
             _events_authorizer_invoke,
             lambda_arn,
             api_id,
@@ -503,6 +610,9 @@ async def _authorize_event_op(
             return False, f"{operation} rejected: AppSync authorizer denied"
         return True, None
 
+    from ministack.app import AUTH
+    if AUTH:
+        return _modes_accept(api_id, _operation_auth_modes(api_id, channel, operation), auth)
     if _strict_auth_enabled() and not _auth_has_known_api_key(api_id, auth):
         return False, f"{operation} rejected: no valid x-api-key"
 
@@ -529,10 +639,20 @@ async def handle_request(method, path, headers, body, query_params):
     host = headers.get("host", "")
     host_match = _APPSYNC_API_HOST_RE.match(host)
     if host_match and path == "/event" and method == "POST":
-        return await _publish(host_match.group(1), headers, body)
+        return await _publish_from_host(
+            host_match.group(1),
+            host_match.group(2),
+            host,
+            headers,
+            body,
+            query_params,
+        )
 
     if path.startswith("/v2/apis"):
         return await _handle_mgmt(method, path, headers, body, query_params)
+
+    if host_match:
+        return _publish_error(404, "UnknownOperationException", "Unknown Operation Request.")
 
     return error_response_json("BadRequestException", f"Unsupported AppSync Events path: {path}", 400)
 
@@ -809,50 +929,93 @@ def _delete_api_key(api_id, key_id):
 # Data plane — HTTP publish
 # ---------------------------------------------------------------------------
 
+def _has_sigv4_credentials(headers: dict, query_params: dict | None) -> bool:
+    """Return whether the publish request carries an explicit SigV4 region."""
+    query_params = query_params or {}
+    auth = headers.get("authorization") or headers.get("Authorization") or ""
+    if auth.startswith("AWS4-HMAC-SHA256") and "Credential=" in auth:
+        return True
+
+    credential = (
+        query_params.get("X-Amz-Credential")
+        or query_params.get("x-amz-credential")
+    )
+    if isinstance(credential, (list, tuple)):
+        credential = credential[0] if credential else ""
+    return bool(credential)
+
+
+async def _publish_from_host(
+    api_id: str,
+    host_region: str | None,
+    host: str,
+    headers: dict,
+    body: bytes,
+    query_params: dict | None,
+):
+    """Publish in the host API's region when API-key auth supplies no SigV4 scope."""
+    if _has_sigv4_credentials(headers, query_params):
+        return await _publish(api_id, headers, body)
+
+    api_scope = _discover_api_scope(api_id, get_account_id())
+    if api_scope is None:
+        return _publish_api_not_found()
+
+    from ministack.core.responses import _request_account_id, _request_region
+
+    account_token, region_token = _request_account_id.set(api_scope[0]), _request_region.set(api_scope[1])
+    try:
+        if (
+            not _is_advertised_dns_host(api_id, host, "HTTP")
+            and host_region is not None
+            and api_scope[1] != host_region
+        ):
+            return _publish_api_not_found()
+        return await _publish(api_id, headers, body)
+    finally:
+        _request_region.reset(region_token)
+        _request_account_id.reset(account_token)
+
+
 async def _publish(api_id: str, headers: dict, body: bytes):
     if api_id not in _apis:
-        return _not_found(f"Api {api_id} not found")
+        return _publish_api_not_found()
 
-    data, err = _parse_json_body(body)
-    if err:
-        return err
+    try:
+        data = json.loads(body) if body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return _publish_error(400, "SerializationException", "Unable to parse request body")
+    if not isinstance(data, dict):
+        return _publish_error(400, "BadRequestException", "Request body must be a JSON object")
 
     channel = data.get("channel")
     events = data.get("events")
-    if not channel or not isinstance(events, list):
-        return error_response_json(
-            "BadRequestException",
-            "Request body must include 'channel' and 'events' (array)",
-            400,
-        )
+    if events is not None and not isinstance(events, list):
+        return _publish_error(400, "SerializationException", "Expected list or null")
+    if not channel:
+        return _publish_error(400, "BadRequestException", "Missing channel")
+    if events is None:
+        return _publish_error(400, "BadRequestException", "Missing events")
     # AWS spec: max 5 events per publish.
     if len(events) > _MAX_EVENTS_PER_BATCH:
-        return error_response_json(
-            "BadRequestException",
-            f"events array may contain at most {_MAX_EVENTS_PER_BATCH} entries",
-            400,
-        )
+        return _publish_error(
+            400, "BadRequestException", f"Input exceeded {_MAX_EVENTS_PER_BATCH} event limit")
 
-    channel_err = _validate_channel(channel, allow_wildcard=False)
-    if channel_err:
-        return error_response_json("BadRequestException", channel_err, 400)
+    if not isinstance(channel, str) or _validate_channel(channel, allow_wildcard=False):
+        return _publish_error(400, "BadRequestException", "Invalid Channel Format")
 
     ns_name = _channel_namespace_for(channel)
     if ns_name is None or ns_name not in _channel_namespaces.get(api_id, {}):
-        return error_response_json(
-            "UnauthorizedException",
-            f"No channel namespace matches '{channel}'",
-            401,
-        )
+        return _publish_error(401, "UnauthorizedException")
 
     ok, message = await _authorize_event_op(
         api_id, str(channel), EVENT_PUBLISH, _auth_from_headers(headers), headers
     )
     if not ok:
-        return error_response_json("UnauthorizedException", message or "Unauthorized", 401)
+        return _publish_error(401, "UnauthorizedException", message)
 
     successful, failed = await _fanout_publish(api_id, channel, events)
-    return json_response({"successful": successful, "failed": failed})
+    return json_response({"successful": successful, "failed": failed}, content_type=REST_JSON_CONTENT_TYPE)
 
 
 async def _fanout_publish(api_id: str, channel: str, events: list) -> tuple[list, list]:
@@ -860,7 +1023,7 @@ async def _fanout_publish(api_id: str, channel: str, events: list) -> tuple[list
 
     Shared between the HTTP ``POST /event`` handler and the WebSocket ``publish``
     frame handler so both paths return the same ``(successful, failed)`` shape.
-    Each outbound frame uses ``"event": [<json-string>]`` per the spec.
+    Each outbound frame carries one JSON-encoded string, as observed on AWS.
     """
     successful: list = []
     failed: list = []
@@ -881,7 +1044,7 @@ async def _fanout_publish(api_id: str, channel: str, events: list) -> tuple[list
                         await conn["outbox"].put({
                             "type": "data",
                             "id": sub_id,
-                            "event": [ev],
+                            "event": ev,
                         })
             successful.append({"identifier": identifier, "index": idx})
         except Exception as e:
@@ -933,6 +1096,48 @@ async def handle_websocket(scope, receive, send, api_id: str):
     if msg.get("type") != "websocket.connect":
         return
 
+    host = ""
+    for name, value in scope.get("headers", []):
+        if name.decode("latin-1").lower() == "host":
+            host = value.decode("latin-1")
+            break
+    host_match = _APPSYNC_REALTIME_HOST_RE.match(host)
+    host_region = host_match.group(2) if host_match else None
+
+    account_id = get_account_id()
+    api_scope = _discover_api_scope(api_id, account_id)
+    if api_scope is None:
+        await send({"type": "websocket.close", "code": 1008})
+        return
+
+    from ministack.core.responses import _request_account_id, _request_region
+    account_id, region = api_scope
+    account_token = _request_account_id.set(account_id)
+    region_token = _request_region.set(region)
+    try:
+        if (
+            not _is_advertised_dns_host(api_id, host, "REALTIME")
+            and host_region is not None
+            and region != host_region
+        ):
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        await _handle_websocket_in_api_scope(
+            scope, receive, send, api_id, account_id, region
+        )
+    finally:
+        _request_region.reset(region_token)
+        _request_account_id.reset(account_token)
+
+
+async def _handle_websocket_in_api_scope(
+    scope,
+    receive,
+    send,
+    api_id: str,
+    account_id: str,
+    region: str,
+):
     if api_id not in _apis:
         await send({"type": "websocket.close", "code": 1008})
         return
@@ -949,6 +1154,8 @@ async def handle_websocket(scope, receive, send, api_id: str):
         if proto.startswith("aws-appsync-event-ws"):
             chosen = proto
             break
+
+    from ministack.app import AUTH
 
     conn_auth, auth_error = _decode_header_subprotocol(requested)
     strict = _strict_auth_enabled()
@@ -993,7 +1200,7 @@ async def handle_websocket(scope, receive, send, api_id: str):
             ):
                 return
         else:
-            ok, connect_rctx = await asyncio.to_thread(
+            ok, connect_rctx = await run_reentrant(
                 _events_authorizer_invoke,
                 lambda_auth_arn,
                 api_id,
@@ -1007,15 +1214,14 @@ async def handle_websocket(scope, receive, send, api_id: str):
                 "connect rejected: AppSync authorizer returned deny or error",
             ):
                 return
+    elif AUTH and not _modes_accept(api_id, _operation_auth_modes(api_id, None, EVENT_CONNECT), conn_auth)[0]:
+        if await _deny_websocket("Unauthorized: no authorization the API accepts for connections"):
+            return
     elif strict and (conn_auth is None or not _auth_has_known_api_key(api_id, conn_auth)):
         if await _deny_websocket(
             "Unauthorized: missing or invalid API key in header-<b64> subprotocol",
         ):
             return
-
-    from ministack.core.responses import _request_account_id
-    account_id = get_account_id()
-    token = _request_account_id.set(account_id)
 
     connection_id = new_uuid()
     outbox: asyncio.Queue = asyncio.Queue()
@@ -1023,6 +1229,7 @@ async def handle_websocket(scope, receive, send, api_id: str):
         _connections[connection_id] = {
             "api_id": api_id,
             "account_id": account_id,
+            "region": region,
             "outbox": outbox,
             "subscriptions": {},
             "auth": conn_auth,
@@ -1087,7 +1294,6 @@ async def handle_websocket(scope, receive, send, api_id: str):
         ka_task.cancel()
         async with _get_connections_lock():
             _connections.pop(connection_id, None)
-        _request_account_id.reset(token)
         try:
             await send({"type": "websocket.close", "code": 1000})
         except Exception:

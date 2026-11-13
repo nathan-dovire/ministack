@@ -1,13 +1,23 @@
-import io
 import json
 import os
 import time
 import uuid as _uuid_mod
-import zipfile
-from urllib.parse import urlparse
 
+import boto3
 import pytest
+from botocore.config import Config
 from botocore.exceptions import ClientError
+
+
+def _regional_ssm(region_name):
+    return boto3.client(
+        "ssm",
+        endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region_name,
+        config=Config(region_name=region_name, retries={"mode": "standard"}),
+    )
 
 
 def test_ssm_put_get(ssm):
@@ -28,85 +38,85 @@ def test_ssm_overwrite(ssm):
     assert resp["Parameter"]["Value"] == "v2"
 
 def test_ssm_put_get_v2(ssm):
-    ssm.put_parameter(Name="/ssm2/pg/host", Value="db.local", Type="String")
-    resp = ssm.get_parameter(Name="/ssm2/pg/host")
+    ssm.put_parameter(Name="/ps2/pg/host", Value="db.local", Type="String")
+    resp = ssm.get_parameter(Name="/ps2/pg/host")
     assert resp["Parameter"]["Value"] == "db.local"
     assert resp["Parameter"]["Type"] == "String"
     assert resp["Parameter"]["Version"] == 1
 
-    ssm.put_parameter(Name="/ssm2/pg/pass", Value="secret123", Type="SecureString")
-    resp_enc = ssm.get_parameter(Name="/ssm2/pg/pass", WithDecryption=True)
+    ssm.put_parameter(Name="/ps2/pg/pass", Value="secret123", Type="SecureString")
+    resp_enc = ssm.get_parameter(Name="/ps2/pg/pass", WithDecryption=True)
     assert resp_enc["Parameter"]["Value"] == "secret123"
 
 def test_ssm_overwrite_version_v2(ssm):
-    ssm.put_parameter(Name="/ssm2/ov/p", Value="v1", Type="String")
-    r1 = ssm.get_parameter(Name="/ssm2/ov/p")
+    ssm.put_parameter(Name="/ps2/ov/p", Value="v1", Type="String")
+    r1 = ssm.get_parameter(Name="/ps2/ov/p")
     assert r1["Parameter"]["Version"] == 1
 
-    ssm.put_parameter(Name="/ssm2/ov/p", Value="v2", Type="String", Overwrite=True)
-    r2 = ssm.get_parameter(Name="/ssm2/ov/p")
+    ssm.put_parameter(Name="/ps2/ov/p", Value="v2", Type="String", Overwrite=True)
+    r2 = ssm.get_parameter(Name="/ps2/ov/p")
     assert r2["Parameter"]["Value"] == "v2"
     assert r2["Parameter"]["Version"] == 2
 
-    ssm.put_parameter(Name="/ssm2/ov/p", Value="v3", Type="String", Overwrite=True)
-    r3 = ssm.get_parameter(Name="/ssm2/ov/p")
+    ssm.put_parameter(Name="/ps2/ov/p", Value="v3", Type="String", Overwrite=True)
+    r3 = ssm.get_parameter(Name="/ps2/ov/p")
     assert r3["Parameter"]["Version"] == 3
 
 def test_ssm_get_by_path_v2(ssm):
-    ssm.put_parameter(Name="/ssm2/path/x", Value="vx", Type="String")
-    ssm.put_parameter(Name="/ssm2/path/y", Value="vy", Type="String")
-    ssm.put_parameter(Name="/ssm2/path/sub/z", Value="vz", Type="String")
+    ssm.put_parameter(Name="/ps2/path/x", Value="vx", Type="String")
+    ssm.put_parameter(Name="/ps2/path/y", Value="vy", Type="String")
+    ssm.put_parameter(Name="/ps2/path/sub/z", Value="vz", Type="String")
 
-    resp = ssm.get_parameters_by_path(Path="/ssm2/path", Recursive=True)
+    resp = ssm.get_parameters_by_path(Path="/ps2/path", Recursive=True)
     names = [p["Name"] for p in resp["Parameters"]]
-    assert "/ssm2/path/x" in names
-    assert "/ssm2/path/y" in names
-    assert "/ssm2/path/sub/z" in names
+    assert "/ps2/path/x" in names
+    assert "/ps2/path/y" in names
+    assert "/ps2/path/sub/z" in names
 
-    resp_shallow = ssm.get_parameters_by_path(Path="/ssm2/path", Recursive=False)
+    resp_shallow = ssm.get_parameters_by_path(Path="/ps2/path", Recursive=False)
     names_shallow = [p["Name"] for p in resp_shallow["Parameters"]]
-    assert "/ssm2/path/x" in names_shallow
-    assert "/ssm2/path/sub/z" not in names_shallow
+    assert "/ps2/path/x" in names_shallow
+    assert "/ps2/path/sub/z" not in names_shallow
 
 def test_ssm_get_parameters_multiple_v2(ssm):
-    ssm.put_parameter(Name="/ssm2/multi/a", Value="va", Type="String")
-    ssm.put_parameter(Name="/ssm2/multi/b", Value="vb", Type="String")
-    resp = ssm.get_parameters(Names=["/ssm2/multi/a", "/ssm2/multi/b", "/ssm2/multi/nope"])
+    ssm.put_parameter(Name="/ps2/multi/a", Value="va", Type="String")
+    ssm.put_parameter(Name="/ps2/multi/b", Value="vb", Type="String")
+    resp = ssm.get_parameters(Names=["/ps2/multi/a", "/ps2/multi/b", "/ps2/multi/nope"])
     assert len(resp["Parameters"]) == 2
-    assert any(p["Name"] == "/ssm2/multi/a" for p in resp["Parameters"])
-    assert any(p["Name"] == "/ssm2/multi/b" for p in resp["Parameters"])
-    assert "/ssm2/multi/nope" in resp["InvalidParameters"]
+    assert any(p["Name"] == "/ps2/multi/a" for p in resp["Parameters"])
+    assert any(p["Name"] == "/ps2/multi/b" for p in resp["Parameters"])
+    assert "/ps2/multi/nope" in resp["InvalidParameters"]
 
 def test_ssm_delete_v2(ssm):
-    ssm.put_parameter(Name="/ssm2/del/tmp", Value="bye", Type="String")
-    ssm.delete_parameter(Name="/ssm2/del/tmp")
+    ssm.put_parameter(Name="/ps2/del/tmp", Value="bye", Type="String")
+    ssm.delete_parameter(Name="/ps2/del/tmp")
     with pytest.raises(ClientError) as exc:
-        ssm.get_parameter(Name="/ssm2/del/tmp")
+        ssm.get_parameter(Name="/ps2/del/tmp")
     assert exc.value.response["Error"]["Code"] == "ParameterNotFound"
     # Real AWS sends `x-amzn-errortype` on JSON-protocol errors; Java/Go SDK v2 read it.
     assert exc.value.response["ResponseMetadata"]["HTTPHeaders"].get("x-amzn-errortype") == "ParameterNotFound"
 
-    ssm.put_parameter(Name="/ssm2/del/b1", Value="v1", Type="String")
-    ssm.put_parameter(Name="/ssm2/del/b2", Value="v2", Type="String")
-    resp = ssm.delete_parameters(Names=["/ssm2/del/b1", "/ssm2/del/b2", "/ssm2/del/ghost"])
+    ssm.put_parameter(Name="/ps2/del/b1", Value="v1", Type="String")
+    ssm.put_parameter(Name="/ps2/del/b2", Value="v2", Type="String")
+    resp = ssm.delete_parameters(Names=["/ps2/del/b1", "/ps2/del/b2", "/ps2/del/ghost"])
     assert len(resp["DeletedParameters"]) == 2
-    assert "/ssm2/del/ghost" in resp["InvalidParameters"]
+    assert "/ps2/del/ghost" in resp["InvalidParameters"]
 
 def test_ssm_describe_v2(ssm):
-    ssm.put_parameter(Name="/ssm2/desc/alpha", Value="va", Type="String", Description="alpha param")
-    ssm.put_parameter(Name="/ssm2/desc/beta", Value="vb", Type="SecureString")
+    ssm.put_parameter(Name="/ps2/desc/alpha", Value="va", Type="String", Description="alpha param")
+    ssm.put_parameter(Name="/ps2/desc/beta", Value="vb", Type="SecureString")
     resp = ssm.describe_parameters(
-        ParameterFilters=[{"Key": "Name", "Option": "BeginsWith", "Values": ["/ssm2/desc/"]}]
+        ParameterFilters=[{"Key": "Name", "Option": "BeginsWith", "Values": ["/ps2/desc/"]}]
     )
     names = [p["Name"] for p in resp["Parameters"]]
-    assert "/ssm2/desc/alpha" in names
-    assert "/ssm2/desc/beta" in names
+    assert "/ps2/desc/alpha" in names
+    assert "/ps2/desc/beta" in names
 
 def test_ssm_parameter_history_v2(ssm):
-    ssm.put_parameter(Name="/ssm2/hist/h", Value="h1", Type="String", Description="d1")
-    ssm.put_parameter(Name="/ssm2/hist/h", Value="h2", Type="String", Overwrite=True, Description="d2")
-    ssm.put_parameter(Name="/ssm2/hist/h", Value="h3", Type="String", Overwrite=True, Description="d3")
-    resp = ssm.get_parameter_history(Name="/ssm2/hist/h")
+    ssm.put_parameter(Name="/ps2/hist/h", Value="h1", Type="String", Description="d1")
+    ssm.put_parameter(Name="/ps2/hist/h", Value="h2", Type="String", Overwrite=True, Description="d2")
+    ssm.put_parameter(Name="/ps2/hist/h", Value="h3", Type="String", Overwrite=True, Description="d3")
+    resp = ssm.get_parameter_history(Name="/ps2/hist/h")
     assert len(resp["Parameters"]) == 3
     assert resp["Parameters"][0]["Value"] == "h1"
     assert resp["Parameters"][0]["Version"] == 1
@@ -114,23 +124,23 @@ def test_ssm_parameter_history_v2(ssm):
     assert resp["Parameters"][2]["Version"] == 3
 
 def test_ssm_tags_v2(ssm):
-    ssm.put_parameter(Name="/ssm2/tag/t1", Value="v", Type="String")
+    ssm.put_parameter(Name="/ps2/tag/t1", Value="v", Type="String")
     ssm.add_tags_to_resource(
         ResourceType="Parameter",
-        ResourceId="/ssm2/tag/t1",
+        ResourceId="/ps2/tag/t1",
         Tags=[{"Key": "team", "Value": "platform"}, {"Key": "env", "Value": "staging"}],
     )
-    resp = ssm.list_tags_for_resource(ResourceType="Parameter", ResourceId="/ssm2/tag/t1")
+    resp = ssm.list_tags_for_resource(ResourceType="Parameter", ResourceId="/ps2/tag/t1")
     tag_map = {t["Key"]: t["Value"] for t in resp["TagList"]}
     assert tag_map["team"] == "platform"
     assert tag_map["env"] == "staging"
 
     ssm.remove_tags_from_resource(
         ResourceType="Parameter",
-        ResourceId="/ssm2/tag/t1",
+        ResourceId="/ps2/tag/t1",
         TagKeys=["team"],
     )
-    resp2 = ssm.list_tags_for_resource(ResourceType="Parameter", ResourceId="/ssm2/tag/t1")
+    resp2 = ssm.list_tags_for_resource(ResourceType="Parameter", ResourceId="/ps2/tag/t1")
     tag_map2 = {t["Key"]: t["Value"] for t in resp2["TagList"]}
     assert "team" not in tag_map2
     assert tag_map2["env"] == "staging"
@@ -244,6 +254,48 @@ def test_ssm_secure_string_not_decrypted_by_default(ssm):
     assert resp2["Parameter"]["Value"] == "mysecret"
 
 
+def test_ssm_describe_parameters_reports_the_key_for_a_secure_string(ssm):
+    """ParameterMetadata.KeyId is "the alias of the AWS KMS key used to
+    encrypt the parameter. Applies to SecureString parameters only", so
+    DescribeParameters reports it for a SecureString and omits it for the
+    rest. Without it Terraform's aws_ssm_parameter records an empty key_id
+    and plans the same in-place update on every run.
+    Reported by @edersonbrilhante."""
+    import uuid as _uuid
+
+    suffix = _uuid.uuid4().hex[:8]
+    default_key = f"/qa/ssm/keyid/default-{suffix}"
+    custom_key = f"/qa/ssm/keyid/custom-{suffix}"
+    plain = f"/qa/ssm/keyid/plain-{suffix}"
+    custom = "arn:aws:kms:us-east-1:000000000000:key/11111111-2222-3333-4444-555555555555"
+    ssm.put_parameter(Name=default_key, Value="s", Type="SecureString")
+    ssm.put_parameter(Name=custom_key, Value="s", Type="SecureString", KeyId=custom)
+    ssm.put_parameter(Name=plain, Value="p", Type="String")
+    try:
+        def described(name):
+            found = ssm.describe_parameters(
+                ParameterFilters=[{"Key": "Name", "Values": [name]}])["Parameters"]
+            assert found, name
+            return found[0]
+
+        # No KeyId on the request: the account's default SSM key, an AWS
+        # managed key, whose alias has the form aws/<service-name>.
+        assert described(default_key)["KeyId"] == "alias/aws/ssm"
+        assert described(custom_key)["KeyId"] == custom
+        assert "KeyId" not in described(plain)
+
+        # ParameterHistory carries the same member.
+        history = ssm.get_parameter_history(Name=default_key)["Parameters"]
+        assert history[-1]["KeyId"] == "alias/aws/ssm"
+        assert "KeyId" not in ssm.get_parameter_history(Name=plain)["Parameters"][-1]
+
+        # GetParameter's Parameter shape has no KeyId member.
+        assert "KeyId" not in ssm.get_parameter(Name=default_key)["Parameter"]
+    finally:
+        for name in (default_key, custom_key, plain):
+            ssm.delete_parameter(Name=name)
+
+
 def test_ssm_get_parameters_by_path_root_non_recursive(ssm):
     """GetParametersByPath with Path=/ and Recursive=False should only return top-level params."""
     ssm.put_parameter(Name="/toplevel", Value="top", Type="String", Overwrite=True)
@@ -253,3 +305,1264 @@ def test_ssm_get_parameters_by_path_root_non_recursive(ssm):
     names = [p["Name"] for p in resp["Parameters"]]
     assert "/toplevel" in names
     assert "/nested/deep" not in names
+
+
+def test_ssm_restore_legacy_parameter_history_uses_parameter_arn_region():
+    from ministack.core.responses import AccountScopedDict, set_request_account_id, set_request_region
+    from ministack.services import ssm as ssm_service
+
+    account_id = "000000000000"
+    name = f"/legacy/history/{_uuid_mod.uuid4().hex[:8]}"
+
+    set_request_account_id(account_id)
+    set_request_region("us-east-1")
+    ssm_service.reset()
+    parameters = AccountScopedDict()
+    parameters[name] = {
+        "Name": name,
+        "Type": "String",
+        "Value": "v2",
+        "Version": 2,
+        "ARN": f"arn:aws:ssm:us-west-2:{account_id}:parameter/{name.lstrip('/')}",
+    }
+    parameter_history = AccountScopedDict()
+    parameter_history[name] = [
+        {"Name": name, "Type": "String", "Value": "v1", "Version": 1},
+        {"Name": name, "Type": "String", "Value": "v2", "Version": 2},
+    ]
+
+    try:
+        ssm_service.load_persisted_state({
+            "parameters": parameters,
+            "parameter_history": parameter_history,
+        })
+
+        assert len(ssm_service._parameter_history.get_scoped(account_id, "us-west-2", name)) == 2
+        assert ssm_service._parameter_history.get_scoped(account_id, "us-east-1", name) is None
+    finally:
+        ssm_service.reset()
+
+
+def test_ssm_restore_legacy_history_prefers_exact_parameter_name_region():
+    from ministack.core.responses import AccountScopedDict, set_request_account_id, set_request_region
+    from ministack.services import ssm as ssm_service
+
+    account_id = "000000000000"
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bare_name = f"legacy-history-exact-{suffix}"
+    path_name = f"/{bare_name}"
+
+    set_request_account_id(account_id)
+    set_request_region("us-east-1")
+    ssm_service.reset()
+    parameters = AccountScopedDict()
+    parameters[bare_name] = {
+        "Name": bare_name,
+        "Type": "String",
+        "Value": "bare",
+        "Version": 1,
+        "ARN": f"arn:aws:ssm:us-west-2:{account_id}:parameter{bare_name}",
+    }
+    parameters[path_name] = {
+        "Name": path_name,
+        "Type": "String",
+        "Value": "path",
+        "Version": 1,
+        "ARN": f"arn:aws:ssm:us-east-1:{account_id}:parameter/{bare_name}",
+    }
+    parameter_history = AccountScopedDict()
+    parameter_history[bare_name] = [
+        {"Name": bare_name, "Type": "String", "Value": "bare", "Version": 1},
+    ]
+
+    try:
+        ssm_service.load_persisted_state({
+            "parameters": parameters,
+            "parameter_history": parameter_history,
+        })
+
+        assert len(ssm_service._parameter_history.get_scoped(account_id, "us-west-2", bare_name)) == 1
+        assert ssm_service._parameter_history.get_scoped(account_id, "us-east-1", bare_name) is None
+    finally:
+        ssm_service.reset()
+
+
+def test_ssm_restore_legacy_bare_name_tags_uses_stored_parameter_arn():
+    from ministack.core.responses import AccountScopedDict, set_request_account_id, set_request_region
+    from ministack.services import ssm as ssm_service
+
+    account_id = "000000000000"
+    name = f"legacy-tag-{_uuid_mod.uuid4().hex[:8]}"
+    legacy_arn = f"arn:aws:ssm:us-west-2:{account_id}:parameter{name}"
+
+    set_request_account_id(account_id)
+    set_request_region("us-east-1")
+    ssm_service.reset()
+    parameters = AccountScopedDict()
+    parameters[name] = {
+        "Name": name,
+        "Type": "String",
+        "Value": "legacy",
+        "Version": 1,
+        "ARN": legacy_arn,
+    }
+    tags = AccountScopedDict()
+    tags[legacy_arn] = {"env": "legacy"}
+
+    try:
+        ssm_service.load_persisted_state({
+            "parameters": parameters,
+            "tags": tags,
+        })
+        set_request_region("us-west-2")
+        assert ssm_service.resolve_parameter_value(legacy_arn) == "legacy"
+        status, _headers, body = ssm_service._list_tags_for_resource({
+            "ResourceType": "Parameter",
+            "ResourceId": name,
+        })
+        assert status == 200
+        assert json.loads(body)["TagList"] == [{"Key": "env", "Value": "legacy"}]
+
+        status, _headers, _body = ssm_service._put_parameter({
+            "Name": name,
+            "Type": "String",
+            "Value": "updated",
+            "Overwrite": True,
+        })
+        assert status == 200
+        assert ssm_service._parameters[name]["ARN"] == legacy_arn
+        status, _headers, body = ssm_service._list_tags_for_resource({
+            "ResourceType": "Parameter",
+            "ResourceId": name,
+        })
+        assert status == 200
+        assert json.loads(body)["TagList"] == [{"Key": "env", "Value": "legacy"}]
+    finally:
+        ssm_service.reset()
+
+
+def test_ssm_arn_lookup_prefers_exact_stored_arn_match():
+    from ministack.core.responses import AccountScopedDict, set_request_account_id, set_request_region
+    from ministack.services import ssm as ssm_service
+
+    account_id = "000000000000"
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bare_name = f"legacy-exact-{suffix}"
+    path_name = f"/{bare_name}"
+    bare_arn = f"arn:aws:ssm:us-west-2:{account_id}:parameter{bare_name}"
+    path_arn = f"arn:aws:ssm:us-west-2:{account_id}:parameter/{bare_name}"
+
+    set_request_account_id(account_id)
+    set_request_region("us-east-1")
+    ssm_service.reset()
+    parameters = AccountScopedDict()
+    parameters[bare_name] = {
+        "Name": bare_name,
+        "Type": "String",
+        "Value": "bare",
+        "Version": 1,
+        "ARN": bare_arn,
+    }
+    parameters[path_name] = {
+        "Name": path_name,
+        "Type": "String",
+        "Value": "path",
+        "Version": 1,
+        "ARN": path_arn,
+    }
+
+    try:
+        ssm_service.load_persisted_state({"parameters": parameters})
+        set_request_region("us-west-2")
+        assert ssm_service.resolve_parameter_value(bare_arn) == "bare"
+        assert ssm_service.resolve_parameter_value(path_arn) == "path"
+    finally:
+        ssm_service.reset()
+
+
+def test_ssm_exact_legacy_slash_twin_can_be_overwritten():
+    from ministack.core.responses import AccountScopedDict, set_request_account_id, set_request_region
+    from ministack.services import ssm as ssm_service
+
+    account_id = "000000000000"
+    suffix = _uuid_mod.uuid4().hex[:8]
+    bare_name = f"legacy-overwrite-{suffix}"
+    path_name = f"/{bare_name}"
+
+    set_request_account_id(account_id)
+    set_request_region("us-east-1")
+    ssm_service.reset()
+    parameters = AccountScopedDict()
+    parameters[bare_name] = {
+        "Name": bare_name,
+        "Type": "String",
+        "Value": "bare",
+        "Version": 1,
+        "ARN": f"arn:aws:ssm:us-west-2:{account_id}:parameter{bare_name}",
+    }
+    parameters[path_name] = {
+        "Name": path_name,
+        "Type": "String",
+        "Value": "path",
+        "Version": 1,
+        "ARN": f"arn:aws:ssm:us-west-2:{account_id}:parameter/{bare_name}",
+    }
+
+    try:
+        ssm_service.load_persisted_state({"parameters": parameters})
+        set_request_region("us-west-2")
+        status, _headers, _body = ssm_service._put_parameter({
+            "Name": bare_name,
+            "Type": "String",
+            "Value": "updated-bare",
+            "Overwrite": True,
+        })
+        assert status == 200
+        assert ssm_service._parameters[bare_name]["Value"] == "updated-bare"
+        assert ssm_service._parameters[path_name]["Value"] == "path"
+    finally:
+        ssm_service.reset()
+
+
+def test_ssm_legacy_no_slash_arn_does_not_fallback_to_path_parameter():
+    from ministack.core.responses import AccountScopedDict, set_request_account_id, set_request_region
+    from ministack.services import ssm as ssm_service
+
+    account_id = "000000000000"
+    suffix = _uuid_mod.uuid4().hex[:8]
+    path_name = f"/legacy-stale-{suffix}"
+    path_arn = f"arn:aws:ssm:us-west-2:{account_id}:parameter/{path_name.lstrip('/')}"
+    stale_legacy_arn = f"arn:aws:ssm:us-west-2:{account_id}:parameter{path_name.lstrip('/')}"
+
+    set_request_account_id(account_id)
+    set_request_region("us-east-1")
+    ssm_service.reset()
+    parameters = AccountScopedDict()
+    parameters[path_name] = {
+        "Name": path_name,
+        "Type": "String",
+        "Value": "path",
+        "Version": 1,
+        "ARN": path_arn,
+    }
+
+    try:
+        ssm_service.load_persisted_state({"parameters": parameters})
+        set_request_region("us-west-2")
+        assert ssm_service.resolve_parameter_value(path_arn) == "path"
+        assert ssm_service.resolve_parameter_value(stale_legacy_arn) is None
+    finally:
+        ssm_service.reset()
+
+
+def test_ssm_malformed_or_foreign_partition_arn_does_not_fallback_to_name():
+    from ministack.core.responses import AccountScopedDict, set_request_account_id, set_request_region
+    from ministack.services import ssm as ssm_service
+
+    account_id = "000000000000"
+    name = f"/invalid-arn/{_uuid_mod.uuid4().hex[:8]}"
+    canonical_arn = f"arn:aws:ssm:us-east-1:{account_id}:parameter/{name.lstrip('/')}"
+    missing_region_arn = f"arn:aws:ssm::{account_id}:parameter/{name.lstrip('/')}"
+    foreign_partition_arn = f"arn:aws-cn:ssm:us-east-1:{account_id}:parameter/{name.lstrip('/')}"
+
+    set_request_account_id(account_id)
+    set_request_region("us-east-1")
+    ssm_service.reset()
+    parameters = AccountScopedDict()
+    parameters[name] = {
+        "Name": name,
+        "Type": "String",
+        "Value": "value",
+        "Version": 1,
+        "ARN": canonical_arn,
+    }
+
+    try:
+        ssm_service.load_persisted_state({"parameters": parameters})
+        assert ssm_service.resolve_parameter_value(canonical_arn) == "value"
+        assert ssm_service.resolve_parameter_value(missing_region_arn) is None
+        assert ssm_service.resolve_parameter_value(foreign_partition_arn) is None
+    finally:
+        ssm_service.reset()
+
+
+def test_ssm_restore_legacy_add_tags_key_for_bare_name_parameter():
+    from ministack.core.responses import AccountScopedDict, set_request_account_id, set_request_region
+    from ministack.services import ssm as ssm_service
+
+    account_id = "000000000000"
+    name = f"legacy-add-tags-{_uuid_mod.uuid4().hex[:8]}"
+    legacy_arn = f"arn:aws:ssm:us-west-2:{account_id}:parameter{name}"
+    legacy_add_tags_arn = f"arn:aws:ssm:us-west-2:{account_id}:parameter/{name}"
+
+    set_request_account_id(account_id)
+    set_request_region("us-east-1")
+    ssm_service.reset()
+    parameters = AccountScopedDict()
+    parameters[name] = {
+        "Name": name,
+        "Type": "String",
+        "Value": "legacy",
+        "Version": 1,
+        "ARN": legacy_arn,
+    }
+    tags = AccountScopedDict()
+    tags[legacy_add_tags_arn] = {"env": "legacy-add-tags"}
+
+    try:
+        ssm_service.load_persisted_state({
+            "parameters": parameters,
+            "tags": tags,
+        })
+        set_request_region("us-west-2")
+        status, _headers, body = ssm_service._list_tags_for_resource({
+            "ResourceType": "Parameter",
+            "ResourceId": name,
+        })
+        assert status == 200
+        assert json.loads(body)["TagList"] == [{"Key": "env", "Value": "legacy-add-tags"}]
+
+        status, _headers, body = ssm_service._list_tags_for_resource({
+            "ResourceType": "Parameter",
+            "ResourceId": legacy_add_tags_arn,
+        })
+        assert status == 200
+        assert json.loads(body)["TagList"] == [{"Key": "env", "Value": "legacy-add-tags"}]
+
+        status, _headers, _body = ssm_service._delete_parameter({"Name": name})
+        assert status == 200
+        assert ssm_service._tags.get_scoped(account_id, "us-west-2", legacy_arn) is None
+        assert ssm_service._tags.get_scoped(account_id, "us-west-2", legacy_add_tags_arn) is None
+    finally:
+        ssm_service.reset()
+
+
+def test_cloudformation_ssm_parameter_uses_canonical_arn_builder():
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import ssm as ssm_service
+    from ministack.services.cloudformation import provisioners
+
+    account_id = "000000000000"
+    name = f"cfn-param-{_uuid_mod.uuid4().hex[:8]}"
+
+    set_request_account_id(account_id)
+    set_request_region("us-west-2")
+    ssm_service.reset()
+    try:
+        provisioners._ssm_create("Param", {"Name": name, "Value": "value"}, "stack")
+        assert ssm_service._parameters[name]["ARN"] == (
+            f"arn:aws:ssm:us-west-2:{account_id}:parameter/{name}"
+        )
+    finally:
+        ssm_service.reset()
+
+
+def test_ssm_parameters_are_region_scoped_by_name(ssm):
+    west = _regional_ssm("us-west-2")
+    name = f"/mr/ssm/{_uuid_mod.uuid4().hex[:8]}"
+
+    ssm.put_parameter(Name=name, Value="east", Type="String")
+    west.put_parameter(Name=name, Value="west", Type="String")
+
+    east_param = ssm.get_parameter(Name=name)["Parameter"]
+    west_param = west.get_parameter(Name=name)["Parameter"]
+
+    assert east_param["Value"] == "east"
+    assert west_param["Value"] == "west"
+    assert ":us-east-1:" in east_param["ARN"]
+    assert ":us-west-2:" in west_param["ARN"]
+
+    ssm.delete_parameter(Name=name)
+    with pytest.raises(ClientError) as exc:
+        ssm.get_parameter(Name=name)
+    assert exc.value.response["Error"]["Code"] == "ParameterNotFound"
+    assert west.get_parameter(Name=name)["Parameter"]["Value"] == "west"
+
+
+def test_ssm_delete_rejects_parameter_arn(ssm):
+    name = f"/mr/ssm/delete-arn/{_uuid_mod.uuid4().hex[:8]}"
+    ssm.put_parameter(Name=name, Value="value", Type="String")
+    arn = ssm.get_parameter(Name=name)["Parameter"]["ARN"]
+
+    with pytest.raises(ClientError) as exc:
+        ssm.delete_parameter(Name=arn)
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert ssm.get_parameter(Name=name)["Parameter"]["Value"] == "value"
+
+    resp = ssm.delete_parameters(Names=[arn])
+    assert arn in resp["InvalidParameters"]
+    assert ssm.get_parameter(Name=name)["Parameter"]["Value"] == "value"
+
+    ssm.delete_parameter(Name=name)
+
+
+def test_ssm_put_rejects_slash_variant_duplicate(ssm):
+    name = f"mr-ssm-duplicate-{_uuid_mod.uuid4().hex[:8]}"
+    ssm.put_parameter(Name=name, Value="bare", Type="String")
+
+    with pytest.raises(ClientError) as exc:
+        ssm.put_parameter(Name=f"/{name}", Value="path", Type="String")
+    assert exc.value.response["Error"]["Code"] == "ParameterAlreadyExists"
+
+    with pytest.raises(ClientError) as exc:
+        ssm.put_parameter(Name=f"/{name}", Value="path", Type="String", Overwrite=True)
+    assert exc.value.response["Error"]["Code"] == "ParameterAlreadyExists"
+
+    assert ssm.get_parameter(Name=name)["Parameter"]["Value"] == "bare"
+    ssm.delete_parameter(Name=name)
+
+
+_SSM_PATH_MSG = (
+    'Parameter name: can\'t be prefixed with "ssm" (case-insensitive). If formed as a path, it can consist '
+    "of sub-paths divided by slash symbol; each sub-path can be formed as a mix of letters, numbers and "
+    "the following 3 symbols .-_"
+)
+_AWS_SSM_PLAIN_MSG = 'Parameter name: can\'t be prefixed with "aws" or "ssm" (case-insensitive).'
+_TAGS_OVERWRITE_MSG = (
+    "Invalid request: tags and overwrite can't be used together. To create a parameter "
+    "with tags, please remove overwrite flag. To update tags for an existing parameter, "
+    "please use AddTagsToResource or RemoveTagsFromResource."
+)
+
+
+def test_ssm_put_parameter_requires_type_on_create(ssm):
+    name = f"/ps-type/{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        ssm.put_parameter(Name=name, Value="x")
+    err = exc.value.response["Error"]
+    assert err["Code"] == "ValidationException"
+    assert err["Message"] == "A parameter type is required when you create a parameter."
+    with pytest.raises(ClientError) as exc:
+        ssm.get_parameter(Name=name)
+    assert exc.value.response["Error"]["Code"] == "ParameterNotFound"
+
+
+def test_ssm_put_parameter_overwrite_keeps_type_when_omitted(ssm):
+    name = f"/ps-type/{_uuid_mod.uuid4().hex[:8]}"
+    ssm.put_parameter(Name=name, Value="old", Type="SecureString")
+    ssm.put_parameter(Name=name, Value="new", Overwrite=True)
+    param = ssm.get_parameter(Name=name, WithDecryption=True)["Parameter"]
+    assert param["Type"] == "SecureString"
+    assert param["Version"] == 2
+    assert param["Value"] == "new"
+    ssm.delete_parameter(Name=name)
+
+
+@pytest.mark.parametrize(
+    "template,code,message",
+    [
+        ("/ssm/{id}", "ValidationException", _SSM_PATH_MSG),
+        ("/SSM/{id}", "ValidationException", _SSM_PATH_MSG),
+        ("/ssm2-{id}/y", "ValidationException", _SSM_PATH_MSG),
+        ("/aws/{id}", "AccessDeniedException", None),
+        ("/AWS/{id}", "AccessDeniedException", None),
+        ("/awsfoo{id}/y", "AccessDeniedException", None),
+        ("ssmTest{id}", "ValidationException", _AWS_SSM_PLAIN_MSG),
+        ("awsTest{id}", "ValidationException", _AWS_SSM_PLAIN_MSG),
+        ("SSM-test{id}", "ValidationException", _AWS_SSM_PLAIN_MSG),
+    ],
+)
+def test_ssm_put_parameter_rejects_reserved_prefixes(ssm, template, code, message):
+    name = template.format(id=_uuid_mod.uuid4().hex[:8])
+    if message is None:
+        message = f"No access to reserved parameter name: {name[1:]}."
+    with pytest.raises(ClientError) as exc:
+        ssm.put_parameter(Name=name, Value="x", Type="String")
+    err = exc.value.response
+    assert err["Error"]["Code"] == code
+    assert err["Error"]["Message"] == message
+    assert err["ResponseMetadata"]["HTTPStatusCode"] == 400
+
+
+def test_ssm_put_parameter_allows_reserved_words_later_in_path(ssm):
+    name = f"/app-{_uuid_mod.uuid4().hex[:8]}/ssm/aws"
+    ssm.put_parameter(Name=name, Value="ok", Type="String")
+    assert ssm.get_parameter(Name=name)["Parameter"]["Value"] == "ok"
+    ssm.delete_parameter(Name=name)
+
+
+def test_ssm_put_parameter_name_error_wins_over_other_checks(ssm):
+    name = f"/aws/{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        ssm.put_parameter(Name=name, Value="x", Overwrite=True, Tags=[{"Key": "k", "Value": "v"}])
+    assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
+
+
+def test_ssm_public_latest_ami_parameter_names_a_stub_image(ssm, ec2):
+    param = ssm.get_parameter(Name="/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64")["Parameter"]
+    assert param["ARN"].split(":")[4] == ""
+    assert ec2.describe_images(ImageIds=[param["Value"]])["Images"][0]["Name"].startswith("al2023-ami-")
+
+
+def test_ssm_put_parameter_rejects_tags_with_overwrite(ssm):
+    tags = [{"Key": "k", "Value": "v"}]
+    new_name = f"/ps-tags/{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        ssm.put_parameter(Name=new_name, Value="x", Type="String", Overwrite=True, Tags=tags)
+    err = exc.value.response["Error"]
+    assert err["Code"] == "ValidationException"
+    assert err["Message"] == _TAGS_OVERWRITE_MSG
+    with pytest.raises(ClientError) as exc:
+        ssm.get_parameter(Name=new_name)
+    assert exc.value.response["Error"]["Code"] == "ParameterNotFound"
+
+    name = f"/ps-tags/{_uuid_mod.uuid4().hex[:8]}"
+    ssm.put_parameter(Name=name, Value="old", Type="String", Tags=tags)
+    with pytest.raises(ClientError) as exc:
+        ssm.put_parameter(Name=name, Value="new", Type="String", Overwrite=True, Tags=[{"Key": "a", "Value": "b"}])
+    assert exc.value.response["Error"]["Message"] == _TAGS_OVERWRITE_MSG
+    param = ssm.get_parameter(Name=name)["Parameter"]
+    assert (param["Value"], param["Version"]) == ("old", 1)
+    assert ssm.list_tags_for_resource(ResourceType="Parameter", ResourceId=name)["TagList"] == tags
+
+    ssm.put_parameter(Name=name, Value="new", Type="String", Overwrite=True, Tags=[])
+    assert ssm.get_parameter(Name=name)["Parameter"]["Value"] == "new"
+    ssm.delete_parameter(Name=name)
+
+
+def test_ssm_parameter_arn_lookup_is_request_region_scoped(ssm):
+    west = _regional_ssm("us-west-2")
+    name = f"/mr/ssm/arn/{_uuid_mod.uuid4().hex[:8]}"
+
+    ssm.put_parameter(Name=name, Value="east", Type="String")
+    west.put_parameter(Name=name, Value="west", Type="String")
+
+    east_arn = ssm.get_parameter(Name=name)["Parameter"]["ARN"]
+    west_arn = west.get_parameter(Name=name)["Parameter"]["ARN"]
+
+    assert ssm.get_parameter(Name=east_arn)["Parameter"]["Value"] == "east"
+    with pytest.raises(ClientError) as exc:
+        ssm.get_parameter(Name=west_arn)
+    assert exc.value.response["Error"]["Code"] == "ParameterNotFound"
+
+
+def test_ssm_tags_accept_current_region_parameter_arn(ssm):
+    west = _regional_ssm("us-west-2")
+    name = f"/mr/ssm/tag/{_uuid_mod.uuid4().hex[:8]}"
+
+    ssm.put_parameter(Name=name, Value="east", Type="String")
+    west.put_parameter(Name=name, Value="west", Type="String")
+
+    east_arn = ssm.get_parameter(Name=name)["Parameter"]["ARN"]
+    ssm.add_tags_to_resource(
+        ResourceType="Parameter",
+        ResourceId=east_arn,
+        Tags=[{"Key": "scope", "Value": "east"}],
+    )
+
+    east_tags = ssm.list_tags_for_resource(ResourceType="Parameter", ResourceId=east_arn)["TagList"]
+    west_tags = west.list_tags_for_resource(ResourceType="Parameter", ResourceId=name)["TagList"]
+
+    assert {tag["Key"]: tag["Value"] for tag in east_tags} == {"scope": "east"}
+    assert west_tags == []
+
+
+def test_ssm_resolve_parameter_value_uses_arn_region_without_tail_fallback():
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import ssm as ssm_service
+
+    original_account = get_account_id()
+    original_region = get_region()
+    name = f"/mr/ssm/resolve/{_uuid_mod.uuid4().hex[:8]}"
+
+    try:
+        ssm_service.reset()
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+        ssm_service._put_parameter({"Name": name, "Value": "east", "Type": "String"})
+
+        west_arn = f"arn:aws:ssm:us-west-2:000000000000:parameter/{name.lstrip('/')}"
+        assert ssm_service.resolve_parameter_value(west_arn) is None
+
+        set_request_region("us-west-2")
+        ssm_service._put_parameter({"Name": name, "Value": "west", "Type": "String"})
+
+        set_request_region("us-east-1")
+        assert ssm_service.resolve_parameter_value(name) == "east"
+        assert ssm_service.resolve_parameter_value(west_arn) == "west"
+        assert ssm_service.resolve_parameter_value(
+            west_arn.replace(":ssm:", ":secretsmanager:", 1)
+        ) is None
+        assert ssm_service.resolve_parameter_value(
+            west_arn.replace(":000000000000:", ":111111111111:", 1)
+        ) is None
+    finally:
+        ssm_service.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_cloudformation_ssm_parameter_is_region_scoped():
+    """A CloudFormation-created ``AWS::SSM::Parameter`` is stored under the
+    deploy request's region, so a client in another region cannot read it."""
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import ssm as ssm_service
+    from ministack.services.cloudformation import provisioners
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "000000000000"
+    name = f"cfn-region-{_uuid_mod.uuid4().hex[:8]}"
+
+    try:
+        set_request_account_id(account_id)
+        set_request_region("us-west-2")
+        ssm_service.reset()
+        provisioners._ssm_create("Param", {"Name": name, "Value": "west"}, "stack")
+
+        # Stored only under the deploy region.
+        assert ssm_service._parameters.get_scoped(account_id, "us-west-2", name) is not None
+        assert ssm_service._parameters.get_scoped(account_id, "us-east-1", name) is None
+
+        # Readable in the deploy region.
+        status, _headers, body = ssm_service._get_parameter({"Name": name})
+        assert status == 200
+        assert json.loads(body)["Parameter"]["Value"] == "west"
+
+        # Absent from another region.
+        set_request_region("us-east-1")
+        status, _headers, body = ssm_service._get_parameter({"Name": name})
+        assert status == 400
+        assert json.loads(body)["__type"] == "ParameterNotFound"
+    finally:
+        ssm_service.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+# ── Run Command helpers ────────────────────────────────────
+# A command needs an agent answering, and this emulator's agent is the container behind the
+# instance. So the tests that send a command register an AMI and launch a real box; the ones that
+# prove refusal do not need one.
+
+
+def _docker_reachable():
+    try:
+        import docker as _probe
+
+        _probe.from_env(timeout=5).ping()
+        return True
+    except Exception:
+        return False
+
+
+requires_docker = pytest.mark.skipif(
+    not _docker_reachable(), reason="no reachable Docker daemon")
+
+
+@pytest.fixture
+def boxed_instance(ec2):
+    """A running instance with a container behind it, so SSM can reach it."""
+    ami = ec2.register_image(Name=f"ssm-{_uuid_mod.uuid4().hex[:8]}",
+                             ImageLocation="alpine:3")["ImageId"]
+    instance_id = ec2.run_instances(ImageId=ami, MinCount=1,
+                                    MaxCount=1)["Instances"][0]["InstanceId"]
+    try:
+        yield instance_id
+    finally:
+        ec2.terminate_instances(InstanceIds=[instance_id])
+        ec2.deregister_image(ImageId=ami)
+
+
+def _poll_invocation(ssm, command_id, instance_id, timeout=30):
+    """Run Command is asynchronous on AWS, so a caller polls to a terminal state."""
+    deadline = time.time() + timeout
+    terminal = {"Success", "Failed", "Cancelled", "TimedOut"}
+    while time.time() < deadline:
+        inv = ssm.get_command_invocation(CommandId=command_id, InstanceId=instance_id)
+        if inv["Status"] in terminal:
+            return inv
+        time.sleep(0.2)
+    raise AssertionError(f"invocation never reached a terminal state: {inv['Status']}")
+
+
+@requires_docker
+@pytest.mark.data_plane
+def test_ssm_run_command_health_probe(ssm, boxed_instance):
+    """The Run Command shape a health probe needs: send, then poll to a terminal invocation."""
+    tag = _uuid_mod.uuid4().hex[:8]
+    command = ssm.send_command(InstanceIds=[boxed_instance], DocumentName="AWS-RunShellScript",
+                               Comment=f"probe {tag}",
+                               Parameters={"commands": ["echo ok"]})["Command"]
+    assert command["CommandId"]
+    assert command["DocumentName"] == "AWS-RunShellScript"
+    assert command["InstanceIds"] == [boxed_instance]
+    assert command["TargetCount"] == 1
+    # SendCommand answers before the command has been delivered, as on AWS.
+    assert command["Status"] == "Pending"
+    assert command["CompletedCount"] == 0
+
+    inv = _poll_invocation(ssm, command["CommandId"], boxed_instance)
+    assert inv["Status"] == "Success"
+    assert inv["StatusDetails"] == "Success"
+    assert inv["ResponseCode"] == 0
+    # The script actually ran in the box.
+    assert inv["StandardOutputContent"].strip() == "ok"
+    assert inv["DocumentName"] == "AWS-RunShellScript"
+    # These are strings in the SSM model, not timestamps, so boto3 must not have parsed them.
+    assert isinstance(inv["ExecutionStartDateTime"], str)
+    assert isinstance(inv["ExecutionEndDateTime"], str)
+
+    # A caller that checks whether the instance is managed before sending must see it.
+    info = ssm.describe_instance_information()["InstanceInformationList"]
+    mine = [i for i in info if i["InstanceId"] == boxed_instance]
+    assert len(mine) == 1
+    assert mine[0]["PingStatus"] == "Online"
+    assert mine[0]["ResourceType"] == "EC2Instance"
+
+
+@requires_docker
+@pytest.mark.data_plane
+def test_ssm_run_command_probe_can_fail(ssm, boxed_instance):
+    """The point of a real box: a health check that is wrong reports Failed, not Success."""
+    command = ssm.send_command(InstanceIds=[boxed_instance], DocumentName="AWS-RunShellScript",
+                               Parameters={"commands": ["echo bad >&2", "exit 7"]})["Command"]
+    inv = _poll_invocation(ssm, command["CommandId"], boxed_instance)
+    assert inv["Status"] == "Failed"
+    assert inv["StatusDetails"] == "Failed"
+    assert inv["ResponseCode"] == 7
+    assert inv["StandardErrorContent"].strip() == "bad"
+    listed = ssm.list_commands(CommandId=command["CommandId"])["Commands"][0]
+    assert listed["Status"] == "Failed"
+    assert listed["ErrorCount"] == 1
+
+
+def test_ssm_send_command_validates_the_instance(ssm, ec2):
+    """AWS folds several problems into InvalidInstanceId: no such node, a terminated one, and
+    an agent that is not running. A metadata-only instance is the last of those."""
+    with pytest.raises(ClientError) as exc:
+        ssm.send_command(InstanceIds=["i-00000000000000000"], DocumentName="AWS-RunShellScript")
+    assert exc.value.response["Error"]["Code"] == "InvalidInstanceId"
+
+    instance_id = ec2.run_instances(ImageId="ami-12345678", MinCount=1,
+                                    MaxCount=1)["Instances"][0]["InstanceId"]
+    ec2.terminate_instances(InstanceIds=[instance_id])
+    with pytest.raises(ClientError) as exc:
+        ssm.send_command(InstanceIds=[instance_id], DocumentName="AWS-RunShellScript")
+    assert exc.value.response["Error"]["Code"] == "InvalidInstanceId"
+
+    # Running, but nothing is behind it, so no agent is answering — which is one of the causes
+    # AWS lists for this error. It is not listed as a managed node either.
+    boxless = ec2.run_instances(ImageId="ami-12345678", MinCount=1,
+                                MaxCount=1)["Instances"][0]["InstanceId"]
+    try:
+        with pytest.raises(ClientError) as exc:
+            ssm.send_command(InstanceIds=[boxless], DocumentName="AWS-RunShellScript")
+        assert exc.value.response["Error"]["Code"] == "InvalidInstanceId"
+        listed = [i["InstanceId"]
+                  for i in ssm.describe_instance_information()["InstanceInformationList"]]
+        assert boxless not in listed
+    finally:
+        ec2.terminate_instances(InstanceIds=[boxless])
+
+
+@requires_docker
+@pytest.mark.data_plane
+def test_ssm_send_command_accepts_a_managed_instance(ssm, boxed_instance):
+    """Rejecting everything would satisfy the refusals above, so prove one is taken."""
+    assert ssm.send_command(InstanceIds=[boxed_instance],
+                            DocumentName="AWS-RunShellScript",
+                            Parameters={"commands": ["true"]})["Command"]["CommandId"]
+    listed = [i["InstanceId"]
+              for i in ssm.describe_instance_information()["InstanceInformationList"]]
+    assert boxed_instance in listed
+
+
+@requires_docker
+@pytest.mark.data_plane
+def test_ssm_command_lookup_filters_and_errors(ssm, ec2):
+    """listCommands narrows by command and instance; unknown ids get what AWS answers."""
+    ami = ec2.register_image(Name=f"ssm-lookup-{_uuid_mod.uuid4().hex[:8]}",
+                             ImageLocation="alpine:3")["ImageId"]
+    instance_id = ec2.run_instances(ImageId=ami, MinCount=1,
+                                    MaxCount=1)["Instances"][0]["InstanceId"]
+    other_id = ec2.run_instances(ImageId=ami, MinCount=1,
+                                 MaxCount=1)["Instances"][0]["InstanceId"]
+    try:
+        mine = ssm.send_command(InstanceIds=[instance_id],
+                                DocumentName="AWS-RunShellScript",
+                                Parameters={"commands": ["true"]})["Command"]["CommandId"]
+        theirs = ssm.send_command(InstanceIds=[other_id],
+                                  DocumentName="AWS-RunShellScript",
+                                  Parameters={"commands": ["true"]})["Command"]["CommandId"]
+
+        assert [c["CommandId"] for c in ssm.list_commands(CommandId=mine)["Commands"]] == [mine]
+        by_instance = [c["CommandId"] for c in ssm.list_commands(InstanceId=other_id)["Commands"]]
+        assert theirs in by_instance and mine not in by_instance
+
+        # A command id nobody knows narrows the list to nothing; AWS does not call it an error.
+        assert ssm.list_commands(CommandId="ffffffff-ffff-ffff-ffff-ffffffffffff")["Commands"] == []
+
+        # AWS resolves the invocation before the command, so this is not InvalidCommandId.
+        with pytest.raises(ClientError) as exc:
+            ssm.get_command_invocation(CommandId="ffffffff-ffff-ffff-ffff-ffffffffffff",
+                                       InstanceId=instance_id)
+        assert exc.value.response["Error"]["Code"] == "InvocationDoesNotExist"
+
+        # A real command, but not for that instance: the invocation does not exist.
+        with pytest.raises(ClientError) as exc:
+            ssm.get_command_invocation(CommandId=mine, InstanceId=other_id)
+        assert exc.value.response["Error"]["Code"] == "InvocationDoesNotExist"
+    finally:
+        ec2.terminate_instances(InstanceIds=[instance_id, other_id])
+        ec2.deregister_image(ImageId=ami)
+
+
+def test_unicode_ssm_parameter(ssm):
+    ssm.put_parameter(Name="/unicode/param", Value="값: τιμή", Type="String")
+    resp = ssm.get_parameter(Name="/unicode/param")
+    assert resp["Parameter"]["Value"] == "값: τιμή"
+
+
+_HT = "/ssm/parameter-store/high-throughput-enabled"
+_HT_ARN = "arn:aws:ssm:us-east-1:000000000000:servicesetting" + _HT
+_TIER = "/ssm/parameter-store/default-parameter-tier"
+# Independent of the implementation. Observed on AWS (GetServiceSetting, us-east-1, 2026-10-10): value and default
+# LastModifiedDate; high-throughput-enabled is the ResetServiceSetting API reference example.
+_OBSERVED_DEFAULTS = {
+    _HT: ("false", 1555532571.138),
+    _TIER: ("Standard", 1565131339.38),
+    "/ssm/documents/console/public-sharing-permission": ("Enable", 1612382724.747),
+    "/ssm/managed-instance/activation-tier": ("standard", 1579134984.656),
+    "/ssm/managed-instance/default-ec2-instance-management-role": ("$None", 1636561263.576),
+    "/ssm/automation/customer-script-log-destination": ("None", 1572919724.731),
+    "/ssm/automation/customer-script-log-group-name": ("/aws/ssm/automation/executeScript", 1572898415.256),
+    "/ssm/automation/enable-adaptive-concurrency": ("False", 1632330231.776),
+    "/ssm/appmanager/appmanager-enabled": ("False", 1604983265.572),
+    "/ssm/opsinsights/opscenter": ("Disabled", 1622077352.094),
+}
+# Accepted values per UpdateServiceSetting's API reference; the other ids accept any string.
+_ACCEPTED = {
+    _HT: ("true", "false"),
+    _TIER: ("Standard", "Advanced", "Intelligent-Tiering"),
+    "/ssm/documents/console/public-sharing-permission": ("Enable", "Disable"),
+    "/ssm/managed-instance/activation-tier": ("standard", "advanced"),
+    "/ssm/appmanager/appmanager-enabled": ("True", "False"),
+    "/ssm/opsinsights/opscenter": ("Enabled", "Disabled"),
+}
+
+
+@pytest.fixture
+def service_settings(ssm):
+    yield ssm
+    for setting_id in _OBSERVED_DEFAULTS:
+        ssm.reset_service_setting(SettingId=setting_id)
+
+
+def _ssm_model():
+    from botocore.loaders import Loader
+    from botocore.model import ServiceModel
+
+    return ServiceModel(Loader().load_service_model("ssm", "service-2"))
+
+
+def _error_code(call, **kwargs):
+    with pytest.raises(ClientError) as exc:
+        call(**kwargs)
+    return exc.value.response["Error"]
+
+
+def test_ssm_service_setting_defaults(service_settings):
+    import re
+
+    # The model lists the SettingIds only in the documentation prose of the request shape.
+    model_ids = set(re.findall(r"/ssm/[a-z0-9/-]+", _ssm_model().shape_for("GetServiceSettingRequest").members["SettingId"].documentation))
+    assert set(_OBSERVED_DEFAULTS) == model_ids
+    for setting_id, (default, modified) in _OBSERVED_DEFAULTS.items():
+        setting = service_settings.get_service_setting(SettingId=setting_id)["ServiceSetting"]
+        assert (setting["SettingValue"], setting["Status"], setting["LastModifiedUser"]) == (default, "Default", "System")
+        assert setting["LastModifiedDate"].timestamp() == pytest.approx(modified), setting_id
+    assert service_settings.get_service_setting(SettingId=_HT)["ServiceSetting"]["ARN"] == _HT_ARN
+
+
+def test_ssm_service_setting_update_and_reset(service_settings):
+    ssm = service_settings
+    assert ssm.update_service_setting(SettingId=_HT_ARN, SettingValue="true")["ResponseMetadata"]["HTTPStatusCode"] == 200
+    setting = ssm.get_service_setting(SettingId=_HT)["ServiceSetting"]
+    assert (setting["SettingValue"], setting["Status"]) == ("true", "Customized")
+    assert "LastModifiedDate" in setting and setting["LastModifiedUser"]
+    reset = ssm.reset_service_setting(SettingId=_HT_ARN)["ServiceSetting"]
+    assert (reset["SettingValue"], reset["Status"], reset["LastModifiedUser"]) == ("false", "Default", "System")
+    for call, extra in ((ssm.get_service_setting, {}), (ssm.reset_service_setting, {}),
+                        (ssm.update_service_setting, {"SettingValue": "x"})):
+        assert _error_code(call, SettingId="/ssm/nope", **extra)["Code"] == "ServiceSettingNotFound"
+
+
+def test_ssm_service_setting_value_validation(service_settings):
+    ssm = service_settings
+    for setting_id, accepted in _ACCEPTED.items():
+        error = _error_code(ssm.update_service_setting, SettingId=setting_id, SettingValue="NotAValue")
+        assert error["Code"] == "ValidationException"
+        assert error["Message"] == f"Invalid setting value, allowed value pattern: {'|'.join(accepted)}"
+        assert ssm.get_service_setting(SettingId=setting_id)["ServiceSetting"]["Status"] == "Default"
+        for value in accepted:
+            ssm.update_service_setting(SettingId=setting_id, SettingValue=value)
+    for setting_id in set(_OBSERVED_DEFAULTS) - set(_ACCEPTED):
+        ssm.update_service_setting(SettingId=setting_id, SettingValue="any")
+
+
+def test_ssm_service_setting_last_modified_user_is_caller(service_settings, iam):
+    username = f"ssm-setting-{_uuid_mod.uuid4().hex[:8]}"
+    arn = iam.create_user(UserName=username)["User"]["Arn"]
+    key = iam.create_access_key(UserName=username)["AccessKey"]
+    try:
+        caller = boto3.client(
+            "ssm",
+            endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+            aws_access_key_id=key["AccessKeyId"],
+            aws_secret_access_key=key["SecretAccessKey"],
+            region_name="us-east-1",
+        )
+        caller.update_service_setting(SettingId=_HT, SettingValue="true")
+        assert service_settings.get_service_setting(SettingId=_HT)["ServiceSetting"]["LastModifiedUser"] == arn
+    finally:
+        iam.delete_access_key(UserName=username, AccessKeyId=key["AccessKeyId"])
+        iam.delete_user(UserName=username)
+
+
+def test_ssm_service_setting_per_region(service_settings):
+    west = _regional_ssm("us-west-2")
+    try:
+        west.update_service_setting(SettingId=_HT, SettingValue="true")
+        assert service_settings.get_service_setting(SettingId=_HT)["ServiceSetting"]["Status"] == "Default"
+        assert west.get_service_setting(SettingId=_HT)["ServiceSetting"]["ARN"].startswith("arn:aws:ssm:us-west-2:")
+    finally:
+        west.reset_service_setting(SettingId=_HT)
+
+
+def test_ssm_service_setting_persisted():
+    from ministack.services import ssm as ssm_service
+
+    ssm_service.reset()
+    try:
+        ssm_service._update_service_setting({"SettingId": _HT, "SettingValue": "true"}, "arn:aws:iam::000000000000:root")
+        saved = ssm_service.get_state()
+        ssm_service.reset()
+        ssm_service.load_persisted_state(saved)
+        body = json.loads(ssm_service._get_service_setting({"SettingId": _HT})[2])
+    finally:
+        ssm_service.reset()
+    assert body["ServiceSetting"]["SettingValue"] == "true"
+
+
+def test_ssm_default_parameter_tier_setting(service_settings):
+    ssm = service_settings
+    tiers = set(_ssm_model().shape_for("ParameterTier").enum)
+    big = "x" * 4097
+    name = f"/tier/{_uuid_mod.uuid4().hex[:8]}"
+    cases = {"Standard": ("Standard", None), "Advanced": ("Advanced", "Advanced"),
+             "Intelligent-Tiering": ("Standard", "Advanced")}
+    try:
+        for default_tier, (small_tier, big_tier) in cases.items():
+            ssm.update_service_setting(SettingId=_TIER, SettingValue=default_tier)
+            put = ssm.put_parameter(Name=name, Value="v", Type="String", Overwrite=True)
+            listed = ssm.describe_parameters(ParameterFilters=[{"Key": "Name", "Values": [name]}])["Parameters"][0]
+            assert (put["Tier"], listed["Tier"]) == (small_tier, small_tier)
+            assert {put["Tier"], listed["Tier"]} <= tiers
+            ssm.delete_parameter(Name=name)
+            if big_tier:
+                assert ssm.put_parameter(Name=name, Value=big, Type="String")["Tier"] == big_tier
+                ssm.delete_parameter(Name=name)
+        # An Advanced parameter stays Advanced when overwritten without a Tier.
+        ssm.put_parameter(Name=name, Value="v", Type="String", Tier="Advanced")
+        ssm.update_service_setting(SettingId=_TIER, SettingValue="Standard")
+        assert ssm.put_parameter(Name=name, Value="w", Type="String", Overwrite=True)["Tier"] == "Advanced"
+    finally:
+        ssm.delete_parameters(Names=[name])
+
+
+def _assert_matches_shape(shape, value, path):
+    if shape.type_name == "structure":
+        assert isinstance(value, dict), path
+        assert set(value) <= set(shape.members), (path, set(value) - set(shape.members))
+        assert set(shape.required_members) <= set(value), path
+        for key, member in value.items():
+            _assert_matches_shape(shape.members[key], member, f"{path}.{key}")
+    elif shape.type_name == "string":
+        assert isinstance(value, str), path
+    elif shape.type_name == "timestamp":
+        assert isinstance(value, (int, float)) and not isinstance(value, bool), path  # json protocol: epoch seconds
+
+
+def test_ssm_service_setting_matches_botocore_model(service_settings):
+    """Raw responses and error codes against the installed botocore ssm service-2.json."""
+    from botocore import xform_name
+
+    ssm = service_settings
+    model = _ssm_model()
+    for operation, extra in (("GetServiceSetting", {}), ("UpdateServiceSetting", {"SettingValue": "true"}),
+                             ("GetServiceSetting", {}), ("ResetServiceSetting", {})):
+        captured = []
+        handler = lambda response_dict, **kw: captured.append(json.loads(response_dict["body"]))  # noqa: E731
+        ssm.meta.events.register(f"response-received.ssm.{operation}", handler)
+        try:
+            getattr(ssm, xform_name(operation))(SettingId=_HT, **extra)
+        finally:
+            ssm.meta.events.unregister(f"response-received.ssm.{operation}", handler)
+        _assert_matches_shape(model.operation_model(operation).output_shape, captured[0], operation)
+    modelled = {e.name for op in ("GetServiceSetting", "UpdateServiceSetting", "ResetServiceSetting")
+                for e in model.operation_model(op).error_shapes}
+    assert _error_code(ssm.get_service_setting, SettingId="/ssm/nope")["Code"] in modelled
+    # ValidationException is not modelled for UpdateServiceSetting; observed on AWS (us-east-1, 2026-10-10).
+    assert "ValidationException" not in modelled
+
+
+# ── Documents + Automation (wire shapes captured on real AWS, us-east-2) ──
+
+def _unique_name(prefix):
+    return f"{prefix}-{_uuid_mod.uuid4().hex[:10]}"
+
+
+def _err(fn, **kw):
+    try:
+        fn(**kw)
+    except ClientError as e:
+        return e.response["Error"]
+    raise AssertionError("expected ClientError")
+
+
+_SLEEP_DOC = """schemaVersion: '0.3'
+description: test sleep doc
+mainSteps:
+- name: snooze
+  action: aws:sleep
+  inputs:
+    Duration: PT1S
+"""
+
+_PARAM_DOC = """schemaVersion: '0.3'
+description: param doc
+parameters:
+  WaitTime:
+    type: String
+    default: PT1S
+mainSteps:
+- name: snooze
+  action: aws:sleep
+  inputs:
+    Duration: "{{ WaitTime }}"
+"""
+
+
+def test_ssm_document_lifecycle(ssm):
+    import hashlib
+    name = _unique_name("doc")
+    desc = ssm.create_document(Name=name, DocumentType="Automation",
+                               DocumentFormat="YAML", Content=_SLEEP_DOC)["DocumentDescription"]
+    assert desc["Hash"] == hashlib.sha256(_SLEEP_DOC.encode()).hexdigest()
+    assert desc["HashType"] == "Sha256"
+    assert desc["Status"] == "Creating"
+    assert desc["PlatformTypes"] == ["Windows", "Linux", "MacOS"]
+    assert desc["LatestVersion"] == "1" and desc["DefaultVersion"] == "1"
+    assert desc["Description"] == "test sleep doc"
+    assert desc["Owner"]
+    captured = []
+    handler = lambda **kw: captured.append(json.loads(kw["response_dict"]["body"]))  # noqa: E731
+    ssm.meta.events.register("response-received.ssm.DescribeDocument", handler)
+    try:
+        full = ssm.describe_document(Name=name)["Document"]
+    finally:
+        ssm.meta.events.unregister("response-received.ssm.DescribeDocument", handler)
+    # DocumentId is on the wire but not in the botocore DocumentDescription shape.
+    assert captured[0]["Document"]["DocumentId"]
+    assert full["Category"] == [] and full["CategoryEnum"] == []
+    getd = []
+    handler2 = lambda **kw: getd.append(json.loads(kw["response_dict"]["body"]))  # noqa: E731
+    ssm.meta.events.register("response-received.ssm.GetDocument", handler2)
+    try:
+        got = ssm.get_document(Name=name, DocumentFormat="YAML")
+    finally:
+        ssm.meta.events.unregister("response-received.ssm.GetDocument", handler2)
+    assert got["Content"] == _SLEEP_DOC and got["DocumentFormat"] == "YAML"
+    assert getd[0]["AllowInvalidContent"] is False
+    got_json = ssm.get_document(Name=name)
+    assert got_json["DocumentFormat"] == "JSON"
+    assert json.loads(got_json["Content"])["schemaVersion"] == "0.3"
+    listed = ssm.list_documents(Filters=[{"Key": "Owner", "Values": ["Self"]}])["DocumentIdentifiers"]
+    assert any(d["Name"] == name for d in listed)
+    ssm.delete_document(Name=name)
+    assert _err(ssm.describe_document, Name=name)["Code"] == "InvalidDocument"
+
+
+def test_ssm_document_timestamps_are_epoch_on_the_wire(ssm):
+    name = _unique_name("doc-ts")
+    captured = []
+    handler = lambda **kw: captured.append(json.loads(kw["response_dict"]["body"]))  # noqa: E731
+    ssm.meta.events.register("response-received.ssm.DescribeDocument", handler)
+    try:
+        ssm.create_document(Name=name, DocumentType="Automation",
+                            DocumentFormat="YAML", Content=_SLEEP_DOC)
+        ssm.describe_document(Name=name)
+    finally:
+        ssm.meta.events.unregister("response-received.ssm.DescribeDocument", handler)
+        ssm.delete_document(Name=name)
+    created = captured[0]["Document"]["CreatedDate"]
+    assert isinstance(created, (int, float)) and not isinstance(created, bool)
+
+
+def test_ssm_document_errors(ssm):
+    name = _unique_name("err")
+    e = _err(ssm.describe_document, Name=name)
+    assert e["Code"] == "InvalidDocument" and "does not exist" in e["Message"]
+    e = _err(ssm.delete_document, Name=name)
+    assert e["Code"] == "InvalidDocument" and "does not exist in your account" in e["Message"]
+    e = _err(ssm.create_document, Name=name, DocumentType="BogusType",
+             DocumentFormat="YAML", Content=_SLEEP_DOC)
+    assert e["Code"] == "ValidationException"
+    e = _err(ssm.create_document, Name=name, DocumentType="Automation", Content=_SLEEP_DOC)
+    assert e["Code"] == "InvalidDocumentContent" and "JSON not well-formed" in e["Message"]
+    e = _err(ssm.create_document, Name=name, DocumentType="Automation", DocumentFormat="YAML",
+             Content="schemaVersion: '0.3'\nmainSteps: []\n")
+    assert e["Code"] == "InvalidDocumentContent" and 'Missing steps in "mainSteps"' in e["Message"]
+    e = _err(ssm.create_document, Name=name, DocumentType="Automation", DocumentFormat="YAML",
+             Content="schemaVersion: '0.3'\nmainSteps:\n- name: s\n  action: aws:notARealAction\n")
+    assert e["Code"] == "InvalidDocumentContent" and "Unknown action" in e["Message"]
+    e = _err(ssm.create_document, Name="AWS-Reserved", DocumentType="Automation",
+             DocumentFormat="YAML", Content=_SLEEP_DOC)
+    assert e["Code"] == "ValidationException" and "Invalid document name" in e["Message"]
+    ssm.create_document(Name=name, DocumentType="Automation", DocumentFormat="YAML", Content=_SLEEP_DOC)
+    e = _err(ssm.create_document, Name=name, DocumentType="Automation",
+             DocumentFormat="YAML", Content=_SLEEP_DOC)
+    assert e["Code"] == "DocumentAlreadyExists" and "with same name" in e["Message"]
+    e = _err(ssm.get_document, Name=name, DocumentVersion="99")
+    assert e["Code"] == "InvalidDocumentVersion" and "latest version is 1" in e["Message"]
+    ssm.delete_document(Name=name)
+
+
+def _wait_terminal(ssm, eid, timeout=30):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        d = ssm.get_automation_execution(AutomationExecutionId=eid)["AutomationExecution"]
+        if d["AutomationExecutionStatus"] not in ("Pending", "InProgress"):
+            return d
+        time.sleep(0.4)
+    return d
+
+
+def test_ssm_automation_sleep_success(ssm):
+    name = _unique_name("auto")
+    ssm.create_document(Name=name, DocumentType="Automation", DocumentFormat="YAML", Content=_SLEEP_DOC)
+    eid = ssm.start_automation_execution(DocumentName=name)["AutomationExecutionId"]
+    d = _wait_terminal(ssm, eid)
+    assert d["AutomationExecutionStatus"] == "Success"
+    assert d["DocumentVersion"] == "1"
+    assert d["ExecutedBy"]
+    assert d["ResolvedTargets"] == {"ParameterValues": [], "Truncated": False}
+    assert "ExecutionEndTime" in d and "CurrentStepName" not in d
+    st = d["StepExecutions"][0]
+    assert st["StepName"] == "snooze" and st["Action"] == "aws:sleep"
+    assert st["StepStatus"] == "Success" and st["StepExecutionId"] != eid
+    assert st["Inputs"]["Duration"] == '"PT1S"'
+    meta = ssm.describe_automation_executions(
+        Filters=[{"Key": "ExecutionId", "Values": [eid]}])["AutomationExecutionMetadataList"]
+    assert len(meta) == 1 and meta[0]["AutomationType"] == "Local"
+    ssm.delete_document(Name=name)
+
+
+def test_ssm_automation_param_resolution(ssm):
+    name = _unique_name("auto-param")
+    ssm.create_document(Name=name, DocumentType="Automation", DocumentFormat="YAML", Content=_PARAM_DOC)
+    e = _err(ssm.start_automation_execution, DocumentName=name,
+             Parameters={"Undeclared": ["x"]})
+    assert e["Code"] == "InvalidAutomationExecutionParametersException"
+    assert "Undefined execution inputs" in e["Message"]
+    eid = ssm.start_automation_execution(DocumentName=name)["AutomationExecutionId"]
+    d = _wait_terminal(ssm, eid)
+    assert d["AutomationExecutionStatus"] == "Success"
+    ssm.delete_document(Name=name)
+
+
+def test_ssm_automation_cancel_and_errors(ssm):
+    name = _unique_name("auto-stop")
+    doc = _SLEEP_DOC.replace("PT1S", "PT60S")
+    ssm.create_document(Name=name, DocumentType="Automation", DocumentFormat="YAML", Content=doc)
+    eid = ssm.start_automation_execution(DocumentName=name)["AutomationExecutionId"]
+    time.sleep(0.5)
+    ssm.stop_automation_execution(AutomationExecutionId=eid)
+    d = ssm.get_automation_execution(AutomationExecutionId=eid)["AutomationExecution"]
+    assert d["AutomationExecutionStatus"] == "Cancelled"
+    assert d["StepExecutions"][0]["StepStatus"] == "Cancelled"
+    e = _err(ssm.start_automation_execution, DocumentName="no-such-doc")
+    assert e["Code"] == "AutomationDefinitionNotFoundException"
+    assert "expected valid document in account" in e["Message"]
+    e = _err(ssm.get_automation_execution, AutomationExecutionId="00000000-0000-0000-0000-000000000000")
+    assert e["Code"] == "AutomationExecutionNotFoundException"
+    assert "does not exist" in e["Message"]
+    ssm.delete_document(Name=name)
+
+
+def test_ssm_automation_unemulated_step_fails(ssm):
+    name = _unique_name("auto-fail")
+    doc = """schemaVersion: '0.3'
+description: calls a missing parameter
+mainSteps:
+- name: read
+  action: aws:executeAwsApi
+  inputs:
+    Service: ssm
+    Api: GetParameter
+    Name: /definitely/missing
+"""
+    ssm.create_document(Name=name, DocumentType="Automation", DocumentFormat="YAML", Content=doc)
+    eid = ssm.start_automation_execution(DocumentName=name)["AutomationExecutionId"]
+    d = _wait_terminal(ssm, eid)
+    assert d["AutomationExecutionStatus"] == "Failed"
+    assert "ParameterNotFound" in d["FailureMessage"]
+    st = d["StepExecutions"][0]
+    assert st["StepStatus"] == "Failed" and st["FailureDetails"]["FailureStage"] == "Invocation"
+    ssm.delete_document(Name=name)
+
+
+@pytest.mark.auth_contract
+def test_ssm_automation_steps_need_the_callers_permissions(ssm, auth_enabled, iam_user):
+    """An automation step calls the API as the caller (or the document's assumeRole), so under AUTH=true
+    it cannot do what the caller may not: a user allowed only to run automations cannot write a parameter."""
+    user = iam_user(policy={"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": [
+        "ssm:CreateDocument", "ssm:DeleteDocument", "ssm:StartAutomationExecution", "ssm:GetAutomationExecution"],
+        "Resource": "*"}]})
+    client = user.client("ssm")
+    name, param = _unique_name("auto-auth"), f"/auto-auth/{_uuid_mod.uuid4().hex[:8]}"
+    doc = f"""schemaVersion: '0.3'
+mainSteps:
+- name: write
+  action: aws:executeAwsApi
+  inputs:
+    Service: ssm
+    Api: PutParameter
+    Name: {param}
+    Value: x
+    Type: String
+"""
+    client.create_document(Name=name, DocumentType="Automation", DocumentFormat="YAML", Content=doc)
+    try:
+        d = _wait_terminal(client, client.start_automation_execution(DocumentName=name)["AutomationExecutionId"])
+        if auth_enabled:
+            assert d["AutomationExecutionStatus"] == "Failed"
+            assert "AccessDeniedException" in d["FailureMessage"] and "ssm:PutParameter" in d["FailureMessage"]
+            with pytest.raises(ClientError):
+                ssm.get_parameter(Name=param)
+        else:
+            assert d["AutomationExecutionStatus"] == "Success"
+            ssm.delete_parameter(Name=param)
+    finally:
+        client.delete_document(Name=name)
+
+
+def test_ssm_create_document_refuses_reserved_prefixes(ssm):
+    """botocore CreateDocument Name: aws, amazon, amzn, AWSEC2, AWSConfigRemediation, AWSSupport are reserved."""
+    doc = json.dumps({"schemaVersion": "0.3", "mainSteps": [{"name": "s", "action": "aws:sleep",
+                                                              "inputs": {"Duration": "PT1S"}}]})
+    for name in ("awsMine", "amazonMine", "amznMine", "AWSEC2-Mine", "AWSSupport-Mine"):
+        with pytest.raises(ClientError) as exc:
+            ssm.create_document(Name=name, DocumentType="Automation", Content=doc)
+        assert exc.value.response["Error"]["Code"] == "ValidationException"

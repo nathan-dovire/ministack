@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 AWS API Request Router.
 Routes incoming requests to the correct service handler based on:
@@ -7,11 +9,50 @@ Routes incoming requests to the correct service handler based on:
   - URL path patterns (e.g., /2015-03-31/functions for Lambda)
 """
 
+import ipaddress
 import logging
 import os
 import re
+import socket
+from urllib.parse import unquote
+
+from ministack.core.arn import ArnParseError, parse_arn
 
 logger = logging.getLogger("ministack")
+
+_KNOWN_AWS_SERVICE_NAMES: frozenset | None = None
+
+
+def _is_aws_service_name(scope_name: str) -> bool:
+    """Whether a SigV4 credential scope names a real AWS service.
+
+    Built lazily from the botocore catalog — service name, endpoint prefix,
+    and signing name per model — so new AWS services are recognized without a
+    table to maintain. Only consulted for scopes that matched no registered
+    service or alias, so a miss never changes routing for implemented
+    services.
+    """
+    global _KNOWN_AWS_SERVICE_NAMES
+    if _KNOWN_AWS_SERVICE_NAMES is None:
+        names = set()
+        try:
+            import botocore.session
+
+            session = botocore.session.get_session()
+            for service in session.get_available_services():
+                names.add(service)
+                try:
+                    meta = session.get_service_model(service).metadata
+                except Exception:
+                    continue
+                names.add(meta.get("endpointPrefix", ""))
+                names.add(meta.get("signingName", ""))
+        except Exception:
+            pass
+        names.discard("")
+        _KNOWN_AWS_SERVICE_NAMES = frozenset(names)
+    return scope_name in _KNOWN_AWS_SERVICE_NAMES
+
 
 # Lambda API paths are versioned by date prefix. Resources enumerated per
 # AWS Lambda API Reference (functions, layers, event-source-mappings,
@@ -20,7 +61,20 @@ logger = logging.getLogger("ministack")
 # and routes via credential scope, but raw HTTP/curl/runtime API don't).
 _LAMBDA_PATH_RE = re.compile(
     r"^/\d{4}-\d{2}-\d{2}/(?:functions|layers|event-source-mappings|"
-    r"account-settings|runtime|tags|code-signing-configs)(?:/|$)"
+    r"account-settings|runtime|tags|code-signing-configs|"
+    # Durable Functions (preview, Dec 2025).
+    r"durable-executions|durable-execution-callbacks)(?:/|$)"
+)
+
+# Lambda Core (botocore `lambda-core`, apiVersion 2026-04-30) network
+# connectors. The request URIs ship under 2026-04-04, not the model's
+# apiVersion — `/2026-04-04/network-connectors[/{Identifier}]`.
+_LAMBDA_CORE_PATH_RE = re.compile(r"^/2026-04-04/network-connectors(?:/|$)")
+
+# The AWS CLI signs MicroVM requests with credential scope `lambda`, so only
+# the path separates them from Lambda's function router.
+_LAMBDA_MICROVM_PATH_RE = re.compile(
+    r"^/2025-09-09/(?:microvms|microvm-images)(?:/|$)"
 )
 
 # ECS Task Metadata V4 paths: /v4/<token>[/task|/stats|...]. Token is
@@ -59,8 +113,29 @@ SERVICE_PATTERNS = {
         "target_prefixes": ["DynamoDB_20120810"],
         "host_patterns": [r"dynamodb\."],
     },
+    # Lambda Core (2026-04-04 URIs) shares Lambda's host and credential scope,
+    # so only the path distinguishes it. Listed before `lambda`; the patterns
+    # are disjoint, and the signed case is handled earlier in detect_service.
+    "lambda-core": {
+        "path_patterns": [r"^/2026-04-04/network-connectors"],
+    },
+    # Detected by path: the AWS CLI signs these as `lambda`.
+    "lambda-microvms": {
+        "path_patterns": [r"^/2025-09-09/microvm"],
+        "host_patterns": [r"lambda-microvms\."],
+    },
+    # DocumentDB signs as `rds`; detect_service() claims its requests by host or content.
+    "documentdb": {
+        "host_patterns": [r"docdb\.", r"documentdb\."],
+    },
     "lambda": {
-        "path_patterns": [r"^/2015-03-31/", r"^/2018-10-31/layers"],
+        "path_patterns": [
+            r"^/2015-03-31/",
+            r"^/2018-10-31/layers",
+            # Durable Functions (preview, Dec 2025) — surface lives on the
+            # Lambda endpoint under a fresh API-version prefix.
+            r"^/2025-12-01/(durable-executions|durable-execution-callbacks|functions)",
+        ],
         "host_patterns": [r"lambda\."],
     },
     "iam": {
@@ -123,6 +198,14 @@ SERVICE_PATTERNS = {
     "athena": {
         "target_prefixes": ["AmazonAthena"],
         "host_patterns": [r"athena\."],
+    },
+    "transcribe": {
+        "target_prefixes": ["Transcribe."],
+        "host_patterns": [r"transcribe\."],
+    },
+    "translate": {
+        "target_prefixes": ["AWSShineFrontendService_"],
+        "host_patterns": [r"translate\."],
     },
     "airflow": {
         "host_patterns": [r"airflow\."],
@@ -219,6 +302,11 @@ SERVICE_PATTERNS = {
         ],
         "credential_scope": "es",
     },
+    "opensearchserverless": {
+        "target_prefixes": ["OpenSearchServerless."],
+        "host_patterns": [r"^aoss\."],
+        "credential_scope": "aoss",
+    },
     "organizations": {
         "target_prefixes": ["AWSOrganizationsV20161128"],
         "host_patterns": [r"^organizations\."],
@@ -240,6 +328,15 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"^batch\."],
         "path_prefixes": ["/v1/"],
         "credential_scope": "batch",
+    },
+    "mq": {
+        "host_patterns": [r"mq\."],
+        "path_patterns": [
+            r"^/v1/brokers",
+            r"^/v1/broker-engine-types",
+            r"^/v1/broker-instance-options",
+            r"^/v1/tags"
+        ],
     },
     "cloudformation": {
         "host_patterns": [r"cloudformation\."],
@@ -263,6 +360,33 @@ SERVICE_PATTERNS = {
         "target_prefixes": ["TransferService"],
         "host_patterns": [r"transfer\."],
         "credential_scope": "transfer",
+    },
+    # IoT Wireless (endpoint prefix `api.iotwireless.{region}`). The bare
+    # token is anchored at a label boundary, so it matches the `api.` host
+    # too. Kept above the iot family for reading order, but there is no
+    # actual overlap: the host never contains the literal `iot.` segment the
+    # control plane's `iot\.` regex needs (`iot` is followed by `w`) — a
+    # router test pins that anyway. The SDK signs with credential scope
+    # `iotwireless` (botocore signingName), which the scope early-return
+    # resolves via this key.
+    "iotwireless": {
+        "host_patterns": [r"iotwireless\."],
+        "credential_scope": "iotwireless",
+        "path_prefixes": ["/position-estimate"],
+    },
+    # IoT Jobs data plane (iot-jobs-data API) MUST come before "iot-data" and
+    # "iot": its host also matches the `iot\.` regex, so first-match-wins
+    # routing would otherwise swallow it — and on the `iot` control plane
+    # `GET /things/{t}/jobs` is a DIFFERENT operation (ListJobExecutionsForThing)
+    # that answers with a different envelope. The pattern must cover both host
+    # spellings: `{prefix}.jobs.iot.{region}.{host}`, the legacy iot:Jobs
+    # endpoint, and `{prefix}.data.jobs.iot.{region}.{host}`, which the AWS
+    # Device SDK's jobs topics document. The SDK also
+    # signs with credential scope `iot-jobs-data` (botocore signingName), which
+    # the scope early-return resolves via this key.
+    "iot-jobs-data": {
+        "host_patterns": [r"jobs\.iot\."],
+        "credential_scope": "iot-jobs-data",
     },
     # IoT data plane (iot-data API) MUST come before "iot" because the host
     # `data-ats.iot.{region}.{host}` matches both `iot\.` and the more
@@ -333,9 +457,42 @@ SERVICE_PATTERNS = {
         "path_prefixes": ["/schedules", "/schedule-groups"],
         "credential_scope": "scheduler",
     },
+    "pipes": {
+        "host_patterns": [r"pipes\."],
+        "path_prefixes": ["/v1/pipes"],
+        "credential_scope": "pipes",
+    },
+    "cloudcontrol": {
+        "target_prefixes": ["CloudApiService"],
+        "host_patterns": [r"cloudcontrolapi\."],
+        "credential_scope": "cloudcontrolapi",
+    },
+    "config": {
+        "target_prefixes": ["StarlingDoveService"],
+        "host_patterns": [r"config\."],
+        "credential_scope": "config",
+    },
     "eks": {
         "host_patterns": [r"eks\."],
+        "path_prefixes": ["/oidc/"],
         "credential_scope": "eks",
+    },
+    "mediaconnect": {
+        "host_patterns": [r"^mediaconnect\."],
+        "credential_scope": "mediaconnect",
+    },
+    # Amazon Location: the client is named `location` but the endpoint prefix
+    # and credential scope are `geo` (botocore signingName), and the modeled
+    # per-operation host prefixes put `cp.tracking.` / `tracking.` in front of
+    # it — so the host reads `cp.tracking.geo.{region}.{host}`. `geo` starts
+    # its own label there, so the token still matches once
+    # `_anchored_host_pattern` anchors it at a label start; no other service's
+    # host carries a `geo` label, so ordering is not sensitive. Under an
+    # endpoint override the host carries no `geo.` at all and routing relies
+    # on the `"geo"` entry in the credential-scope map below.
+    "location": {
+        "host_patterns": [r"geo\."],
+        "credential_scope": "geo",
     },
     "tagging": {
         "target_prefixes": ["ResourceGroupsTaggingAPI_20170126"],
@@ -370,7 +527,176 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"cur\."],
         "credential_scope": "cur",
     },
+    "budgets": {
+        "target_prefixes": ["AWSBudgetServiceGateway"],
+        "host_patterns": [r"budgets\."],
+        "credential_scope": "budgets",
+    },
+    # Managed Service for Apache Flink. The v1 API (KinesisAnalytics_20150814)
+    # shares the `kinesisanalytics` signing name and is not implemented, so
+    # requests route on the v2 target prefix.
+    "kinesisanalyticsv2": {
+        "target_prefixes": ["KinesisAnalytics_20180523"],
+        "host_patterns": [r"kinesisanalytics\."],
+        "credential_scope": "kinesisanalytics",
+    },
+    "inspector2": {
+        "host_patterns": [r"inspector2\."],
+        "credential_scope": "inspector2",
+    },
+    # AWS Signer (REST-JSON, signing name `signer`). No other pattern
+    # contains "signer.", so placement in this dict is not order-sensitive;
+    # SDK requests resolve via the credential-scope early return, unsigned
+    # clients via the /signing-jobs + /signing-profiles path rules.
+    "signer": {
+        "host_patterns": [r"signer\."],
+        "credential_scope": "signer",
+    },
+    "dsql": {
+        "host_patterns": [r"dsql\."],
+        "credential_scope": "dsql",
+    },
+    "s3tables": {
+        "host_patterns": [r"s3tables\."],
+        "credential_scope": "s3tables",
+        "path_prefixes": ["/buckets", "/iceberg"],
+    },
+    # NOTE: bedrock-runtime must be listed BEFORE bedrock because the host
+    # `bedrock-runtime.{region}.amazonaws.com` matches both `bedrock-runtime\.`
+    # and the looser `bedrock\.` regex — detect_service iterates in dict order.
+    "bedrock-runtime": {
+        "host_patterns": [r"bedrock-runtime\."],
+        "credential_scope": "bedrock",
+        "path_prefixes": ["/model/"],
+    },
+    "bedrock": {
+        "host_patterns": [r"bedrock\."],
+        "credential_scope": "bedrock",
+        "path_prefixes": ["/foundation-models", "/inference-profiles"],
+    },
+    "kafka": {
+        "host_patterns": [r"^kafka\."],
+        "credential_scope": "kafka",
+        "path_prefixes": ["/v1/clusters", "/v1/configurations", "/v1/tags", "/api/v2"],
+    },
 }
+
+
+_OPENSEARCH_PATH_PREFIXES = tuple(
+    prefix.lower() for prefix in SERVICE_PATTERNS["opensearch"]["path_prefixes"]
+)
+
+
+# Host-header routing (step 5 of detect_service) is restricted to hosts the
+# stack is reachable under. Real AWS endpoints are ``<service>.<region>.
+# amazonaws.com``; local deployments answer under ``localhost`` /
+# ``*.localhost``, the bare container name, a two-label alias (``s3.dev``,
+# ``sqs.internal``), an IP literal, ``MINISTACK_HOST`` and the container
+# hostname. Anything else — a customer domain fronted by a proxy, a probe
+# with a made-up Host — is never an AWS endpoint, so its labels carry no
+# routing information. A deployment reachable under another name points
+# ``MINISTACK_HOST`` at it.
+_BUILTIN_HOST_SUFFIXES = (
+    "localhost",
+    "amazonaws.com",
+    "amazonaws.com.cn",
+)
+
+
+def _container_hostname() -> str:
+    try:
+        return socket.gethostname().lower()
+    except OSError:
+        return ""
+
+
+_CONTAINER_HOSTNAME = _container_hostname()
+
+
+def _served_host_suffixes() -> tuple:
+    """Suffixes (lower-case, no port) a Host header may end with to qualify for
+    host-pattern routing. Read per call so tests and init scripts can change the
+    environment without a restart; the work is a handful of dict lookups."""
+    suffixes = list(_BUILTIN_HOST_SUFFIXES)
+    for value in (
+        os.environ.get("MINISTACK_HOST", ""),
+        os.environ.get("HOSTNAME", ""),
+        _CONTAINER_HOSTNAME,
+    ):
+        value = _strip_host_port(value)
+        if value:
+            suffixes.append(value)
+    return tuple(suffixes)
+
+
+def _strip_host_port(host: str) -> str:
+    """``example.com:4566`` -> ``example.com``; ``[::1]:4566`` -> ``::1``.
+    Lower-cases and trims whitespace."""
+    host = (host or "").strip().lower()
+    if host.startswith("["):
+        end = host.find("]")
+        return host[1:end] if end > 0 else host
+    if host.count(":") == 1:
+        return host.rsplit(":", 1)[0]
+    return host  # bare IPv6 without brackets, or no port
+
+
+def _host_served_by_stack(host: str) -> bool:
+    """True when ``host`` names this stack: no Host at all, a single label
+    (``ministack``, ``localhost``, a compose service name), a two-label alias
+    (``s3.dev``), an IPv4/IPv6 literal, or a name under one of the served
+    suffixes at a label boundary (``s3.us-east-1.localhost`` yes,
+    ``notlocalhost`` no). A customer domain has at least three labels."""
+    hostname = _strip_host_port(host)
+    if not hostname or "." not in hostname:
+        return True
+    try:
+        ipaddress.ip_address(hostname)
+        return True
+    except ValueError:
+        pass
+    hostname = hostname.rstrip(".")
+    if hostname.count(".") == 1:
+        return True  # ``<service>.<lan-suffix>`` alias, the LocalStack-era shape
+    for suffix in _served_host_suffixes():
+        if hostname == suffix or hostname.endswith("." + suffix):
+            return True
+    return False
+
+
+_ANCHORED_HOST_PATTERNS: dict = {}
+
+
+def _anchored_host_pattern(pattern: str) -> "re.Pattern":
+    r"""Compile a ``host_patterns`` entry so a bare service token matches only at
+    the start of a label. ``iot\.`` becomes ``(^|\.)iot\.`` — it still matches
+    ``a1-ats.iot.us-east-1.amazonaws.com`` but no longer ``notiot.example``.
+    Entries that already anchor themselves (``^es\.``) or begin at a dot
+    (``\.s3\.``) are compiled as written."""
+    compiled = _ANCHORED_HOST_PATTERNS.get(pattern)
+    if compiled is None:
+        anchored = pattern
+        if pattern[:1].isalnum():
+            anchored = r"(^|\.)" + pattern
+        compiled = re.compile(anchored)
+        _ANCHORED_HOST_PATTERNS[pattern] = compiled
+    return compiled
+
+
+# The closed query-parameter set of ListSigningJobs, and the shape of a signing
+# job id. Both are used to keep the unsigned /signing-jobs path rules off
+# path-style S3 traffic for a bucket of that name.
+_LIST_SIGNING_JOBS_PARAMS = frozenset({
+    "status", "isRevoked", "platformId", "requestedBy", "jobInvoker",
+    "maxResults", "nextToken", "signatureExpiresBefore", "signatureExpiresAfter",
+})
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def _documentdb_claims(params):
+    from ministack.services.documentdb import claims_request
+
+    return claims_request(params)
 
 
 def detect_service(method: str, path: str, headers: dict, query_params: dict) -> str:
@@ -378,7 +704,6 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
     host = headers.get("host", "")
     target = headers.get("x-amz-target", "")
     auth = headers.get("authorization", "")
-    content_type = headers.get("content-type", "")
 
     # 1. Check X-Amz-Target header (most reliable for JSON-based services)
     if target:
@@ -393,17 +718,102 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
     # win before credential-scope routing.
     if method == "POST" and path == "/event" and re.search(r"\.appsync-api\.", host):
         return "appsync-events"
+    # GraphQL requests use the same host family with the fixed "/graphql" path.
+    if method == "POST" and path == "/graphql" and re.search(r"\.appsync-api\.", host):
+        return "appsync"
 
     # 2. Check Authorization header for service name in credential scope
     if auth:
         match = re.search(r"Credential=[^/]+/[^/]+/[^/]+/([^/]+)/", auth)
         if match:
             svc_name = match.group(1)
+            # bedrock + bedrock-runtime both sign with credential scope
+            # "bedrock" (verified via botocore signing_name). Disambiguate by
+            # path (runtime hits /model/...) and host (real AWS endpoint).
+            # This must run before the SERVICE_PATTERNS early-return so the
+            # runtime branch isn't shadowed by the control-plane entry.
+            if svc_name == "bedrock":
+                # bedrock, bedrock-runtime, bedrock-agent, bedrock-agent-runtime
+                # all sign as "bedrock" (verified via botocore signing_name).
+                # Disambiguate by path + host. Order matters — runtime checks
+                # before control plane so /async-invoke wins over a generic
+                # bedrock control-plane fallback.
+                if "bedrock-agent-runtime" in host:
+                    return "bedrock-agent-runtime"
+                if "bedrock-agent" in host:
+                    return "bedrock-agent"
+                if "bedrock-runtime" in host:
+                    return "bedrock-runtime"
+                # bedrock-agent-runtime paths (case-sensitive vs bedrock-agent)
+                if (path.startswith("/retrieveAndGenerate")
+                    or path.startswith("/rerank")
+                    or path.startswith("/optimize-prompt")
+                    or path.startswith("/generateQuery")
+                    or path.startswith("/sessions")
+                    or re.match(r"^/agents/[^/]+/agentAliases/", path)
+                    or re.match(r"^/flows/[^/]+/aliases/[^/]+/executions", path)
+                    or re.match(r"^/flows/[^/]+/executions$", path)
+                    or (method == "POST" and re.match(r"^/flows/[^/]+/aliases/[^/]+$", path))
+                    or re.match(r"^/knowledgebases/[^/]+/retrieve$", path)):
+                    return "bedrock-agent-runtime"
+                if path.startswith("/tags/"):
+                    decoded_path = unquote(path)
+                    tag_arn = decoded_path.removeprefix("/tags/")
+                    try:
+                        tag_spec = parse_arn(tag_arn)
+                    except ArnParseError:
+                        return "bedrock-agent-runtime"
+                    if tag_spec.service != "bedrock":
+                        return "bedrock-agent-runtime"
+                    if (":session/" in decoded_path
+                        or tag_spec.resource == "session"
+                        or tag_spec.resource.startswith("session/")
+                        or tag_spec.resource.startswith("session:")
+                        or (":flow/" in decoded_path
+                            and "/aliases/" in decoded_path
+                            and "/executions/" in decoded_path)
+                        or (tag_spec.resource.startswith("flow/")
+                            and "/aliases/" in tag_spec.resource
+                            and "/executions/" in tag_spec.resource)):
+                        return "bedrock-agent-runtime"
+                    return "bedrock-agent"
+                # bedrock-agent control-plane paths
+                if (path.startswith("/agents/")
+                    or path.startswith("/agents")
+                    or path.startswith("/knowledgebases")
+                    or path.startswith("/flows")
+                    or path.startswith("/prompts")):
+                    return "bedrock-agent"
+                # bedrock-runtime data plane paths
+                if (path.startswith("/model/")
+                    or path.startswith("/guardrail/")
+                    or path.startswith("/async-invoke")):
+                    return "bedrock-runtime"
+                return "bedrock"
+            if svc_name == "lambda" and _LAMBDA_MICROVM_PATH_RE.match(path):
+                return "lambda-microvms"
+            # Lambda Core also signs as `lambda`: endpointPrefix AND signingName
+            # are both `lambda` (botocore lambda-core/2026-04-30), so the scope
+            # cannot tell the three apart. The path checks must sit
+            # before the SERVICE_PATTERNS early-return below, or `lambda`
+            # matches there and the request reaches the function router, which
+            # reads `/2026-04-04/network-connectors` as a function name.
+            if svc_name == "lambda" and _LAMBDA_CORE_PATH_RE.match(path):
+                return "lambda-core"
             if svc_name in SERVICE_PATTERNS:
+                # DocumentDB signs as `rds`: a docdb host, Engine=docdb, or a
+                # DocumentDB cluster or instance named in the request is DocumentDB's.
+                if svc_name == "rds" and (re.search(r"^(docdb|documentdb)\.", host)
+                                          or _documentdb_claims(query_params)):
+                    return "documentdb"
                 return svc_name
             # Map common credential scope names
             scope_map = {
                 "monitoring": "monitoring",
+                # bedrock-agentcore-control and bedrock-agentcore both sign with
+                # credential scope "bedrock-agentcore" (verified via botocore
+                # signing_name); one handler serves both, dispatching by path.
+                "bedrock-agentcore": "bedrock-agentcore",
                 "execute-api": "apigateway",
                 "ses": "ses",
                 "states": "states",
@@ -423,6 +833,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "waf-regional": "waf-regional",
                 "es": "opensearch",
                 "opensearch": "opensearch",
+                "aoss": "opensearchserverless",
                 "organizations": "organizations",
                 "account": "account",
                 "batch": "batch",
@@ -449,13 +860,32 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "appconfigdata": "appconfigdata",
                 "scheduler": "scheduler",
                 "eks": "eks",
+                # Amazon Location signs with scope `geo`, not `location`
+                # (botocore signingName). With an endpoint override the host
+                # has no `geo.` in it, so this entry is the primary routing
+                # signal for the location service.
+                "geo": "location",
+                "mediaconnect": "mediaconnect",
                 "tagging": "tagging",
                 "resource-groups": "resource-groups",
                 "cloudtrail": "cloudtrail",
                 "cur": "cur",
+                "budgets": "budgets",
+                "kinesisanalytics": "kinesisanalyticsv2",
+                "inspector2": "inspector2",
+                "dsql": "dsql",
+                "s3tables": "s3tables",
+                "kafka": "kafka",
             }
             if svc_name in scope_map:
                 return scope_map[svc_name]
+            # A request signed for a real AWS service MiniStack does not
+            # implement must not fall through to the S3 path catch-all —
+            # answering NoSuchBucket for a glacier/pinpoint call lies about
+            # which service failed. Surface it as its (unsupported) service
+            # so dispatch returns "Unsupported service: <name>".
+            if _is_aws_service_name(svc_name):
+                return svc_name
 
     # 3. Check query parameters for Action-based APIs (SQS, SNS, IAM, STS, CloudWatch)
     action = (
@@ -539,6 +969,11 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             "ListInstanceProfiles": "iam",
             "ListInstanceProfilesForRole": "iam",
             "UpdateAssumeRolePolicy": "iam",
+            "UpdateRoleDescription": "iam",
+            "PutRolePermissionsBoundary": "iam",
+            "DeleteRolePermissionsBoundary": "iam",
+            "PutUserPermissionsBoundary": "iam",
+            "DeleteUserPermissionsBoundary": "iam",
             "AttachUserPolicy": "iam",
             "DetachUserPolicy": "iam",
             "ListAttachedUserPolicies": "iam",
@@ -554,6 +989,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             "GetCallerIdentity": "sts",
             "AssumeRole": "sts",
             "GetSessionToken": "sts",
+            "GetFederationToken": "sts",
             "AssumeRoleWithWebIdentity": "sts",
             "AssumeRoleWithSAML": "sts",
             # CloudWatch actions
@@ -598,6 +1034,15 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             "UpdateTemplate": "ses",
             "SendTemplatedEmail": "ses",
             "SendBulkTemplatedEmail": "ses",
+            "CreateReceiptRuleSet": "ses",
+            "ListReceiptRuleSets": "ses",
+            "DescribeReceiptRuleSet": "ses",
+            "DeleteReceiptRuleSet": "ses",
+            "SetActiveReceiptRuleSet": "ses",
+            "DescribeActiveReceiptRuleSet": "ses",
+            "CreateReceiptRule": "ses",
+            "DescribeReceiptRule": "ses",
+            "DeleteReceiptRule": "ses",
             # RDS actions
             "CreateDBInstance": "rds",
             "DeleteDBInstance": "rds",
@@ -665,6 +1110,10 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             "StopInstances": "ec2",
             "StartInstances": "ec2",
             "RebootInstances": "ec2",
+            "AssociateIamInstanceProfile": "ec2",
+            "DescribeIamInstanceProfileAssociations": "ec2",
+            "DisassociateIamInstanceProfile": "ec2",
+            "ReplaceIamInstanceProfileAssociation": "ec2",
             "DescribeImages": "ec2",
             "CreateSecurityGroup": "ec2",
             "DeleteSecurityGroup": "ec2",
@@ -776,6 +1225,12 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
             "UpdateTerminationProtection": "cloudformation",
             "SetStackPolicy": "cloudformation",
             "GetStackPolicy": "cloudformation",
+            "SignalResource": "cloudformation",
+            "RollbackStack": "cloudformation",
+            "DetectStackDrift": "cloudformation",
+            "DescribeStackDriftDetectionStatus": "cloudformation",
+            "DetectStackResourceDrift": "cloudformation",
+            "DescribeStackResourceDrifts": "cloudformation",
             # EBS Snapshots
             # Note: CreateSnapshot, DeleteSnapshot, DescribeSnapshots are intentionally
             # omitted here because they conflict with ElastiCache actions of the same
@@ -811,14 +1266,30 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
         return "imds"
     if path_lower.startswith("/v2/credentials"):
         return "imds"
+    if path_lower.startswith("/v1/chat/completions"):
+        # OpenAI-shape inference, served on the bedrock-runtime surface.
+        # openai-python sends unsigned POSTs, so route purely on path.
+        return "bedrock-runtime"
     if path_lower.startswith("/v1/apis") or path_lower.startswith("/v1/tags/arn:aws:appsync"):
         return "appsync"
+    # IoT Wireless GetPositionEstimate — boto3 signs (scope `iotwireless`)
+    # and the host pattern also matches, but an unsigned caller (curl) must
+    # still resolve by path. POST-only and exact, so an S3 object named
+    # `position-estimate` keeps routing to S3 on GET/PUT.
+    if method == "POST" and path_lower == "/position-estimate":
+        return "iotwireless"
     if path_lower.startswith("/key-value-stores/"):
         return "cloudfront-keyvaluestore"
     if path_lower.startswith("/2020-05-31/"):
         return "cloudfront"
     if path_lower.startswith("/2013-04-01/"):
         return "route53"
+    # OpenSearch's REST-JSON management API may arrive without a usable
+    # SigV4 Authorization header when invoked from Lambda custom-resource
+    # providers. Route its versioned paths before the generic S3 fallback;
+    # otherwise POST UpdateDomainConfig returns S3's XML MethodNotAllowed.
+    if path_lower.startswith(_OPENSEARCH_PATH_PREFIXES):
+        return "opensearch"
     if (path_lower.startswith("/v2/apis") or path_lower.startswith("/v2/tags")) and (
         re.search(r"appsync-api\.", host) or re.search(r"appsync-realtime-api\.", host)
     ):
@@ -830,8 +1301,17 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
         or path_lower.startswith("/apikeys")
         or path_lower.startswith("/usageplans")
         or path_lower.startswith("/domainnames")
+        or path_lower.startswith("/clientcertificates")
+        or path_lower.startswith("/domainnameaccessassociations")
+        or path_lower.startswith("/rejectdomainnameaccessassociations")
     ):
         return "apigateway"
+    # Before the Lambda path check: both live on the Lambda endpoint, and an
+    # unsigned caller (curl) has no credential scope to disambiguate with.
+    if _LAMBDA_MICROVM_PATH_RE.match(path_lower):
+        return "lambda-microvms"
+    if _LAMBDA_CORE_PATH_RE.match(path_lower):
+        return "lambda-core"
     if _LAMBDA_PATH_RE.match(path_lower):
         return "lambda"
     if path_lower.startswith(("/oauth2/", "/login", "/logout")):
@@ -842,6 +1322,35 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
         return "cognito-idp"
     if _ECS_METADATA_PATH_RE.match(path_lower):
         return "ecs-metadata"
+    # EKS OIDC discovery / JWKS for IRSA — Terraform's
+    # aws_iam_openid_connect_provider fetches these as plain unsigned HTTPS
+    # GETs, so we route by path before falling into the generic /clusters ECS
+    # rule below.
+    if path_lower.startswith("/oidc/"):
+        return "eks"
+    # AWS Signer REST-JSON paths for unsigned clients (SigV4 requests route
+    # via the `signer` credential scope above). Segment-anchored, limited to
+    # the methods the signer surface serves, and further narrowed by the
+    # ListSigningJobs parameter set and the uuid shape of a job id, so
+    # path-style S3 traffic for a bucket like "signing-jobs-archive", and all
+    # but a bare unsigned GET or POST on a bucket named exactly
+    # "signing-jobs", still falls through to S3.
+    if path_lower == "/signing-jobs" and method in ("POST", "GET"):
+        # S3 marks its own listings and multipart/delete POSTs in the query,
+        # and ListSigningJobs has a closed parameter set, so a path-style S3
+        # request for a bucket named "signing-jobs" keeps its verbs.
+        if not (set(query_params) - _LIST_SIGNING_JOBS_PARAMS):
+            return "signer"
+    if method == "GET" and path_lower.startswith("/signing-jobs/"):
+        rest = path_lower[len("/signing-jobs/"):]
+        # A signing job id is a uuid, so an S3 object key that is not one
+        # falls through rather than being read as a DescribeSigningJob.
+        if rest and "/" not in rest and _UUID_RE.fullmatch(rest):
+            return "signer"
+    if method in ("PUT", "GET") and path_lower.startswith("/signing-profiles/"):
+        rest = path_lower[len("/signing-profiles/"):]
+        if rest and "/" not in rest:
+            return "signer"
     if path_lower.startswith(("/clusters", "/taskdefinitions", "/tasks", "/services", "/stoptask")):
         return "ecs"
     # smithy-rpc-v2-cbor path: /service/ServiceName/operation/ActionName
@@ -849,32 +1358,119 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
         if "granite" in path_lower or "cloudwatch" in path_lower:
             return "monitoring"
 
-    # 5. Check host header patterns
-    for svc, patterns in SERVICE_PATTERNS.items():
-        for hp in patterns.get("host_patterns", []):
-            if re.search(hp, host):
-                return svc
+    # 5. Check host header patterns — only for hosts this stack actually
+    # serves. The patterns are service tokens (``iot\.``, ``logs\.``,
+    # ``email\.`` ...) and a customer domain that happens to contain one
+    # (``probe.iot.example.com``, ``logs.example.com``) must not be routed
+    # into that service; it falls through to the default like any other
+    # unclassified request. Each token is matched at a label boundary.
+    if _host_served_by_stack(host):
+        for svc, patterns in SERVICE_PATTERNS.items():
+            for hp in patterns.get("host_patterns", []):
+                if _anchored_host_pattern(hp).search(host):
+                    return svc
+
+    # 6a. A Query-protocol call to a service we don't implement (redshift,
+    # elasticbeanstalk, cloudsearch, sdb, importexport, ...) is a POST to the
+    # service root with an x-www-form-urlencoded body (Action=...&Version=...).
+    # Real AWS answers with a Query <ErrorResponse> envelope at HTTP 400;
+    # falling through to S3 returns a 405 <Error> root that botocore's query
+    # parser can't read (it raises a bare KeyError('Error')). Restrict to
+    # POST-to-root so we don't hijack S3 requests whose body carries a
+    # form-urlencoded Content-Type (e.g. urllib defaults it on a raw PUT body).
+    if (method == "POST" and path in ("/", "")
+            and "application/x-www-form-urlencoded" in headers.get("content-type", "")):
+        return "unknown_query"
 
     # 6. Default to S3 (same as real LocalStack behavior)
     return "s3"
 
 
-def extract_region(headers: dict) -> str:
-    """Extract AWS region from the request."""
-    auth = headers.get("authorization", "")
-    match = re.search(r"Credential=[^/]+/[^/]+/([^/]+)/", auth)
-    if match:
-        return match.group(1)
-    return os.environ.get("MINISTACK_REGION", "us-east-1")
+def _credential_from_query(query_params) -> str:
+    """SigV4 query (presigned) auth carries the credential in the
+    ``X-Amz-Credential`` query param (``AKID/date/region/service/aws4_request``)
+    instead of the Authorization header. Return that value, or ''. ``query_params``
+    is a parse_qs-style dict ({name: [values]})."""
+    if not query_params:
+        return ""
+    cred = query_params.get("X-Amz-Credential") or query_params.get("x-amz-credential")
+    if isinstance(cred, (list, tuple)):
+        cred = cred[0] if cred else ""
+    return cred or ""
 
 
-def extract_access_key_id(headers: dict) -> str:
-    """Extract the AWS access key ID from the Authorization header."""
+def _query_value(query_params, name: str) -> str:
+    if not query_params:
+        return ""
+    value = query_params.get(name) or query_params.get(name.lower())
+    if isinstance(value, (list, tuple)):
+        value = value[0] if value else ""
+    return value or ""
+
+
+def _single_region(region_set: str) -> str | None:
+    """A SigV4a ``X-Amz-Region-Set`` names one region only when it holds no
+    wildcard and no list."""
+    region_set = region_set.strip()
+    if not region_set or "*" in region_set or "," in region_set:
+        return None
+    return region_set
+
+
+def extract_signed_region(headers: dict, query_params=None) -> str | None:
+    """Region the request was signed for, or None when it carries none.
+
+    SigV4 scopes are ``AKID/date/region/service/aws4_request``. SigV4a scopes
+    drop the region (``AKID/date/service/aws4_request``) and sign an
+    ``X-Amz-Region-Set`` instead, which only counts when it names one region.
+    Unsigned, SigV2 and malformed requests have no signed region."""
     auth = headers.get("authorization", "")
-    if auth:
+    if auth.startswith("AWS4-HMAC-SHA256"):
+        match = re.search(r"Credential=[^/]+/\d{8}/([^/]+)/[^/]+/aws4_request", auth)
+        return match.group(1) if match else None
+    if auth.startswith("AWS4-ECDSA-P256-SHA256"):
+        return _single_region(headers.get("x-amz-region-set", ""))
+    algorithm = _query_value(query_params, "X-Amz-Algorithm")
+    if algorithm == "AWS4-ECDSA-P256-SHA256":
+        return _single_region(_query_value(query_params, "X-Amz-Region-Set"))
+    # A bare X-Amz-Credential (no algorithm) still names its region, as
+    # IoT WebSocket and AppSync clients send it.
+    if algorithm in ("", "AWS4-HMAC-SHA256"):
+        parts = _credential_from_query(query_params).split("/")
+        if len(parts) == 5 and parts[2] and parts[4] == "aws4_request":
+            return parts[2]
+    return None
+
+
+def extract_region(headers: dict, query_params=None) -> str:
+    """Extract AWS region from the request (Authorization header, then SigV4
+    presigned ``X-Amz-Credential`` query param), else the default region."""
+    return extract_signed_region(headers, query_params) or os.environ.get("MINISTACK_REGION", "us-east-1")
+
+
+def extract_access_key_id(headers: dict, query_params=None) -> str:
+    """Extract the AWS access key ID from the Authorization header, or from the
+    query-string credentials of a presigned URL — SigV4 or SigV4a ``X-Amz-Credential``
+    or SigV2 ``AWSAccessKeyId``. A SigV4a key names the account with AUTH unset too,
+    as a SigV4 one does; only AUTH=true verifies the signature."""
+    auth = headers.get("authorization", "")
+    if auth.startswith(("AWS4-HMAC", "AWS4-ECDSA-P256-SHA256")):
         match = re.search(r"Credential=([^/]+)/", auth)
         if match:
             return match.group(1)
+
+    cred = _credential_from_query(query_params)
+    if cred:
+        return cred.split("/")[0]
+
+    if query_params and "AWSAccessKeyId" in query_params:
+        return query_params["AWSAccessKeyId"][0]
+
+    if auth.startswith("AWS "):
+        match = re.search(r"AWS ([^:]+):", auth)
+        if match:
+            return match.group(1)
+
     return ""
 
 

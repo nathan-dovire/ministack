@@ -1,46 +1,64 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 CloudWatch Logs Service Emulator.
 JSON-based API via X-Amz-Target (Logs_20140328).
 Supports: CreateLogGroup, DeleteLogGroup, DescribeLogGroups,
           CreateLogStream, DeleteLogStream, DescribeLogStreams,
-          PutLogEvents, GetLogEvents, FilterLogEvents,
+          PutLogEvents, GetLogEvents, FilterLogEvents, GetLogRecord, GetLogGroupFields,
+          StartLiveTail,
           PutRetentionPolicy, DeleteRetentionPolicy,
           PutSubscriptionFilter, DeleteSubscriptionFilter, DescribeSubscriptionFilters,
           TagLogGroup, UntagLogGroup, ListTagsLogGroup,
           TagResource, UntagResource, ListTagsForResource,
           PutDestination, DeleteDestination, DescribeDestinations,
           PutDestinationPolicy,
+          PutResourcePolicy, DescribeResourcePolicies, DeleteResourcePolicy,
           PutMetricFilter, DeleteMetricFilter, DescribeMetricFilters,
           StartQuery, GetQueryResults, StopQuery,
           PutDeliverySource, GetDeliverySource, DeleteDeliverySource, DescribeDeliverySources,
           PutDeliveryDestination, GetDeliveryDestination, DeleteDeliveryDestination, DescribeDeliveryDestinations,
+          PutDeliveryDestinationPolicy, GetDeliveryDestinationPolicy, DeleteDeliveryDestinationPolicy,
           CreateDelivery, GetDelivery, DeleteDelivery, DescribeDeliveries.
 """
 
 import base64
+import contextlib
 import copy
 import fnmatch
+import heapq
 import json
 import logging
 import os
+import re
+import threading
 import time
+import zlib
+from bisect import bisect_left, bisect_right
+from datetime import datetime, timezone
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
+    StreamingResponse,
     error_response_json,
     get_account_id,
     get_region,
-    json_response,
     new_uuid,
+)
+from ministack.core.responses import (
+    json_response as _core_json_response,
 )
 
 logger = logging.getLogger("logs")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-from ministack.core.persistence import PERSIST_STATE, load_state
 
-_log_groups = AccountScopedDict()
+_log_groups = AccountRegionScopedDict()
+# Protect appends and cursor bounds; never hold this during delivery or filtering.
+_log_events_lock = threading.Lock()
 # group_name -> {
 #   arn, creationTime, retentionInDays (int|None), tags: {str: str},
 #   subscriptionFilters: {filterName: {filterName, logGroupName, filterPattern,
@@ -50,26 +68,66 @@ _log_groups = AccountScopedDict()
 #             firstEventTimestamp, lastEventTimestamp, lastIngestionTime}},
 # }
 
-_destinations = AccountScopedDict()
+# Region-scoped: CW Logs destinations and the vended-logs delivery resources
+# are region-specific in AWS (were account-only → leaked across regions). Each
+# carries an ARN, so legacy account-scoped state migrates to its ARN's region.
+_destinations = AccountRegionScopedDict()
 # dest_name -> {destinationName, targetArn, roleArn, accessPolicy, arn, creationTime}
 
-_metric_filters = AccountScopedDict()
+_resource_policies = AccountRegionScopedDict()
+# policy_name -> {policyName, policyDocument, policyScope, lastUpdatedTime, revisionId}
+_log_group_policies = AccountRegionScopedDict()
+# log_group_name -> the one RESOURCE-scoped policy a log group can have
+_MAX_ACCOUNT_RESOURCE_POLICIES = 10
+
+_metric_filters = AccountRegionScopedDict()
 # (log_group_name, filter_name) -> {filterName, logGroupName, filterPattern, metricTransformations, creationTime}
 
-_queries = AccountScopedDict()
-# query_id -> {queryId, logGroupName, startTime, endTime, queryString, status}
+_queries = AccountRegionScopedDict()
+# query_id -> {queryId, logGroupName, startTime, endTime, queryString, status,
+#              results, statistics}
 
-_delivery_sources = AccountScopedDict()
+# Opaque Insights/GetLogRecord pointers → full transformed log record fields.
+# Keys are UUID strings assigned at PutLogEvents time (AWS-shaped: opaque).
+_log_records = AccountRegionScopedDict()
+# ptr -> {
+#   "@ptr", "@timestamp", "@message", "@logStream", "@log",
+#   "_timestamp_ms" (internal; stripped from GetLogRecord responses)
+# }
+
+_delivery_sources = AccountRegionScopedDict()
 # source_name -> {name, arn, resourceArns: [str], logType, service, tags}
 
-_delivery_destinations = AccountScopedDict()
+_delivery_destinations = AccountRegionScopedDict()
 # dest_name -> {name, arn, deliveryDestinationType, outputFormat,
 #               deliveryDestinationConfiguration: {destinationResourceArn}, tags}
 
-_deliveries = AccountScopedDict()
+_deliveries = AccountRegionScopedDict()
 # delivery_id -> {id, arn, deliverySourceName, deliveryDestinationArn,
 #                 deliveryDestinationType, recordFields, fieldDelimiter,
 #                 s3DeliveryConfiguration, tags}
+
+# Active StartLiveTail sessions (not persisted). session_id -> session dict.
+# Populated while an ASGI stream is open; PutLogEvents fans matching events in.
+_live_tail_sessions: dict[str, dict] = {}
+
+# AWS Live Tail: one sessionUpdate per second (empty when idle), and at most
+# 10 buffered sessionUpdate events before the oldest is dropped.
+_LIVE_TAIL_IDLE_SECONDS = 1.0
+_LIVE_TAIL_QUEUE_MAX = 10
+
+
+def _drop_none(value):
+    """AWS omits unset members; it never sends null."""
+    if isinstance(value, dict):
+        return {k: _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
+def json_response(data, status=200, **kwargs):
+    return _core_json_response(_drop_none(data), status, **kwargs)
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -78,34 +136,113 @@ def get_state():
     return {
         "log_groups": copy.deepcopy(_log_groups),
         "destinations": copy.deepcopy(_destinations),
+        "resource_policies": copy.deepcopy(_resource_policies),
+        "log_group_policies": copy.deepcopy(_log_group_policies),
         "metric_filters": copy.deepcopy(_metric_filters),
         "queries": copy.deepcopy(_queries),
+        "log_records": copy.deepcopy(_log_records),
         "delivery_sources": copy.deepcopy(_delivery_sources),
         "delivery_destinations": copy.deepcopy(_delivery_destinations),
         "deliveries": copy.deepcopy(_deliveries),
     }
 
 
-def restore_state(data):
+def _region_for_log_group(account_id: str, log_group_name: str | None) -> str | None:
+    if not log_group_name:
+        return None
+    for (acct, region, name), _group in _log_groups.all_items():
+        if acct == account_id and name == log_group_name:
+            return region
+    return None
+
+
+def _metric_filter_log_group_name(key, value) -> str | None:
+    if isinstance(key, (list, tuple)) and key:
+        return key[0]
+    if isinstance(value, dict):
+        return value.get("logGroupName")
+    return None
+
+
+def _metric_filter_restore_region(account_id: str, key, value) -> str:
+    group_name = _metric_filter_log_group_name(key, value)
+    return (
+        _region_for_log_group(account_id, group_name)
+        or _metric_filters._region_for_legacy_value(key, value)
+    )
+
+
+def _query_restore_region(account_id: str, value) -> str:
+    if isinstance(value, dict):
+        group_names = []
+        if value.get("logGroupName"):
+            group_names.append(value["logGroupName"])
+        group_names.extend(value.get("logGroupNames") or [])
+        for group_name in group_names:
+            region = _region_for_log_group(account_id, group_name)
+            if region:
+                return region
+    return get_region()
+
+
+def _restore_metric_filters(metric_filters):
+    if isinstance(metric_filters, AccountRegionScopedDict):
+        _metric_filters.update(metric_filters)
+        return
+    if isinstance(metric_filters, AccountScopedDict):
+        for (account_id, key), value in metric_filters._data.items():
+            region = _metric_filter_restore_region(account_id, key, value)
+            _metric_filters.set_scoped(account_id, region, key, value)
+        return
+    if isinstance(metric_filters, dict):
+        account_id = get_account_id()
+        for key, value in metric_filters.items():
+            region = _metric_filter_restore_region(account_id, key, value)
+            _metric_filters.set_scoped(account_id, region, key, value)
+
+
+def _restore_queries(queries):
+    if isinstance(queries, AccountRegionScopedDict):
+        _queries.update(queries)
+        return
+    if isinstance(queries, AccountScopedDict):
+        for (account_id, key), value in queries._data.items():
+            _queries.set_scoped(account_id, _query_restore_region(account_id, value), key, value)
+        return
+    if isinstance(queries, dict):
+        account_id = get_account_id()
+        for key, value in queries.items():
+            if isinstance(key, tuple) and len(key) == 3:
+                _queries.set_scoped(key[0], key[1], key[2], value)
+            elif isinstance(key, tuple) and len(key) == 2:
+                _queries.set_scoped(key[0], _query_restore_region(key[0], value), key[1], value)
+            else:
+                _queries.set_scoped(account_id, _query_restore_region(account_id, value), key, value)
+
+
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     if data:
-        _log_groups.update(data.get("log_groups", {}))
+        with _log_events_lock:
+            _log_groups.update(data.get("log_groups", {}))
+            # Older snapshots stored arrival order, including late events.
+            for _, group in _log_groups.all_items():
+                for stream in group.get("streams", {}).values():
+                    stream["events"] = sorted(stream["events"], key=_event_timestamp)
         _destinations.update(data.get("destinations", {}))
-        _metric_filters.update(data.get("metric_filters", {}))
-        _queries.update(data.get("queries", {}))
+        _resource_policies.update(data.get("resource_policies", {}))
+        _log_group_policies.update(data.get("log_group_policies", {}))
+        _restore_metric_filters(data.get("metric_filters", {}))
+        _restore_queries(data.get("queries", {}))
+        _log_records.update(data.get("log_records", {}))
         _delivery_sources.update(data.get("delivery_sources", {}))
         _delivery_destinations.update(data.get("delivery_destinations", {}))
         _deliveries.update(data.get("deliveries", {}))
 
 
-try:
-    _restored = load_state("cloudwatch_logs")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +251,11 @@ except Exception:
 
 def _make_group_arn(name):
     return f"arn:aws:logs:{get_region()}:{get_account_id()}:log-group:{name}:*"
+
+
+def _make_group_arn_no_star(name):
+    """ARN form accepted by StartLiveTail (no trailing ``:*``)."""
+    return f"arn:aws:logs:{get_region()}:{get_account_id()}:log-group:{name}"
 
 
 def _resolve_group_by_arn(arn):
@@ -125,6 +267,61 @@ def _resolve_group_by_arn(arn):
         if g["arn"].rstrip(":*") == arn_normalized:
             return name
     return None
+
+
+def _log_group_name_from_identifier_arn(identifier: str) -> str | None:
+    try:
+        spec = parse_arn(identifier)
+    except ArnParseError:
+        return None
+    if (
+        spec.service != "logs"
+        or spec.account_id != get_account_id()
+        or spec.region != get_region()
+    ):
+        return None
+    prefix = "log-group:"
+    if not spec.resource.startswith(prefix):
+        return None
+    name = spec.resource[len(prefix):]
+    if name.endswith(":*"):
+        name = name[:-2]
+    return name or None
+
+
+def log_group_policy_allows(group: str, stream: str, service: str, source_arn: str) -> bool:
+    """Whether the resource policies let an AWS service write to a log group.
+
+    EventBridge writes to a log group target as ``events.amazonaws.com``: it
+    needs ``logs:CreateLogStream`` and ``logs:PutLogEvents`` allowed by one of
+    the account's resource policies or the group's own. Captured on AWS
+    (us-west-2, 2026-11-08): a group no policy allowed received nothing. Only
+    under AUTH=true; with auth disabled every delivery passes, as for SQS and
+    SNS. A Deny in any of the policies wins.
+    """
+    from ministack.app import AUTH
+    if not AUTH:
+        return True
+    from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+
+    documents = [p["policyDocument"] for p in _resource_policies.values()]
+    if group in _log_group_policies:
+        documents.append(_log_group_policies[group]["policyDocument"])
+    for action in ("logs:CreateLogStream", "logs:PutLogEvents"):
+        # The caller is the service itself, so only a Service principal (or "*") matches.
+        ctx = EvalContext(
+            principal_arn="*",
+            principal_type="Service",
+            principal_account="",
+            action=action,
+            resource_arn=f"arn:aws:logs:{get_region()}:{get_account_id()}:log-group:{group}:log-stream:{stream}",
+            region=get_region(),
+            service_context={"aws:sourcearn": source_arn, "aws:sourceaccount": get_account_id()},
+        )
+        decisions = {evaluate_resource_policy(doc, ctx, service=service).decision for doc in documents}
+        if "Deny" in decisions or "Allow" not in decisions:
+            return False
+    return True
 
 
 def _decode_token(token):
@@ -139,6 +336,15 @@ def _decode_token(token):
 
 def _encode_token(offset):
     return base64.b64encode(str(offset).encode()).decode()
+
+
+def _offset_paged(data, key, items):
+    start = max(_decode_token(data.get("nextToken")), 0)
+    end = start + (data.get("limit") or len(items))
+    resp = {key: items[start:end]}
+    if end < len(items):
+        resp["nextToken"] = _encode_token(end)
+    return json_response(resp)
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +370,9 @@ async def handle_request(method, path, headers, body, query_params):
         "PutLogEvents": _put_log_events,
         "GetLogEvents": _get_log_events,
         "FilterLogEvents": _filter_log_events,
+        "GetLogRecord": _get_log_record,
+        "GetLogGroupFields": _get_log_group_fields,
+        "StartLiveTail": _start_live_tail,
         "PutRetentionPolicy": _put_retention_policy,
         "DeleteRetentionPolicy": _delete_retention_policy,
         "PutSubscriptionFilter": _put_subscription_filter,
@@ -179,6 +388,9 @@ async def handle_request(method, path, headers, body, query_params):
         "DeleteDestination": _delete_destination,
         "DescribeDestinations": _describe_destinations,
         "PutDestinationPolicy": _put_destination_policy,
+        "PutResourcePolicy": _put_resource_policy,
+        "DescribeResourcePolicies": _describe_resource_policies,
+        "DeleteResourcePolicy": _delete_resource_policy,
         "PutMetricFilter": _put_metric_filter,
         "DeleteMetricFilter": _delete_metric_filter,
         "DescribeMetricFilters": _describe_metric_filters,
@@ -193,6 +405,9 @@ async def handle_request(method, path, headers, body, query_params):
         "GetDeliveryDestination": _get_delivery_destination,
         "DeleteDeliveryDestination": _delete_delivery_destination,
         "DescribeDeliveryDestinations": _describe_delivery_destinations,
+        "PutDeliveryDestinationPolicy": _put_delivery_destination_policy,
+        "GetDeliveryDestinationPolicy": _get_delivery_destination_policy,
+        "DeleteDeliveryDestinationPolicy": _delete_delivery_destination_policy,
         "CreateDelivery": _create_delivery,
         "GetDelivery": _get_delivery,
         "DeleteDelivery": _delete_delivery,
@@ -202,12 +417,22 @@ async def handle_request(method, path, headers, body, query_params):
     handler = handlers.get(action)
     if not handler:
         return error_response_json("InvalidOperationException", f"Unknown action: {action}", 400)
+    if action in {"TagResource", "UntagResource", "ListTagsForResource"}:
+        invalid = validate_tag_resource_arn(data.get("resourceArn", ""))
+        if invalid is not None:
+            return invalid
     return handler(data)
 
 
 # ---------------------------------------------------------------------------
 # Log groups
 # ---------------------------------------------------------------------------
+
+# The log classes CreateLogGroup takes; "If you omit this parameter, the
+# default of STANDARD is used" and "The value of logGroupClass can't be
+# changed after a log group is created".
+_LOG_GROUP_CLASSES = ("STANDARD", "INFREQUENT_ACCESS", "DELIVERY")
+
 
 def _create_log_group(data):
     name = data.get("logGroupName")
@@ -218,10 +443,21 @@ def _create_log_group(data):
             "ResourceAlreadyExistsException",
             f"The specified log group already exists: {name}", 400,
         )
+    group_class = data.get("logGroupClass") or "STANDARD"
+    if group_class not in _LOG_GROUP_CLASSES:
+        return error_response_json(
+            "InvalidParameterException",
+            f"1 validation error detected: Value '{group_class}' at 'logGroupClass' "
+            "failed to satisfy constraint: Member must satisfy enum value set: "
+            f"[{', '.join(_LOG_GROUP_CLASSES)}]", 400,
+        )
     _log_groups[name] = {
         "arn": _make_group_arn(name),
         "creationTime": int(time.time() * 1000),
         "retentionInDays": None,
+        "logGroupClass": group_class,
+        "kmsKeyId": data.get("kmsKeyId") or None,
+        "deletionProtectionEnabled": bool(data.get("deletionProtectionEnabled", False)),
         "tags": dict(data.get("tags", {})),
         "subscriptionFilters": {},
         "streams": {},
@@ -236,7 +472,11 @@ def _delete_log_group(data):
             "ResourceNotFoundException",
             f"The specified log group does not exist: {name}", 400,
         )
+    _forget_log_records_for_group(name)
     del _log_groups[name]
+    _log_group_policies.pop(name, None)
+    for key in [k for k in _metric_filters if k[0] == name]:
+        del _metric_filters[key]
     return json_response({})
 
 
@@ -268,15 +508,24 @@ def _describe_log_groups(data):
         entry = {
             "logGroupName": n,
             "arn": g["arn"],
+            "logGroupArn": _make_group_arn_no_star(n),
             "creationTime": g["creationTime"],
             "storedBytes": sum(
                 sum(len(e.get("message", "")) for e in s["events"])
                 for s in g["streams"].values()
             ),
             "metricFilterCount": sum(1 for k in _metric_filters if k[0] == n),
+            # Always reported: every log group has a class, and a consumer
+            # that reads it back (Terraform's aws_cloudwatch_log_group) plans
+            # a replacement when the member is missing. A group created before
+            # the field was stored reads as the default.
+            "logGroupClass": g.get("logGroupClass") or "STANDARD",
+            "deletionProtectionEnabled": g.get("deletionProtectionEnabled", False),
         }
         if g.get("retentionInDays") is not None:
             entry["retentionInDays"] = g["retentionInDays"]
+        if g.get("kmsKeyId"):
+            entry["kmsKeyId"] = g["kmsKeyId"]
         groups.append(entry)
 
     resp: dict = {"logGroups": groups}
@@ -331,6 +580,7 @@ def _delete_log_stream(data):
             "ResourceNotFoundException",
             f"The specified log stream does not exist: {stream}", 400,
         )
+    _forget_log_records_for_stream(group, stream)
     del _log_groups[group]["streams"][stream]
     return json_response({})
 
@@ -392,6 +642,34 @@ def _describe_log_streams(data):
 # Log events
 # ---------------------------------------------------------------------------
 
+def _event_timestamp(event):
+    return event["timestamp"]
+
+
+def _append_log_events(stream, events):
+    """Append events keeping the stream chronological; a late batch replaces the list with a stable merge."""
+    if not events:
+        return
+    ordered = sorted(events, key=_event_timestamp)
+    # Every stored event has an eventId, as on AWS; internal writers come without one.
+    for event in ordered:
+        event.setdefault("eventId", new_uuid())
+    first, last = ordered[0]["timestamp"], ordered[-1]["timestamp"]
+    with _log_events_lock:
+        history = stream["events"]
+        late = bool(history and history[-1]["timestamp"] > first)
+        if late:
+            stream["events"] = list(heapq.merge(history, ordered, key=_event_timestamp))
+        else:
+            history.extend(ordered)
+        if stream["firstEventTimestamp"] is None or first < stream["firstEventTimestamp"]:
+            stream["firstEventTimestamp"] = first
+        if stream["lastEventTimestamp"] is None or last > stream["lastEventTimestamp"]:
+            stream["lastEventTimestamp"] = last
+        stream["lastIngestionTime"] = events[-1]["ingestionTime"]
+    logger.debug("Stored log events count=%d late_batch=%s", len(events), late)
+
+
 def _put_log_events(data):
     group = data.get("logGroupName")
     stream = data.get("logStreamName")
@@ -410,25 +688,620 @@ def _put_log_events(data):
 
     s = _log_groups[group]["streams"][stream]
     now_ms = int(time.time() * 1000)
+    stored = []
 
     for e in events:
         ts = e.get("timestamp", now_ms)
         msg = e.get("message", "")
-        s["events"].append({"timestamp": ts, "message": msg, "ingestionTime": now_ms})
+        ptr = new_uuid()
+        stored.append({
+            "timestamp": ts,
+            "message": msg,
+            "ingestionTime": now_ms,
+            "eventId": ptr,
+        })
+        _log_records[ptr] = _build_log_record(
+            ptr=ptr,
+            timestamp_ms=ts,
+            message=msg,
+            log_group=group,
+            log_stream=stream,
+        )
 
-        if s["firstEventTimestamp"] is None or ts < s["firstEventTimestamp"]:
-            s["firstEventTimestamp"] = ts
-        if s["lastEventTimestamp"] is None or ts > s["lastEventTimestamp"]:
-            s["lastEventTimestamp"] = ts
-        s["lastIngestionTime"] = now_ms
+    _append_log_events(s, stored)
 
     token = str(int(s["uploadSequenceToken"]) + 1)
     s["uploadSequenceToken"] = token
+
+    _fanout_to_subscription_filters(group, stream, events)
+    # Fan out the stored shape (ingestionTime filled) to any Live Tail sessions.
+    _fanout_to_live_tail_sessions(group, stream, stored)
     return json_response({"nextSequenceToken": token})
 
 
+def _format_insights_timestamp(timestamp_ms: int) -> str:
+    """AWS Logs Insights @timestamp string (UTC, millisecond precision)."""
+    dt = datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc)
+    return dt.strftime("%Y-%m-%d %H:%M:%S.") + f"{dt.microsecond // 1000:03d}"
+
+
+def _build_log_record(*, ptr, timestamp_ms, message, log_group, log_stream):
+    return {
+        "@ptr": ptr,
+        "@timestamp": _format_insights_timestamp(timestamp_ms),
+        "@message": message,
+        "@logStream": log_stream,
+        "@log": log_group,
+        "_timestamp_ms": timestamp_ms,
+    }
+
+
+def _public_log_record(record: dict) -> dict:
+    """Strip MiniStack-internal fields before returning GetLogRecord payload."""
+    return {k: v for k, v in record.items() if not k.startswith("_")}
+
+
+def _forget_log_records_for_stream(group_name: str, stream_name: str) -> None:
+    to_delete = [
+        ptr
+        for ptr, record in list(_log_records.items())
+        if record.get("@log") == group_name and record.get("@logStream") == stream_name
+    ]
+    for ptr in to_delete:
+        del _log_records[ptr]
+
+
+def _forget_log_records_for_group(group_name: str) -> None:
+    to_delete = [
+        ptr for ptr, record in list(_log_records.items()) if record.get("@log") == group_name
+    ]
+    for ptr in to_delete:
+        del _log_records[ptr]
+
+
+def _get_log_record(data):
+    """Retrieve the full transformed field map for one Insights ``@ptr``.
+
+    AWS accepts ``unmask``; MiniStack does not implement field masking, so the
+    flag is accepted and ignored. Invalid/missing pointers raise
+    ``InvalidParameterException`` (AWS behavior).
+    """
+    ptr = data.get("logRecordPointer")
+    if not ptr:
+        return error_response_json(
+            "InvalidParameterException",
+            "1 validation error detected: Value null at 'logRecordPointer' "
+            "failed to satisfy constraint: Member must not be null",
+            400,
+        )
+    # Accepted for SDK/AWS parity; masking is not implemented.
+    _ = data.get("unmask", False)
+
+    record = _log_records.get(ptr)
+    if not record:
+        return error_response_json(
+            "InvalidParameterException",
+            "Invalid logRecordPointer provided",
+            400,
+        )
+    return json_response({"logRecord": _public_log_record(record)})
+
+
+_SYSTEM_LOG_GROUP_FIELDS = (
+    "@timestamp",
+    "@message",
+    "@logStream",
+    "@ptr",
+    "@log",
+)
+
+
+def _json_field_names(message: str) -> set[str]:
+    """Discover dotted field names from a JSON object message (AWS-style flatten)."""
+    try:
+        parsed = json.loads(message)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return set()
+    if not isinstance(parsed, dict):
+        return set()
+
+    names: set[str] = set()
+
+    def walk(obj, prefix: str = "") -> None:
+        if not isinstance(obj, dict):
+            return
+        for key, value in obj.items():
+            name = f"{prefix}.{key}" if prefix else str(key)
+            names.add(name)
+            if isinstance(value, dict):
+                walk(value, name)
+            elif isinstance(value, list):
+                # AWS Insights discovers array members with numeric index segments
+                # (e.g. items.0.id), not flattened under the bare parent key.
+                for idx, item in enumerate(value):
+                    indexed = f"{name}.{idx}"
+                    if isinstance(item, dict):
+                        names.add(indexed)
+                        walk(item, indexed)
+                    else:
+                        names.add(indexed)
+
+    walk(parsed)
+    return names
+
+
+def _resolve_log_group_fields_target(data) -> tuple[str | None, object | None]:
+    """Return (group_name, error_response). Exactly one of name/identifier required."""
+    name = data.get("logGroupName")
+    identifier = data.get("logGroupIdentifier")
+    has_name = bool(name)
+    has_identifier = bool(identifier)
+    if has_name == has_identifier:
+        return None, error_response_json(
+            "InvalidParameterException",
+            "Exactly one of logGroupName or logGroupIdentifier must be specified",
+            400,
+        )
+    if has_name:
+        return name, None
+    if identifier.startswith("arn:") or ":log-group:" in identifier:
+        resolved = _log_group_name_from_identifier_arn(identifier)
+        if not resolved:
+            return None, error_response_json(
+                "ResourceNotFoundException",
+                f"The specified log group does not exist: {identifier}",
+                400,
+            )
+        return resolved, None
+    return identifier, None
+
+
+def _get_log_group_fields(data):
+    """Return field names present in recent events, with rough presence percent.
+
+    Time window matches AWS: optional ``time`` (epoch seconds) searches ±8 minutes
+    around that center; otherwise the most recent 15 minutes. JSON object messages
+    contribute flattened dotted keys; system ``@*`` fields are counted when present
+    on the stored Insights record.
+    """
+    group_name, err = _resolve_log_group_fields_target(data)
+    if err is not None:
+        return err
+    if group_name not in _log_groups:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"The specified log group does not exist: {group_name}",
+            400,
+        )
+
+    if data.get("time") is not None:
+        center = int(data["time"])
+        start_s = center - 8 * 60
+        end_s = center + 8 * 60
+    else:
+        # _collect_query_records takes epoch seconds and uses end_s*1000 as an
+        # inclusive ms bound. Flooring "now" to seconds would drop events in the
+        # current partial second (timestamp > end_s*1000), so extend end by 1s.
+        end_s = int(time.time()) + 1
+        start_s = end_s - 15 * 60
+
+    records = _collect_query_records([group_name], start_s, end_s)
+    total = len(records)
+    if total == 0:
+        return json_response({"logGroupFields": []})
+
+    counts: dict[str, int] = {}
+    for record in records:
+        present: set[str] = set()
+        for field in _SYSTEM_LOG_GROUP_FIELDS:
+            if field in record and record.get(field) is not None:
+                present.add(field)
+        present.update(_json_field_names(record.get("@message", "")))
+        for field in present:
+            counts[field] = counts.get(field, 0) + 1
+
+    fields = []
+    for name, count in counts.items():
+        percent = int(round(100.0 * count / total))
+        percent = max(0, min(100, percent))
+        fields.append({"name": name, "percent": percent})
+    fields.sort(key=lambda item: (-item["percent"], item["name"]))
+    return json_response({"logGroupFields": fields})
+
+
+# ---------------------------------------------------------------------------
+# Live Tail (StartLiveTail eventstream)
+# ---------------------------------------------------------------------------
+
+def _es_encode_message(headers: dict[str, str], payload: bytes) -> bytes:
+    """Encode one ``application/vnd.amazon.eventstream`` message (AWS wire format)."""
+    hdr_bytes = bytearray()
+    for name, value in headers.items():
+        name_b = name.encode("utf-8")
+        val_b = value.encode("utf-8")
+        hdr_bytes.append(len(name_b))
+        hdr_bytes.extend(name_b)
+        hdr_bytes.append(7)  # string
+        hdr_bytes.extend(len(val_b).to_bytes(2, "big"))
+        hdr_bytes.extend(val_b)
+
+    headers_length = len(hdr_bytes)
+    total_length = 12 + headers_length + len(payload) + 4
+    prelude = total_length.to_bytes(4, "big") + headers_length.to_bytes(4, "big")
+    prelude_crc = zlib.crc32(prelude).to_bytes(4, "big")
+    msg_head = prelude + prelude_crc + bytes(hdr_bytes) + payload
+    message_crc = zlib.crc32(msg_head).to_bytes(4, "big")
+    return msg_head + message_crc
+
+
+def _es_event(event_type: str, payload: dict) -> bytes:
+    return _es_encode_message(
+        {
+            ":message-type": "event",
+            ":event-type": event_type,
+            ":content-type": "application/json",
+        },
+        json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+    )
+
+
+def _resolve_live_tail_group_name(identifier: str) -> str | None:
+    """Resolve a StartLiveTail logGroupIdentifier (ARN without ``:*``, or bare name)."""
+    if not identifier:
+        return None
+    if identifier.startswith("arn:"):
+        if identifier.endswith(":*"):
+            return None  # AWS rejects trailing :* for Live Tail identifiers
+        return _log_group_name_from_identifier_arn(identifier) or _resolve_group_by_arn(identifier)
+    if identifier in _log_groups:
+        return identifier
+    return None
+
+
+def _live_tail_stream_allowed(stream_name: str, stream_names, stream_prefixes) -> bool:
+    if stream_names:
+        return stream_name in stream_names
+    if stream_prefixes:
+        return any(stream_name.startswith(prefix) for prefix in stream_prefixes)
+    return True
+
+
+def _fanout_to_live_tail_sessions(group_name: str, stream_name: str, events: list[dict]) -> None:
+    """Push matching PutLogEvents into active Live Tail session queues."""
+    import asyncio
+
+    if not events or not _live_tail_sessions:
+        return
+    account_id = get_account_id()
+    region = get_region()
+    for session in list(_live_tail_sessions.values()):
+        if session.get("account_id") != account_id or session.get("region") != region:
+            continue
+        if group_name not in session["group_names"]:
+            continue
+        if not _live_tail_stream_allowed(
+            stream_name, session.get("stream_names"), session.get("stream_prefixes")
+        ):
+            continue
+        identifier = session["identifiers_by_name"][group_name]
+        filter_pattern = session.get("filter_pattern") or ""
+        matched = []
+        for event in events:
+            message = event.get("message", "")
+            if not _subscription_pattern_matches(filter_pattern, message):
+                continue
+            matched.append(
+                {
+                    "logStreamName": stream_name,
+                    "logGroupIdentifier": identifier,
+                    "message": message,
+                    "timestamp": event.get("timestamp"),
+                    "ingestionTime": event.get("ingestionTime"),
+                }
+            )
+        if not matched:
+            continue
+        queue = session["queue"]
+        item = (matched, False)
+        try:
+            queue.put_nowait(item)
+        except asyncio.QueueFull:
+            # AWS keeps at most 10 LiveTailSessionUpdate events; drop oldest.
+            session["sampled"] = True
+            with contextlib.suppress(asyncio.QueueEmpty):
+                queue.get_nowait()
+            with contextlib.suppress(asyncio.QueueFull):
+                queue.put_nowait((matched, True))
+
+
+async def _await_http_disconnect(receive) -> None:
+    while True:
+        message = await receive()
+        if message.get("type") == "http.disconnect":
+            return
+
+
+def _start_live_tail(data):
+    """Start a Live Tail session.
+
+    Holds the HTTP eventstream open until the client disconnects. Matching
+    ``PutLogEvents`` calls fan into ``sessionUpdate`` frames via an asyncio
+    queue (same pattern as API Gateway WebSocket outboxes). Idle empty
+    ``sessionUpdate`` frames are emitted once per second (AWS cadence). At most
+    10 updates are buffered; overflow drops the oldest and sets ``sampled``.
+    """
+    import asyncio
+
+    identifiers = data.get("logGroupIdentifiers") or []
+    if not identifiers:
+        return error_response_json(
+            "InvalidParameterException",
+            "1 validation error detected: Value null at 'logGroupIdentifiers' "
+            "failed to satisfy constraint: Member must not be null",
+            400,
+        )
+    if len(identifiers) > 10:
+        return error_response_json(
+            "InvalidParameterException",
+            "logGroupIdentifiers may contain at most 10 items",
+            400,
+        )
+
+    stream_names = data.get("logStreamNames") or None
+    stream_prefixes = data.get("logStreamNamePrefixes") or None
+    if stream_names and stream_prefixes:
+        return error_response_json(
+            "InvalidParameterException",
+            "logStreamNames and logStreamNamePrefixes are mutually exclusive",
+            400,
+        )
+    if (stream_names or stream_prefixes) and len(identifiers) != 1:
+        return error_response_json(
+            "InvalidParameterException",
+            "logStreamNames/logStreamNamePrefixes require exactly one log group",
+            400,
+        )
+
+    resolved_names: list[str] = []
+    identifiers_by_name: dict[str, str] = {}
+    for identifier in identifiers:
+        name = _resolve_live_tail_group_name(identifier)
+        if not name or name not in _log_groups:
+            return error_response_json(
+                "ResourceNotFoundException",
+                f"The specified log group does not exist: {identifier}",
+                400,
+            )
+        if name not in resolved_names:
+            resolved_names.append(name)
+            identifiers_by_name[name] = (
+                identifier if identifier.startswith("arn:") else _make_group_arn_no_star(name)
+            )
+
+    filter_pattern = data.get("logEventFilterPattern") or ""
+    request_id = new_uuid()
+    session_id = new_uuid()
+    start_payload = {
+        "requestId": request_id,
+        "sessionId": session_id,
+        "logGroupIdentifiers": [identifiers_by_name[n] for n in resolved_names],
+    }
+    if stream_names:
+        start_payload["logStreamNames"] = list(stream_names)
+    if stream_prefixes:
+        start_payload["logStreamNamePrefixes"] = list(stream_prefixes)
+    if filter_pattern:
+        start_payload["logEventFilterPattern"] = filter_pattern
+
+    account_id = get_account_id()
+    region = get_region()
+
+    initial_bytes = _es_encode_message(
+        {
+            ":message-type": "event",
+            ":event-type": "initial-response",
+            ":content-type": "application/json",
+        },
+        b"{}",
+    )
+    start_bytes = _es_event("sessionStart", start_payload)
+
+    async def _run(send, receive):
+        async def _send_chunk(payload: bytes, *, more: bool = True) -> None:
+            await send({"type": "http.response.body", "body": payload, "more_body": more})
+
+        # Register before the first await so concurrent PutLogEvents cannot race
+        # past sessionStart into a missing session.
+        queue: asyncio.Queue = asyncio.Queue(maxsize=_LIVE_TAIL_QUEUE_MAX)
+        session = {
+            "session_id": session_id,
+            "account_id": account_id,
+            "region": region,
+            "group_names": set(resolved_names),
+            "identifiers_by_name": identifiers_by_name,
+            "stream_names": list(stream_names) if stream_names else None,
+            "stream_prefixes": list(stream_prefixes) if stream_prefixes else None,
+            "filter_pattern": filter_pattern,
+            "queue": queue,
+            "sampled": False,
+        }
+        _live_tail_sessions[session_id] = session
+
+        await _send_chunk(initial_bytes)
+        await _send_chunk(start_bytes)
+
+        disconnect_task = asyncio.create_task(_await_http_disconnect(receive))
+        try:
+            while not disconnect_task.done():
+                get_task = asyncio.create_task(queue.get())
+                done, _pending = await asyncio.wait(
+                    {get_task, disconnect_task},
+                    timeout=_LIVE_TAIL_IDLE_SECONDS,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if disconnect_task in done:
+                    get_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await get_task
+                    break
+                if get_task in done:
+                    item = get_task.result()
+                    if item is None:
+                        break
+                    results, sampled_flag = item
+                    sampled = bool(sampled_flag or session.get("sampled"))
+                    session["sampled"] = False
+                    await _send_chunk(
+                        _es_event(
+                            "sessionUpdate",
+                            {
+                                "sessionMetadata": {"sampled": sampled},
+                                "sessionResults": results,
+                            },
+                        )
+                    )
+                else:
+                    get_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await get_task
+                    await _send_chunk(
+                        _es_event(
+                            "sessionUpdate",
+                            {
+                                "sessionMetadata": {"sampled": False},
+                                "sessionResults": [],
+                            },
+                        )
+                    )
+        finally:
+            _live_tail_sessions.pop(session_id, None)
+            disconnect_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await disconnect_task
+            with contextlib.suppress(Exception):
+                await _send_chunk(b"", more=False)
+
+    return (
+        200,
+        {
+            "Content-Type": "application/vnd.amazon.eventstream",
+            "x-amzn-RequestId": request_id,
+        },
+        StreamingResponse(_run),
+    )
+
+
+def _subscription_pattern_matches(pattern, message):
+    """Minimal CloudWatch Logs filter-pattern match: an empty pattern matches
+    every event; otherwise every bare term in the pattern must appear in the
+    message. The full filter-pattern grammar is intentionally not implemented."""
+    if not pattern or not pattern.strip():
+        return True
+    import re
+    terms = re.findall(r"[A-Za-z0-9_./:-]+", pattern)
+    return all(t in (message or "") for t in terms) if terms else True
+
+
+def _fanout_to_subscription_filters(group_name, stream_name, events):
+    """Forward matching log events to each subscription filter's destination
+    Lambda, in AWS's `awslogs` gzip+base64 envelope (#896). Best-effort — a
+    delivery failure must never break log ingestion. Only Lambda destinations
+    are delivered; Kinesis/Firehose destinations are stored but not delivered."""
+    grp = _log_groups.get(group_name)
+    if not grp or not events:
+        return
+    filters = grp.get("subscriptionFilters") or {}
+    if not filters:
+        return
+    import gzip
+    import threading
+    now_ms = int(time.time() * 1000)
+    for f in filters.values():
+        # Best-effort per filter: a delivery error must NEVER break log
+        # ingestion (PutLogEvents / Lambda log emit both call this).
+        try:
+            dest = f.get("destinationArn", "")
+            if ":function:" not in dest:
+                continue  # only Lambda destinations are delivered
+            fn = dest.split(":function:")[-1].split(":")[0]
+            # Guard the self-feeding loop: a filter on /aws/lambda/<fn> pointing
+            # back at <fn> would invoke→log→invoke forever.
+            if group_name == f"/aws/lambda/{fn}":
+                continue
+            matched = [e for e in events
+                       if _subscription_pattern_matches(f.get("filterPattern", ""), e.get("message", ""))]
+            if not matched:
+                continue
+            payload = {
+                "messageType": "DATA_MESSAGE",
+                "owner": get_account_id(),
+                "logGroup": group_name,
+                "logStream": stream_name,
+                "subscriptionFilters": [f.get("filterName", "")],
+                "logEvents": [
+                    {"id": new_uuid().replace("-", ""),
+                     "timestamp": e.get("timestamp", now_ms),
+                     "message": e.get("message", "")}
+                    for e in matched
+                ],
+            }
+            awslogs_event = {"awslogs": {
+                "data": base64.b64encode(gzip.compress(json.dumps(payload).encode())).decode()
+            }}
+            from ministack.services import lambda_svc
+            rec = lambda_svc._functions.get(fn)
+            if rec:
+                # Scope the invoke from the function's own config: a bare
+                # thread has an empty context, so plain _execute_function would
+                # run the subscriber (and its side effects — own log group,
+                # downstream calls) under the default account for any
+                # non-default tenant.
+                threading.Thread(target=lambda_svc._execute_function_with_config_scope,
+                                 args=(rec, awslogs_event), daemon=True).start()
+            else:
+                logger.warning("subscription filter %s: destination Lambda %s not found",
+                               f.get("filterName"), fn)
+        except Exception as exc:
+            logger.debug("subscription filter delivery failed: %s", exc)
+
+
+def _resolve_log_group_name(data):
+    """Per AWS: GetLogEvents / FilterLogEvents accept either `logGroupName` or
+    `logGroupIdentifier` (name or ARN), but not both. Returns the resolved name
+    or None."""
+    name = data.get("logGroupName")
+    if name:
+        return name
+    ident = data.get("logGroupIdentifier")
+    if not ident:
+        return None
+    if ident.startswith("arn:"):
+        return _log_group_name_from_identifier_arn(ident) or ident
+    return ident
+
+
+def _event_cursor(history, size, position, forward):
+    """GetLogEvents boundary as "<timestamp>:<k>" (k-th event of that timestamp), or "-" at the head."""
+    anchor = position - 1 if forward or position == size else position
+    if not 0 <= anchor < size:
+        return "-"
+    timestamp = history[anchor]["timestamp"]
+    return f"{timestamp}:{position - bisect_left(history, timestamp, hi=size, key=_event_timestamp)}"
+
+
+def _event_token_position(history, size, token):
+    direction, _, cursor = token.partition("/")
+    if direction not in ("f", "b"):
+        raise ValueError(token)
+    forward = direction == "f"
+    if cursor == "-":
+        return forward, 0 if forward else size
+    timestamp, offset = cursor.split(":")
+    return forward, bisect_left(history, int(timestamp), hi=size, key=_event_timestamp) + int(offset)
+
+
 def _get_log_events(data):
-    group = data.get("logGroupName")
+    group = _resolve_log_group_name(data)
     stream = data.get("logStreamName")
     limit = min(data.get("limit", 10000), 10000)
     start_from_head = data.get("startFromHead", False)
@@ -447,40 +1320,43 @@ def _get_log_events(data):
             f"The specified log stream does not exist: {stream}", 400,
         )
 
-    all_events = _log_groups[group]["streams"][stream]["events"]
+    with _log_events_lock:
+        history = _log_groups[group]["streams"][stream]["events"]
+        size = len(history)
+    lower = bisect_left(history, start_time, hi=size, key=_event_timestamp) if start_time is not None else 0
+    upper = bisect_left(history, end_time, lo=lower, hi=size, key=_event_timestamp) if end_time is not None else size
 
-    filtered = all_events
-    if start_time is not None:
-        filtered = [e for e in filtered if e["timestamp"] >= start_time]
-    if end_time is not None:
-        filtered = [e for e in filtered if e["timestamp"] <= end_time]
-
-    # Parse offset from token: f/<offset> for forward, b/<offset> for backward
-    offset = 0
+    forward = start_from_head
+    position = lower if forward else upper
     if next_token:
         try:
-            offset = int(next_token.split("/", 1)[1])
-        except (IndexError, ValueError):
-            offset = 0
-
-    if start_from_head or (next_token and next_token.startswith("f/")):
-        page = filtered[offset:offset + limit]
-        new_forward = f"f/{offset + len(page)}"
-        new_backward = f"b/{offset}"
+            forward, position = _event_token_position(history, size, next_token)
+        except ValueError:
+            return error_response_json("InvalidParameterException", "The specified nextToken is invalid.", 400)
+        position = min(max(position, lower), upper)
+    if forward:
+        start, end = position, min(position + limit, upper)
     else:
-        end = len(filtered) - offset if next_token and next_token.startswith("b/") else len(filtered)
-        start = max(0, end - limit)
-        page = filtered[start:end]
-        new_forward = f"f/{end}"
-        new_backward = f"b/{len(filtered) - start}"
+        start, end = max(lower, position - limit), position
+    page = history[start:end]
 
+    forward_token = f"f/{_event_cursor(history, size, end, True)}"
+    backward_token = f"b/{_event_cursor(history, size, start, False)}"
     # AWS behaviour: when at end of stream, return the caller's token
     # so SDK clients stop paginating
-    forward_token = next_token if (next_token and len(page) < limit) else new_forward
-    backward_token = next_token if (next_token and offset == 0 and next_token.startswith("b/")) else new_backward
+    if next_token and not page:
+        if forward:
+            forward_token = next_token
+        else:
+            backward_token = next_token
 
+    # OutputLogEvent is only {timestamp, message, ingestionTime}; strip internal
+    # fields (e.g. the eventId used by FilterLogEvents / GetLogRecord).
     return json_response({
-        "events": page,
+        "events": [
+            {"timestamp": e["timestamp"], "message": e["message"], "ingestionTime": e["ingestionTime"]}
+            for e in page
+        ],
         "nextForwardToken": forward_token,
         "nextBackwardToken": backward_token,
     })
@@ -518,8 +1394,13 @@ def _compile_filter_pattern(raw: str):
     return _matches
 
 
+def _stream_event_range(events, stream_name, start, end):
+    for index in range(start, end):
+        yield events[index], stream_name
+
+
 def _filter_log_events(data):
-    group = data.get("logGroupName")
+    group = _resolve_log_group_name(data)
     raw_pattern = data.get("filterPattern", "")
     pattern_fn = _compile_filter_pattern(raw_pattern)
     limit = min(data.get("limit", 10000), 10000)
@@ -534,28 +1415,40 @@ def _filter_log_events(data):
         )
 
     events = []
-    searched = []
+    ranges = []
     streams = _log_groups[group]["streams"]
     target_streams = stream_names if stream_names else list(streams.keys())
 
-    for sn in target_streams:
-        if sn not in streams:
-            continue
-        searched.append({"logStreamName": sn, "searchedCompletely": True})
-        for e in streams[sn]["events"]:
-            ts = e["timestamp"]
-            if start_time is not None and ts < start_time:
+    with _log_events_lock:
+        for sn in target_streams:
+            stream = streams.get(sn)
+            if stream is None:
                 continue
-            if end_time is not None and ts > end_time:
-                continue
-            if not pattern_fn(e.get("message", "")):
-                continue
-            events.append({**e, "logStreamName": sn})
-            if len(events) >= limit:
-                break
+            history = stream["events"]
+            start = bisect_left(history, start_time, key=_event_timestamp) if start_time is not None else 0
+            end = bisect_right(history, end_time, key=_event_timestamp) if end_time is not None else len(history)
+            ranges.append(_stream_event_range(history, sn, start, end))
 
-    events.sort(key=lambda ev: ev["timestamp"])
-    return json_response({"events": events[:limit], "searchedLogStreams": searched})
+    # merge is stable across input streams and only pulls the next candidate.
+    skip = _decode_token(data.get("nextToken"))
+    position = 0
+    more = False
+    for event, sn in heapq.merge(*ranges, key=lambda entry: (entry[0]["timestamp"], entry[0].get("ingestionTime", 0))):
+        if position < skip:
+            position += 1
+            continue
+        if len(events) >= limit:
+            more = True
+            break
+        position += 1
+        if pattern_fn(event.get("message", "")):
+            events.append({**event, "logStreamName": sn})
+    logger.debug("FilterLogEvents streams=%d scanned=%d returned=%d limit=%s",
+                 len(ranges), position - skip, len(events), limit)
+    resp = {"events": events, "searchedLogStreams": []}
+    if more:
+        resp["nextToken"] = _encode_token(position)
+    return json_response(resp)
 
 
 # ---------------------------------------------------------------------------
@@ -711,40 +1604,91 @@ def _list_tags_log_group(data):
 # Tags – modern ARN-based APIs
 # ---------------------------------------------------------------------------
 
+def _tag_resource_identity(arn: str, account_id: str, region: str):
+    parsed = parse_arn(arn)
+    resource_type, _, name = parsed.resource.partition(":")
+    stores = {
+        "log-group": _log_groups,
+        "delivery-source": _delivery_sources,
+        "delivery-destination": _delivery_destinations,
+        "delivery": _deliveries,
+    }
+    pattern = r"[\w./#-]+" if resource_type == "log-group" else r"[\w.-]+"
+    if (parsed.partition != "aws" or parsed.service != "logs"
+            or parsed.account_id != account_id or parsed.region != region
+            or resource_type not in stores or not re.fullmatch(pattern, name, flags=re.ASCII)):
+        raise ArnParseError("Invalid resourceArn")
+    return stores[resource_type], resource_type, name
+
+
+def validate_tag_resource_arn(arn: str, *, account_id: str | None = None,
+                              region: str | None = None):
+    """Modern tag APIs validate scope and ARN shape before IAM policy checks."""
+    try:
+        _tag_resource_identity(arn, account_id or get_account_id(), region or get_region())
+    except ArnParseError:
+        # Observed on live Logs: lowercase message, JSON 1.1, no error header.
+        return json_response({"__type": "ValidationException", "message": "Invalid resourceArn"},
+                             400, content_type="application/x-amz-json-1.1")
+    return None
+
+
+def resolve_tag_resource(arn: str, *, account_id: str | None = None,
+                         region: str | None = None):
+    """Use the same validated, scoped resource for IAM context and tag dispatch."""
+    account_id, region = account_id or get_account_id(), region or get_region()
+    try:
+        store, resource_type, name = _tag_resource_identity(arn, account_id, region)
+    except ArnParseError:
+        return None
+    record = store.get_scoped(account_id, region, name)
+    if record is None:
+        return None
+    stored_arn = record.get("arn", "")
+    if resource_type == "log-group":
+        stored_arn = stored_arn.removesuffix(":*")
+    return record if stored_arn == arn else None
+
+
+def _resolve_tag_record_by_arn(arn: str):
+    record = resolve_tag_resource(arn)
+    return record.setdefault("tags", {}) if record is not None else None
+
+
 def _tag_resource(data):
     arn = data.get("resourceArn", "")
-    group = _resolve_group_by_arn(arn)
-    if not group:
+    tags = _resolve_tag_record_by_arn(arn)
+    if tags is None:
         return error_response_json(
             "ResourceNotFoundException",
             f"The specified resource does not exist: {arn}", 400,
         )
-    _log_groups[group]["tags"].update(data.get("tags", {}))
+    tags.update(data.get("tags", {}))
     return json_response({})
 
 
 def _untag_resource(data):
     arn = data.get("resourceArn", "")
-    group = _resolve_group_by_arn(arn)
-    if not group:
+    tags = _resolve_tag_record_by_arn(arn)
+    if tags is None:
         return error_response_json(
             "ResourceNotFoundException",
             f"The specified resource does not exist: {arn}", 400,
         )
     for key in data.get("tagKeys", []):
-        _log_groups[group]["tags"].pop(key, None)
+        tags.pop(key, None)
     return json_response({})
 
 
 def _list_tags_for_resource(data):
     arn = data.get("resourceArn", "")
-    group = _resolve_group_by_arn(arn)
-    if not group:
+    tags = _resolve_tag_record_by_arn(arn)
+    if tags is None:
         return error_response_json(
             "ResourceNotFoundException",
             f"The specified resource does not exist: {arn}", 400,
         )
-    return json_response({"tags": dict(_log_groups[group]["tags"])})
+    return json_response({"tags": dict(tags)})
 
 
 # ---------------------------------------------------------------------------
@@ -811,6 +1755,126 @@ def _put_destination_policy(data):
     return json_response({})
 
 
+def _format_resource_policy(policy):
+    formatted = {
+        "policyDocument": policy["policyDocument"],
+        "lastUpdatedTime": policy["lastUpdatedTime"],
+        "policyScope": policy.get("policyScope", "ACCOUNT"),
+        "resourceArn": policy.get("resourceArn"),
+        "revisionId": policy["revisionId"],
+    }
+    if policy.get("policyName"):
+        formatted["policyName"] = policy["policyName"]
+    return formatted
+
+
+def _revision_mismatch():
+    return error_response_json(
+        "OperationAbortedException",
+        "The revision id does not match the latest revision id.", 400,
+    )
+
+
+def _policy_target_missing(action):
+    return error_response_json(
+        "InvalidParameterException", f"{action} request must contain policy name or resource arn.", 400)
+
+
+def _put_resource_policy(data):
+    name = data.get("policyName")
+    document = data.get("policyDocument")
+    resource_arn = data.get("resourceArn")
+    if not name and not resource_arn:
+        return _policy_target_missing("PutResourcePolicy")
+    if not document:
+        return error_response_json(
+            "InvalidParameterException",
+            "policyName and policyDocument are required.", 400,
+        )
+    expected_revision = data.get("expectedRevisionId")
+    policy = {
+        "policyName": name,
+        "policyDocument": document,
+        "lastUpdatedTime": int(time.time() * 1000),
+        "revisionId": new_uuid(),
+    }
+    if resource_arn:
+        # RESOURCE scope: one policy per existing log group, its revision a counter.
+        group = _resolve_group_by_arn(resource_arn)
+        if group is None:
+            return error_response_json(
+                "ResourceNotFoundException", "The specified log group does not exist.", 400)
+        existing = _log_group_policies.get(group)
+        if (existing is None) != (expected_revision is None):
+            return error_response_json(
+                "OperationAbortedException",
+                "A conflicting operation is currently in progress against this resource. Please try again.", 400)
+        if existing and existing["revisionId"] != expected_revision:
+            return error_response_json("InvalidParameterException", "Invalid ExpectedRevisionId", 400)
+        current = existing["revisionId"] if existing else ""
+        revision = str(int(current) + 1) if current.isdigit() else "1"
+        policy.update(policyScope="RESOURCE", resourceArn=resource_arn, revisionId=revision)
+        _log_group_policies[group] = policy
+    else:
+        existing = _resource_policies.get(name)
+        if expected_revision is not None and (not existing or existing["revisionId"] != expected_revision):
+            return _revision_mismatch()
+        if existing is None and len(_resource_policies) >= _MAX_ACCOUNT_RESOURCE_POLICIES:
+            return error_response_json(
+                "LimitExceededException",
+                f"Resource limit exceeded. An account can have at most "
+                f"{_MAX_ACCOUNT_RESOURCE_POLICIES} resource policies.", 400)
+        policy["policyScope"] = "ACCOUNT"
+        _resource_policies[name] = policy
+    formatted = _format_resource_policy(policy)
+    if resource_arn:
+        del formatted["revisionId"]  # a log group's policy carries it only at the top level
+    return json_response({"resourcePolicy": formatted, "revisionId": policy["revisionId"]})
+
+
+def _describe_resource_policies(data):
+    resource_arn = data.get("resourceArn")
+    scope = data.get("policyScope") or "ACCOUNT"
+    if scope not in ("ACCOUNT", "RESOURCE"):
+        return error_response_json(
+            "InvalidParameterException",
+            "1 validation error detected: Value at 'policyScope' failed to satisfy constraint: "
+            "Member must satisfy enum value set: [ACCOUNT, RESOURCE]", 400)
+    if resource_arn:
+        group = _resolve_group_by_arn(resource_arn)
+        found = _log_group_policies.get(group) if group else None
+        policies = [found] if found else []
+    elif scope == "RESOURCE":
+        policies = list(_log_group_policies.values())
+    else:
+        policies = list(_resource_policies.values())
+    return _offset_paged(data, "resourcePolicies", [_format_resource_policy(p) for p in policies])
+
+
+def _delete_resource_policy(data):
+    name = data.get("policyName")
+    resource_arn = data.get("resourceArn")
+    if not name and not resource_arn:
+        return _policy_target_missing("DeleteResourcePolicy")
+    if resource_arn:
+        group = _resolve_group_by_arn(resource_arn)
+        existing = _log_group_policies.get(group) if group else None
+        if existing is None:
+            return error_response_json(
+                "ResourceNotFoundException", "No policy found for ResourceArn", 400)
+        if data.get("expectedRevisionId") != existing["revisionId"]:
+            return error_response_json("InvalidParameterException", "Invalid ExpectedRevisionId", 400)
+        del _log_group_policies[group]
+        return json_response({})
+    if name not in _resource_policies:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Policy with name [{name}] does not exist.", 400,
+        )
+    del _resource_policies[name]
+    return json_response({})
+
+
 # ---------------------------------------------------------------------------
 # Metric Filters
 # ---------------------------------------------------------------------------
@@ -853,10 +1917,24 @@ def _delete_metric_filter(data):
 
 def _describe_metric_filters(data):
     group = data.get("logGroupName")
-    prefix = data.get("filterNamePrefix", "")
+    # The prefix only applies within a log group.
+    prefix = data.get("filterNamePrefix", "") if group else ""
+    metric_name = data.get("metricName")
+    namespace = data.get("metricNamespace")
     limit = min(data.get("limit", 50), 50)
     token = data.get("nextToken")
 
+    if bool(metric_name) != bool(namespace):
+        return error_response_json(
+            "InvalidParameterException",
+            "Describe Metric Filters request must contain both MetricName and MetricNamespace", 400,
+        )
+    if group and metric_name:
+        return error_response_json(
+            "InvalidParameterException",
+            "Describe Metric Filters request must contain either logGroupName "
+            "or metricName and metricNamespace", 400,
+        )
     if group and group not in _log_groups:
         return error_response_json(
             "ResourceNotFoundException",
@@ -866,7 +1944,10 @@ def _describe_metric_filters(data):
     filters = sorted(
         (mf for mf in _metric_filters.values()
          if (not group or mf["logGroupName"] == group)
-         and (not prefix or mf["filterName"].startswith(prefix))),
+         and (not prefix or mf["filterName"].startswith(prefix))
+         and (not metric_name or any(
+             t.get("metricName") == metric_name and t.get("metricNamespace") == namespace
+             for t in mf["metricTransformations"]))),
         key=lambda f: f["filterName"],
     )
 
@@ -881,19 +1962,333 @@ def _describe_metric_filters(data):
 
 
 # ---------------------------------------------------------------------------
-# CloudWatch Logs Insights (stubs)
+# CloudWatch Logs Insights
 # ---------------------------------------------------------------------------
 
+def _split_insights_pipes(query_string: str) -> list[str]:
+    """Split a CWLI query on ``|`` outside quotes and ``/regex/`` literals."""
+    text = query_string or ""
+    parts: list[str] = []
+    buf: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "|":
+            parts.append("".join(buf).strip())
+            buf = []
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            while i < n:
+                c = text[i]
+                buf.append(c)
+                if c == "\\" and i + 1 < n:
+                    buf.append(text[i + 1])
+                    i += 2
+                    continue
+                if c == quote:
+                    i += 1
+                    break
+                i += 1
+            continue
+        if ch == "/":
+            buf.append(ch)
+            i += 1
+            while i < n:
+                c = text[i]
+                buf.append(c)
+                if c == "\\" and i + 1 < n:
+                    buf.append(text[i + 1])
+                    i += 2
+                    continue
+                if c == "/":
+                    i += 1
+                    # optional flags (e.g. i)
+                    while i < n and text[i].isalpha():
+                        buf.append(text[i])
+                        i += 1
+                    break
+                i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    parts.append("".join(buf).strip())
+    return [p for p in parts if p]
+
+
+def _parse_insights_fields(query_string: str) -> list[str]:
+    """Extract field names from a simple ``fields a, b | ...`` Insights query.
+
+    Falls back to the CWLT/default set when the query has no fields clause.
+    Supports a CWLI subset: ``fields``, ``filter``, ``sort @timestamp``, ``limit``.
+    """
+    for stage in _split_insights_pipes(query_string):
+        match = re.match(r"(?i)^fields\s+(.+)$", stage.strip())
+        if match:
+            fields = [part.strip() for part in match.group(1).split(",") if part.strip()]
+            if "@ptr" not in fields:
+                fields.append("@ptr")
+            return fields
+    return ["@timestamp", "@message", "@logStream", "@log", "@ptr"]
+
+
+def _clamp_insights_limit(value) -> int | None:
+    try:
+        return max(1, min(int(value), 10000))
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_insights_limit(query_string: str, explicit_limit) -> int:
+    """Effective Insights limit: ``min(query | limit, StartQuery limit)``.
+
+    Both sides default to 10000 when omitted. The query-string limit must apply
+    to the post-filter result set and must not be bypassed by a large API limit.
+    """
+    pipe_limit = None
+    for stage in _split_insights_pipes(query_string):
+        match = re.match(r"(?i)^limit\s+(\d+)\s*$", stage.strip())
+        if match:
+            pipe_limit = _clamp_insights_limit(match.group(1))
+    api_limit = _clamp_insights_limit(explicit_limit) if explicit_limit is not None else None
+    if pipe_limit is None and api_limit is None:
+        return 10000
+    if pipe_limit is None:
+        return api_limit
+    if api_limit is None:
+        return pipe_limit
+    return min(pipe_limit, api_limit)
+
+
+def _compile_insights_filter(stage: str):
+    """Compile one ``filter`` stage into a predicate ``record -> bool``.
+
+    Supported forms:
+    - ``filter @logStream = 'exact'``
+    - ``filter @message like /pattern/`` or ``/pattern/i``
+    - ``filter toMillis(@timestamp) <=|>=|<|>|=|!= <epoch_ms>``
+    """
+    text = stage.strip()
+    if not re.match(r"(?i)^filter\b", text):
+        return None
+    body = re.sub(r"(?i)^filter\s+", "", text, count=1).strip()
+
+    eq = re.match(r"^(@\w+)\s*=\s*'((?:\\'|[^'])*)'\s*$", body)
+    if eq:
+        field, raw = eq.group(1), eq.group(2).replace("\\'", "'")
+
+        def _eq_pred(record, _field=field, _raw=raw):
+            public = _public_log_record(record)
+            return str(public.get(_field, "")) == _raw
+
+        return _eq_pred
+
+    like = re.match(r"^(@\w+)\s+like\s+/((?:\\.|[^/])*)/([i]*)\s*$", body, re.IGNORECASE)
+    if like:
+        field, pattern, flags_s = like.group(1), like.group(2), like.group(3)
+        flags = re.IGNORECASE if "i" in (flags_s or "").lower() else 0
+        try:
+            compiled = re.compile(pattern, flags)
+        except re.error:
+            return lambda _record: False
+
+        def _like_pred(record, _field=field, _compiled=compiled):
+            public = _public_log_record(record)
+            return _compiled.search(str(public.get(_field, ""))) is not None
+
+        return _like_pred
+
+    # CWLT surround queries bound neighbors with toMillis(@timestamp).
+    # Silently ignoring this form made ``after`` return the earliest events
+    # in the stream (sort asc + limit) instead of events at/after the pivot.
+    tomillis = re.match(
+        r"^toMillis\(@timestamp\)\s*(<=|>=|<|>|!=|=)\s*(-?\d+)\s*$",
+        body,
+    )
+    if tomillis:
+        op, bound = tomillis.group(1), int(tomillis.group(2))
+        comparators = {
+            "<=": lambda ts, b: ts <= b,
+            ">=": lambda ts, b: ts >= b,
+            "<": lambda ts, b: ts < b,
+            ">": lambda ts, b: ts > b,
+            "=": lambda ts, b: ts == b,
+            "!=": lambda ts, b: ts != b,
+        }
+        compare = comparators[op]
+
+        def _tomillis_pred(record, _compare=compare, _bound=bound):
+            return _compare(int(record.get("_timestamp_ms", 0)), _bound)
+
+        return _tomillis_pred
+
+    # Unsupported filter form — ignore (subset emulator).
+    return None
+
+
+def _parse_insights_sort(query_string: str) -> tuple[str, bool] | None:
+    """Return ``(field, ascending)`` for ``sort @timestamp [asc|desc]``, else None."""
+    for stage in _split_insights_pipes(query_string):
+        match = re.match(
+            r"(?i)^sort\s+(@\w+)(?:\s+(asc|desc))?\s*$",
+            stage.strip(),
+        )
+        if match:
+            field = match.group(1)
+            direction = (match.group(2) or "asc").lower()
+            return field, direction != "desc"
+    return None
+
+
+def _insights_filter_predicates(query_string: str) -> list:
+    preds = []
+    for stage in _split_insights_pipes(query_string):
+        if not re.match(r"(?i)^filter\b", stage.strip()):
+            continue
+        pred = _compile_insights_filter(stage)
+        if pred is not None:
+            preds.append(pred)
+    return preds
+
+
+def _apply_insights_sort(records: list[dict], query_string: str) -> list[dict]:
+    sort_spec = _parse_insights_sort(query_string)
+    if not sort_spec:
+        return records
+    field, ascending = sort_spec
+    if field == "@timestamp":
+        return sorted(
+            records,
+            key=lambda r: r.get("_timestamp_ms", 0),
+            reverse=not ascending,
+        )
+    return sorted(
+        records,
+        key=lambda r: str(_public_log_record(r).get(field, "")),
+        reverse=not ascending,
+    )
+
+
+def _resolve_query_log_groups(data) -> list[str]:
+    groups: list[str] = []
+    if data.get("logGroupName"):
+        groups.append(data["logGroupName"])
+    for name in data.get("logGroupNames") or []:
+        if name and name not in groups:
+            groups.append(name)
+    for identifier in data.get("logGroupIdentifiers") or []:
+        # Accept plain names or ARNs (...:log-group:NAME[:*]).
+        name = identifier
+        if ":log-group:" in identifier:
+            name = identifier.split(":log-group:", 1)[1]
+            if name.endswith(":*"):
+                name = name[:-2]
+            elif ":" in name:
+                name = name.split(":", 1)[0]
+        if name and name not in groups:
+            groups.append(name)
+    return groups
+
+
+def _collect_query_records(group_names, start_time_s, end_time_s):
+    """Collect stored log records in [start, end] (epoch seconds, AWS Insights)."""
+    start_ms = int(start_time_s) * 1000
+    end_ms = int(end_time_s) * 1000
+    collected = []
+    for group_name in group_names:
+        group = _log_groups.get(group_name)
+        if not group:
+            continue
+        for stream_name, stream in group.get("streams", {}).items():
+            for event in stream.get("events", []):
+                ts = event.get("timestamp", 0)
+                if ts < start_ms or ts > end_ms:
+                    continue
+                ptr = event.get("eventId")
+                record = _log_records.get(ptr) if ptr else None
+                if not record:
+                    # Rebuild for events ingested before ptr indexing existed.
+                    ptr = ptr or new_uuid()
+                    record = _build_log_record(
+                        ptr=ptr,
+                        timestamp_ms=ts,
+                        message=event.get("message", ""),
+                        log_group=group_name,
+                        log_stream=stream_name,
+                    )
+                    _log_records[ptr] = record
+                    event["eventId"] = ptr
+                collected.append(record)
+    collected.sort(key=lambda r: r.get("_timestamp_ms", 0))
+    return collected
+
+
+def _row_from_record(record: dict, fields: list[str]) -> list[dict]:
+    public = _public_log_record(record)
+    return [{"field": field, "value": str(public.get(field, ""))} for field in fields]
+
+
 def _start_query(data):
+    """Run a CloudWatch Logs Insights query (CWLI subset).
+
+    Supported: ``fields``, chained ``filter`` (``@field = '…'``,
+    ``@field like /regex/[i]``, ``toMillis(@timestamp)`` comparisons),
+    ``sort @timestamp asc|desc``, and ``limit``.
+    Filters are AND-ed; ``limit`` applies after filter+sort as
+    ``min(query limit, StartQuery limit)``.
+    """
+    group_names = _resolve_query_log_groups(data)
+    if not group_names:
+        return error_response_json(
+            "InvalidParameterException",
+            "logGroupName, logGroupNames, or logGroupIdentifiers is required",
+            400,
+        )
+    for name in group_names:
+        if name not in _log_groups:
+            return error_response_json(
+                "ResourceNotFoundException",
+                f"The specified log group does not exist: {name}",
+                400,
+            )
+
+    query_string = data.get("queryString", "")
+    fields = _parse_insights_fields(query_string)
+    limit = _parse_insights_limit(query_string, data.get("limit"))
+    start_time = data.get("startTime", 0)
+    end_time = data.get("endTime", int(time.time()))
+
+    scanned = _collect_query_records(group_names, start_time, end_time)
+    predicates = _insights_filter_predicates(query_string)
+    if predicates:
+        filtered = [r for r in scanned if all(pred(r) for pred in predicates)]
+    else:
+        filtered = list(scanned)
+    ordered = _apply_insights_sort(filtered, query_string)
+    limited = ordered[:limit]
+    results = [_row_from_record(record, fields) for record in limited]
+    bytes_scanned = float(sum(len(r.get("@message", "")) for r in scanned))
+
     query_id = new_uuid()
     _queries[query_id] = {
         "queryId": query_id,
         "logGroupName": data.get("logGroupName", ""),
         "logGroupNames": data.get("logGroupNames", []),
-        "startTime": data.get("startTime", 0),
-        "endTime": data.get("endTime", 0),
-        "queryString": data.get("queryString", ""),
+        "logGroupIdentifiers": data.get("logGroupIdentifiers", []),
+        "startTime": start_time,
+        "endTime": end_time,
+        "queryString": query_string,
         "status": "Complete",
+        "results": results,
+        "statistics": {
+            "recordsMatched": float(len(filtered)),
+            "recordsScanned": float(len(scanned)),
+            "bytesScanned": bytes_scanned,
+        },
     }
     return json_response({"queryId": query_id})
 
@@ -906,11 +2301,35 @@ def _get_query_results(data):
             "ResourceNotFoundException",
             f"The specified query does not exist: {query_id}", 400,
         )
-    return json_response({
+    all_results = query.get("results", [])
+    statistics = query.get(
+        "statistics",
+        {"recordsMatched": 0.0, "recordsScanned": 0.0, "bytesScanned": 0.0},
+    )
+    start = _decode_token(data.get("nextToken"))
+    max_items = data.get("maxItems")
+    if max_items is None:
+        page = all_results[start:]
+        return json_response({
+            "status": query["status"],
+            "results": page,
+            "statistics": statistics,
+        })
+    try:
+        limit = max(1, int(max_items))
+    except (TypeError, ValueError):
+        limit = len(all_results) - start if start < len(all_results) else 0
+        limit = max(1, limit) if limit else 1
+    end = start + limit
+    page = all_results[start:end]
+    resp = {
         "status": query["status"],
-        "results": [],
-        "statistics": {"recordsMatched": 0.0, "recordsScanned": 0.0, "bytesScanned": 0.0},
-    })
+        "results": page,
+        "statistics": statistics,
+    }
+    if end < len(all_results):
+        resp["nextToken"] = _encode_token(end)
+    return json_response(resp)
 
 
 def _stop_query(data):
@@ -923,11 +2342,21 @@ def _stop_query(data):
 def reset():
     _log_groups.clear()
     _destinations.clear()
+    _resource_policies.clear()
+    _log_group_policies.clear()
     _metric_filters.clear()
     _queries.clear()
+    _log_records.clear()
     _delivery_sources.clear()
     _delivery_destinations.clear()
     _deliveries.clear()
+    # Wake any held Live Tail streams so they exit on reset.
+    for session in list(_live_tail_sessions.values()):
+        queue = session.get("queue")
+        if queue is not None:
+            with contextlib.suppress(Exception):
+                queue.put_nowait(None)
+    _live_tail_sessions.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -954,8 +2383,10 @@ def _make_delivery_arn(delivery_id):
 # not supply it; any value in the request is ignored. The field is
 # always server-computed so it stays stable across describe calls.
 def _derive_service_from_arn(arn):
-    parts = arn.split(":", 5)
-    return parts[2] if len(parts) >= 3 else ""
+    try:
+        return parse_arn(arn).service
+    except ArnParseError:
+        return ""
 
 
 # AWS derives deliveryDestinationType from the destination resource ARN
@@ -964,10 +2395,10 @@ def _derive_destination_type_from_arn(arn):
     """Parse arn:aws:<svc>:region:acct:<resource>/... and map to the
     deliveryDestinationType label AWS returns. Returns None if the ARN
     doesn't match a supported target service."""
-    parts = arn.split(":", 5)
-    if len(parts) < 3:
+    try:
+        svc = parse_arn(arn).service
+    except ArnParseError:
         return None
-    svc = parts[2]
     if svc == "s3":
         return "S3"
     if svc == "logs":
@@ -978,6 +2409,61 @@ def _derive_destination_type_from_arn(arn):
 
 
 _VALID_OUTPUT_FORMATS = {"json", "plain", "w3c", "raw", "parquet"}
+_DELIVERY_SOURCE_NON_SOURCES = {"firehose", "lambda", "logs", "s3", "sns", "sqs"}
+
+
+def _validation_error(message):
+    return error_response_json("ValidationException", message, 400)
+
+
+def _delivery_source_spec(resource_arn):
+    try:
+        spec = parse_arn(resource_arn)
+    except ArnParseError:
+        return None, _validation_error("Invalid ARN provided.")
+    if spec.region and spec.region != get_region():
+        return None, _validation_error("Cross-region Delivery Source is not supported. Please use a different region.")
+    if spec.account_id and spec.account_id != get_account_id():
+        return None, _validation_error("Account id from identity does not match the resourceArn.")
+    if spec.service in _DELIVERY_SOURCE_NON_SOURCES:
+        return None, error_response_json("ResourceNotFoundException", "Cannot access provided service.", 400)
+    return spec, None
+
+
+def _delivery_destination_resource_spec(destination_resource_arn):
+    try:
+        spec = parse_arn(destination_resource_arn)
+    except ArnParseError:
+        return None, _validation_error("Invalid ARN provided.")
+    if spec.service not in ("firehose", "logs", "s3"):
+        return None, _validation_error("Delivery Destination Resource ARN is of unsupported service.")
+    if spec.service == "s3":
+        if spec.region or spec.account_id:
+            return None, _validation_error("Invalid ARN provided.")
+        return spec, None
+    if spec.region != get_region():
+        return None, _validation_error("Region from identity does not match the Destination Resource ARN.")
+    if spec.account_id != get_account_id():
+        return None, _validation_error("Account id from identity does not match the Destination Resource ARN.")
+    return spec, None
+
+
+def _delivery_destination_spec(delivery_destination_arn):
+    try:
+        spec = parse_arn(delivery_destination_arn)
+    except ArnParseError:
+        return None, _validation_error("Invalid ARN provided.")
+    if spec.service != "logs" or not spec.resource.startswith("delivery-destination:"):
+        return None, _validation_error("Action logs:CreateDelivery should have a valid resource ARN to authorize against.")
+    if spec.region != get_region():
+        return None, _validation_error("Cross-region Delivery Destination is not supported. Please use a different region.")
+    if spec.account_id != get_account_id():
+        return None, error_response_json(
+            "AccessDeniedException",
+            f"User is not authorized to perform: logs:CreateDelivery on resource: {delivery_destination_arn}",
+            400,
+        )
+    return spec, None
 
 
 def _put_delivery_source(data):
@@ -993,7 +2479,10 @@ def _put_delivery_source(data):
 
     # AWS derives the service label from the resource ARN; ignore any
     # caller-supplied value.
-    derived_service = _derive_service_from_arn(resource_arn)
+    resource_spec, err = _delivery_source_spec(resource_arn)
+    if err:
+        return err
+    derived_service = resource_spec.service
 
     existing = _delivery_sources.get(name)
     if existing:
@@ -1002,6 +2491,8 @@ def _put_delivery_source(data):
         existing["service"] = derived_service
         if "tags" in data:
             existing["tags"] = dict(data["tags"])
+        if data.get("deliverySourceConfiguration") is not None:
+            existing["deliverySourceConfiguration"] = dict(data["deliverySourceConfiguration"])
         source = existing
     else:
         source = {
@@ -1012,6 +2503,8 @@ def _put_delivery_source(data):
             "service": derived_service,
             "tags": dict(data.get("tags", {})),
         }
+        if data.get("deliverySourceConfiguration") is not None:
+            source["deliverySourceConfiguration"] = dict(data["deliverySourceConfiguration"])
         _delivery_sources[name] = source
     return json_response({"deliverySource": _format_delivery_source(source)})
 
@@ -1024,6 +2517,8 @@ def _format_delivery_source(source):
         "service": source.get("service", ""),
         "logType": source.get("logType", ""),
         "tags": dict(source.get("tags", {})),
+        **({"deliverySourceConfiguration": dict(source["deliverySourceConfiguration"])}
+           if "deliverySourceConfiguration" in source else {}),
     }
 
 
@@ -1051,7 +2546,7 @@ def _delete_delivery_source(data):
 
 def _describe_delivery_sources(data):
     sources = [_format_delivery_source(s) for s in _delivery_sources.values()]
-    return json_response({"deliverySources": sources})
+    return _offset_paged(data, "deliverySources", sources)
 
 
 def _put_delivery_destination(data):
@@ -1069,6 +2564,9 @@ def _put_delivery_destination(data):
     # AWS derives deliveryDestinationType from the destination resource
     # ARN (s3 -> S3, logs -> CWL, firehose -> FH); callers cannot
     # override it.
+    _dest_resource_spec, err = _delivery_destination_resource_spec(destination_resource_arn)
+    if err:
+        return err
     derived_type = _derive_destination_type_from_arn(destination_resource_arn)
     if derived_type is None:
         return error_response_json(
@@ -1145,7 +2643,48 @@ def _delete_delivery_destination(data):
 
 def _describe_delivery_destinations(data):
     dests = [_format_delivery_destination(d) for d in _delivery_destinations.values()]
-    return json_response({"deliveryDestinations": dests})
+    return _offset_paged(data, "deliveryDestinations", dests)
+
+
+def _put_delivery_destination_policy(data):
+    name = data.get("deliveryDestinationName")
+    policy = data.get("deliveryDestinationPolicy")
+    if not name or not policy:
+        return error_response_json(
+            "ValidationException",
+            "deliveryDestinationName and deliveryDestinationPolicy are required.", 400,
+        )
+    dest = _delivery_destinations.get(name)
+    if not dest:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Delivery destination does not exist: {name}", 400,
+        )
+    dest["policy"] = policy
+    return json_response({"policy": {"deliveryDestinationPolicy": policy}})
+
+
+def _get_delivery_destination_policy(data):
+    name = data.get("deliveryDestinationName")
+    dest = _delivery_destinations.get(name)
+    if not dest or not dest.get("policy"):
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Delivery destination policy does not exist: {name}", 400,
+        )
+    return json_response({"policy": {"deliveryDestinationPolicy": dest["policy"]}})
+
+
+def _delete_delivery_destination_policy(data):
+    name = data.get("deliveryDestinationName")
+    dest = _delivery_destinations.get(name)
+    if not dest or not dest.get("policy"):
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Delivery destination policy does not exist: {name}", 400,
+        )
+    del dest["policy"]
+    return json_response({})
 
 
 def _create_delivery(data):
@@ -1155,11 +2694,10 @@ def _create_delivery(data):
         return error_response_json("ValidationException", "deliverySourceName is required.", 400)
     if not dest_arn:
         return error_response_json("ValidationException", "deliveryDestinationArn is required.", 400)
-    if source_name not in _delivery_sources:
-        return error_response_json(
-            "ResourceNotFoundException",
-            f"Delivery source does not exist: {source_name}", 400,
-        )
+
+    _dest_spec, err = _delivery_destination_spec(dest_arn)
+    if err:
+        return err
 
     # AWS rejects CreateDelivery unless the destination ARN resolves to a
     # destination we've previously recorded via PutDeliveryDestination —
@@ -1172,7 +2710,12 @@ def _create_delivery(data):
     if dest_type is None:
         return error_response_json(
             "ResourceNotFoundException",
-            f"Delivery destination does not exist: {dest_arn}", 400,
+            "Requested Delivery Destination does not exist in this account.", 400,
+        )
+    if source_name not in _delivery_sources:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Delivery source does not exist: {source_name}", 400,
         )
 
     # AWS allows at most one Delivery per (deliverySourceName,
@@ -1242,4 +2785,4 @@ def _delete_delivery(data):
 
 def _describe_deliveries(data):
     deliveries = [_format_delivery(d) for d in _deliveries.values()]
-    return json_response({"deliveries": deliveries})
+    return _offset_paged(data, "deliveries", deliveries)

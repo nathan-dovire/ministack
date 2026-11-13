@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """X.509 certificate utilities for Ministack.
 
 Generic crypto helpers for generating self-signed CAs, signing leaf
@@ -5,6 +7,13 @@ certificates, and computing certificate fingerprints. Used by the IoT
 service for its local CA and available for reuse by ACM, API Gateway
 custom domains, or any other service that needs local certificate
 operations.
+
+Certificates minted here are meant to be verified by ordinary clients, so
+they follow RFC 5280 rather than the minimum OpenSSL will tolerate: a leaf
+carries an Authority Key Identifier naming its issuer. Python 3.13 turns on
+``ssl.VERIFY_X509_STRICT`` in ``ssl.create_default_context()``, and a strict
+verifier rejects a leaf without one ("Missing Authority Key Identifier"). A
+self-signed CA is exempt and does not carry it.
 
 Requires the ``cryptography`` library (declared as part of ``[full]``
 optional deps). Functions raise ``RuntimeError`` with a clear message
@@ -15,27 +24,61 @@ from __future__ import annotations
 
 import datetime as _dt
 import hashlib
+import importlib.util
 import logging
+import warnings
 
 logger = logging.getLogger("x509_utils")
 
-try:
-    from cryptography import x509
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import ec, rsa
-    from cryptography.x509.oid import NameOID
-
-    HAS_CRYPTO = True
-except ImportError:  # pragma: no cover - exercised only when extras missing
-    HAS_CRYPTO = False
+# Imported on first use: `cryptography` is ~11 MiB that an idle server never needs.
+HAS_CRYPTO = importlib.util.find_spec("cryptography") is not None
+x509 = InvalidSignature = hashes = serialization = ec = rsa = NameOID = None
 
 
 def _require_crypto() -> None:
+    global x509, InvalidSignature, hashes, serialization, ec, rsa, NameOID
     if not HAS_CRYPTO:
         raise RuntimeError(
             "ministack.core.x509_utils requires the `cryptography` package. "
             "Install Ministack with `[full]` extras or add cryptography>=41.0."
         )
+    if x509 is None:
+        from cryptography import x509 as _x509
+        from cryptography.exceptions import InvalidSignature
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import ec, rsa
+        from cryptography.x509.oid import NameOID
+
+        x509 = _x509
+
+
+def generate_self_signed(
+    country: str,
+    locality: str,
+    common_name: str,
+    not_before: _dt.datetime,
+    not_after: _dt.datetime,
+) -> str:
+    """A self-signed certificate PEM for subject C/L/CN, valid from *not_before* to *not_after*."""
+    _require_crypto()
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([
+        x509.NameAttribute(NameOID.COUNTRY_NAME, country),
+        x509.NameAttribute(NameOID.LOCALITY_NAME, locality),
+        x509.NameAttribute(NameOID.COMMON_NAME, common_name),
+    ])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(not_before)
+        .not_valid_after(not_after)
+        .sign(private_key=key, algorithm=hashes.SHA256())
+    )
+    return cert.public_bytes(serialization.Encoding.PEM).decode("utf-8")
 
 
 def generate_ca(
@@ -107,6 +150,7 @@ def sign_leaf_certificate(
     san_ips: list[str] | None = None,
     days_valid: int = 825,
     key_type: str = "rsa2048",
+    subject_rdns: list[tuple[str, str]] | None = None,
 ) -> tuple[str, str, str]:
     """Generate a fresh keypair and sign a leaf certificate with the given CA.
 
@@ -118,6 +162,8 @@ def sign_leaf_certificate(
         san_ips: Optional list of IPv4/IPv6 strings to include as SubjectAltName.
         days_valid: Validity period in days (default 825, AWS-style).
         key_type: ``"rsa2048"`` (default) or ``"ec256"``.
+        subject_rdns: extra subject attributes after the CN, as
+            ``[("OU", "RDS"), ("O", "Amazon.com"), ...]`` in wire order.
 
     Returns:
         Tuple ``(cert_pem, private_key_pem, public_key_pem)``.
@@ -136,9 +182,20 @@ def sign_leaf_certificate(
     else:
         raise ValueError(f"Unsupported key_type: {key_type!r}")
 
-    subject = x509.Name([
-        x509.NameAttribute(NameOID.COMMON_NAME, common_name),
-    ])
+    _RDN_OIDS = {
+        "OU": NameOID.ORGANIZATIONAL_UNIT_NAME,
+        "O": NameOID.ORGANIZATION_NAME,
+        "L": NameOID.LOCALITY_NAME,
+        "ST": NameOID.STATE_OR_PROVINCE_NAME,
+        "C": NameOID.COUNTRY_NAME,
+    }
+    with warnings.catch_warnings():
+        # RDS ships the endpoint as CN, 105 bytes on a 63-char identifier.
+        warnings.simplefilter("ignore")
+        attributes = [x509.NameAttribute(NameOID.COMMON_NAME, common_name, _validate=False)]
+        for key, value in subject_rdns or []:
+            attributes.append(x509.NameAttribute(_RDN_OIDS[key], value))
+        subject = x509.Name(attributes)
     now = _dt.datetime.now(_dt.timezone.utc)
 
     builder = (
@@ -150,6 +207,12 @@ def sign_leaf_certificate(
         .not_valid_before(now - _dt.timedelta(minutes=1))
         .not_valid_after(now + _dt.timedelta(days=days_valid))
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        # RFC 5280 §4.2.1.1: a certificate that is not self-issued must name the
+        # key that signed it, and a strict verifier enforces it (see above).
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_cert.public_key()),
+            critical=False,
+        )
         .add_extension(
             x509.KeyUsage(
                 digital_signature=True,
@@ -200,6 +263,105 @@ def sign_leaf_certificate(
     return cert_pem, private_pem, public_pem
 
 
+def sign_certificate_request(ca_cert_pem: str, ca_key_pem: str, csr_pem: str) -> str:
+    """Issue a leaf certificate for a PEM CSR, signed by the given CA.
+
+    The certificate carries the CSR's subject and public key; the key never
+    leaves the caller. It is shaped like the certificates AWS IoT's
+    ``CreateCertificateFromCsr`` returns: not a CA, digital signature only,
+    valid until the end of 2049.
+
+    Raises:
+        ValueError: the CSR does not parse, its self-signature does not
+            verify, or its key is neither RSA of at least 2048 bits nor EC on
+            P-256, P-384 or P-521 (the keys AWS accepts).
+    """
+    _require_crypto()
+
+    try:
+        csr = x509.load_pem_x509_csr(csr_pem.encode("utf-8"))
+        valid = csr.is_signature_valid
+    except Exception as e:
+        raise ValueError(f"invalid CSR: {e}") from e
+    if not valid:
+        raise ValueError("invalid CSR: the signature does not verify")
+    key = csr.public_key()
+    if not (
+        (isinstance(key, rsa.RSAPublicKey) and key.key_size >= 2048)
+        or (isinstance(key, ec.EllipticCurvePublicKey) and key.curve.name in ("secp256r1", "secp384r1", "secp521r1"))
+    ):
+        raise ValueError("invalid CSR: the key type or size is not accepted")
+    ca_cert = x509.load_pem_x509_certificate(ca_cert_pem.encode("utf-8"))
+    ca_key = serialization.load_pem_private_key(ca_key_pem.encode("utf-8"), password=None)
+    now = _dt.datetime.now(_dt.timezone.utc)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(csr.subject)
+        .issuer_name(ca_cert.subject)
+        .public_key(csr.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - _dt.timedelta(minutes=1))
+        .not_valid_after(_dt.datetime(2049, 12, 31, 23, 59, 59, tzinfo=_dt.timezone.utc))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_cert.public_key()),
+            critical=False,
+        )
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(csr.public_key()), critical=False)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=False,
+                crl_sign=False,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .sign(private_key=ca_key, algorithm=hashes.SHA256())
+    )
+    return cert.public_bytes(serialization.Encoding.PEM).decode("utf-8")
+
+
+def certificate_is_signed_by(cert_pem: str, ca_cert_pem: str) -> bool:
+    """Return True when ``cert_pem`` carries a valid signature from ``ca_cert_pem``.
+
+    The issuer/subject distinguished names are compared first — cheap, and the
+    only discriminator when several CAs share a subject — and then the
+    signature itself is verified against the CA's public key.
+
+    This answers "did this CA issue this certificate", not "is this chain
+    trusted right now": validity dates, basic constraints and revocation are
+    deliberately not considered, matching what AWS IoT's ``RegisterCertificate``
+    needs to know about ``caCertificatePem``.
+
+    Args:
+        cert_pem: The leaf certificate in PEM format.
+        ca_cert_pem: The claimed issuing CA certificate in PEM format.
+
+    Returns:
+        True if the CA's key signed the leaf, False otherwise (including
+        unparseable input and unsupported signature algorithms).
+    """
+    _require_crypto()
+    try:
+        cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+        ca_cert = x509.load_pem_x509_certificate(ca_cert_pem.encode("utf-8"))
+    except Exception:
+        return False
+    if cert.issuer != ca_cert.subject:
+        return False
+    try:
+        cert.verify_directly_issued_by(ca_cert)
+    except (InvalidSignature, ValueError, TypeError):
+        return False
+    return True
+
+
 def get_certificate_id(cert_pem: str) -> str:
     """Return a stable 64-char hex identifier for a certificate.
 
@@ -210,3 +372,11 @@ def get_certificate_id(cert_pem: str) -> str:
     cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
     der = cert.public_bytes(serialization.Encoding.DER)
     return hashlib.sha256(der).hexdigest()
+
+
+def certificate_common_name(cert_pem: str) -> str | None:
+    """Return the subject common name of ``cert_pem``, or None when it has none."""
+    _require_crypto()
+    cert = x509.load_pem_x509_certificate(cert_pem.encode("utf-8"))
+    names = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+    return str(names[0].value) if names else None

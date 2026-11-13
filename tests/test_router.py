@@ -4,11 +4,31 @@ Pure routing-layer tests — no boto3, no live server. Covers the path-based
 fallback (i.e. when neither X-Amz-Target nor a SigV4 credential scope is
 available to disambiguate the service).
 """
+import os
+import subprocess
+import sys
+import textwrap
+
 import pytest
 
 from ministack.core.router import detect_service
 
 _HEADERS = {"host": "localhost:4566"}
+
+
+@pytest.mark.parametrize("action", [
+    "CreateReceiptRuleSet", "ListReceiptRuleSets", "DescribeReceiptRuleSet",
+    "DeleteReceiptRuleSet", "SetActiveReceiptRuleSet", "DescribeActiveReceiptRuleSet",
+    "CreateReceiptRule", "DescribeReceiptRule", "DeleteReceiptRule",
+])
+@pytest.mark.parametrize("method", ["GET", "POST"])
+def test_ses_receipt_actions_route_without_signature(action, method):
+    headers = dict(_HEADERS)
+    if method == "POST":
+        headers["content-type"] = "application/x-www-form-urlencoded"
+    # app.py passes parsed POST form parameters to the same router argument
+    # that holds GET query parameters.
+    assert detect_service(method, "/", headers, {"Action": [action], "Version": ["2010-12-01"]}) == "ses"
 
 
 @pytest.mark.parametrize("path", [
@@ -82,3 +102,548 @@ def test_lambda_credential_scope_still_routes_when_path_unknown():
         ),
     }
     assert detect_service("GET", "/2099-01-01/something-new", headers, {}) == "lambda"
+
+
+@pytest.mark.parametrize(("method", "path"), [
+    ("POST", "/2021-01-01/opensearch/domain/example/config"),
+    ("GET", "/2021-01-01/opensearch/domain/example"),
+    ("POST", "/2021-01-01/opensearch/domain-info"),
+    ("GET", "/2021-01-01/domain/example"),
+    ("GET", "/2021-01-01/versions"),
+    ("GET", "/2021-01-01/compatibleVersions"),
+    ("POST", "/2021-01-01/tags"),
+    ("POST", "/2021-01-01/tags-removal"),
+])
+def test_opensearch_management_paths_route_without_sigv4(method, path):
+    """OpenSearch custom-resource calls must not fall through to S3."""
+    assert detect_service(method, path, _HEADERS, {}) == "opensearch"
+
+
+def test_unknown_opensearch_version_path_still_falls_back_to_s3():
+    assert detect_service(
+        "POST", "/2021-01-01/not-opensearch/domain/example/config", _HEADERS, {}
+    ) == "s3"
+
+
+def _sigv4_headers(service):
+    return {
+        "host": "localhost:4566",
+        "authorization": (
+            "AWS4-HMAC-SHA256 "
+            f"Credential=test/20260811/us-east-1/{service}/aws4_request, "
+            "SignedHeaders=host, Signature=fake"
+        ),
+    }
+
+
+@pytest.mark.parametrize("path", [
+    "/2025-09-09/microvm-images",
+    "/2025-09-09/microvm-images/ministack/versions/1",
+    "/2025-09-09/microvms",
+    "/2025-09-09/microvms/microvm-123/terminate",
+])
+def test_lambda_microvm_paths_override_lambda_credential_scope(path):
+    """The AWS CLI signs Lambda MicroVM requests with the `lambda` scope.
+
+    The path must therefore win over the generic Lambda function router, or
+    `/2025-09-09/microvm-images` is treated as a Lambda function name.
+    """
+    assert detect_service("POST", path, _sigv4_headers("lambda"), {}) == "lambda-microvms"
+
+
+@pytest.mark.parametrize("path", [
+    "/2025-09-09/microvm-images",
+    "/2025-09-09/microvms",
+])
+def test_lambda_microvm_paths_route_without_signature(path):
+    assert detect_service("POST", path, _HEADERS, {}) == "lambda-microvms"
+
+
+def test_iot_jobs_data_credential_scope_routes():
+    """The SDK signs iot-jobs-data requests with the `iot-jobs-data` scope
+    (botocore signingName); the same path signed with `iot` must stay on the
+    control plane — GET /things/{t}/jobs is GetPendingJobExecutions on one
+    client and ListJobExecutionsForThing on the other."""
+    assert detect_service(
+        "GET", "/things/t1/jobs", _sigv4_headers("iot-jobs-data"), {}
+    ) == "iot-jobs-data"
+    assert detect_service("GET", "/things/t1/jobs", _sigv4_headers("iot"), {}) == "iot"
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        # The legacy iot:Jobs endpoint shape.
+        "a1b2c3.jobs.iot.us-east-1.localhost:4566",
+        # The spelling the AWS Device SDK's jobs documentation uses.
+        "a1b2c3.data.jobs.iot.us-east-1.localhost:4566",
+    ],
+)
+def test_iot_jobs_data_host_routes_before_iot(host):
+    """Both jobs-endpoint spellings also match the `iot\\.` regex — the
+    iot-jobs-data entry must win via pattern ordering, or the request lands on
+    the control plane where GET /things/{t}/jobs is a different operation."""
+    assert detect_service(
+        "GET", "/things/t1/jobs/$next", {"host": host}, {}
+    ) == "iot-jobs-data"
+
+
+# --- Step 5: host-header routing ------------------------------------------
+#
+# The ``host_patterns`` regexes are service tokens (``iot\.``, ``logs\.``,
+# ``email\.`` ...). They are consulted only for hosts the stack actually
+# serves, and each token has to sit at a label boundary. The expectations below
+# were captured from the router *before* the guard existed, so they pin that
+# AWS-shaped hosts route exactly as they always did.
+
+# ``<token>.<suffix>`` -> service, for every ``host_patterns`` entry whose
+# token can stand alone as the first label.
+_TOKEN_ROUTES = {
+    "account": "account", "acm": "acm", "airflow": "airflow", "aos": "opensearch",
+    "apigateway": "apigateway", "appconfig": "appconfig",
+    "appconfigdata": "appconfigdata", "appsync": "appsync",
+    "appsync-api": "appsync-events", "appsync-realtime-api": "appsync-events",
+    "athena": "athena", "autoscaling": "autoscaling", "backup": "backup",
+    "batch": "batch", "bedrock": "bedrock", "bedrock-runtime": "bedrock-runtime",
+    "budgets": "budgets",
+    "kinesisanalytics": "kinesisanalyticsv2",
+    "cloudcontrolapi": "cloudcontrol", "cloudformation": "cloudformation",
+    "cloudfront": "cloudfront", "cloudfront-kvs": "cloudfront-keyvaluestore",
+    "cloudtrail": "cloudtrail", "codebuild": "codebuild",
+    "cognito-identity": "cognito-identity", "cognito-idp": "cognito-idp",
+    "config": "config", "cur": "cur", "dsql": "dsql", "dynamodb": "dynamodb",
+    "ec2": "ec2", "ecr": "ecr", "ecs": "ecs", "eks": "eks",
+    "elasticache": "elasticache", "elasticfilesystem": "elasticfilesystem",
+    "elasticloadbalancing": "elasticloadbalancing",
+    "elasticmapreduce": "elasticmapreduce", "email": "ses", "es": "opensearch",
+    "events": "events", "execute-api": "apigateway", "firehose": "firehose",
+    "glue": "glue", "iam": "iam", "inspector2": "inspector2", "iot": "iot",
+    "kafka": "kafka", "kinesis": "kinesis", "kinesis-firehose": "firehose",
+    "kms": "kms", "lambda": "lambda", "lambda-microvms": "lambda-microvms",
+    "logs": "logs", "mediaconnect": "mediaconnect", "monitoring": "monitoring",
+    "mq": "mq", "opensearch": "opensearch", "organizations": "organizations",
+    "pipes": "pipes", "rds": "rds", "rds-data": "rds-data",
+    "resource-groups": "resource-groups", "route53": "route53", "s3": "s3",
+    "s3files": "s3files", "s3tables": "s3tables", "scheduler": "scheduler",
+    "secretsmanager": "secretsmanager", "servicediscovery": "servicediscovery",
+    "sns": "sns", "sqs": "sqs", "ssm": "ssm", "states": "states", "sts": "sts",
+    "tagging": "tagging", "transfer": "transfer", "waf": "waf", "wafv2": "wafv2",
+    "waf-regional": "waf-regional",
+    # multi-label tokens
+    "streams.dynamodb": "dynamodbstreams", "api.ecr": "ecr",
+    "jobs.iot": "iot-jobs-data", "data-ats.iot": "iot-data", "data.iot": "iot-data",
+    # tokens that are *not* a service by themselves — stay on the default
+    "email-smtp": "s3",
+}
+
+_SERVED_SUFFIXES = (
+    "eu-central-1.amazonaws.com",
+    "us-east-1.amazonaws.com",
+    "us-east-1.localhost:4566",
+    "localhost:4566",           # the short form: sts.localhost:4566
+)
+
+# A two-label alias (``s3.dev``, the LocalStack-era shape) is served as well;
+# only the single-label tokens fit it — ``streams.dynamodb.dev`` has three
+# labels and is a customer domain like any other.
+_ALIAS_SUFFIX = "dev"
+
+# Shapes that carry a resource id or a legacy/dualstack spelling in front of
+# the token, plus a few AWS hosts no pattern claims (must stay on the default).
+_EXPLICIT_HOST_ROUTES = [
+    ("mybucket.s3.eu-central-1.amazonaws.com", "s3"),
+    ("mybucket.s3.us-east-1.localhost:4566", "s3"),
+    ("mybucket.s3-eu-west-1.amazonaws.com", "s3"),
+    ("s3-eu-west-1.amazonaws.com", "s3"),
+    ("mybucket.s3-website-us-east-1.amazonaws.com", "s3"),
+    ("s3-fips.us-east-1.amazonaws.com", "s3"),
+    ("s3.cn-north-1.amazonaws.com.cn", "s3"),
+    ("sqs.cn-north-1.amazonaws.com.cn", "sqs"),
+    ("abcd1234.execute-api.eu-central-1.amazonaws.com", "apigateway"),
+    ("abcd1234.execute-api.localhost:4566", "apigateway"),
+    ("a1b2c3-ats.iot.eu-central-1.amazonaws.com", "iot"),
+    ("a1b2c3-ats.iot.us-east-1.localhost:4566", "iot"),
+    ("a1b2c3.credentials.iot.eu-central-1.amazonaws.com", "iot"),
+    ("a1b2c3.data-ats.iot.eu-central-1.amazonaws.com", "iot-data"),
+    ("a1b2c3.data.iot.eu-central-1.amazonaws.com", "iot-data"),
+    ("a1b2c3.jobs.iot.eu-central-1.amazonaws.com", "iot-jobs-data"),
+    ("a1b2c3.data.jobs.iot.eu-central-1.amazonaws.com", "iot-jobs-data"),
+    ("lambda-microvms.localhost:4566", "lambda-microvms"),
+    ("myfn.lambda-microvms.us-east-1.localhost:4566", "lambda-microvms"),
+    ("123456789012.dkr.ecr.eu-central-1.amazonaws.com", "ecr"),
+    ("abcd1234.appsync-api.eu-central-1.amazonaws.com", "appsync-events"),
+    ("abcd1234.appsync-realtime-api.eu-central-1.amazonaws.com", "appsync-events"),
+    ("waf.amazonaws.com", "waf"),
+    ("sts.amazonaws.com", "sts"),
+    ("iam.amazonaws.com", "iam"),
+    ("route53.amazonaws.com", "route53"),
+    ("cloudfront.amazonaws.com", "cloudfront"),
+    ("search-mydomain-abc.eu-central-1.es.amazonaws.com", "s3"),
+    ("vpc-mydomain.eu-central-1.es.amazonaws.com", "s3"),
+    ("mydomain.auth.eu-central-1.amazoncognito.com", "s3"),
+    ("queue.amazonaws.com", "s3"),
+    ("localhost:4566", "s3"),
+    ("localhost", "s3"),
+    ("127.0.0.1:4566", "s3"),
+    ("ministack:4566", "s3"),
+    ("ministack-core:4566", "s3"),
+    ("", "s3"),
+]
+
+
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        (f"{token}.{suffix}", svc)
+        for token, svc in _TOKEN_ROUTES.items()
+        for suffix in _SERVED_SUFFIXES
+    ]
+    + [
+        (f"{token}.{_ALIAS_SUFFIX}", svc)
+        for token, svc in _TOKEN_ROUTES.items()
+        if "." not in token
+    ]
+    + _EXPLICIT_HOST_ROUTES,
+)
+def test_aws_shaped_hosts_route_as_before(host, expected):
+    assert detect_service("GET", "/status", {"host": host}, {}) == expected
+
+
+@pytest.mark.parametrize("host", [
+    "abcd1234.appsync-api.eu-central-1.amazonaws.com",
+    "abcd1234.appsync-api.us-east-1.localhost:4566",
+    "abcd1234.appsync-api.localhost:4566",
+])
+@pytest.mark.parametrize("signed", [False, True])
+def test_appsync_api_hosts_route_graphql_to_appsync_and_event_to_events(host, signed):
+    headers = {"host": host}
+    if signed:
+        headers["authorization"] = (
+            "AWS4-HMAC-SHA256 Credential=test/20261012/us-east-1/appsync/aws4_request, "
+            "SignedHeaders=host, Signature=x"
+        )
+    assert detect_service("POST", "/graphql", headers, {}) == "appsync"
+    assert detect_service("POST", "/event", headers, {}) == "appsync-events"
+
+
+@pytest.mark.parametrize("host", [
+    "probe.iot.example.com",
+    "logs.example.com",
+    "email.corp.example",
+    "status.lambda.example.com",
+    "console.example.com",
+    "s3.iot-example.local",              # not served until the operator says so
+    "iot.example.com:4566",
+])
+def test_foreign_hosts_are_not_routed_by_service_token(host):
+    """A customer domain is never an AWS endpoint: a Host the stack does not
+    serve carries no routing information, however its labels are spelled."""
+    assert detect_service("GET", "/status", {"host": host}, {}) == "s3"
+
+
+def test_iotwireless_credential_scope_routes():
+    """boto3 signs GetPositionEstimate with the `iotwireless` scope
+    (botocore signingName); the scope early-return resolves it directly."""
+    assert detect_service(
+        "POST", "/position-estimate", _sigv4_headers("iotwireless"), {}
+    ) == "iotwireless"
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        # The real endpoint prefix: api.iotwireless.{region}.
+        "api.iotwireless.us-east-1.localhost:4566",
+        "iotwireless.us-east-1.localhost:4566",
+    ],
+)
+def test_iotwireless_host_routes(host):
+    assert detect_service(
+        "POST", "/position-estimate", {"host": host}, {}
+    ) == "iotwireless"
+
+
+def test_iotwireless_host_does_not_disturb_iot_family():
+    """`api.iotwireless.` never contains the literal `iot.` segment, so there
+    is no overlap with the iot control-plane regex in either direction — pin
+    that the iot family still resolves as before."""
+    assert detect_service(
+        "GET", "/things", {"host": "iot.us-east-1.localhost:4566"}, {}
+    ) == "iot"
+    assert detect_service(
+        "GET",
+        "/things/t1/jobs/$next",
+        {"host": "a1b2c3.jobs.iot.us-east-1.localhost:4566"},
+        {},
+    ) == "iot-jobs-data"
+
+
+def test_iotwireless_unsigned_path_routes_post_only():
+    """An unsigned POST resolves by path; a GET of the same path stays on the
+    S3 fallback (an object may legitimately be named `position-estimate`)."""
+    assert detect_service("POST", "/position-estimate", _HEADERS, {}) == "iotwireless"
+    assert detect_service("GET", "/position-estimate", _HEADERS, {}) == "s3"
+
+
+@pytest.mark.parametrize(("host", "expected"), [
+    ("s3.ministack:4566", "s3"),
+    ("iot.localhost:4566", "iot"),
+    ("sqs.dev", "sqs"),                # two labels: an alias, not a customer domain
+    ("dynamodb.dev:4566", "dynamodb"),
+    ("iot.127.0.0.1.nip.io", "s3"),    # a dotted name, not an IP literal
+    ("logs.ministack.internal", "s3"),  # three labels, not served
+])
+def test_guard_boundaries(host, expected):
+    assert detect_service("GET", "/status", {"host": host}, {}) == expected
+
+
+@pytest.mark.parametrize("host", [
+    "probe-iot.localhost:4566",         # token after a hyphen
+    "notlogs.localhost:4566",           # token inside a label
+    "myemail.us-east-1.localhost:4566",
+])
+def test_served_host_tokens_match_only_at_label_start(host):
+    assert detect_service("GET", "/status", {"host": host}, {}) == "s3"
+
+
+def test_served_host_prefers_the_multi_label_token():
+    # ``appconfig.`` used to also match ``config\.`` by substring; ordering
+    # saved it. With anchored tokens the second pattern no longer fires.
+    assert detect_service(
+        "GET", "/status", {"host": "appconfig.us-east-1.localhost:4566"}, {}
+    ) == "appconfig"
+
+
+def test_signer_credential_scope_routes():
+    """boto3 signs signer requests with credential scope `signer` (botocore
+    signingName) — the scope early-return must resolve it."""
+    assert detect_service(
+        "POST", "/signing-jobs", _sigv4_headers("signer"), {}
+    ) == "signer"
+    assert detect_service(
+        "GET", "/signing-profiles/prof1", _sigv4_headers("signer"), {}
+    ) == "signer"
+
+
+def test_signer_host_routes():
+    headers = {"host": "signer.us-east-1.localhost:4566"}
+    assert detect_service("GET", "/signing-jobs/9d2c58d6-4a1b-4c3d-8e5f-0a1b2c3d4e5f", headers, {}) == "signer"
+
+
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("POST", "/signing-jobs"),
+        ("GET", "/signing-jobs"),
+        ("GET", "/signing-jobs/9d2c58d6-4a1b-4c3d-8e5f-0a1b2c3d4e5f"),
+        ("PUT", "/signing-profiles/prof1"),
+        ("GET", "/signing-profiles/prof1"),
+    ],
+)
+def test_signer_unsigned_paths_route_by_prefix(method, path):
+    """Without SigV4 the default is S3 — the /signing-jobs and
+    /signing-profiles path rules must claim signer's REST-JSON surface
+    before that fallback."""
+    assert detect_service(method, path, _HEADERS, {}) == "signer"
+
+
+@pytest.mark.parametrize(("method", "path", "query"), [
+    # A key that is not a job id: DescribeSigningJob takes a uuid.
+    ("GET", "/signing-jobs/report.json", {}),
+    ("GET", "/signing-jobs/2026-09-09", {}),
+    # S3 marks its own listing and its multipart/delete POSTs in the query,
+    # and ListSigningJobs has none of those parameters.
+    ("GET", "/signing-jobs", {"list-type": "2"}),
+    ("GET", "/signing-jobs", {"prefix": "signed/"}),
+    ("POST", "/signing-jobs", {"delete": ""}),
+    ("POST", "/signing-jobs", {"uploads": ""}),
+])
+def test_signer_paths_leave_s3_traffic_alone(method, path, query):
+    """A bucket named exactly "signing-jobs" keeps the requests that carry an
+    S3 marker; only the shapes signer's own surface uses are claimed."""
+    assert detect_service(method, path, _HEADERS, query) == "s3"
+
+
+@pytest.mark.parametrize(("method", "path"), [
+    # Buckets that merely share the prefix.
+    ("GET", "/signing-jobs-archive"),
+    ("GET", "/signing-jobs-archive/report.json"),
+    ("PUT", "/signing-profiles-backup/dump.bin"),
+    # Verbs signer's surface doesn't serve, on the exact-named bucket.
+    ("PUT", "/signing-jobs/new-object"),
+    ("DELETE", "/signing-jobs/old-object"),
+    ("DELETE", "/signing-profiles/prof1"),
+    # Multi-segment object keys inside the exact-named bucket, and the
+    # bare list-bucket GET on "signing-profiles" (ListSigningProfiles is
+    # not implemented, so S3 keeps it).
+    ("GET", "/signing-jobs/path/to/object"),
+    ("GET", "/signing-profiles/nested/key"),
+    ("GET", "/signing-profiles"),
+])
+def test_signer_lookalike_s3_paths_stay_on_s3(method, path):
+    """Regression: `startswith("/signing-jobs")` hijacked unsigned path-style
+    S3 traffic for any bucket whose name starts with that prefix. The rules
+    are segment-anchored and method-limited now, so this traffic falls
+    through to the S3 default."""
+    assert detect_service(method, path, _HEADERS, {}) == "s3"
+
+
+@pytest.mark.parametrize("host", [
+    "ministack",
+    "ministack-core:4566",
+    "127.0.0.1:4566",
+    "[::1]:4566",
+])
+def test_stack_hosts_without_service_labels_fall_to_default(host):
+    assert detect_service("GET", "/status", {"host": host}, {}) == "s3"
+
+
+def test_ministack_host_env_is_a_served_suffix(monkeypatch):
+    monkeypatch.setenv("MINISTACK_HOST", "aws.dev.example")
+    assert detect_service("GET", "/status", {"host": "sqs.aws.dev.example:4566"}, {}) == "sqs"
+    assert detect_service(
+        "GET", "/status", {"host": "abcd1234.execute-api.aws.dev.example"}, {}
+    ) == "apigateway"
+    assert detect_service("GET", "/status", {"host": "sqs.other.example"}, {}) == "s3"
+
+
+def test_container_hostname_is_a_served_suffix(monkeypatch):
+    monkeypatch.setenv("HOSTNAME", "core-7f3a")
+    assert detect_service("GET", "/status", {"host": "sns.core-7f3a:4566"}, {}) == "sns"
+
+
+def test_location_credential_scope_routes():
+    """Amazon Location signs with credential scope `geo`, not `location`
+    (botocore signingName). Under an endpoint override the host carries no
+    `geo.` — the scope map is the only routing signal left."""
+    assert detect_service(
+        "POST", "/tracking/v0/trackers", _sigv4_headers("geo"), {}
+    ) == "location"
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        # The modeled per-operation host prefixes in front of geo.{region}:
+        # `cp.tracking.` on the tracker control plane...
+        "cp.tracking.geo.us-east-1.localhost:4566",
+        # ...and `tracking.` on the device-position data plane.
+        "tracking.geo.us-east-1.localhost:4566",
+    ],
+)
+def test_location_host_routes(host):
+    assert detect_service(
+        "POST", "/tracking/v0/trackers", {"host": host}, {}
+    ) == "location"
+
+
+# ---------------------------------------------------------------------------
+# What a request pulls in
+# ---------------------------------------------------------------------------
+
+
+def test_first_request_does_not_import_cloudformation():
+    """A request to any service must not load the CloudFormation package.
+
+    In a subprocess: the rest of the suite has imported everything already.
+    """
+    src = textwrap.dedent(
+        """
+        import asyncio, sys
+        from ministack.app import app
+
+        async def receive():
+            return {"type": "http.request", "body": b""}
+
+        async def send(message):
+            pass
+
+        for method in ("GET", "PUT", "POST"):
+            asyncio.run(app(
+                {"type": "http", "method": method, "path": "/",
+                 "query_string": b"", "headers": []},
+                receive, send,
+            ))
+        print(",".join(
+            m for m in ("ministack.services.cloudformation", "ministack.services.appsync", "graphql")
+            if m in sys.modules
+        ))
+        """
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", src],
+        capture_output=True,
+        text=True,
+        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        env={**os.environ, "IOT_MTLS_ENABLED": "0"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "", f"request imported {proc.stdout.strip()}"
+
+
+def test_cfn_signal_prefix_matches_wait_conditions():
+    """Guards the literal in app.py against drifting from the module."""
+    from ministack.services.cloudformation import wait_conditions
+
+    assert wait_conditions.SIGNAL_PATH == "/_ministack/cfn-signal/"
+
+
+_SIGV4_AUTH = (
+    "AWS4-HMAC-SHA256 Credential=AKID/20261012/{region}/s3/aws4_request, "
+    "SignedHeaders=host, Signature=abc"
+)
+_SIGV4A_AUTH = (
+    "AWS4-ECDSA-P256-SHA256 Credential=AKID/20261012/s3/aws4_request, "
+    "SignedHeaders=host;x-amz-region-set, Signature=abc"
+)
+
+
+@pytest.mark.parametrize("headers,query,expected", [
+    ({"authorization": _SIGV4_AUTH.format(region="eu-west-1")}, None, "eu-west-1"),
+    ({}, {"X-Amz-Algorithm": ["AWS4-HMAC-SHA256"],
+          "X-Amz-Credential": ["AKID/20261012/ap-south-1/s3/aws4_request"]}, "ap-south-1"),
+    ({}, {"X-Amz-Credential": ["AKID/20261012/us-west-2/appsync/aws4_request"]}, "us-west-2"),
+    ({}, {"X-Amz-Credential": ["AKID/20261012/s3/aws4_request"]}, None),
+    ({"authorization": _SIGV4A_AUTH, "x-amz-region-set": "eu-west-1"}, None, "eu-west-1"),
+    ({"authorization": _SIGV4A_AUTH, "x-amz-region-set": "*"}, None, None),
+    ({"authorization": _SIGV4A_AUTH, "x-amz-region-set": "us-east-1,eu-west-1"}, None, None),
+    ({"authorization": _SIGV4A_AUTH}, None, None),
+    ({}, {"X-Amz-Algorithm": ["AWS4-ECDSA-P256-SHA256"],
+          "X-Amz-Credential": ["AKID/20261012/s3/aws4_request"],
+          "X-Amz-Region-Set": ["us-west-2"]}, "us-west-2"),
+    ({}, {"X-Amz-Algorithm": ["AWS4-ECDSA-P256-SHA256"],
+          "X-Amz-Credential": ["AKID/20261012/s3/aws4_request"],
+          "X-Amz-Region-Set": ["*"]}, None),
+    ({"authorization": "AWS AKID:signature"}, None, None),
+    ({}, {"AWSAccessKeyId": ["AKID"], "Signature": ["x"]}, None),
+    ({}, None, None),
+    ({"authorization": "AWS4-HMAC-SHA256 Credential=AKID/20261012/s3/aws4_request"}, None, None),
+])
+def test_extract_signed_region(headers, query, expected):
+    from ministack.core.router import extract_signed_region
+
+    assert extract_signed_region(headers, query) == expected
+
+
+def test_extract_region_never_returns_the_service_for_sigv4a(monkeypatch):
+    """A SigV4a scope has no region segment; it used to yield region "s3"."""
+    from ministack.core.router import extract_region
+
+    monkeypatch.delenv("MINISTACK_REGION", raising=False)
+    assert extract_region({"authorization": _SIGV4A_AUTH, "x-amz-region-set": "*"}) == "us-east-1"
+    query = {"X-Amz-Algorithm": ["AWS4-ECDSA-P256-SHA256"],
+             "X-Amz-Credential": ["AKID/20261012/s3/aws4_request"]}
+    assert extract_region({}, query) == "us-east-1"
+    monkeypatch.setenv("MINISTACK_REGION", "eu-central-1")
+    assert extract_region({}, query) == "eu-central-1"
+    assert extract_region({"authorization": _SIGV4_AUTH.format(region="sa-east-1")}) == "sa-east-1"
+
+
+def test_extract_access_key_id_reads_sigv4a_credentials():
+    """A SigV4a header or presigned URL names its key, as SigV4 does; the server sets the account from it with AUTH unset too."""
+    from ministack.core.router import extract_access_key_id
+
+    assert extract_access_key_id({"authorization": _SIGV4A_AUTH, "x-amz-region-set": "*"}) == "AKID"
+    query = {"X-Amz-Algorithm": ["AWS4-ECDSA-P256-SHA256"],
+             "X-Amz-Credential": ["AKID/20261012/s3/aws4_request"]}
+    assert extract_access_key_id({}, query) == "AKID"

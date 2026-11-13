@@ -1,17 +1,24 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 AWS Response formatting utilities.
 Handles XML responses (S3, SQS, SNS, IAM, STS, CloudWatch) and
 JSON responses (DynamoDB, Lambda, SecretsManager, CloudWatch Logs).
 """
 
+import contextlib
 import contextvars
+import functools
 import hashlib
 import json
+import logging
 import os
 import re
 import uuid
 from datetime import datetime, timezone
 from xml.etree.ElementTree import Element, SubElement, tostring
+
+from ministack.core.arn import ArnParseError, parse_arn
 
 # Request-scoped account ID for multi-tenancy.
 # Set per-request in app.py from the Authorization header.
@@ -23,16 +30,49 @@ _request_account_id: contextvars.ContextVar[str] = contextvars.ContextVar(
 _12_DIGIT_RE = re.compile(r"^\d{12}$")
 
 
+def _account_from_sts_session(access_key_id: str):
+    """The account an STS session belongs to, or None if this is not a session key.
+
+    An assumed-role session's key is ``ASIA...``, not 12 digits, so without this it falls to the
+    default account and the session operates in the WRONG TENANT: it sees none of the resources in
+    the account whose role it assumed, and any write lands in the default account instead. That
+    makes cross-account access — the ordinary way one account reaches another's resources —
+    silently not work, while AssumeRole itself reports success.
+
+    Imported lazily because `services.sts` imports this module.
+    """
+    try:
+        from ministack.services import sts as sts_svc
+
+        session = sts_svc._sessions.get(access_key_id)
+        if not session:
+            return None
+        # arn:aws:sts::<account>:assumed-role/<role>/<session>
+        parts = str(session.get("Arn", "")).split(":")
+        if len(parts) > 4 and _12_DIGIT_RE.match(parts[4]):
+            return parts[4]
+    except Exception:
+        pass
+    return None
+
+
 def set_request_account_id(access_key_id: str) -> None:
     """Set the account ID for the current request from the access key.
     If the access key is a 12-digit number, use it as the account ID.
+    An STS session key resolves to the account of the role it assumed.
     Otherwise fall back to the MINISTACK_ACCOUNT_ID env var or 000000000000."""
     if access_key_id and _12_DIGIT_RE.match(access_key_id):
         _request_account_id.set(access_key_id)
-    else:
-        _request_account_id.set(
-            os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
-        )
+        return
+
+    assumed = _account_from_sts_session(access_key_id) if access_key_id else None
+    if assumed:
+        _request_account_id.set(assumed)
+        return
+
+    _request_account_id.set(
+        os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
+    )
 
 
 def get_account_id() -> str:
@@ -61,6 +101,42 @@ def set_request_region(region: str | None) -> None:
 def get_region() -> str:
     """Return the region for the current request."""
     return _request_region.get()
+
+
+# Request-scoped caller address, for records that report where a request came from.
+_request_client_ip: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "_request_client_ip",
+    default="127.0.0.1",
+)
+
+
+def set_request_client_ip(address: str) -> None:
+    """Set the caller's address for the current request."""
+    _request_client_ip.set(address)
+
+
+def get_request_client_ip() -> str:
+    """Return the caller's address for the current request."""
+    return _request_client_ip.get()
+
+
+@contextlib.contextmanager
+def request_scope(account_id: str, region: str):
+    """Pin the request-scoped account and region around a block that reaches
+    into another service's store.
+
+    Cross-service work that starts outside an HTTP request — a background poller,
+    an MQTT broker session, an event dispatcher — has no request scope of its own,
+    but the stores it writes to are scoped by these contextvars. Such a caller
+    knows the account and region it is acting for and pins them here.
+    """
+    account_token = _request_account_id.set(account_id)
+    region_token = _request_region.set(region)
+    try:
+        yield
+    finally:
+        _request_region.reset(region_token)
+        _request_account_id.reset(account_token)
 
 
 class AccountScopedDict:
@@ -109,18 +185,32 @@ class AccountScopedDict:
         return self._scoped(key) in self._data
 
     def __len__(self):
-        return sum(1 for k in self._data if self._is_mine(k))
+        # Snapshot: a concurrent insert during a live walk raises
+        # RuntimeError("dictionary changed size during iteration").
+        return sum(1 for k in list(self._data) if self._is_mine(k))
 
     def __bool__(self):
-        return any(self._is_mine(k) for k in self._data)
+        return any(self._is_mine(k) for k in list(self._data))
 
     def __iter__(self):
-        for k in self._data:
+        for k in list(self._data):
             if self._is_mine(k):
                 yield self._unscope(k)
 
     def get(self, key, default=None):
         return self._data.get(self._scoped(key), default)
+
+    def get_scoped(self, account_id, region, key, default=None):
+        return self._data.get((account_id, key), default)
+
+    def set_scoped(self, account_id, region, key, value):
+        self._data[(account_id, key)] = value
+
+    def contains_scoped(self, account_id, region, key):
+        return (account_id, key) in self._data
+
+    def pop_scoped(self, account_id, region, key, *args):
+        return self._data.pop((account_id, key), *args)
 
     def pop(self, key, *args):
         return self._data.pop(self._scoped(key), *args)
@@ -129,13 +219,13 @@ class AccountScopedDict:
         return self._data.setdefault(self._scoped(key), default)
 
     def keys(self):
-        return [self._unscope(k) for k in self._data if self._is_mine(k)]
+        return [self._unscope(k) for k in list(self._data) if self._is_mine(k)]
 
     def values(self):
-        return [v for k, v in self._data.items() if self._is_mine(k)]
+        return [v for k, v in list(self._data.items()) if self._is_mine(k)]
 
     def items(self):
-        return [(self._unscope(k), v) for k, v in self._data.items() if self._is_mine(k)]
+        return [(self._unscope(k), v) for k, v in list(self._data.items()) if self._is_mine(k)]
 
     def update(self, other):
         if isinstance(other, AccountScopedDict):
@@ -162,6 +252,175 @@ class AccountScopedDict:
 
     def __repr__(self):
         return f"AccountScopedDict({dict(self.items())})"
+
+
+class AccountRegionScopedDict:
+    """A dict-like container that namespaces keys by account ID and region.
+
+    This mirrors ``AccountScopedDict`` while adding the current request region
+    to the internal key. It lets regional services keep their existing module
+    stores and dict operations while preventing same-name regional resources
+    from colliding or leaking across requests.
+    """
+
+    __slots__ = ("_data",)
+
+    def __init__(self):
+        self._data: dict = {}
+
+    # -- internal helpers --------------------------------------------------
+
+    def _scoped(self, key):
+        return (get_account_id(), get_region(), key)
+
+    def _unscope(self, scoped_key):
+        return scoped_key[2]
+
+    def _prefix(self):
+        return (get_account_id(), get_region())
+
+    def _is_mine(self, scoped_key):
+        return scoped_key[:2] == self._prefix()
+
+    # -- dict interface ----------------------------------------------------
+
+    def __setitem__(self, key, value):
+        self._data[self._scoped(key)] = value
+
+    def __getitem__(self, key):
+        return self._data[self._scoped(key)]
+
+    def __delitem__(self, key):
+        del self._data[self._scoped(key)]
+
+    def __contains__(self, key):
+        return self._scoped(key) in self._data
+
+    def __len__(self):
+        # Snapshot: a concurrent insert during a live walk raises
+        # RuntimeError("dictionary changed size during iteration").
+        return sum(1 for k in list(self._data) if self._is_mine(k))
+
+    def __bool__(self):
+        return any(self._is_mine(k) for k in list(self._data))
+
+    def __iter__(self):
+        for k in list(self._data):
+            if self._is_mine(k):
+                yield self._unscope(k)
+
+    def get(self, key, default=None):
+        return self._data.get(self._scoped(key), default)
+
+    def get_scoped(self, account_id, region, key, default=None):
+        return self._data.get((account_id, region, key), default)
+
+    def set_scoped(self, account_id, region, key, value):
+        self._data[(account_id, region, key)] = value
+
+    def contains_scoped(self, account_id, region, key):
+        return (account_id, region, key) in self._data
+
+    def pop_scoped(self, account_id, region, key, *args):
+        return self._data.pop((account_id, region, key), *args)
+
+    def pop(self, key, *args):
+        return self._data.pop(self._scoped(key), *args)
+
+    def setdefault(self, key, default=None):
+        return self._data.setdefault(self._scoped(key), default)
+
+    def keys(self):
+        return [self._unscope(k) for k in list(self._data) if self._is_mine(k)]
+
+    def values(self):
+        return [v for k, v in list(self._data.items()) if self._is_mine(k)]
+
+    def items(self):
+        return [(self._unscope(k), v) for k, v in list(self._data.items()) if self._is_mine(k)]
+
+    def values_scoped(self, account_id, region):
+        return [v for k, v in list(self._data.items()) if k[:2] == (account_id, region)]
+
+    def items_scoped(self, account_id, region):
+        return [(self._unscope(k), v) for k, v in list(self._data.items()) if k[:2] == (account_id, region)]
+
+    def all_values(self):
+        return list(self._data.values())
+
+    def all_items(self):
+        return list(self._data.items())
+
+    def has_any(self):
+        return bool(self._data)
+
+    def _region_for_legacy_value(self, key, value):
+        return (
+            _best_effort_region_from_arnish(key)
+            or _best_effort_region_from_arnish(value)
+            or get_region()
+        )
+
+    def update(self, other):
+        if isinstance(other, AccountRegionScopedDict):
+            self._data.update(other._data)
+        elif isinstance(other, AccountScopedDict):
+            for (account_id, key), value in other._data.items():
+                region = self._region_for_legacy_value(key, value)
+                self._data[(account_id, region, key)] = value
+        elif isinstance(other, dict):
+            for k, v in other.items():
+                region = self._region_for_legacy_value(k, v)
+                self._data[(get_account_id(), region, k)] = v
+
+    def clear(self):
+        """Clear ALL accounts' and regions' data (used by reset)."""
+        self._data.clear()
+
+    def to_dict(self):
+        """Convert ALL accounts' and regions' data to a plain dict."""
+        return dict(self._data)
+
+    @classmethod
+    def from_dict(cls, data):
+        """Restore from a plain dict produced by to_dict()."""
+        obj = cls()
+        obj._data = dict(data)
+        return obj
+
+    def __repr__(self):
+        return f"AccountRegionScopedDict({dict(self.items())})"
+
+
+def _best_effort_region_from_arnish(value):
+    """Find a region in legacy persisted data without validating request input."""
+    if isinstance(value, str):
+        if not value.startswith("arn:"):
+            return None
+        try:
+            region = parse_arn(value).region
+        except ArnParseError:
+            return None
+        return region or None
+
+    if isinstance(value, dict):
+        for key, candidate in value.items():
+            if isinstance(key, str) and key.lower().endswith("arn"):
+                region = _best_effort_region_from_arnish(candidate)
+                if region:
+                    return region
+        for candidate in value.values():
+            region = _best_effort_region_from_arnish(candidate)
+            if region:
+                return region
+        return None
+
+    if isinstance(value, (list, tuple, set)):
+        for candidate in value:
+            region = _best_effort_region_from_arnish(candidate)
+            if region:
+                return region
+    return None
 
 
 def xml_response(root_tag: str, namespace: str, children: dict, status: int = 200) -> tuple:
@@ -199,10 +458,127 @@ def _dict_to_xml(parent: Element, data):
         parent.text = data
 
 
-def json_response(data: dict, status: int = 200) -> tuple:
-    """Build an AWS-style JSON response."""
+# Response/error body content types. The json protocol (awsJson1.0/1.1) answers
+# `application/x-amz-json-1.0`; a rest-json service answers `application/json`.
+JSON_1_0_CONTENT_TYPE = "application/x-amz-json-1.0"
+REST_JSON_CONTENT_TYPE = "application/json"
+
+
+@functools.lru_cache(maxsize=None)
+def _service_model(service: str):
+    import botocore.session
+
+    return botocore.session.get_session().get_service_model(service)
+
+
+def to_output_shape(service: str, shape_name: str, value):
+    """*value* with only the members the botocore output shape has, recursively (JSON protocols)."""
+    return _trim_to_shape(_service_model(service).shape_for(shape_name), value)
+
+
+def _trim_to_shape(shape, value):
+    if shape.type_name == "structure" and isinstance(value, dict):
+        return {k: _trim_to_shape(shape.members[k], v) for k, v in value.items() if k in shape.members}
+    if shape.type_name == "list" and isinstance(value, list):
+        return [_trim_to_shape(shape.member, v) for v in value]
+    if shape.type_name == "map" and isinstance(value, dict):
+        return {k: _trim_to_shape(shape.value, v) for k, v in value.items()}
+    return value
+
+
+# Query-protocol request parsing, shared by the Query/XML services. A form body is flattened by parse_qs into
+# {key: [values]}; query_value reads one member back, typed by its botocore shape. The member.N index rules are
+# AWS's Query front end, not any one service's.
+
+def param(params, key, default=""):
+    """The first value of *key* in a ``parse_qs`` dict (a repeated key keeps its first value, as AWS does)."""
+    val = params.get(key, [default])
+    return (val[0] if val else default) if isinstance(val, list) else val
+
+
+def query_value(params, prefix, shape):
+    """A Query-protocol member under *prefix*, typed by its botocore shape, or None when absent."""
+    if shape.type_name == "structure":
+        out = {}
+        for member, member_shape in shape.members.items():
+            value = query_value(params, f"{prefix}.{member}", member_shape)
+            if value is not None:
+                out[member] = value
+        return out or None
+    if shape.type_name == "list":
+        items, i = [], 1
+        while (value := query_value(params, f"{prefix}.member.{i}", shape.member)) is not None:
+            items.append(value)
+            i += 1
+        return items or None
+    if shape.type_name == "map":
+        out, i = {}, 1
+        while f"{prefix}.entry.{i}.key" in params:
+            out[param(params, f"{prefix}.entry.{i}.key")] = query_value(params, f"{prefix}.entry.{i}.value",
+                                                                         shape.value)
+            i += 1
+        return out or None
+    if prefix not in params:
+        return None
+    raw = param(params, prefix)
+    if shape.type_name in ("integer", "long"):
+        return int(raw)
+    if shape.type_name in ("double", "float"):
+        return float(raw)
+    if shape.type_name == "boolean":
+        return raw.lower() == "true"
+    return raw
+
+
+# AWS reads a member index below 999,999,999 as a position (sparse-list error above a gap of 10) and refuses
+# 999,999,999 and above as "Index N is illegal" (captured on Auto Scaling, us-east-2, 2026-11-06). The range
+# between 99,999,999 and 999,999,999 is not captured, so the sparse error is kept there.
+MAX_LISTED_DIGITS = 9
+
+INTEGER = re.compile(r"-?[0-9]+")
+DECIMAL = re.compile(r"-?([0-9]+\.?[0-9]*|\.[0-9]+)")
+
+
+def member_index(text):
+    """The number of a ``member.N`` index, or None when AWS calls it illegal. Compared as text, never through
+    int(): the digit string is untrusted and can be thousands long."""
+    significant = text.lstrip("0")
+    if len(significant) > MAX_LISTED_DIGITS or significant == "9" * MAX_LISTED_DIGITS:
+        return None
+    return int(text)
+
+
+def member_numbering_error(indexes, illegal=None):
+    """``(code, message)`` for a list's ``member.N`` numbering AWS refuses, or None.
+
+    Index 0 is refused, and so is a gap that skips 11 or more list elements: with the present indexes sorted
+    ascending and the previous one starting at 1, an index i after p skips i - p. The count carries thousands
+    separators, and the first offending gap in ascending order is reported. *illegal* is the first index
+    ``member_index`` refused, as sent.
+    """
+    if 0 in indexes:
+        return "MalformedInput", "0 is not a valid index"
+    previous = 1
+    for index in sorted(indexes):
+        if index - previous >= 11:
+            return "MalformedInput", f"Excessively sparse input would skip {index - previous:,} list elements"
+        previous = index
+    if illegal:
+        return "MalformedInput", f"Index {illegal} is illegal"
+    return None
+
+
+def json_response(data: dict, status: int = 200, *,
+                  content_type: str = JSON_1_0_CONTENT_TYPE) -> tuple:
+    """Build an AWS-style JSON response.
+
+    `content_type` follows the service's protocol: the json protocol answers
+    `application/x-amz-json-1.0` (the default here), while a rest-json service
+    answers `application/json`. SDKs pick their parser from the service model
+    rather than this header, so it is about matching the wire.
+    """
     body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-    return status, {"Content-Type": "application/x-amz-json-1.0"}, body
+    return status, {"Content-Type": content_type}, body
 
 
 def error_response_xml(code: str, message: str, status: int, namespace: str = "http://s3.amazonaws.com/doc/2006-03-01/") -> tuple:
@@ -222,22 +598,246 @@ def error_response_xml(code: str, message: str, status: int, namespace: str = "h
     return status, {"Content-Type": "application/xml"}, body
 
 
-def error_response_json(code: str, message: str, status: int = 400) -> tuple:
+def error_response_json(code: str, message: str, status: int = 400, extra: dict | None = None,
+                        *, message_key: str = "message",
+                        content_type: str = JSON_1_0_CONTENT_TYPE) -> tuple:
     """AWS-style JSON error response.
 
     Real AWS emits the error type in BOTH the body (`__type`) and the
     `x-amzn-errortype` response header. Java/Go SDK v2 prefer the header;
     boto3 reads the body. Send both.
+
+    `extra` carries the modeled members some exceptions add to the body (for
+    example `resourceId` / `resourceArn` on `ResourceAlreadyExistsException`),
+    so callers never have to rebuild the envelope themselves.
+
+    `message_key` is the wire name of the message member, which is NOT the same
+    across services: it is whatever the exception shape declares, after any
+    `locationName`. Most json-protocol services model `message`, which is why
+    that is the default, but for example iotwireless models `Message`. boto3
+    finds either; Java/Go SDK v2 unmarshal by the modeled name, so the wrong
+    casing loses the message there. Pull the shape before overriding this.
+
+    `content_type` likewise: `application/x-amz-json-1.0` suits the json
+    protocol, while a rest-json service answers `application/json`. Both SDK
+    and boto3 pick their parser from the service model rather than this header,
+    so it is about matching the wire, not about parsing.
     """
     data = {
         "__type": code,
-        "message": message,
+        message_key: message,
     }
+    if extra:
+        data.update(extra)
     body = json.dumps(data, ensure_ascii=False).encode("utf-8")
     return status, {
-        "Content-Type": "application/x-amz-json-1.0",
+        "Content-Type": content_type,
         "x-amzn-errortype": code,
     }, body
+
+
+class StreamingResponse:
+    """Marker body for long-lived HTTP responses (chunked ASGI ``more_body``).
+
+    Handlers return ``(status, headers, StreamingResponse(runner))``. The ASGI
+    app sends ``http.response.start`` with whatever headers the handler set,
+    then awaits ``runner(send, receive)``. The runner should emit
+    ``http.response.body`` frames with ``more_body=True`` and finish with
+    ``more_body=False``; a runner that cannot finish the body should leave the
+    final frame unsent so the client sees a truncated response.
+    """
+
+    __slots__ = ("runner",)
+
+    def __init__(self, runner):
+        self.runner = runner
+
+
+# ---------------------------------------------------------------------------
+# Envelope Content-Type normalization
+#
+# Real AWS picks a response envelope's Content-Type from the *service's
+# protocol*, not from a generic default — and services disagree: DynamoDB
+# answers ``application/x-amz-json-1.0`` while Kinesis answers
+# ``application/x-amz-json-1.1``; query-protocol services answer
+# ``text/xml`` while EC2 answers ``text/xml;charset=UTF-8``. The botocore
+# service model carries everything needed to reproduce this: ``protocol``
+# and ``jsonVersion``. Small override tables cover wire quirks the model
+# does not declare.
+#
+# Evidence: real AWS wire captures diffed per service — error-path values
+# from a us-east-1 sweep, success-path values from a us-east-1/us-west-2/
+# eu-west-1/ap-southeast-2 sweep. The model values below matched the
+# captured Content-Type on every probed service.
+# ---------------------------------------------------------------------------
+
+# Ministack registry/service names that differ from the botocore client name.
+_BOTOCORE_NAME = {
+    "states": "stepfunctions",
+    "monitoring": "cloudwatch",
+    "elasticloadbalancing": "elbv2",
+    "airflow": "mwaa",
+    "elasticmapreduce": "emr",
+    "tagging": "resourcegroupstaggingapi",
+}
+
+# Wire-observed Content-Types that contradict what the model implies.
+#   sesv2 — rest-json service, but AWS emits application/x-amz-json-1.1 on
+#           errors (capture: get_email_identity 404). Error-path only: its
+#           successes answer application/json like any rest-json service,
+#           so this override does not apply to success envelopes.
+#   s3    — rest-xml, but S3 answers application/xml where the other
+#           rest-xml services (route53) answer text/xml.
+_WIRE_CT_OVERRIDE = {
+    "sesv2": "application/x-amz-json-1.1",
+    "s3": "application/xml",
+}
+
+# Success-path overrides. The s3 quirk holds on both paths; sesv2's does
+# not (see above), so it is absent here.
+#   monitoring — declared ``smithy-rpc-v2-cbor`` in newer botocore, but
+#              MiniStack also serves its query-compatible JSON mode,
+#              which AWS answers as application/x-amz-json-1.0 (real-AWS
+#              capture). Same-family scoping keeps the XML query path on
+#              the model-independent text/xml below.
+_WIRE_CT_SUCCESS_OVERRIDE = {
+    "s3": "application/xml",
+    "monitoring": "application/x-amz-json-1.0",
+}
+
+_JSON_FAMILY = {
+    "application/json",
+    "application/x-amz-json-1.0",
+    "application/x-amz-json-1.1",
+}
+_XML_FAMILY = {"application/xml", "text/xml"}
+
+
+@functools.lru_cache(maxsize=None)
+def _service_model(service: str):
+    """The botocore service model for a ministack service name, or None."""
+    try:
+        import botocore.session
+    except ImportError:
+        return None
+    name = _BOTOCORE_NAME.get(service, service)
+    try:
+        return botocore.session.get_session().get_service_model(name)
+    except Exception:
+        return None
+
+
+def _family_of(ct_base: str):
+    """The envelope family ``ct_base`` belongs to, or None for payload
+    types (``application/octet-stream``, ``image/*``, ``text/plain``, ...)."""
+    if ct_base in _JSON_FAMILY:
+        return _JSON_FAMILY
+    if ct_base in _XML_FAMILY:
+        return _XML_FAMILY
+    return None
+
+
+def _expected_envelope_content_type(service: str, emitted_ct: str,
+                                    overrides: dict) -> str | None:
+    """The Content-Type real AWS emits for this service's envelopes.
+
+    ``emitted_ct`` decides which family to correct within: a service that
+    answered an XML envelope gets the XML value for its protocol, a JSON
+    envelope gets the JSON value. ``overrides`` is the path-appropriate
+    wire-quirk table; an override only applies inside its own family (the
+    s3 override must not turn a JSON success/error into XML). Returns None
+    when there is nothing evidence-backed to enforce (unknown service,
+    non-envelope type, or a family the model does not wire-map — e.g. a
+    JSON body from a declared-cbor service served as query-compatible
+    JSON).
+    """
+    base = emitted_ct.split(";", 1)[0].strip().lower()
+    override = overrides.get(service)
+    if override is not None and _family_of(base) is _family_of(override):
+        return override
+
+    model = _service_model(service)
+    if model is None:
+        return None
+    protocol = model.metadata.get("protocol")
+
+    if base in _JSON_FAMILY:
+        if protocol == "json":
+            version = model.metadata.get("jsonVersion") or "1.0"
+            return f"application/x-amz-json-{version}"
+        if protocol == "rest-json":
+            return "application/json"
+        return None
+    if base in _XML_FAMILY:
+        # A declared-cbor service that emitted an XML envelope is serving
+        # its legacy Query API mode (cloudwatch is the case in point) —
+        # AWS's query endpoint answers text/xml there like any other
+        # query-protocol service.
+        if protocol in ("query", "smithy-rpc-v2-cbor"):
+            return "text/xml"
+        if protocol == "ec2":
+            return "text/xml;charset=UTF-8"
+        if protocol == "rest-xml":
+            return "text/xml"  # s3's application/xml is the override above
+    return None
+
+
+def expected_error_content_type(service: str, emitted_ct: str) -> str | None:
+    """The Content-Type real AWS emits for this service's error envelope."""
+    return _expected_envelope_content_type(service, emitted_ct, _WIRE_CT_OVERRIDE)
+
+
+def expected_success_content_type(service: str, emitted_ct: str) -> str | None:
+    """The Content-Type real AWS emits for this service's success envelope.
+
+    An emitted ``text/xml`` is already wire-final and is never rewritten:
+    on an API envelope it is the correct value (route53, cloudfront), and
+    on e.g. an S3 object stored with a ``text/xml`` Content-Type it is
+    payload that the s3 override would otherwise corrupt to
+    ``application/xml``.
+    """
+    base = emitted_ct.split(";", 1)[0].strip().lower()
+    if base == "text/xml":
+        return None
+    return _expected_envelope_content_type(service, emitted_ct,
+                                           _WIRE_CT_SUCCESS_OVERRIDE)
+
+
+def fix_error_content_type(service: str, status: int, headers: dict) -> None:
+    """Rewrite ``headers['Content-Type']`` in place when an error envelope
+    carries the wrong wire value for the service's protocol.
+
+    Scoped to error responses: success payloads (e.g. an S3 object that
+    happens to be JSON) must never be rewritten by the error table.
+    """
+    if status < 400:
+        return
+    emitted = headers.get("Content-Type", "")
+    if not emitted:
+        return
+    expected = expected_error_content_type(service, emitted)
+    if expected and emitted != expected:
+        headers["Content-Type"] = expected
+
+
+def fix_success_content_type(service: str, status: int, headers: dict) -> None:
+    """Rewrite ``headers['Content-Type']`` in place when a success envelope
+    carries the wrong wire value for the service's protocol.
+
+    Scoped to non-error responses and, within them, to known envelope
+    Content-Types: binary/streaming/payload types
+    (``application/octet-stream``, ``text/plain``, ``image/*``, ...) are
+    never touched, and an emitted ``text/xml`` passes through untouched
+    (see ``expected_success_content_type``).
+    """
+    if status >= 400:
+        return
+    emitted = headers.get("Content-Type", "")
+    if not emitted:
+        return
+    expected = expected_success_content_type(service, emitted)
+    if expected and emitted != expected:
+        headers["Content-Type"] = expected
 
 
 def now_iso() -> str:
@@ -288,6 +888,64 @@ def apply_image_prefix(image: str) -> str:
     if image.startswith(prefix + "/"):
         return image
     return f"{prefix}/{image}"
+
+
+def _docker_hub_repository(repository: str) -> str | None:
+    """The Docker Hub path of ``repository`` (``library/x`` for official images),
+    or None when it names another registry."""
+    first, _, rest = repository.partition("/")
+    if rest and first in ("docker.io", "index.docker.io", "registry-1.docker.io"):
+        repository = rest
+    elif rest and ("." in first or ":" in first or first == "localhost"):
+        return None
+    return repository if "/" in repository else f"library/{repository}"
+
+
+def docker_hub_mirrors(repository: str) -> list[str]:
+    """Public mirrors of a Docker Hub repository, tried when Docker Hub fails."""
+    hub = _docker_hub_repository(repository)
+    if hub is None:
+        return []
+    ecr = f"docker/{hub}" if hub.startswith("library/") else hub
+    return [f"public.ecr.aws/{ecr}", f"mirror.gcr.io/{hub}"]
+
+
+def install_docker_hub_fallback() -> None:
+    """Retry a failed Docker Hub pull from ECR Public, then mirror.gcr.io, and tag
+    the result with the name that was asked for. Covers every Docker client,
+    including the pull ``containers.run`` makes for a missing image."""
+    try:
+        from docker.errors import APIError
+        from docker.models.images import ImageCollection
+        from docker.utils import parse_repository_tag
+    except ImportError:
+        return
+    original = ImageCollection.pull
+    if getattr(original, "_ministack_fallback", False):
+        return
+
+    def pull(self, repository, tag=None, all_tags=False, **kwargs):
+        try:
+            return original(self, repository, tag=tag, all_tags=all_tags, **kwargs)
+        except APIError as hub_error:
+            repo, parsed_tag = parse_repository_tag(repository)
+            tag = tag or parsed_tag or "latest"
+            if all_tags or ":" in tag:  # digests cannot be re-tagged
+                raise
+            for mirror in docker_hub_mirrors(repo):
+                try:
+                    image = original(self, mirror, tag=tag, **kwargs)
+                except APIError:
+                    continue
+                image.tag(repo, tag)
+                logging.getLogger("ministack").warning(
+                    "Docker Hub pull of %s:%s failed (%s); pulled %s:%s instead",
+                    repo, tag, hub_error.explanation or hub_error, mirror, tag)
+                return image
+            raise
+
+    pull._ministack_fallback = True
+    ImageCollection.pull = pull
 
 
 def sha256_hash(data: bytes) -> str:

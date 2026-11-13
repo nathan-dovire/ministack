@@ -1,15 +1,39 @@
+import asyncio
+import base64
 import io
 import json
 import os
+import re
 import time
+import uuid
 import uuid as _uuid_mod
 import zipfile
-from urllib.parse import urlparse
+from types import SimpleNamespace
 
+import boto3
+import cbor2
 import pytest
+from botocore.config import Config
+from botocore.eventstream import EventStreamBuffer
 from botocore.exceptions import ClientError
 
+from ministack.core.responses import AccountRegionScopedDict, request_scope
+from ministack.services import kinesis
+
 _LAMBDA_ROLE = "arn:aws:iam::000000000000:role/lambda-role"
+
+
+def _regional_kin(region_name, account_id="test"):
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    return boto3.client(
+        "kinesis",
+        endpoint_url=endpoint,
+        aws_access_key_id=account_id,
+        aws_secret_access_key="test",
+        region_name=region_name,
+        config=Config(region_name=region_name, retries={"mode": "standard"}),
+    )
+
 
 def test_kinesis_put_get(kin):
     kin.create_stream(StreamName="test-stream", ShardCount=1)
@@ -98,6 +122,62 @@ def test_kinesis_describe_stream_v2(kin):
     summary = kin.describe_stream_summary(StreamName="kin-desc-v2")
     assert summary["StreamDescriptionSummary"]["StreamName"] == "kin-desc-v2"
 
+
+def test_kinesis_stream_arn_rejects_foreign_region_without_name_fallback(kin):
+    """StreamARN inputs must be parsed before matching account-scoped state."""
+    west = _regional_kin("us-west-2")
+    stream_name = f"kin-arn-scope-{_uuid_mod.uuid4().hex[:8]}"
+    west.create_stream(StreamName=stream_name, ShardCount=1)
+    west_arn = west.describe_stream(StreamName=stream_name)["StreamDescription"]["StreamARN"]
+
+    with pytest.raises(ClientError) as exc:
+        kin.describe_stream(StreamARN=west_arn)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    with pytest.raises(ClientError) as exc:
+        kin.put_record(StreamARN=west_arn, Data=b"no-fallback", PartitionKey="pk")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_kinesis_same_name_streams_are_region_scoped(kin):
+    west = _regional_kin("us-west-2")
+    stream_name = f"kin-region-scope-{_uuid_mod.uuid4().hex[:8]}"
+
+    kin.create_stream(StreamName=stream_name, ShardCount=1)
+    west.create_stream(StreamName=stream_name, ShardCount=1)
+
+    east_desc = kin.describe_stream(StreamName=stream_name)["StreamDescription"]
+    west_desc = west.describe_stream(StreamName=stream_name)["StreamDescription"]
+
+    assert east_desc["StreamARN"] == f"arn:aws:kinesis:us-east-1:000000000000:stream/{stream_name}"
+    assert west_desc["StreamARN"] == f"arn:aws:kinesis:us-west-2:000000000000:stream/{stream_name}"
+    assert stream_name in kin.list_streams()["StreamNames"]
+    assert stream_name in west.list_streams()["StreamNames"]
+
+
+def test_kinesis_stream_names_do_not_fallback_across_region_or_account(kin):
+    owner_account = "111111111111"
+    west_owner = _regional_kin("us-west-2", account_id=owner_account)
+    east_owner = _regional_kin("us-east-1", account_id=owner_account)
+    west_default = _regional_kin("us-west-2")
+    stream_name = f"kin-no-fallback-{_uuid_mod.uuid4().hex[:8]}"
+
+    west_owner.create_stream(StreamName=stream_name, ShardCount=1)
+    west_arn = west_owner.describe_stream(StreamName=stream_name)["StreamDescription"]["StreamARN"]
+
+    with pytest.raises(ClientError) as exc:
+        east_owner.describe_stream(StreamName=stream_name)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    with pytest.raises(ClientError) as exc:
+        west_default.describe_stream(StreamName=stream_name)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    with pytest.raises(ClientError) as exc:
+        kin.describe_stream(StreamARN=west_arn)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 def test_kinesis_tags_v2(kin):
     kin.create_stream(StreamName="kin-tag-v2", ShardCount=1)
     kin.add_tags_to_stream(StreamName="kin-tag-v2", Tags={"env": "test", "team": "data"})
@@ -161,7 +241,7 @@ def test_kinesis_split_shard(kin):
     kin.split_shard(StreamName=sname, ShardToSplit=shard_id, NewStartingHashKey=mid)
     time.sleep(0.3)
     desc2 = kin.describe_stream(StreamName=sname)
-    assert len(desc2["StreamDescription"]["Shards"]) == 2
+    assert len([s for s in desc2["StreamDescription"]["Shards"] if "EndingSequenceNumber" not in s["SequenceNumberRange"]]) == 2
     kin.delete_stream(StreamName=sname)
 
 def test_kinesis_merge_shards(kin):
@@ -182,7 +262,7 @@ def test_kinesis_merge_shards(kin):
     )
     time.sleep(0.3)
     desc2 = kin.describe_stream(StreamName=sname)
-    assert len(desc2["StreamDescription"]["Shards"]) == 1
+    assert len([s for s in desc2["StreamDescription"]["Shards"] if "EndingSequenceNumber" not in s["SequenceNumberRange"]]) == 1
     kin.delete_stream(StreamName=sname)
 
 def test_kinesis_update_shard_count(kin):
@@ -215,6 +295,240 @@ def test_kinesis_register_deregister_consumer(kin):
     consumers2 = kin.list_stream_consumers(StreamARN=stream_arn)
     assert not any(c["ConsumerName"] == "my-consumer" for c in consumers2["Consumers"])
     kin.delete_stream(StreamName=sname)
+
+
+def _subscribe_setup(kin, shards=1):
+    sname = f"intg-sub-{_uuid_mod.uuid4().hex[:8]}"
+    kin.create_stream(StreamName=sname, ShardCount=shards)
+    stream_arn = kin.describe_stream(StreamName=sname)["StreamDescription"]["StreamARN"]
+    consumer_arn = kin.register_stream_consumer(
+        StreamARN=stream_arn, ConsumerName="efo")["Consumer"]["ConsumerARN"]
+    return sname, consumer_arn
+
+
+def test_kinesis_subscribe_to_shard_pushes_backlog_then_new_records(kin):
+    sname, consumer_arn = _subscribe_setup(kin)
+    first = [kin.put_record(StreamName=sname, Data=f"r{i}".encode(), PartitionKey="k")["SequenceNumber"]
+             for i in range(2)]
+    resp = kin.subscribe_to_shard(ConsumerARN=consumer_arn, ShardId="shardId-000000000000",
+                                  StartingPosition={"Type": "TRIM_HORIZON"})
+    events = iter(resp["EventStream"])
+    event = next(events)["SubscribeToShardEvent"]
+    assert [r["Data"] for r in event["Records"]] == [b"r0", b"r1"]
+    assert [r["SequenceNumber"] for r in event["Records"]] == first
+    assert event["ContinuationSequenceNumber"] == first[-1]
+    assert event["MillisBehindLatest"] == 0
+
+    third = kin.put_record(StreamName=sname, Data=b"r2", PartitionKey="k")["SequenceNumber"]
+    event = next(events)["SubscribeToShardEvent"]
+    assert [(r["Data"], r["PartitionKey"]) for r in event["Records"]] == [(b"r2", "k")]
+    assert event["ContinuationSequenceNumber"] == third
+    resp["EventStream"].close()
+
+    resumed = kin.subscribe_to_shard(
+        ConsumerARN=consumer_arn, ShardId="shardId-000000000000",
+        StartingPosition={"Type": "AFTER_SEQUENCE_NUMBER", "SequenceNumber": first[0]})
+    with pytest.raises(ClientError) as exc:  # refused within 5 s of the first call
+        kin.subscribe_to_shard(ConsumerARN=consumer_arn, ShardId="shardId-000000000000",
+                               StartingPosition={"Type": "LATEST"})
+    assert exc.value.response["Error"]["Code"] == "ResourceInUseException"
+    event = next(iter(resumed["EventStream"]))["SubscribeToShardEvent"]
+    assert [r["SequenceNumber"] for r in event["Records"]] == [first[1], third]
+    resumed["EventStream"].close()
+    kin.delete_stream(StreamName=sname)
+
+
+def test_kinesis_subscribe_to_shard_latest_starts_empty_and_takeover_ends_the_old_stream(kin):
+    sname, consumer_arn = _subscribe_setup(kin)
+    kin.put_record(StreamName=sname, Data=b"old", PartitionKey="k")
+    old = kin.subscribe_to_shard(ConsumerARN=consumer_arn, ShardId="shardId-000000000000",
+                                 StartingPosition={"Type": "LATEST"})
+    old_events = iter(old["EventStream"])
+    event = next(old_events)["SubscribeToShardEvent"]
+    assert event["Records"] == [] and event["ContinuationSequenceNumber"]
+
+    time.sleep(5.2)
+    new = kin.subscribe_to_shard(ConsumerARN=consumer_arn, ShardId="shardId-000000000000",
+                                 StartingPosition={"Type": "LATEST"})
+    with pytest.raises(ClientError) as exc:
+        for _ in old_events:
+            pass
+    assert exc.value.response["Error"]["Code"] == "ResourceInUseException"
+    assert next(iter(new["EventStream"]))["SubscribeToShardEvent"]["Records"] == []
+    new["EventStream"].close()
+    kin.delete_stream(StreamName=sname)
+
+
+def test_kinesis_subscribe_to_shard_ends_with_child_shards_after_a_split(kin):
+    sname, consumer_arn = _subscribe_setup(kin)
+    resp = kin.subscribe_to_shard(ConsumerARN=consumer_arn, ShardId="shardId-000000000000",
+                                  StartingPosition={"Type": "TRIM_HORIZON"})
+    events = iter(resp["EventStream"])
+    assert "ChildShards" not in next(events)["SubscribeToShardEvent"]
+    kin.split_shard(StreamName=sname, ShardToSplit="shardId-000000000000",
+                    NewStartingHashKey=str(2**127))
+    last = [e["SubscribeToShardEvent"] for e in events][-1]
+    assert sorted(c["ShardId"] for c in last["ChildShards"]) == [
+        "shardId-000000000001", "shardId-000000000002"]
+    assert all(c["ParentShards"] == ["shardId-000000000000"] for c in last["ChildShards"])
+    kin.delete_stream(StreamName=sname)
+
+
+def test_kinesis_subscribe_to_shard_errors(kin):
+    sname, consumer_arn = _subscribe_setup(kin)
+    cases = [
+        (dict(ConsumerARN=consumer_arn + "0", ShardId="shardId-000000000000",
+              StartingPosition={"Type": "LATEST"}), "ResourceNotFoundException"),
+        (dict(ConsumerARN=consumer_arn, ShardId="shardId-000000000009",
+              StartingPosition={"Type": "LATEST"}), "ResourceNotFoundException"),
+        (dict(ConsumerARN=consumer_arn, ShardId="shardId-000000000000",
+              StartingPosition={"Type": "AT_SEQUENCE_NUMBER"}), "InvalidArgumentException"),
+    ]
+    for kwargs, code in cases:
+        with pytest.raises(ClientError) as exc:
+            kin.subscribe_to_shard(**kwargs)
+        assert exc.value.response["Error"]["Code"] == code
+    kin.delete_stream(StreamName=sname)
+
+
+def test_kinesis_subscribe_to_shard_cbor_events(kin):
+    import urllib.request
+
+    import cbor2
+    from botocore.eventstream import EventStreamBuffer
+
+    sname, consumer_arn = _subscribe_setup(kin)
+    kin.put_record(StreamName=sname, Data=b"\x00\x01", PartitionKey="k")
+    request = urllib.request.Request(
+        kin.meta.endpoint_url, method="POST",
+        data=cbor2.dumps({"ConsumerARN": consumer_arn, "ShardId": "shardId-000000000000",
+                          "StartingPosition": {"Type": "TRIM_HORIZON"}}),
+        headers={"Content-Type": "application/x-amz-cbor-1.1",
+                 "X-Amz-Target": "Kinesis_20131202.SubscribeToShard",
+                 "Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/kinesis/aws4_request"})
+    buffer, messages = EventStreamBuffer(), []
+    with urllib.request.urlopen(request, timeout=10) as response:
+        while len(messages) < 2:
+            buffer.add_data(response.read1(65536))
+            messages.extend(buffer)
+    assert messages[0].headers[":event-type"] == "initial-response"
+    event = messages[1]
+    assert event.headers[":content-type"] == "application/x-amz-cbor-1.1"
+    record = cbor2.loads(event.payload)["Records"][0]
+    assert record["Data"] == b"\x00\x01"
+    kin.delete_stream(StreamName=sname)
+
+
+def test_kinesis_consumer_arns_reject_foreign_region_without_exact_key_fallback(kin):
+    """ConsumerARN paths must not resolve a consumer owned by another request region."""
+    west = _regional_kin("us-west-2")
+    stream_name = f"kin-consumer-arn-scope-{_uuid_mod.uuid4().hex[:8]}"
+    consumer_name = "west-consumer"
+    west.create_stream(StreamName=stream_name, ShardCount=1)
+    west_arn = west.describe_stream(StreamName=stream_name)["StreamDescription"]["StreamARN"]
+    consumer_arn = west.register_stream_consumer(
+        StreamARN=west_arn,
+        ConsumerName=consumer_name,
+    )["Consumer"]["ConsumerARN"]
+
+    with pytest.raises(ClientError) as exc:
+        kin.list_stream_consumers(StreamARN=west_arn)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    for kwargs in (
+        {"ConsumerARN": consumer_arn},
+        {"StreamARN": west_arn, "ConsumerName": consumer_name},
+    ):
+        with pytest.raises(ClientError) as exc:
+            kin.describe_stream_consumer(**kwargs)
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    with pytest.raises(ClientError) as exc:
+        kin.deregister_stream_consumer(ConsumerARN=consumer_arn)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+    assert west.describe_stream_consumer(ConsumerARN=consumer_arn)["ConsumerDescription"]["ConsumerName"] == consumer_name
+
+
+def test_kinesis_restore_legacy_account_scoped_state_uses_arn_region():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import kinesis as _kin
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "000000000000"
+    stream_name = "LegacyKinesisStream"
+    stream_arn = f"arn:aws:kinesis:us-west-2:{account_id}:stream/{stream_name}"
+    consumer_arn = f"{stream_arn}/consumer/legacy-consumer:1700000000"
+
+    legacy_streams = AccountScopedDict()
+    legacy_streams._data[(account_id, stream_name)] = {
+        "StreamName": stream_name,
+        "StreamARN": stream_arn,
+        "StreamStatus": "ACTIVE",
+        "StreamModeDetails": {"StreamMode": "PROVISIONED"},
+        "RetentionPeriodHours": 24,
+        "shards": {},
+        "tags": {},
+        "CreationTimestamp": 1700000000,
+        "EncryptionType": "NONE",
+    }
+    legacy_iterators = AccountScopedDict()
+    legacy_iterators._data[(account_id, "legacy-iterator-with-arn")] = {
+        "stream": stream_name,
+        "stream_arn": stream_arn,
+        "shard_id": "shardId-000000000000",
+        "position": 0,
+        "created_at": 1700000000,
+    }
+    legacy_iterators._data[(account_id, "legacy-iterator-with-stream-name")] = {
+        "stream": stream_name,
+        "shard_id": "shardId-000000000000",
+        "position": 0,
+        "created_at": 1700000000,
+    }
+    legacy_consumers = AccountScopedDict()
+    legacy_consumers._data[(account_id, consumer_arn)] = {
+        "ConsumerARN": consumer_arn,
+        "ConsumerName": "legacy-consumer",
+        "ConsumerStatus": "ACTIVE",
+        "ConsumerCreationTimestamp": 1700000000,
+        "StreamARN": stream_arn,
+    }
+
+    _kin.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region("us-east-1")
+
+        _kin.load_persisted_state({
+            "streams": legacy_streams,
+            "shard_iterators": legacy_iterators,
+            "consumers": legacy_consumers,
+        })
+
+        assert _kin._streams.get_scoped(account_id, "us-east-1", stream_name) is None
+        assert _kin._streams.get_scoped(account_id, "us-west-2", stream_name)["StreamARN"] == stream_arn
+        assert _kin._shard_iterators.get_scoped(
+            account_id, "us-west-2", "legacy-iterator-with-arn"
+        )["stream_arn"] == stream_arn
+        stream_name_iterator = _kin._shard_iterators.get_scoped(
+            account_id, "us-west-2", "legacy-iterator-with-stream-name"
+        )
+        assert stream_name_iterator["stream"] == stream_name
+        assert "stream_arn" not in stream_name_iterator
+        assert _kin._consumers.get_scoped(account_id, "us-west-2", consumer_arn)["ConsumerARN"] == consumer_arn
+    finally:
+        _kin.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
 
 def test_kinesis_at_timestamp_iterator(kin):
     """AT_TIMESTAMP shard iterator returns records after the given timestamp."""
@@ -392,3 +706,1113 @@ def test_kinesis_cbor_put_record(kin):
     )
     records = kin.get_records(ShardIterator=it["ShardIterator"])
     assert len(records["Records"]) == 1
+
+
+def test_kinesis_describe_echoes_the_encryption_key_id(kin):
+    """StartStreamEncryption stores KeyId; the describe paths must return it.
+
+    AWS reports KeyId alongside EncryptionType in both StreamDescription and
+    StreamDescriptionSummary. Storing it without echoing it means the Terraform
+    provider reads kms_key_id as empty on a stream that is in fact encrypted, so
+    every plan proposes setting it again.
+    """
+    name = "qa-kinesis-keyid"
+    kin.create_stream(StreamName=name, ShardCount=1)
+    key = "arn:aws:kms:us-east-1:000000000000:alias/aws/kinesis"
+    kin.start_stream_encryption(
+        StreamName=name, EncryptionType="KMS", KeyId=key
+    )
+
+    desc = kin.describe_stream(StreamName=name)["StreamDescription"]
+    assert desc["EncryptionType"] == "KMS"
+    assert desc.get("KeyId") == key
+
+    summary = kin.describe_stream_summary(StreamName=name)[
+        "StreamDescriptionSummary"
+    ]
+    assert summary["EncryptionType"] == "KMS"
+    assert summary.get("KeyId") == key
+
+    # An unencrypted stream must not report a KeyId at all — AWS omits the field
+    # rather than returning an empty one, and an empty string would read as drift.
+    kin.stop_stream_encryption(
+        StreamName=name, EncryptionType="KMS", KeyId=key
+    )
+    desc = kin.describe_stream(StreamName=name)["StreamDescription"]
+    assert desc["EncryptionType"] == "NONE"
+    assert "KeyId" not in desc
+
+
+# --- SubscribeToShard across retention pruning (in-process dispatch) ---
+
+_SUB_STARTS = ("TRIM_HORIZON", "LATEST", "AT_SEQUENCE_NUMBER", "AFTER_SEQUENCE_NUMBER", "AT_TIMESTAMP")
+_SUB_SHARD = "shardId-000000000000"
+
+
+@pytest.fixture
+def subscription_state(monkeypatch):
+    clock = [1_700_000_000.0]
+    monkeypatch.setattr(kinesis, "time", SimpleNamespace(time=lambda: clock[0]))
+    monkeypatch.setattr(kinesis, "_streams", AccountRegionScopedDict())
+    monkeypatch.setattr(kinesis, "_consumers", AccountRegionScopedDict())
+    monkeypatch.setattr(kinesis, "_subscriptions", {})
+    monkeypatch.setattr(kinesis, "_SUBSCRIPTION_IDLE_SECONDS", 0)
+    return clock
+
+
+async def _sub_call(action, data, is_cbor=False):
+    encode = cbor2.dumps if is_cbor else lambda value: json.dumps(value).encode()
+    headers = {"x-amz-target": f"Kinesis_20131202.{action}"}
+    if is_cbor:
+        headers["content-type"] = "application/x-amz-cbor-1.1"
+    result = await kinesis.handle_request("POST", "/", headers, encode(data), {})
+    assert result[0] == 200, result
+    if action == "SubscribeToShard":
+        return result[2]
+    return cbor2.loads(result[2]) if is_cbor else json.loads(result[2])
+
+
+async def _sub_setup():
+    await _sub_call("CreateStream", {"StreamName": "retention", "ShardCount": 1})
+    arn = (await _sub_call("DescribeStream", {"StreamName": "retention"}))["StreamDescription"]["StreamARN"]
+    consumer = await _sub_call("RegisterStreamConsumer", {"StreamARN": arn, "ConsumerName": "reader"})
+    return consumer["Consumer"]["ConsumerARN"]
+
+
+async def _sub_put(value):
+    return (await _sub_call("PutRecord", {
+        "StreamName": "retention", "PartitionKey": "p", "Data": base64.b64encode(value).decode(),
+    }))["SequenceNumber"]
+
+
+def _sub_starting(kind, sequence, timestamp):
+    result = {"Type": kind}
+    if "SEQUENCE_NUMBER" in kind:
+        result["SequenceNumber"] = sequence
+    if kind == "AT_TIMESTAMP":
+        result["Timestamp"] = timestamp
+    return result
+
+
+async def _sub_run(response, is_cbor, on_event):
+    disconnect = asyncio.Event()
+    events = []
+
+    async def receive():
+        await disconnect.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        if not message.get("body"):
+            return
+        buffer = EventStreamBuffer()
+        buffer.add_data(message["body"])
+        for frame in buffer:
+            assert frame.headers[":message-type"] == "event", frame.headers
+            assert frame.headers[":content-type"] == (
+                "application/x-amz-cbor-1.1" if is_cbor else "application/json")
+            if frame.headers[":event-type"] == "initial-response":
+                continue
+            assert frame.headers[":event-type"] == "SubscribeToShardEvent"
+            event = cbor2.loads(frame.payload) if is_cbor else json.loads(frame.payload)
+            events.append(event)
+            if await on_event(event, len(events)):
+                disconnect.set()
+
+    await asyncio.wait_for(response.runner(send, receive), timeout=5)
+    return events
+
+
+@pytest.mark.parametrize("is_cbor", [False, True], ids=["json", "cbor"])
+@pytest.mark.parametrize("kind", _SUB_STARTS)
+def test_subscription_delivers_after_repeated_retention_and_idle_polls(subscription_state, kind, is_cbor):
+    clock = subscription_state
+
+    async def exercise():
+        with request_scope("000000000000", "us-east-1"):
+            consumer = await _sub_setup()
+            old = await _sub_put(b"old")
+            timestamp = clock[0]
+            clock[0] += 3
+            retained = await _sub_put(b"retained")
+            clock[0] += 24 * 3600 - 4
+            response = await _sub_call("SubscribeToShard", {
+                "ConsumerARN": consumer, "ShardId": _SUB_SHARD,
+                "StartingPosition": _sub_starting(kind, old, timestamp),
+            }, is_cbor)
+            expected = []
+
+            async def on_event(event, number):
+                # The two backlog records expire separately within the normal
+                # five-minute subscription lifetime. Idle and append after
+                # each pruning, while keeping newly delivered records alive.
+                if number == 1:
+                    clock[0] += 2
+                    kinesis._expire_records(kinesis._streams["retention"])
+                elif number == 4:
+                    clock[0] += 3
+                    kinesis._expire_records(kinesis._streams["retention"])
+                elif number in (2, 5):
+                    expected.append(await _sub_put(f"new-{number}".encode()))
+                return number == 7
+
+            events = await _sub_run(response, is_cbor, on_event)
+            initial = ([] if kind == "LATEST" else [retained] if kind == "AFTER_SEQUENCE_NUMBER"
+                       else [old, retained])
+            assert [r["SequenceNumber"] for r in events[0]["Records"]] == initial
+            assert [r["SequenceNumber"] for e in events[1:] for r in e["Records"]] == expected
+            assert events[1]["Records"] == events[4]["Records"] == events[6]["Records"] == []
+            assert events[1]["ContinuationSequenceNumber"] == events[0]["ContinuationSequenceNumber"]
+            assert events[2]["ContinuationSequenceNumber"] == expected[0]
+            assert events[3]["ContinuationSequenceNumber"] == expected[0]
+            assert events[4]["ContinuationSequenceNumber"] == expected[0]
+            assert events[5]["ContinuationSequenceNumber"] == expected[1]
+            assert events[6]["ContinuationSequenceNumber"] == expected[1]
+            assert all(e["MillisBehindLatest"] == 0 and "ChildShards" not in e for e in events)
+            records = events[2]["Records"] + events[5]["Records"]
+            assert [r["Data"] if is_cbor else base64.b64decode(r["Data"]) for r in records] == [
+                b"new-2", b"new-5"]
+            assert not kinesis._subscriptions
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("is_cbor", [False, True], ids=["json", "cbor"])
+@pytest.mark.parametrize("kind", _SUB_STARTS)
+def test_subscription_keeps_checkpoint_when_all_records_expire_before_runner(subscription_state, kind, is_cbor):
+    clock = subscription_state
+
+    async def exercise():
+        with request_scope("000000000000", "us-east-1"):
+            consumer = await _sub_setup()
+            old = await _sub_put(b"old")
+            timestamp = clock[0]
+            shard_start = kinesis._streams["retention"]["shards"][_SUB_SHARD]["starting_sequence_number"]
+            clock[0] += 24 * 3600 - 1
+            response = await _sub_call("SubscribeToShard", {
+                "ConsumerARN": consumer, "ShardId": _SUB_SHARD,
+                "StartingPosition": _sub_starting(kind, old, timestamp),
+            }, is_cbor)
+            clock[0] += 2
+            kinesis._expire_records(kinesis._streams["retention"])
+
+            async def on_event(event, number):
+                return True
+
+            events = await _sub_run(response, is_cbor, on_event)
+            assert events[0]["Records"] == []
+            # Preserve the existing selected checkpoint value; do not invent
+            # an AWS empty-shard checkpoint number.
+            checkpoint = old if kind in ("LATEST", "AFTER_SEQUENCE_NUMBER") else shard_start
+            assert events[0]["ContinuationSequenceNumber"] == checkpoint
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize("is_cbor", [False, True], ids=["json", "cbor"])
+@pytest.mark.parametrize("kind", _SUB_STARTS)
+def test_subscription_captures_selection_before_runner_and_pruning(subscription_state, kind, is_cbor):
+    clock = subscription_state
+
+    async def exercise():
+        with request_scope("000000000000", "us-east-1"):
+            consumer = await _sub_setup()
+            await _sub_put(b"expired-prefix")
+            clock[0] += 1
+            selected = await _sub_put(b"selected")
+            timestamp = clock[0]
+            clock[0] += 24 * 3600 - 1
+            response = await _sub_call("SubscribeToShard", {
+                "ConsumerARN": consumer, "ShardId": _SUB_SHARD,
+                "StartingPosition": _sub_starting(kind, selected, timestamp),
+            }, is_cbor)
+            # Only the prefix expires. Append between response creation and
+            # runner startup, so LATEST must retain the establishment boundary.
+            clock[0] += 1
+            appended = await _sub_put(b"appended")
+
+            async def on_event(event, number):
+                return True
+
+            # Run with another request's context to exercise the saved tenant.
+            with request_scope("111111111111", "eu-west-1"):
+                events = await _sub_run(response, is_cbor, on_event)
+            expected = [appended] if kind in ("LATEST", "AFTER_SEQUENCE_NUMBER") else [selected, appended]
+            assert [r["SequenceNumber"] for r in events[0]["Records"]] == expected
+            assert events[0]["ContinuationSequenceNumber"] == appended
+
+    asyncio.run(exercise())
+
+
+def _kin_error(exc):
+    err = exc.value.response["Error"]
+    return exc.value.response["ResponseMetadata"]["HTTPStatusCode"], err["Code"], err["Message"]
+
+
+def _unused_account():
+    return "9" + str(_uuid_mod.uuid4().int)[:11]
+
+
+def test_kinesis_resource_policy_follows_aws(kin):
+    """Captured on AWS (us-east-1, 2026-10-26): codes, messages and check order of the resource-policy calls."""
+    name = f"rp-{_uuid_mod.uuid4().hex[:8]}"
+    kin.create_stream(StreamName=name, ShardCount=1)
+    arn = kin.describe_stream_summary(StreamName=name)["StreamDescriptionSummary"]["StreamARN"]
+    account = arn.split(":")[4]
+    consumer = kin.register_stream_consumer(StreamARN=arn, ConsumerName="c")["Consumer"]["ConsumerARN"]
+
+    def policy(resource, actions):
+        return json.dumps({"Version": "2012-10-17", "Statement": [{"Sid": "x", "Effect": "Allow",
+                           "Principal": {"AWS": f"arn:aws:iam::{account}:root"}, "Action": actions, "Resource": resource}]})
+
+    try:
+        assert kin.get_resource_policy(ResourceARN=arn)["Policy"] == "{}"
+        with pytest.raises(ClientError) as exc:
+            kin.delete_resource_policy(ResourceARN=arn)
+        assert _kin_error(exc) == (400, "ResourceNotFoundException", f"No resource policy found for resource ARN {arn}.")
+        for document, message in (
+            ("not json", "Policy validation error: This policy contains invalid Json"),
+            ("{}", "Policy validation error: Missing required field Version"),
+            ('{"Version":"2012-10-17"}', "Policy validation error: Missing required field Statement"),
+            (policy(consumer, ["kinesis:GetRecords"]), "Policy validation error: Resource policy contains invalid statement"
+             " at line 1, column 41: The resource policy's resource must be the same as the resource ARN."),
+        ):
+            with pytest.raises(ClientError) as exc:
+                kin.put_resource_policy(ResourceARN=arn, Policy=document)
+            assert _kin_error(exc) == (400, "InvalidArgumentException", message)
+        with pytest.raises(ClientError) as exc:
+            kin.put_resource_policy(ResourceARN=consumer, Policy=policy(consumer, ["kinesis:GetRecords"]))
+        assert _kin_error(exc) == (400, "InvalidArgumentException", "Policy validation error: Resource policy contains invalid"
+                                   ' statement at line 1, column 41: The following action names are invalid: "kinesis:GetRecords"')
+
+        stream_policy = policy(arn, ["kinesis:GetRecords", "kinesis:GetShardIterator"])
+        kin.put_resource_policy(ResourceARN=arn, Policy=stream_policy)
+        # AWS stores the document compact (separators without spaces).
+        assert kin.get_resource_policy(ResourceARN=arn)["Policy"] == json.dumps(
+            json.loads(stream_policy), separators=(",", ":"))
+        kin.put_resource_policy(ResourceARN=consumer, Policy=policy(consumer, ["kinesis:SubscribeToShard"]))
+        kin.delete_resource_policy(ResourceARN=arn)
+        assert kin.get_resource_policy(ResourceARN=arn)["Policy"] == "{}"
+
+        missing = arn.rsplit("/", 1)[0] + "/no-such-stream"
+        with pytest.raises(ClientError) as exc:
+            kin.get_resource_policy(ResourceARN=missing)
+        assert _kin_error(exc) == (400, "ResourceNotFoundException", f"Stream no-such-stream under account {account} not found.")
+        with pytest.raises(ClientError) as exc:
+            # An account no request has used does not exist.
+            kin.get_resource_policy(ResourceARN=arn.replace(f":{account}:", f":{_unused_account()}:"))
+        assert _kin_error(exc) == (400, "UnrecognizedClientException", "No account found for the given parameters")
+        west = arn.replace(":us-east-1:", ":us-west-2:")
+        with pytest.raises(ClientError) as exc:
+            kin.get_resource_policy(ResourceARN=west)
+        assert _kin_error(exc) == (400, "InvalidArgumentException",
+                                   f"The region specified in the ARN '{west}' does not match the endpoint region")
+    finally:
+        kin.delete_stream(StreamName=name, EnforceConsumerDeletion=True)
+
+
+def test_kinesis_resource_policy_goes_with_its_stream(kin):
+    name = f"rp-del-{_uuid_mod.uuid4().hex[:8]}"
+    kin.create_stream(StreamName=name, ShardCount=1)
+    arn = kin.describe_stream_summary(StreamName=name)["StreamDescriptionSummary"]["StreamARN"]
+    account = arn.split(":")[4]
+    kin.put_resource_policy(ResourceARN=arn, Policy=json.dumps({"Version": "2012-10-17", "Statement": [{
+        "Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{account}:root"}, "Action": "kinesis:GetRecords",
+        "Resource": arn}]}))
+    kin.delete_stream(StreamName=name)
+    kin.create_stream(StreamName=name, ShardCount=1)
+    try:
+        assert kin.get_resource_policy(ResourceARN=arn)["Policy"] == "{}"
+    finally:
+        kin.delete_stream(StreamName=name)
+_FILTER_HANDLER = """
+import base64
+
+def handler(event, context):
+    for r in event["Records"]:
+        print("XREC " + base64.b64decode(r["kinesis"]["data"]).decode())
+    return len(event["Records"])
+"""
+
+
+@pytest.mark.parametrize("pattern, expected", [
+    ({"data": {"kind": ["keep"]}}, ['{"kind": "keep"}', '{"kind": "keep", "n": 2}']),
+    ({"data": {"n": [{"numeric": [">", 1]}]}}, ['{"kind": "keep", "n": 2}']),
+    ({"partitionKey": ["pk-b"]}, ['{"kind": "drop"}', "not json"]),
+    ({"partitionKey": [{"prefix": "pk-"}], "data": {"kind": [{"exists": True}]}},
+     ['{"kind": "keep"}', '{"kind": "drop"}', '{"kind": "keep", "n": 2}']),
+], ids=["data-field", "data-numeric", "metadata-only-matches-non-json", "metadata-and-data"])
+def test_kinesis_esm_filter_criteria_match_decoded_data_and_metadata(lam, kin, logs, pattern, expected):
+    """Black box: the function only receives the records the pattern selects."""
+    stream = f"kin-filter-{_uuid_mod.uuid4().hex[:8]}"
+    kin.create_stream(StreamName=stream, ShardCount=1)
+    arn = kin.describe_stream_summary(StreamName=stream)["StreamDescriptionSummary"]["StreamARN"]
+    for data, pk in (('{"kind": "keep"}', "pk-a"), ('{"kind": "drop"}', "pk-b"),
+                     ("not json", "pk-b"), ('{"kind": "keep", "n": 2}', "pk-a")):
+        kin.put_record(StreamName=stream, Data=data.encode(), PartitionKey=pk)
+
+    fn = f"kin-filter-fn-{_uuid_mod.uuid4().hex[:8]}"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", _FILTER_HANDLER)
+    lam.create_function(FunctionName=fn, Runtime="python3.12", Role=_LAMBDA_ROLE,
+                        Handler="index.handler", Code={"ZipFile": buf.getvalue()})
+    esm = lam.create_event_source_mapping(
+        FunctionName=fn, EventSourceArn=arn, StartingPosition="TRIM_HORIZON",
+        FilterCriteria={"Filters": [{"Pattern": json.dumps(pattern)}]})["UUID"]
+    try:
+        received = []
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            try:
+                events = logs.filter_log_events(logGroupName=f"/aws/lambda/{fn}")["events"]
+            except ClientError:
+                events = []
+            received = [line[len("XREC "):] for e in events for line in e["message"].splitlines()
+                        if line.startswith("XREC ")]
+            if len(received) >= len(expected):
+                break
+            time.sleep(0.5)
+        time.sleep(2)  # nothing that should have been filtered turns up later
+        events = logs.filter_log_events(logGroupName=f"/aws/lambda/{fn}")["events"]
+        received = [line[len("XREC "):] for e in events for line in e["message"].splitlines()
+                    if line.startswith("XREC ")]
+        assert received == expected
+    finally:
+        lam.delete_event_source_mapping(UUID=esm)
+        lam.delete_function(FunctionName=fn)
+        kin.delete_stream(StreamName=stream)
+
+
+def _account_client(service, account):
+    return boto3.client(service, endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+                        aws_access_key_id=account, aws_secret_access_key="test", region_name="us-east-1")
+
+
+def test_kinesis_esm_reads_a_stream_in_another_account(lam, logs, auth_enabled):
+    """A function in one account maps a stream in another (same region); records reach it."""
+    if auth_enabled:
+        pytest.skip("account selection by access key needs AUTH unset")
+    owner = _account_client("kinesis", "111111111111")
+    stream = f"xacct-{_uuid_mod.uuid4().hex[:8]}"
+    owner.create_stream(StreamName=stream, ShardCount=1)
+    arn = owner.describe_stream_summary(StreamName=stream)["StreamDescriptionSummary"]["StreamARN"]
+    for n in range(3):
+        owner.put_record(StreamName=stream, Data=f"rec-{n}".encode(), PartitionKey="pk")
+
+    fn = f"xacct-fn-{_uuid_mod.uuid4().hex[:8]}"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", _FILTER_HANDLER)
+    lam.create_function(FunctionName=fn, Runtime="python3.12", Role=_LAMBDA_ROLE,
+                        Handler="index.handler", Code={"ZipFile": buf.getvalue()})
+    try:
+        missing = arn.rsplit("/", 1)[0] + "/no-such-stream"
+        with pytest.raises(ClientError) as exc:
+            lam.create_event_source_mapping(FunctionName=fn, EventSourceArn=missing, StartingPosition="LATEST")
+        assert exc.value.response["Error"]["Message"] == (
+            f"Cannot access stream {missing}. Please ensure the role can perform the GetRecords, "
+            "GetShardIterator, DescribeStream, DescribeStreamSummary, ListShards, and ListStreams Actions "
+            "on your stream.")
+        # AUTH=false: no stream policy is needed.
+        esm = lam.create_event_source_mapping(FunctionName=fn, EventSourceArn=arn,
+                                              StartingPosition="TRIM_HORIZON")["UUID"]
+        received, deadline = [], time.time() + 30
+        while time.time() < deadline and len(received) < 3:
+            try:
+                events = logs.filter_log_events(logGroupName=f"/aws/lambda/{fn}")["events"]
+            except ClientError:
+                events = []
+            received = [line[len("XREC "):] for e in events for line in e["message"].splitlines()
+                        if line.startswith("XREC ")]
+            time.sleep(0.5)
+        assert received == ["rec-0", "rec-1", "rec-2"]
+        lam.delete_event_source_mapping(UUID=esm)
+    finally:
+        lam.delete_function(FunctionName=fn)
+        owner.delete_stream(StreamName=stream)
+
+
+def test_kinesis_mapping_read_needs_every_read_in_the_stream_policy():
+    """The stream policy must allow the function's role session every read a mapping makes."""
+    from ministack.core.responses import request_scope
+    from ministack.services import kinesis as kmod
+
+    owner, consumer, name = "111111111111", "222222222222", f"pol-{_uuid_mod.uuid4().hex[:8]}"
+    arn = f"arn:aws:kinesis:us-east-1:{owner}:stream/{name}"
+    role = f"arn:aws:iam::{consumer}:role/reader"
+    with request_scope(owner, "us-east-1"):
+        kmod._create_stream({"StreamName": name, "ShardCount": 1})
+    try:
+        assert kmod.mapping_read_denied(arn, role, "fn", consumer)[1] == "kinesis:DescribeStream"
+        reads = ["kinesis:DescribeStream", "kinesis:DescribeStreamSummary", "kinesis:GetRecords",
+                 "kinesis:GetShardIterator", "kinesis:ListShards"]
+
+        def grant(actions):
+            with request_scope(owner, "us-east-1"):
+                kmod._resource_policies[arn] = json.dumps({"Version": "2012-10-17", "Statement": [{
+                    "Effect": "Allow", "Principal": {"AWS": role}, "Action": actions, "Resource": arn}]})
+
+        grant(reads[:-1])
+        assert kmod.mapping_read_denied(arn, role, "fn", consumer)[1] == "kinesis:ListShards"
+        grant(reads)
+        assert kmod.mapping_read_denied(arn, role, "fn", consumer) is None
+        assert kmod.mapping_read_denied(arn, f"arn:aws:iam::{consumer}:role/other", "fn", consumer) is not None
+    finally:
+        with request_scope(owner, "us-east-1"):
+            kmod._resource_policies.pop(arn, None)
+            kmod._streams.pop(name, None)
+
+
+# ---------------------------------------------------------------------------
+# Resource policies as AWS validates and stores them (recorded in us-east-1)
+# ---------------------------------------------------------------------------
+
+_CONSUMER = "222222222222"
+
+
+def _read_policy(stream_arn, principal, actions=("kinesis:DescribeStream", "kinesis:DescribeStreamSummary",
+                                                 "kinesis:GetRecords", "kinesis:GetShardIterator",
+                                                 "kinesis:ListShards")):
+    return json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow", "Principal": {"AWS": principal},
+                       "Action": list(actions) if isinstance(actions, tuple) else actions, "Resource": stream_arn}],
+    })
+
+
+def _use_account(account_id):
+    """MiniStack knows an account once it holds an IAM identity or a stream; give it a role."""
+    _consumer_role(account=account_id)
+
+
+def _consumer_role(name="consumer-role", account=_CONSUMER):
+    iam = _account_client("iam", account)
+    try:
+        iam.create_role(RoleName=name, AssumeRolePolicyDocument=json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"},
+                           "Action": "sts:AssumeRole"}],
+        }))
+    except iam.exceptions.EntityAlreadyExistsException:
+        pass
+    return f"arn:aws:iam::{account}:role/{name}"
+
+
+def _new_stream(kin, prefix):
+    name = f"{prefix}-{_uuid_mod.uuid4().hex[:8]}"
+    kin.create_stream(StreamName=name, ShardCount=1)
+    return name, kin.describe_stream_summary(StreamName=name)["StreamDescriptionSummary"]["StreamARN"]
+
+
+def test_kinesis_resource_policy_put_get_delete(kin):
+    name, arn = _new_stream(kin, "kin-rp")
+    role = _consumer_role()
+    # Sent pretty, with one-element lists and a bare account id: AWS stores it
+    # compact, in its own key order, with lists of one collapsed and the
+    # account id as its root ARN, principals sorted as written.
+    policy = json.dumps({
+        "Statement": [{"Resource": [arn], "Action": ["kinesis:GetRecords"],
+                       "Principal": {"AWS": [_CONSUMER, role]}, "Effect": "Allow", "Sid": "Read"}],
+        "Version": "2012-10-17",
+    }, indent=2)
+
+    assert kin.get_resource_policy(ResourceARN=arn)["Policy"] == "{}"
+    kin.put_resource_policy(ResourceARN=arn, Policy=policy)
+    assert kin.get_resource_policy(ResourceARN=arn)["Policy"] == (
+        '{"Version":"2012-10-17","Statement":[{"Sid":"Read","Effect":"Allow",'
+        f'"Principal":{{"AWS":["arn:aws:iam::{_CONSUMER}:root","{role}"]}},'
+        f'"Action":"kinesis:GetRecords","Resource":"{arn}"}}]}}'
+    )
+
+    kin.delete_resource_policy(ResourceARN=arn)
+    assert kin.get_resource_policy(ResourceARN=arn)["Policy"] == "{}"
+    with pytest.raises(ClientError) as exc:
+        kin.delete_resource_policy(ResourceARN=arn)
+    assert exc.value.response["Error"] == {
+        "Code": "ResourceNotFoundException",
+        "Message": f"No resource policy found for resource ARN {arn}.",
+    }
+
+
+# Recorded against Kinesis (us-east-1): what PutResourcePolicy answers for each
+# document, given the stream ARN. "{arn}" is the stream's ARN.
+_POLICY_CASES = {
+    "not json": ("not json", "Policy validation error: This policy contains invalid Json"),
+    "array": ("[]", "Policy validation error: This policy contains invalid Json"),
+    "empty": ("", "Policy validation error: Resource policy size should be greater than 0 and less than 20000 bytes"),
+    "too big": ("x" * 20001,
+                "Policy validation error: Resource policy size should be greater than 0 and less than 20000 bytes"),
+    "no version": ('{"Statement": []}', "Policy validation error: Missing required field Version"),
+    "bad version": ('{"Version": "bogus", "Statement": []}',
+                    "Policy validation error: The policy must contain a valid version string"),
+    "no statement": ('{"Version": "2012-10-17"}', "Policy validation error: Missing required field Statement"),
+    "empty statement": ('{"Version": "2012-10-17", "Statement": []}',
+                        "Policy validation error: Could not parse the policy: Statement is empty!"),
+    "unknown field": ('{"Version": "2012-10-17", "Statement": [], "Foo": 1}',
+                      "Policy validation error: Unknown field Foo"),
+    "not-action": ('{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"AWS": "%(acct)s"}, '
+                   '"NotAction": "kinesis:PutRecord", "Resource": "{arn}"}]}',
+                   "Policy validation error: Has prohibited field NotAction"),
+    "no effect": ('{"Version": "2012-10-17", "Statement": [{"Principal": {"AWS": "%(acct)s"}, '
+                  '"Action": "kinesis:GetRecords", "Resource": "{arn}"}]}',
+                  "Policy validation error: Missing required field Effect"),
+    "sid not a string": ('{"Version": "2012-10-17", "Statement": [{"Sid": 5, "Effect": "Allow", '
+                         '"Principal": {"AWS": "%(acct)s"}, "Action": "kinesis:GetRecords", "Resource": "{arn}"}]}',
+                         "Policy validation error: Syntax error at position (1,50)"),
+    "invalid sid": ('{"Version": "2012-10-17", "Statement": [{"Sid": "a b", "Effect": "Allow", '
+                    '"Principal": {"AWS": "%(acct)s"}, "Action": "kinesis:GetRecords", "Resource": "{arn}"}]}',
+                    "Policy validation error: Resource policy contains invalid statement at line 1, column 41: "
+                    "The following Statement Ids are invalid: a b, "),
+    "invalid action": ('{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"AWS": "%(acct)s"}, '
+                       '"Action": ["kinesis:CreateStream", "kinesis:Nope"], "Resource": "{arn}"}]}',
+                       "Policy validation error: Resource policy contains invalid statement at line 1, column 41: "
+                       'The following action names are invalid: "kinesis:CreateStream", "kinesis:Nope"'),
+    "wildcard action": ('{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"AWS": "%(acct)s"}, '
+                        '"Action": "kinesis:*", "Resource": "{arn}"}]}',
+                        "Policy validation error: Resource policy contains invalid statement at line 1, column 41: "
+                        "The resource policy cannot contain invalid actions: [kinesis:*]."),
+    "wildcard principal": ('{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": "*", '
+                           '"Action": "kinesis:GetRecords", "Resource": "{arn}"}]}',
+                           "Policy validation error: Resource policy contains invalid statement at line 1, "
+                           "column 41: The resource policy cannot contain the wildcard principal."),
+    "service principal": ('{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", '
+                          '"Principal": {"Service": "lambda.amazonaws.com"}, "Action": "kinesis:GetRecords", '
+                          '"Resource": "{arn}"}]}',
+                          "Policy validation error: Resource policy contains invalid statement at line 1, "
+                          "column 41: The resource policy cannot contain Service principals."),
+    "other resource": ('{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"AWS": "%(acct)s"}, '
+                       '"Action": "kinesis:GetRecords", "Resource": "*"}]}',
+                       "Policy validation error: Resource policy contains invalid statement at line 1, column 41: "
+                       "The resource policy's resource must be the same as the resource ARN."),
+    "second statement, pretty": ('{\n  "Version": "2012-10-17",\n  "Statement": [\n    {"Sid": "a", "Effect": "Allow", '
+                                 '"Principal": {"AWS": "%(acct)s"}, "Action": "kinesis:GetRecords", '
+                                 '"Resource": "{arn}"},\n    {"Sid": "a", "Effect": "Allow", '
+                                 '"Principal": {"AWS": "%(acct)s"}, "Action": "kinesis:GetRecords", '
+                                 '"Resource": "{arn}"}\n  ]\n}',
+                                 "Policy validation error: Resource policy contains invalid statement at line 4, "
+                                 "column {col}: The Statement Ids in the policy are not unique"),
+}
+
+
+@pytest.mark.parametrize("case", list(_POLICY_CASES))
+def test_kinesis_resource_policy_validation_matches_aws(kin, case):
+    _name, arn = _new_stream(kin, "kin-rp-val")
+    _use_account(_CONSUMER)
+    unused = _unused_account()
+    document, message = _POLICY_CASES[case]
+    document = (document % {"acct": _CONSUMER, "unused": unused} if "%(" in document else document)
+    document = document.replace("{arn}", arn)
+    if "{col}" in message:
+        # Reported just past the token before the offending statement: the
+        # first statement's closing brace, on line 4.
+        message = message.replace("{col}", str(document.splitlines()[3].rindex("},") + 2))
+    with pytest.raises(ClientError) as exc:
+        kin.put_resource_policy(ResourceARN=arn, Policy=document)
+    assert exc.value.response["Error"] == {"Code": "InvalidArgumentException", "Message": message}
+    assert kin.get_resource_policy(ResourceARN=arn)["Policy"] == "{}"
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("principal", ["arn:aws:iam::{unused}:root", "arn:aws:iam::{acct}:role/no-such-role"])
+def test_kinesis_resource_policy_principal_must_exist_under_auth(kin, auth_enabled, principal):
+    """Under AUTH=true a principal MiniStack does not hold is refused, as AWS refuses one that does not exist;
+    with AUTH off it is stored, as MiniStack does not require roles to exist elsewhere."""
+    _name, arn = _new_stream(kin, "kin-rp-princ")
+    _use_account(_CONSUMER)
+    principal = principal.format(unused=_unused_account(), acct=_CONSUMER)
+    policy = _read_policy(arn, principal, ["kinesis:GetRecords"])
+    if auth_enabled:
+        with pytest.raises(ClientError) as exc:
+            kin.put_resource_policy(ResourceARN=arn, Policy=policy)
+        assert exc.value.response["Error"] == {"Code": "InvalidArgumentException",
+                                               "Message": "Invalid principal in policy document."}
+        assert kin.get_resource_policy(ResourceARN=arn)["Policy"] == "{}"
+    else:
+        kin.put_resource_policy(ResourceARN=arn, Policy=policy)
+        assert principal in kin.get_resource_policy(ResourceARN=arn)["Policy"]
+
+
+def test_kinesis_resource_policy_resource_errors(kin):
+    name, arn = _new_stream(kin, "kin-rp-err")
+    _use_account(_CONSUMER)
+    missing = arn.rsplit("/", 1)[0] + "/no-such-stream"
+    other_region = arn.replace(":us-east-1:", ":us-west-2:")
+    unused = arn.replace(f":{arn.split(':')[4]}:", f":{_unused_account()}:")
+
+    def error(call):
+        with pytest.raises(ClientError) as exc:
+            call()
+        return exc.value.response["Error"]
+
+    # The policy is checked before the stream: a policy for a missing stream
+    # naming the stream it was sent for is refused for its resource.
+    assert error(lambda: kin.get_resource_policy(ResourceARN=missing)) == {
+        "Code": "ResourceNotFoundException",
+        "Message": f"Stream no-such-stream under account {arn.split(':')[4]} not found."}
+    assert error(lambda: kin.put_resource_policy(ResourceARN=missing, Policy=_read_policy(missing, _CONSUMER))) == {
+        "Code": "ResourceNotFoundException",
+        "Message": f"Stream no-such-stream under account {arn.split(':')[4]} not found."}
+    assert error(lambda: kin.put_resource_policy(ResourceARN=missing, Policy=_read_policy(arn, _CONSUMER)))[
+        "Message"].endswith("The resource policy's resource must be the same as the resource ARN.")
+    assert error(lambda: kin.get_resource_policy(ResourceARN=other_region)) == {
+        "Code": "InvalidArgumentException",
+        "Message": f"The region specified in the ARN '{other_region}' does not match the endpoint region"}
+    assert error(lambda: kin.delete_resource_policy(ResourceARN=unused)) == {
+        "Code": "UnrecognizedClientException", "Message": "No account found for the given parameters"}
+
+    # Only the owner's account manages the policy.
+    other = _account_client("kinesis", _CONSUMER)
+    assert error(lambda: other.put_resource_policy(ResourceARN=arn, Policy=_read_policy(arn, _CONSUMER))) == {
+        "Code": "AccessDeniedException",
+        "Message": f"User: arn:aws:iam::{_CONSUMER}:root is not authorized to perform: kinesis:PutResourcePolicy "
+                   f"on resource: {arn} because no resource-based policy allows the kinesis:PutResourcePolicy action"}
+
+
+def test_kinesis_resource_policy_follows_stream_and_consumer_lifecycle(kin):
+    _use_account(_CONSUMER)
+    name, arn = _new_stream(kin, "kin-rp-life")
+    consumer_arn = kin.register_stream_consumer(StreamARN=arn, ConsumerName="efo")["Consumer"]["ConsumerARN"]
+    consumer_policy = _read_policy(consumer_arn, _CONSUMER, ["kinesis:SubscribeToShard"])
+
+    with pytest.raises(ClientError) as exc:  # a stream action on a consumer
+        kin.put_resource_policy(ResourceARN=consumer_arn, Policy=_read_policy(consumer_arn, _CONSUMER))
+    assert 'The following action names are invalid: "kinesis:DescribeStream"' in exc.value.response["Error"]["Message"]
+    kin.put_resource_policy(ResourceARN=consumer_arn, Policy=consumer_policy)
+    assert json.loads(kin.get_resource_policy(ResourceARN=consumer_arn)["Policy"])["Statement"][0]["Action"] == (
+        "kinesis:SubscribeToShard")
+    kin.deregister_stream_consumer(ConsumerARN=consumer_arn)
+    consumer_arn = kin.register_stream_consumer(StreamARN=arn, ConsumerName="efo")["Consumer"]["ConsumerARN"]
+    assert kin.get_resource_policy(ResourceARN=consumer_arn)["Policy"] == "{}"
+
+    kin.put_resource_policy(ResourceARN=arn, Policy=_read_policy(arn, _CONSUMER))
+    kin.delete_stream(StreamName=name)
+    kin.create_stream(StreamName=name, ShardCount=1)
+    assert kin.get_resource_policy(ResourceARN=arn)["Policy"] == "{}"
+
+
+@pytest.mark.auth_contract
+def test_kinesis_stream_policy_grants_a_named_user_contract(auth_enabled, iam_user, kin):
+    """In the owner's account, a stream policy naming a user allows that user
+    even without an identity policy."""
+    name = f"kin-rp-auth-{_uuid_mod.uuid4().hex[:8]}"
+    kin.create_stream(StreamName=name, ShardCount=1)
+    arn = kin.describe_stream_summary(StreamName=name)["StreamDescriptionSummary"]["StreamARN"]
+    user = iam_user()
+    client = user.client("kinesis")
+    try:
+        if auth_enabled:
+            with pytest.raises(ClientError) as exc:
+                client.describe_stream_summary(StreamARN=arn)
+            assert exc.value.response["Error"] == {
+                "Code": "AccessDeniedException",
+                "Message": f"User: {user.arn} is not authorized to perform: kinesis:DescribeStreamSummary on resource: "
+                           f"{arn} because no identity-based policy allows the kinesis:DescribeStreamSummary action"}
+        else:
+            client.describe_stream_summary(StreamARN=arn)
+
+        kin.put_resource_policy(ResourceARN=arn, Policy=_read_policy(
+            arn, user.arn, "kinesis:DescribeStreamSummary"))
+        assert client.describe_stream_summary(StreamARN=arn)["StreamDescriptionSummary"]["StreamARN"] == arn
+    finally:
+        kin.delete_stream(StreamName=name)
+
+
+# ---------------------------------------------------------------------------
+# Lambda event source mappings on another account's stream (#2443)
+# ---------------------------------------------------------------------------
+
+PRODUCER = "111111111111"
+CONSUMER = "222222222222"
+REGION = "us-east-1"
+ROLE_NAME = "xacct-consumer-role"
+ROLE_ARN = f"arn:aws:iam::{CONSUMER}:role/{ROLE_NAME}"
+OTHER_ROLE_ARN = f"arn:aws:iam::{CONSUMER}:role/xacct-someone-else"
+OTHER_ACCOUNT = "333333333333"
+READ_ACTIONS = [
+    "kinesis:DescribeStream", "kinesis:DescribeStreamSummary",
+    "kinesis:GetRecords", "kinesis:GetShardIterator", "kinesis:ListShards",
+]
+
+# Prints one line per record it is given, so a test sees exactly what arrived.
+HANDLER = """
+import base64, json
+
+def handler(event, context):
+    for r in event["Records"]:
+        print("XREC " + json.dumps({
+            "data": base64.b64decode(r["kinesis"]["data"]).decode(),
+            "partitionKey": r["kinesis"]["partitionKey"],
+            "sequenceNumber": r["kinesis"]["sequenceNumber"],
+            "eventSourceARN": r["eventSourceARN"],
+            "eventSource": r["eventSource"],
+            "awsRegion": r["awsRegion"],
+        }))
+    return len(event["Records"])
+"""
+
+
+def _client(service, account_id, region=REGION):
+    return boto3.client(
+        service, endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+        region_name=region, aws_access_key_id=account_id, aws_secret_access_key="test",
+        config=Config(retries={"total_max_attempts": 1}),
+    )
+
+
+def _policy(stream_arn, principal=ROLE_ARN, actions=READ_ACTIONS, extra=()):
+    return json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"AWS": principal},
+            "Action": actions,
+            "Resource": stream_arn,
+        }, *extra],
+    })
+
+
+def _code(exc_info):
+    return exc_info.value.response["Error"]["Code"]
+
+
+class Accounts:
+    """A producer stream and consumer functions, cleaned up afterwards."""
+
+    def __init__(self):
+        self.kin = _client("kinesis", PRODUCER)
+        self.consumer_kin = _client("kinesis", CONSUMER)
+        self.lam = _client("lambda", CONSUMER)
+        self.logs = _client("logs", CONSUMER)
+        self._cleanup = []
+        # A policy may only name principals that exist: the function's role, a
+        # second role, and a third account. The producer and third accounts hold an IAM
+        # user, so MiniStack knows they exist, as they do on AWS.
+        iam = _client("iam", CONSUMER)
+        for role in (ROLE_NAME, OTHER_ROLE_ARN.rsplit("/", 1)[1]):
+            try:
+                iam.create_role(RoleName=role, AssumeRolePolicyDocument=json.dumps({
+                    "Version": "2012-10-17",
+                    "Statement": [{"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"},
+                                   "Action": "sts:AssumeRole"}],
+                }))
+            except iam.exceptions.EntityAlreadyExistsException:
+                pass
+        for account in (PRODUCER, OTHER_ACCOUNT):
+            try:  # MiniStack knows an account once it holds an IAM identity
+                _client("iam", account).create_user(UserName="xacct-account-user")
+            except ClientError:
+                pass
+
+    def stream(self, client=None, shards=1, name=None):
+        client = client or self.kin
+        name = name or f"xacct-{uuid.uuid4().hex[:10]}"
+        client.create_stream(StreamName=name, ShardCount=shards)
+        self._cleanup.append(lambda: client.delete_stream(StreamName=name))
+        arn = client.describe_stream_summary(StreamName=name)["StreamDescriptionSummary"]["StreamARN"]
+        return name, arn
+
+    def function(self):
+        name = f"xacct-fn-{uuid.uuid4().hex[:10]}"
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("index.py", HANDLER)
+        self.lam.create_function(
+            FunctionName=name, Runtime="python3.12", Handler="index.handler",
+            Role=ROLE_ARN, Code={"ZipFile": buf.getvalue()},
+        )
+        self._cleanup.append(lambda: self.lam.delete_function(FunctionName=name))
+        return name
+
+    def mapping(self, function, stream_arn, **kwargs):
+        kwargs.setdefault("StartingPosition", "TRIM_HORIZON")
+        esm = self.lam.create_event_source_mapping(FunctionName=function, EventSourceArn=stream_arn, **kwargs)
+        self._cleanup.append(lambda: self.lam.delete_event_source_mapping(UUID=esm["UUID"]))
+        return esm["UUID"]
+
+    def received(self, function):
+        """Every record the function has logged, in log order."""
+        try:
+            events = self.logs.filter_log_events(logGroupName=f"/aws/lambda/{function}", limit=10000)["events"]
+        except ClientError:
+            return []  # no log group until the first invocation
+        return [json.loads(line[len("XREC "):])
+                for event in events for line in event["message"].splitlines()
+                if line.startswith("XREC ")]
+
+    def wait_received(self, function, count, timeout=30):
+        deadline = time.time() + timeout
+        records = []
+        while time.time() < deadline:
+            records = self.received(function)
+            if len(records) >= count:
+                return records
+            time.sleep(0.5)
+        return records
+
+    def wait_result(self, esm_uuid, prefix, timeout=30):
+        deadline = time.time() + timeout
+        result = ""
+        while time.time() < deadline:
+            result = self.lam.get_event_source_mapping(UUID=esm_uuid).get("LastProcessingResult", "")
+            if result.startswith(prefix):
+                return result
+            time.sleep(0.5)
+        return result
+
+    def close(self):
+        for undo in reversed(self._cleanup):
+            try:
+                undo()
+            except ClientError:
+                pass
+
+
+@pytest.fixture
+def accounts():
+    a = Accounts()
+    yield a
+    a.close()
+
+
+# ---------------------------------------------------------------------------
+# CreateEventSourceMapping
+# ---------------------------------------------------------------------------
+
+_CANNOT_ACCESS = ("Cannot access stream {arn}. Please ensure the role can perform the GetRecords, GetShardIterator, "
+                  "DescribeStream, DescribeStreamSummary, ListShards, and ListStreams Actions on your stream.")
+
+
+def _refused(exc_info):
+    return exc_info.value.response["Error"]
+
+
+def test_mapping_accepts_another_accounts_stream_its_policy_grants(accounts):
+    _name, arn = accounts.stream()
+    accounts.kin.put_resource_policy(ResourceARN=arn, Policy=_policy(arn))
+    fn = accounts.function()
+    esm = accounts.mapping(fn, arn)
+
+    got = accounts.lam.get_event_source_mapping(UUID=esm)
+    assert got["EventSourceArn"] == arn
+    assert got["FunctionArn"] == f"arn:aws:lambda:{REGION}:{CONSUMER}:function:{fn}"
+    listed = accounts.lam.list_event_source_mappings(EventSourceArn=arn)["EventSourceMappings"]
+    assert [m["UUID"] for m in listed] == [esm]
+
+
+def test_mapping_refuses_a_stream_missing_from_the_other_account(accounts):
+    fn = accounts.function()
+    missing = f"arn:aws:kinesis:{REGION}:{PRODUCER}:stream/xacct-missing-{uuid.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        accounts.mapping(fn, missing)
+    assert _refused(exc) == {"Code": "InvalidParameterValueException", "Message": _CANNOT_ACCESS.format(arn=missing)}
+
+
+def test_mapping_refuses_an_account_that_does_not_exist(accounts):
+    fn = accounts.function()
+    nobody = str(uuid.uuid4().int)[:12].rjust(12, "9")
+    arn = f"arn:aws:kinesis:{REGION}:{nobody}:stream/anything"
+    with pytest.raises(ClientError) as exc:
+        accounts.mapping(fn, arn)
+    assert _refused(exc) == {
+        "Code": "InvalidParameterValueException",
+        "Message": "Received Exception while reading from provided stream. No account found for the given parameters",
+    }
+
+
+def test_mapping_refuses_another_accounts_stream_in_another_region(accounts):
+    _name, west_arn = accounts.stream(client=_client("kinesis", PRODUCER, "us-west-2"))
+    fn = accounts.function()
+    with pytest.raises(ClientError) as exc:
+        accounts.mapping(fn, west_arn)
+    assert _refused(exc) == {"Code": "InvalidParameterValueException",
+                             "Message": f"Event source region must match Lambda region {REGION}"}
+
+
+# ---------------------------------------------------------------------------
+# Delivery
+# ---------------------------------------------------------------------------
+
+def test_function_receives_every_record_across_shards_and_batches(accounts):
+    name, arn = accounts.stream(shards=2)
+    accounts.kin.put_resource_policy(ResourceARN=arn, Policy=_policy(arn))
+    sent = []
+    for i in range(25):
+        resp = accounts.kin.put_record(StreamName=name, Data=f"record-{i}".encode(), PartitionKey=f"pk-{i % 5}")
+        sent.append((f"record-{i}", f"pk-{i % 5}", resp["SequenceNumber"]))
+    fn = accounts.function()
+    accounts.mapping(fn, arn, BatchSize=10)
+
+    got = accounts.wait_received(fn, len(sent))
+    assert sorted((r["data"], r["partitionKey"], r["sequenceNumber"]) for r in got) == sorted(sent)
+    assert {(r["eventSourceARN"], r["eventSource"], r["awsRegion"]) for r in got} == {
+        (arn, "aws:kinesis", REGION)}
+    for pk in {pk for _d, pk, _s in sent}:
+        # Order holds within a partition key, as it does within a shard.
+        assert [r["data"] for r in got if r["partitionKey"] == pk] == [d for d, p, _s in sent if p == pk]
+
+
+def test_latest_mapping_only_delivers_records_written_after_it(accounts):
+    name, arn = accounts.stream()
+    accounts.kin.put_resource_policy(ResourceARN=arn, Policy=_policy(arn))
+    accounts.kin.put_record(StreamName=name, Data=b"before", PartitionKey="pk")
+    fn = accounts.function()
+    esm = accounts.mapping(fn, arn, StartingPosition="LATEST")
+    time.sleep(2)  # let the poller pin the starting position
+    accounts.kin.put_record(StreamName=name, Data=b"after", PartitionKey="pk")
+
+    accounts.wait_result(esm, "OK")
+    assert [r["data"] for r in accounts.wait_received(fn, 1)] == ["after"]
+
+
+def test_mapping_reads_the_owners_stream_not_a_same_named_local_one(accounts):
+    name, producer_arn = accounts.stream()
+    _same, consumer_arn = accounts.stream(client=accounts.consumer_kin, name=name)
+    assert producer_arn != consumer_arn
+    accounts.kin.put_resource_policy(ResourceARN=producer_arn, Policy=_policy(producer_arn))
+    accounts.kin.put_record(StreamName=name, Data=b"from-producer", PartitionKey="pk")
+    accounts.consumer_kin.put_record(StreamName=name, Data=b"from-consumer", PartitionKey="pk")
+
+    remote_fn, local_fn = accounts.function(), accounts.function()
+    accounts.mapping(remote_fn, producer_arn)
+    accounts.mapping(local_fn, consumer_arn)
+
+    assert [(r["data"], r["eventSourceARN"]) for r in accounts.wait_received(remote_fn, 1)] == [
+        ("from-producer", producer_arn)]
+    assert [(r["data"], r["eventSourceARN"]) for r in accounts.wait_received(local_fn, 1)] == [
+        ("from-consumer", consumer_arn)]
+    time.sleep(2)  # nothing else turns up later
+    assert len(accounts.received(remote_fn)) == 1 and len(accounts.received(local_fn)) == 1
+
+
+def test_disabled_mapping_waits_until_enabled(accounts):
+    name, arn = accounts.stream()
+    accounts.kin.put_resource_policy(ResourceARN=arn, Policy=_policy(arn))
+    accounts.kin.put_record(StreamName=name, Data=b"held", PartitionKey="pk")
+    fn = accounts.function()
+    esm = accounts.mapping(fn, arn, Enabled=False)
+
+    time.sleep(3)
+    assert accounts.received(fn) == []
+    accounts.lam.update_event_source_mapping(UUID=esm, Enabled=True)
+    assert [r["data"] for r in accounts.wait_received(fn, 1)] == ["held"]
+
+
+# ---------------------------------------------------------------------------
+# The stream policy decides, when the mapping is created and on every pass
+# ---------------------------------------------------------------------------
+
+def _deny_get_records(stream_arn):
+    return {"Effect": "Deny", "Principal": {"AWS": ROLE_ARN}, "Action": "kinesis:GetRecords",
+            "Resource": stream_arn}
+
+
+# (principal, actions, extra statements, mapping allowed)
+_POLICIES = {
+    "execution-role": (ROLE_ARN, READ_ACTIONS, (), True),
+    "account-id": (CONSUMER, READ_ACTIONS, (), True),
+    "account-root": (f"arn:aws:iam::{CONSUMER}:root", READ_ACTIONS, (), True),
+    "other-role": (OTHER_ROLE_ARN, READ_ACTIONS, (), False),
+    "other-account": (OTHER_ACCOUNT, READ_ACTIONS, (), False),
+    "missing-list-shards": (ROLE_ARN, READ_ACTIONS[:-1], (), False),
+    "explicit-deny": (ROLE_ARN, READ_ACTIONS, "deny", False),
+    "no-policy": (None, None, (), False),
+}
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("case", list(_POLICIES))
+def test_stream_policy_decides_the_mapping_contract(accounts, case, auth_enabled):
+    """Under AUTH=true the stream's policy decides, as on AWS; AUTH=false maps any existing stream."""
+    principal, actions, extra, allowed = _POLICIES[case]
+    allowed = allowed or not auth_enabled
+    name, arn = accounts.stream()
+    if principal is not None:
+        statements = [_deny_get_records(arn)] if extra == "deny" else []
+        accounts.kin.put_resource_policy(ResourceARN=arn, Policy=_policy(arn, principal, actions, statements))
+    accounts.kin.put_record(StreamName=name, Data=b"payload", PartitionKey="pk")
+    fn = accounts.function()
+
+    if allowed:
+        esm = accounts.mapping(fn, arn)
+        assert [r["data"] for r in accounts.wait_received(fn, 1)] == ["payload"]
+        assert accounts.wait_result(esm, "OK").startswith("OK")  # "OK" on AWS
+    else:
+        with pytest.raises(ClientError) as exc:
+            accounts.mapping(fn, arn)
+        assert _refused(exc) == {"Code": "InvalidParameterValueException", "Message": _CANNOT_ACCESS.format(arn=arn)}
+
+
+def _problem(action, arn):
+    """LastProcessingResult as AWS words it; the session name is Lambda's own."""
+    return re.compile(
+        rf"PROBLEM: User: arn:aws:sts::{CONSUMER}:assumed-role/{ROLE_NAME}/awslambda_\d+_\d+ is not authorized "
+        rf"to perform: {re.escape(action)} on resource: {re.escape(arn)} because no resource-based policy "
+        rf"allows the {re.escape(action)} action$")
+
+
+@pytest.mark.auth_contract
+def test_revoking_and_granting_the_policy_stops_and_resumes_delivery_contract(accounts, auth_enabled):
+    """Recorded on AWS: revoking the grant stops a running mapping, which names
+    DescribeStream; granting again delivers what was held. AUTH=false keeps delivering."""
+    name, arn = accounts.stream()
+    accounts.kin.put_resource_policy(ResourceARN=arn, Policy=_policy(arn))
+    fn = accounts.function()
+    esm = accounts.mapping(fn, arn)
+    accounts.kin.put_record(StreamName=name, Data=b"first", PartitionKey="pk")
+    assert [r["data"] for r in accounts.wait_received(fn, 1)] == ["first"]
+
+    accounts.kin.delete_resource_policy(ResourceARN=arn)
+    accounts.kin.put_record(StreamName=name, Data=b"second", PartitionKey="pk")
+    if not auth_enabled:
+        assert [r["data"] for r in accounts.wait_received(fn, 2)] == ["first", "second"]
+        return
+    assert _problem("kinesis:DescribeStream", arn).match(accounts.wait_result(esm, "PROBLEM"))
+    time.sleep(2)
+    assert [r["data"] for r in accounts.received(fn)] == ["first"]
+    assert accounts.lam.get_event_source_mapping(UUID=esm)["State"] == "Enabled"
+
+    # Granting again picks up where delivery stopped.
+    accounts.kin.put_resource_policy(ResourceARN=arn, Policy=_policy(arn))
+    assert [r["data"] for r in accounts.wait_received(fn, 2)] == ["first", "second"]
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("missing", READ_ACTIONS)
+def test_a_running_mapping_needs_only_get_records_contract(accounts, missing, auth_enabled):
+    """Recorded on AWS: once created, a mapping keeps delivering without any of
+    the other read actions; without GetRecords it stops and names it."""
+    name, arn = accounts.stream()
+    accounts.kin.put_resource_policy(ResourceARN=arn, Policy=_policy(arn))
+    fn = accounts.function()
+    esm = accounts.mapping(fn, arn)
+    accounts.kin.put_resource_policy(
+        ResourceARN=arn, Policy=_policy(arn, actions=[a for a in READ_ACTIONS if a != missing]))
+    accounts.kin.put_record(StreamName=name, Data=b"payload", PartitionKey="pk")
+
+    if missing == "kinesis:GetRecords" and auth_enabled:
+        assert _problem(missing, arn).match(accounts.wait_result(esm, "PROBLEM"))
+        time.sleep(2)
+        assert accounts.received(fn) == []
+    else:
+        assert [r["data"] for r in accounts.wait_received(fn, 1)] == ["payload"]
+
+
+def test_only_the_owner_manages_the_stream_policy(accounts):
+    _name, arn = accounts.stream()
+    policy = _policy(arn)
+    accounts.kin.put_resource_policy(ResourceARN=arn, Policy=policy)
+    for call in (
+        lambda: accounts.consumer_kin.put_resource_policy(ResourceARN=arn, Policy=policy),
+        lambda: accounts.consumer_kin.get_resource_policy(ResourceARN=arn),
+        lambda: accounts.consumer_kin.delete_resource_policy(ResourceARN=arn),
+    ):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert _code(exc) == "AccessDeniedException"
+    assert json.loads(accounts.kin.get_resource_policy(ResourceARN=arn)["Policy"]) == json.loads(policy)
+    with pytest.raises(ClientError) as exc:
+        accounts.consumer_kin.get_resource_policy(ResourceARN=arn)
+    assert _refused(exc)["Message"] == (
+        f"User: arn:aws:iam::{CONSUMER}:root is not authorized to perform: kinesis:GetResourcePolicy on resource: "
+        f"{arn} because no resource-based policy allows the kinesis:GetResourcePolicy action")

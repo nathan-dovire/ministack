@@ -1,9 +1,11 @@
-FROM python:3.12-slim AS builder
+FROM python:3.13-slim AS builder
 
 # Full variant — Debian/glibc base so DuckDB and psycopg2 install from
 # published manylinux wheels instead of building from source against musl.
 # See issue #411: DuckDB has no musllinux wheels and runs ~30% slower
 # on musl per upstream docs; psycopg2-binary likewise has no musl wheels.
+# awscli 1.45.x pins botocore exactly and 1.46 bundles its own copy (~120 MB),
+# so the CLI is installed without deps and runs on the botocore pinned here.
 RUN pip install --no-cache-dir --no-compile \
         hypercorn==0.18.0 \
         "cbor2>=5.4.0" \
@@ -15,19 +17,109 @@ RUN pip install --no-cache-dir --no-compile \
         "psycopg2-binary>=2.9" \
         "duckdb>=0.10.0" \
         "asyncssh>=2.14" \
+        "aws-sam-translator>=1.90" \
         "boto3>=1.34" \
-        "awscli"
+        "jsonata-python>=0.7.0" \
+        "graphql-core==3.2.12" \
+        "botocore==1.43.124" \
+        "docutils>=0.18.1,<=0.19" \
+        "colorama>=0.2.5,<0.4.7" \
+        "rsa>=3.1.2,<4.8" \
+    && pip install --no-cache-dir --no-compile --no-deps awscli==1.45.63
 
 # Strip awscli help examples (~25 MB), Python cache files (~15 MB),
 # pip metadata, and DuckDB stub / ADBC artefacts that aren't used at runtime.
-RUN rm -rf /usr/local/lib/python3.12/site-packages/awscli/examples \
-    && find /usr/local/lib/python3.12/site-packages -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null \
-    && rm -rf /usr/local/lib/python3.12/site-packages/pip*.dist-info \
-    && rm -rf /usr/local/lib/python3.12/site-packages/pip* \
-    && rm -rf /usr/local/lib/python3.12/site-packages/_duckdb-stubs \
-    && rm -rf /usr/local/lib/python3.12/site-packages/adbc_driver_duckdb
+RUN rm -rf /usr/local/lib/python3.13/site-packages/awscli/examples \
+    && find /usr/local/lib/python3.13/site-packages -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null \
+    && rm -rf /usr/local/lib/python3.13/site-packages/pip*.dist-info \
+    && rm -rf /usr/local/lib/python3.13/site-packages/pip* \
+    && rm -rf /usr/local/lib/python3.13/site-packages/_duckdb-stubs \
+    && rm -rf /usr/local/lib/python3.13/site-packages/adbc_driver_duckdb
 
-FROM python:3.12-slim
+# Compile the IAM-auth compatibility plugin against each supported MySQL
+# series. The compiler and headers remain isolated in these build stages.
+FROM mysql:8.0 AS plugin-build-80
+USER root
+RUN mysql_version="$(rpm -q --qf '%{VERSION}-%{RELEASE}' mysql-community-server-minimal)" \
+    && sed -i 's#/docker/#/#' /etc/yum.repos.d/mysql-community-minimal.repo \
+    && microdnf install -y gcc-c++ "mysql-community-debugsource-${mysql_version}" \
+    && microdnf clean all
+ARG TARGETARCH
+COPY contrib/mysql-iam-plugin/aws_auth_plugin.cc /tmp/aws_auth_plugin.cc
+RUN arch="${TARGETARCH}"; \
+    if [ -z "${arch}" ]; then \
+      case "$(uname -m)" in \
+        x86_64) arch=amd64 ;; \
+        aarch64) arch=arm64 ;; \
+        *) echo "unsupported build architecture: $(uname -m)" >&2; exit 1 ;; \
+      esac; \
+    fi; \
+    header="$(rpm -ql mysql-community-debugsource | grep '/include/mysql/plugin_auth.h$' | head -1)"; \
+    include_dir="$(dirname "$(dirname "${header}")")"; \
+    mkdir -p "/opt/ministack/mysql-plugins/8.0/${arch}"; \
+    g++ -O2 -Wall -Wextra -Werror -fPIC -shared \
+      -DMYSQL_ABI_CHECK -DMYSQL_DYNAMIC_PLUGIN \
+      -I"${include_dir}" \
+      -o "/opt/ministack/mysql-plugins/8.0/${arch}/aws_auth_plugin.so" \
+      /tmp/aws_auth_plugin.cc; \
+    nm -D "/opt/ministack/mysql-plugins/8.0/${arch}/aws_auth_plugin.so" \
+      | grep -q ' _mysql_plugin_interface_version_$'
+
+FROM mysql:8.4 AS plugin-build
+USER root
+RUN mysql_version="$(rpm -q --qf '%{VERSION}-%{RELEASE}' mysql-community-server-minimal)" \
+    && sed -i 's#/docker/#/#' /etc/yum.repos.d/mysql-community-minimal.repo \
+    && microdnf install -y gcc-c++ "mysql-community-debugsource-${mysql_version}" \
+    && microdnf clean all
+ARG TARGETARCH
+COPY contrib/mysql-iam-plugin/aws_auth_plugin.cc /tmp/aws_auth_plugin.cc
+RUN arch="${TARGETARCH}"; \
+    if [ -z "${arch}" ]; then \
+      case "$(uname -m)" in \
+        x86_64) arch=amd64 ;; \
+        aarch64) arch=arm64 ;; \
+        *) echo "unsupported build architecture: $(uname -m)" >&2; exit 1 ;; \
+      esac; \
+    fi; \
+    header="$(rpm -ql mysql-community-debugsource | grep '/include/mysql/plugin_auth.h$' | head -1)"; \
+    include_dir="$(dirname "$(dirname "${header}")")"; \
+    mkdir -p "/opt/ministack/mysql-plugins/8.4/${arch}"; \
+    g++ -O2 -Wall -Wextra -Werror -fPIC -shared \
+      -DMYSQL_ABI_CHECK -DMYSQL_DYNAMIC_PLUGIN \
+      -I"${include_dir}" \
+      -o "/opt/ministack/mysql-plugins/8.4/${arch}/aws_auth_plugin.so" \
+      /tmp/aws_auth_plugin.cc; \
+    nm -D "/opt/ministack/mysql-plugins/8.4/${arch}/aws_auth_plugin.so" \
+      | grep -q ' _mysql_plugin_interface_version_$'
+COPY --from=plugin-build-80 /opt/ministack/mysql-plugins/8.0 /opt/ministack/mysql-plugins/8.0
+
+# Rebuild ICU's locale data as English-only. Debian's libicudata.so is 31 MB of
+# locale tables and nothing else — statically linked, zero exported symbols —
+# and Node is the only binary in the image that links ICU. Alpine packages the
+# same upstream ICU release as a 3 MB data file, so wrapping that with ICU's own
+# genccode produces a drop-in replacement. Non-English `Intl` formatting falls
+# back to English, which is what the Alpine image has always done; a derived
+# image can restore it with `apt-get install --reinstall libicu76`.
+FROM alpine:3.22 AS icu-data
+RUN apk add --no-cache icu-data-en
+
+FROM python:3.13-slim AS icu-build
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends icu-devtools gcc libc6-dev libicu-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=icu-data /usr/share/icu/ /tmp/icu/
+RUN set -eux; \
+    dat="$(find /tmp/icu -name 'icudt*.dat' | head -1)"; \
+    stem="$(basename "${dat}" .dat)"; \
+    ver="$(basename "$(dirname "${dat}")")"; \
+    cd /tmp; \
+    genccode -e "${stem%l}" -d /tmp "${dat}"; \
+    gcc -shared -fPIC -O2 -o "/tmp/libicudata.so.${ver}" "/tmp/${stem}_dat.c"; \
+    strip "/tmp/libicudata.so.${ver}"; \
+    ln -s "libicudata.so.${ver}" /tmp/libicudata.so.slim
+
+
+FROM python:3.13-slim AS prep
 
 LABEL maintainer="MiniStack" \
       description="Local AWS Service Emulator — full variant with DuckDB (Athena), PostgreSQL, MySQL drivers, and SFTP"
@@ -36,16 +128,17 @@ LABEL maintainer="MiniStack" \
 # Lambda Node.js + init scripts), then strip pip and locale/doc payload
 # we never use at runtime.
 RUN apt-get update \
+    && apt-get upgrade -y \
     && apt-get install -y --no-install-recommends nodejs bash \
     && apt-get purge -y --auto-remove -o APT::AutoRemove::RecommendsImportant=false \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/* /tmp/* \
-    && rm -rf /usr/local/lib/python3.12/site-packages/pip* /usr/local/bin/pip* \
+    && rm -rf /usr/local/lib/python3.13/site-packages/pip* /usr/local/bin/pip* \
     && rm -rf /usr/share/doc /usr/share/man /usr/share/info /usr/share/locale
 
 WORKDIR /opt/ministack
 
 # Copy cleaned Python packages and CLI entrypoints from builder.
-COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
 COPY --from=builder /usr/local/bin/aws /usr/local/bin/aws
 COPY --from=builder /usr/local/bin/aws_completer /usr/local/bin/aws_completer
 COPY --from=builder /usr/local/bin/hypercorn /usr/local/bin/hypercorn
@@ -54,6 +147,7 @@ COPY bin/awslocal /usr/local/bin/awslocal
 RUN chmod +x /usr/local/bin/awslocal
 
 COPY ministack/ ministack/
+COPY --from=plugin-build /opt/ministack/mysql-plugins /opt/ministack/mysql-plugins
 
 RUN groupadd -r ministack && useradd -r -g ministack ministack
 RUN mkdir -p /tmp/ministack-data/s3 && chown -R ministack:ministack /tmp/ministack-data
@@ -61,6 +155,54 @@ RUN mkdir -p /docker-entrypoint-initaws.d/ready.d \
              /etc/localstack/init/boot.d \
              /etc/localstack/init/ready.d && \
     chown -R ministack:ministack /docker-entrypoint-initaws.d /etc/localstack
+
+# Swap in the English-only ICU data, then drop payload no runtime path reads:
+# the npm helper packages Debian ships beside node (the keep-list is read out of
+# libnode itself, because it aborts at startup if an externalized builtin such as
+# undici or acorn-walk is missing), perl (nothing here reverse-depends on it, and
+# the dpkg entry goes too so a scanner stops reporting its CVEs against files
+# that are gone),
+# glibc's legacy iconv converters (Python uses its own codecs; the few kept are
+# the ones a C library caller could plausibly ask for) and stdlib corners that
+# cannot run here now that pip is stripped. The `test -f` fails the build rather
+# than shipping a mismatch if the base's ICU major moves ahead of Alpine's, and
+# the node check proves Intl still works after the swap.
+COPY --from=icu-build /tmp/libicudata.so.* /tmp/icu-slim/
+RUN set -eux; \
+    target="$(find /usr/lib -type f -name 'libicudata.so.*' | head -1)"; \
+    slim="/tmp/icu-slim/$(basename "${target}")"; \
+    test -f "${slim}"; \
+    cp "${slim}" "${target}"; \
+    rm -rf /tmp/icu-slim; \
+    node -e "if (new Date(0).toLocaleDateString('en-US',{month:'long'}) !== 'January') process.exit(1)"; \
+    gconv="$(dirname "$(find /usr/lib -name 'UTF-16.so' -path '*gconv*' | head -1)")"; \
+    find "${gconv}" -name '*.so' \
+        ! -name 'UTF-16.so' ! -name 'UTF-32.so' ! -name 'UTF-7.so' \
+        ! -name 'UNICODE.so' ! -name 'ISO8859-1.so' ! -name 'CP1252.so' -delete; \
+    rm -rf /usr/local/lib/python3.13/ensurepip \
+           /usr/local/lib/python3.13/idlelib \
+           /usr/local/lib/python3.13/tkinter \
+           /usr/local/lib/python3.13/pydoc_data \
+           /usr/local/lib/python3.13/turtledemo \
+           /usr/local/lib/python3.13/turtle.py; \
+    python3 -c "import re,glob,os,shutil; \
+lib=glob.glob('/usr/lib/*/libnode.so.*')[0]; \
+keep={q.split('/')[4] for q in re.findall(r'/usr/share/nodejs/[A-Za-z0-9@._/-]+', open(lib,'rb').read().decode('latin1'))}; \
+[shutil.rmtree(os.path.join('/usr/share/nodejs',d), ignore_errors=True) for d in os.listdir('/usr/share/nodejs') if d not in keep]"; \
+    rm -rf /usr/bin/perl /usr/bin/perl5.40.1 /usr/lib/*/perl-base \
+           /usr/lib/*/perl5 /usr/share/perl5 /usr/share/perl; \
+    dpkg --purge --force-remove-essential --force-depends perl-base 2>/dev/null || true; \
+    node -e "require('http'); if (typeof fetch !== 'function') process.exit(1)"; \
+    rm -rf /var/cache/* /var/log/* /tmp/*
+
+# The layers above sum to more than the filesystem they produce: `apt-get
+# upgrade` rewrites base files into a new layer, and a later `rm -rf` cannot
+# shrink the layer beneath it. Flattening reclaims that, at the cost of layer
+# sharing with the base image on pull.
+FROM scratch
+COPY --from=prep / /
+
+WORKDIR /opt/ministack
 VOLUME /docker-entrypoint-initaws.d
 VOLUME /etc/localstack/init
 
@@ -75,6 +217,9 @@ ENV MINISTACK_VERSION=${MINISTACK_VERSION} \
     REDIS_PORT=6379 \
     RDS_BASE_PORT=15432 \
     RDS_PERSIST=0 \
+    DSQL_BASE_PORT=25432 \
+    DSQL_PERSIST=0 \
+    DSQL_STRICT=0 \
     ELASTICACHE_BASE_PORT=16379 \
     LAMBDA_EXECUTOR=local \
     USE_SSL=0 \
@@ -86,6 +231,6 @@ EXPOSE 4566 2222
 
 # Pure Python healthcheck — no curl dependency; USE_SSL for HTTP/HTTPS.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-    CMD python -c "import os,ssl,urllib.request as r; t=os.environ.get('USE_SSL','').strip().lower() in ('1','true','yes'); r.urlopen(('https' if t else 'http')+'://localhost:4566/_ministack/health',context=ssl._create_unverified_context() if t else None)" || exit 1
+    CMD python -c "import os,ssl,urllib.request as r; t=os.environ.get('USE_SSL','').strip().lower() in ('1','true','yes'); p=os.environ.get('GATEWAY_PORT') or os.environ.get('EDGE_PORT') or '4566'; r.urlopen(('https' if t else 'http')+'://localhost:'+p+'/_ministack/health',context=ssl._create_unverified_context() if t else None)" || exit 1
 
 ENTRYPOINT ["python", "-m", "ministack"]

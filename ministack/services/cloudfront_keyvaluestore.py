@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 CloudFront KeyValueStore Data-Plane Service Emulator.
 JSON REST API — signing name: cloudfront-keyvaluestore.
@@ -13,11 +15,11 @@ import copy
 import json
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import unquote
 
-from ministack.core.persistence import load_state
-from ministack.core.responses import AccountScopedDict, json_response, new_uuid
+from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.responses import AccountScopedDict, get_account_id, json_response, new_uuid
 
 logger = logging.getLogger("cloudfront-keyvaluestore")
 
@@ -44,20 +46,21 @@ def get_state():
     return copy.deepcopy({"stores": _stores})
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     if not data:
         return
     _stores.clear()
-    for k, v in (data.get("stores") or {}).items():
-        _stores[k] = v
+    # update() carries every account's entries; iterating a scoped dict yields
+    # only the caller's, and `or {}` discards it entirely, since both its
+    # truthiness and its iteration are account-scoped and the loader runs at
+    # boot with no request scope.
+    _stores.update(data.get("stores", {}))
 
 
-try:
-    _restored = load_state("cloudfront_keyvaluestore")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logging.getLogger(__name__).exception("Failed to restore persisted state; continuing with fresh store")
 
 
 # ---------------------------------------------------------------------------
@@ -70,21 +73,60 @@ def _error(code: str, message: str, status: int) -> tuple:
     return status, {"Content-Type": "application/json"}, body
 
 
+def _kvs_name_from_arn(arn: str):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None, _error("ValidationException", f"Invalid KvsARN: {arn}", 400)
+    if (
+        spec.partition != "aws"
+        or spec.service != "cloudfront"
+        or spec.region
+        or spec.account_id != get_account_id()
+    ):
+        return None, _error("ValidationException", f"Invalid KvsARN: {arn}", 400)
+
+    prefix = "key-value-store/"
+    if not spec.resource.startswith(prefix):
+        return None, _error("ValidationException", f"Invalid KvsARN: {arn}", 400)
+    name = spec.resource[len(prefix):]
+    if not name or "/" in name:
+        return None, _error("ValidationException", f"Invalid KvsARN: {arn}", 400)
+    return name, None
+
+
 def _get_store(arn: str):
+    name, err = _kvs_name_from_arn(arn)
+    if err:
+        return None, err
+
     store = _stores.get(arn)
     if store is None:
         from ministack.services.cloudfront import _kvstores
 
-        kvs = None
-        for v in _kvstores.values():
-            if v["ARN"] == arn:
-                kvs = v
-                break
+        kvs = _kvstores.get(name)
+        if kvs and kvs.get("ARN") != arn:
+            kvs = None
         if kvs is None:
-            return None
+            return None, _error("ResourceNotFoundException", f"Key value store {arn} was not found.", 404)
         store = {"etag": new_uuid(), "items": {}}
         _stores[arn] = store
-    return store
+    return store, None
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def function_snapshot(arn: str):
+    """What cf.kvs() reads in a function: the store's items and its meta() times, or None if it is gone."""
+    store, err = _get_store(arn)
+    if err:
+        return None
+    from ministack.services.cloudfront import _kvstores
+
+    created = next((v.get("LastModifiedTime") for v in _kvstores.values() if v["ARN"] == arn), None)
+    return {"items": dict(store["items"]), "created": created, "updated": store.get("updated") or created}
 
 
 def _compute_size(items: dict) -> int:
@@ -127,7 +169,7 @@ async def handle_request(method, path, headers, body, query_params):
         if method == "GET":
             return _describe_store(arn)
 
-    return _error("InvalidRequestException", f"No route for {method} {path}", 400)
+    return _error("ValidationException", f"No route for {method} {path}", 400)
 
 
 # ---------------------------------------------------------------------------
@@ -136,9 +178,9 @@ async def handle_request(method, path, headers, body, query_params):
 
 
 def _describe_store(arn: str):
-    store = _get_store(arn)
-    if store is None:
-        return _error("ResourceNotFoundException", f"Key value store {arn} was not found.", 404)
+    store, err = _get_store(arn)
+    if err:
+        return err
 
     from ministack.services.cloudfront import _kvstores
 
@@ -177,9 +219,9 @@ def _qp_first(query_params, key):
 
 
 def _list_keys(arn: str, query_params):
-    store = _get_store(arn)
-    if store is None:
-        return _error("ResourceNotFoundException", f"Key value store {arn} was not found.", 404)
+    store, err = _get_store(arn)
+    if err:
+        return err
 
     raw_max = _qp_first(query_params, "MaxResults")
     try:
@@ -217,9 +259,9 @@ def _list_keys(arn: str, query_params):
 
 
 def _get_key(arn: str, key: str):
-    store = _get_store(arn)
-    if store is None:
-        return _error("ResourceNotFoundException", f"Key value store {arn} was not found.", 404)
+    store, err = _get_store(arn)
+    if err:
+        return err
 
     value = store["items"].get(key)
     if value is None:
@@ -235,9 +277,9 @@ def _get_key(arn: str, key: str):
 
 
 def _put_key(arn: str, key: str, headers, body):
-    store = _get_store(arn)
-    if store is None:
-        return _error("ResourceNotFoundException", f"Key value store {arn} was not found.", 404)
+    store, err = _get_store(arn)
+    if err:
+        return err
 
     if_match = headers.get("if-match")
     if not if_match:
@@ -256,6 +298,7 @@ def _put_key(arn: str, key: str, headers, body):
 
     store["items"][key] = value
     store["etag"] = new_uuid()
+    store["updated"] = _now_iso()
 
     resp = {
         "ItemCount": len(store["items"]),
@@ -265,9 +308,9 @@ def _put_key(arn: str, key: str, headers, body):
 
 
 def _delete_key(arn: str, key: str, headers):
-    store = _get_store(arn)
-    if store is None:
-        return _error("ResourceNotFoundException", f"Key value store {arn} was not found.", 404)
+    store, err = _get_store(arn)
+    if err:
+        return err
 
     if_match = headers.get("if-match")
     if not if_match:
@@ -281,6 +324,7 @@ def _delete_key(arn: str, key: str, headers):
 
     del store["items"][key]
     store["etag"] = new_uuid()
+    store["updated"] = _now_iso()
 
     resp = {
         "ItemCount": len(store["items"]),
@@ -290,9 +334,9 @@ def _delete_key(arn: str, key: str, headers):
 
 
 def _update_keys(arn: str, headers, body):
-    store = _get_store(arn)
-    if store is None:
-        return _error("ResourceNotFoundException", f"Key value store {arn} was not found.", 404)
+    store, err = _get_store(arn)
+    if err:
+        return err
 
     if_match = headers.get("if-match")
     if not if_match:
@@ -338,6 +382,7 @@ def _update_keys(arn: str, headers, body):
     for k in validated_deletes:
         store["items"].pop(k, None)
     store["etag"] = new_uuid()
+    store["updated"] = _now_iso()
 
     resp = {
         "ItemCount": len(store["items"]),

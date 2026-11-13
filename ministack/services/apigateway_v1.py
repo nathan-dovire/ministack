@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 API Gateway REST API v1 Emulator.
 
@@ -32,6 +34,7 @@ Control plane endpoints implemented:
   POST   /restapis/{id}/stages                                             — CreateStage
   GET    /restapis/{id}/stages                                             — GetStages
   GET    /restapis/{id}/stages/{stageName}                                 — GetStage
+  GET    /restapis/{id}/stages/{stageName}/exports/{exportType}            — GetExport
   PATCH  /restapis/{id}/stages/{stageName}                                 — UpdateStage
   DELETE /restapis/{id}/stages/{stageName}                                 — DeleteStage
   POST   /restapis/{id}/authorizers                                        — CreateAuthorizer
@@ -43,6 +46,15 @@ Control plane endpoints implemented:
   GET    /restapis/{id}/models                                             — GetModels
   GET    /restapis/{id}/models/{modelName}                                 — GetModel
   DELETE /restapis/{id}/models/{modelName}                                 — DeleteModel
+  POST   /restapis/{id}/documentation/parts                                — CreateDocumentationPart
+  GET    /restapis/{id}/documentation/parts                                — GetDocumentationParts
+  GET    /restapis/{id}/documentation/parts/{partId}                       — GetDocumentationPart
+  PATCH  /restapis/{id}/documentation/parts/{partId}                       — UpdateDocumentationPart
+  DELETE /restapis/{id}/documentation/parts/{partId}                       — DeleteDocumentationPart
+  PUT    /restapis/{id}/gatewayresponses/{responseType}                    — PutGatewayResponse
+  GET    /restapis/{id}/gatewayresponses                                   — GetGatewayResponses
+  GET    /restapis/{id}/gatewayresponses/{responseType}                    — GetGatewayResponse
+  DELETE /restapis/{id}/gatewayresponses/{responseType}                    — DeleteGatewayResponse
   GET    /apikeys                                                          — GetApiKeys
   POST   /apikeys                                                          — CreateApiKey
   GET    /apikeys/{keyId}                                                  — GetApiKey
@@ -64,23 +76,56 @@ Control plane endpoints implemented:
 
 Data plane:
   Requests to /{apiId}.execute-api.localhost/{stage}/{path} are dispatched
-  when api_id is found in _rest_apis.
+  when api_id is found in the ambient account. The mock host pattern has no
+  region segment, so unsigned execute-api requests resolve the REST API's
+  owning region by API id and run the invocation in that scope.
+
+Custom domains:
+  REGIONAL and EDGE records are both keyed per region in MiniStack; EDGE
+  global name uniqueness is not enforced. Data-plane requests addressed by a
+  registered custom domain host ARE routed: app.py resolves the Host through
+  resolve_base_path_mapping() before any host-pattern guessing runs (longest
+  base path wins, "(none)" or an empty base path is the root mapping, a
+  mapping's stage is authoritative when set, and a stage-less mapping takes
+  the stage from the remaining request path).
 """
 
-import asyncio
 import base64
+import copy
 import datetime
+import decimal
+import functools
+import ipaddress
 import json
 import logging
-import os
 import re
+import secrets
+import string
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
-from ministack.services.apigateway import _timeout_from_env, _urlopen_async
+import yaml
+
+from ministack.core.arn import ArnParseError, execute_api_arn, parse_arn
+from ministack.core.concurrency import run_reentrant
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    AccountScopedDict,
+    get_account_id,
+    get_region,
+    new_uuid,
+    request_scope,
+)
+from ministack.services.apigateway import (
+    _b64url_decode,
+    _fetch_jwks,
+    _resolve_jwks_url,
+    _timeout_from_env,
+    _urlopen_async,
+    _verify_rs256_signature,
+)
 
 
 def _now_unix():
@@ -92,24 +137,125 @@ def _now_unix():
 logger = logging.getLogger("apigateway_v1")
 _PROXY_TIMEOUT_SECONDS = _timeout_from_env("MINISTACK_APIGW_PROXY_TIMEOUT_SECONDS", 30.0)
 
-REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
-
 # ---- Module-level state ----
-# All per-tenant state uses AccountScopedDict so the same REST API id in two
-# different accounts never collides and list operations don't leak cross-account.
-_rest_apis = AccountScopedDict()           # rest_api_id -> RestApi
-_resources = AccountScopedDict()           # rest_api_id -> {resource_id -> Resource}
-_stages_v1 = AccountScopedDict()           # rest_api_id -> {stage_name -> Stage}
-_deployments_v1 = AccountScopedDict()      # rest_api_id -> {deployment_id -> Deployment}
-_authorizers_v1 = AccountScopedDict()      # rest_api_id -> {authorizer_id -> Authorizer}
-_models = AccountScopedDict()              # rest_api_id -> {model_id -> Model}
-_api_keys = AccountScopedDict()            # key_id -> ApiKey
-_usage_plans = AccountScopedDict()         # plan_id -> UsagePlan
-_usage_plan_keys = AccountScopedDict()     # plan_id -> {key_id -> UsagePlanKey}
-_domain_names = AccountScopedDict()        # domain_name -> DomainName
-_base_path_mappings = AccountScopedDict()  # domain_name -> {base_path -> BasePathMapping}
+# Per-resource state is scoped by account and region so same identifiers in
+# different regions do not collide or leak through control-plane list/get calls.
+_rest_apis = AccountRegionScopedDict()           # rest_api_id -> RestApi
+_resources = AccountRegionScopedDict()           # rest_api_id -> {resource_id -> Resource}
+_stages_v1 = AccountRegionScopedDict()           # rest_api_id -> {stage_name -> Stage}
+_deployments_v1 = AccountRegionScopedDict()      # rest_api_id -> {deployment_id -> Deployment}
+_authorizers_v1 = AccountRegionScopedDict()      # rest_api_id -> {authorizer_id -> Authorizer}
+# Data-plane cache of Lambda-authorizer OUTPUT — the policy document and the
+# context, not the allow/deny verdict — keyed by (account, region, rest_api_id,
+# authorizer_id, stage, identity values). Value: (expiry_epoch, policy, context).
+# The policy is re-evaluated against every request's own method ARN, so a cached
+# Allow issued for one method or one stage cannot answer another. Ephemeral (not
+# persisted); honors authorizerResultTtlInSeconds.
+_authorizer_cache = {}
+# Entries are keyed on caller-supplied tokens, so the cache is capped rather than
+# left to grow with every distinct token a long-lived instance ever sees.
+_AUTHORIZER_CACHE_MAX = 1024
+# AWS's default when CreateAuthorizer omits authorizerResultTtlInSeconds.
+_DEFAULT_AUTHORIZER_TTL = 300
+_models = AccountRegionScopedDict()              # rest_api_id -> {model_id -> Model}
+_api_keys = AccountRegionScopedDict()            # key_id -> ApiKey
+_usage_plans = AccountRegionScopedDict()         # plan_id -> UsagePlan
+_usage_plan_keys = AccountRegionScopedDict()     # plan_id -> {key_id -> UsagePlanKey}
+_domain_names = AccountRegionScopedDict()        # domain_name -> DomainName
+_base_path_mappings = AccountRegionScopedDict()  # domain_name -> {base_path -> BasePathMapping}
 _v1_tags = AccountScopedDict()             # resource_arn -> {key -> value}
-_account_settings = AccountScopedDict()    # singleton per account: stores fields set via UpdateAccount
+_account_settings = AccountRegionScopedDict()    # singleton per account+region: stores fields set via UpdateAccount
+_gateway_responses = AccountRegionScopedDict()   # rest_api_id -> {response_type -> customized GatewayResponse}
+# rest_api_id -> {deployment_id -> customized gateway responses at CreateDeployment}
+_deployed_gateway_responses = AccountRegionScopedDict()
+_documentation_parts = AccountRegionScopedDict()  # rest_api_id -> {part_id -> DocumentationPart}
+_request_validators = AccountRegionScopedDict()   # rest_api_id -> {validator_id -> RequestValidator}
+_client_certificates = AccountRegionScopedDict()  # client_certificate_id -> ClientCertificate
+_access_associations = AccountRegionScopedDict()  # association ARN -> DomainNameAccessAssociation
+
+
+_GATEWAY_RESPONSE_TYPES = (
+    "DEFAULT_4XX",
+    "DEFAULT_5XX",
+    "RESOURCE_NOT_FOUND",
+    "UNAUTHORIZED",
+    "INVALID_API_KEY",
+    "ACCESS_DENIED",
+    "AUTHORIZER_FAILURE",
+    "AUTHORIZER_CONFIGURATION_ERROR",
+    "INVALID_SIGNATURE",
+    "EXPIRED_TOKEN",
+    "MISSING_AUTHENTICATION_TOKEN",
+    "INTEGRATION_FAILURE",
+    "INTEGRATION_TIMEOUT",
+    "API_CONFIGURATION_ERROR",
+    "UNSUPPORTED_MEDIA_TYPE",
+    "BAD_REQUEST_PARAMETERS",
+    "BAD_REQUEST_BODY",
+    "REQUEST_TOO_LARGE",
+    "THROTTLED",
+    "QUOTA_EXCEEDED",
+    "WAF_FILTERED",
+)
+
+_DEFAULT_GATEWAY_RESPONSE_STATUS_CODES = {
+    "RESOURCE_NOT_FOUND": "404",
+    "UNAUTHORIZED": "401",
+    "INVALID_API_KEY": "403",
+    "ACCESS_DENIED": "403",
+    "AUTHORIZER_FAILURE": "500",
+    "AUTHORIZER_CONFIGURATION_ERROR": "500",
+    "INVALID_SIGNATURE": "403",
+    "EXPIRED_TOKEN": "403",
+    "MISSING_AUTHENTICATION_TOKEN": "403",
+    "INTEGRATION_FAILURE": "504",
+    "INTEGRATION_TIMEOUT": "504",
+    "API_CONFIGURATION_ERROR": "500",
+    "UNSUPPORTED_MEDIA_TYPE": "415",
+    "BAD_REQUEST_PARAMETERS": "400",
+    "BAD_REQUEST_BODY": "400",
+    "REQUEST_TOO_LARGE": "413",
+    "THROTTLED": "429",
+    "QUOTA_EXCEEDED": "429",
+    "WAF_FILTERED": "403",
+}
+
+_DEFAULT_GATEWAY_RESPONSE_TEMPLATE = '{"message":$context.error.messageString}'
+
+# x-amzn-ErrorType API Gateway stamps on the gateway errors it emits.
+_GATEWAY_RESPONSE_ERROR_TYPES = {
+    "MISSING_AUTHENTICATION_TOKEN": "MissingAuthenticationTokenException",
+    "UNAUTHORIZED": "UnauthorizedException",
+    "ACCESS_DENIED": "AccessDeniedException",
+    "AUTHORIZER_FAILURE": "AuthorizerConfigurationException",
+    "AUTHORIZER_CONFIGURATION_ERROR": "AuthorizerConfigurationException",
+    "API_CONFIGURATION_ERROR": "InternalServerErrorException",
+    "BAD_REQUEST_PARAMETERS": "BadRequestException",
+    "BAD_REQUEST_BODY": "BadRequestException",
+    "DEFAULT_5XX": "InternalServerErrorException",
+    "THROTTLED": "TooManyRequestsException",
+}
+
+_GATEWAY_TEMPLATE_VARIABLE = re.compile(
+    r"\$(?:\{(context(?:\.\w+)+)\}|(context(?:\.[A-Za-z]\w*)+))"
+)
+
+_DOCUMENTATION_LOCATION_TYPES = frozenset(
+    {
+        "API",
+        "AUTHORIZER",
+        "MODEL",
+        "RESOURCE",
+        "METHOD",
+        "PATH_PARAMETER",
+        "QUERY_PARAMETER",
+        "REQUEST_HEADER",
+        "REQUEST_BODY",
+        "RESPONSE",
+        "RESPONSE_HEADER",
+        "RESPONSE_BODY",
+    }
+)
 
 
 # ---- Helpers ----
@@ -119,9 +265,18 @@ def _new_id():
     return new_uuid().replace("-", "")[:10]
 
 
+def _drop_none(value):
+    """AWS omits unset members; it never sends null."""
+    if isinstance(value, dict):
+        return {k: _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
 def _v1_response(data, status=200):
     """API Gateway v1 uses application/json."""
-    return status, {"Content-Type": "application/json"}, json.dumps(data, ensure_ascii=False).encode("utf-8")
+    return status, {"Content-Type": "application/json"}, json.dumps(_drop_none(data), ensure_ascii=False).encode("utf-8")
 
 
 def _encode_rest_api_policy(policy):
@@ -153,6 +308,11 @@ def _rest_api_view(api):
     view = dict(api)
     if "policy" in view:
         view["policy"] = _encode_rest_api_policy(view["policy"])
+    # Nothing provisions in the background, so an API is AVAILABLE as soon as it exists.
+    view["apiStatus"] = "AVAILABLE"
+    root_id = next((r["id"] for r in (_resources.get(view.get("id")) or {}).values() if r.get("path") == "/"), None)
+    if root_id:
+        view["rootResourceId"] = root_id
     return view
 
 
@@ -448,6 +608,11 @@ def _apply_stage_patch(stage, patch_ops):
     leftover = []
     for op in patch_ops:
         if not _try_apply_method_settings_patch(stage, op):
+            if "value" in op:
+                path = op.get("path", "")
+                if path in ("/tracingEnabled", "/cacheClusterEnabled"):
+                    # UpdateStage sends patch `value` as strings (e.g. `"true"` for `tracingEnabled`)
+                    op["value"] = str(op["value"]).lower() == "true"
             leftover.append(op)
     if leftover:
         _apply_patch(stage, leftover)
@@ -470,7 +635,20 @@ def _match_recursive(resources, parent_id, segments, params):
     segment = segments[0]
     remaining = segments[1:]
     children = [r for r in resources.values() if r.get("parentId") == parent_id]
-    for child in children:
+
+    # AWS resolves by specificity, not resource-creation order: a literal
+    # segment wins over a {param} sibling, which wins over a greedy {proxy+}.
+    # Without this, a {id} resource registered before a literal sibling would
+    # match first and shadow it (405 on the literal path).
+    def _precedence(res):
+        pp = res.get("pathPart", "")
+        if pp.startswith("{") and pp.endswith("+}"):
+            return 2  # greedy {proxy+} — lowest priority
+        if pp.startswith("{") and pp.endswith("}"):
+            return 1  # path parameter
+        return 0      # literal segment — highest priority
+
+    for child in sorted(children, key=_precedence):
         pp = child.get("pathPart", "")
         if pp.endswith("+}") and pp.startswith("{"):
             # greedy {proxy+}
@@ -496,29 +674,124 @@ def _match_recursive(resources, parent_id, segments, params):
     return None, params
 
 
-async def _call_lambda(func_name, event, qualifier=None):
-    """Invoke a Lambda function and return the parsed response dict.
+def _match_greedy_fallback(api_id, segments, http_method):
+    """Fallback for a path-matched resource that does not serve this verb.
 
-    ``qualifier`` may be a version number or alias name; aliases resolve to
-    their target version via ``_get_func_record_for_qualifier`` so aliased
-    integration URIs (arn:...:function:<name>:<alias>) invoke correctly (#407)."""
+    API Gateway resolves on the resource+method pair. A resource only keeps the
+    request when it declares the verb being asked for; otherwise the request
+    falls through to a greedy `{proxy+}` elsewhere in the tree. Measured on real
+    AWS, all three of these fall through: a node with no methods at all (`/jobs`,
+    existing only as the parent of `/jobs/{operation_type}`), a node carrying
+    only a CORS `OPTIONS` preflight, and a node declaring some other verb.
+
+    That includes the case where the sibling's declared method is guarded: an
+    open root `{proxy+} ANY` does serve `GET /admin` while `/admin POST` is
+    `AWS_IAM`-protected, because routing happens before authorization. It reads
+    like an auth bypass and it is worth knowing about, but it is what the
+    service does, so it is what this emulates.
+
+    Finds the most specific `{proxy+}` resource whose parent path is a prefix
+    of the request path AND that defines the method (or ANY) — which may be a
+    sibling of the methodless node, not only an ancestor. Literal prefix
+    segments must match exactly; `{param}` prefix segments capture. Returns
+    ``(resource, path_params)`` or ``(None, None)`` — callers keep their
+    existing rejection when nothing can serve the method.
+    """
+    resources = _resources.get(api_id, {})
+    best = None
+    for res in resources.values():
+        part = res.get("pathPart", "")
+        if not (part.startswith("{") and part.endswith("+}")):
+            continue
+        methods = res.get("resourceMethods") or {}
+        if http_method not in methods and "ANY" not in methods:
+            continue
+        prefix = [s for s in res.get("path", "").strip("/").split("/")[:-1] if s]
+        # {proxy+} must consume at least one segment.
+        if len(prefix) >= len(segments):
+            continue
+        params = {}
+        matched = True
+        for want, got in zip(prefix, segments):
+            if want.startswith("{") and want.endswith("}") and not want.endswith("+}"):
+                params[want[1:-1]] = got
+            elif want != got:
+                matched = False
+                break
+        if not matched:
+            continue
+        params[part[1:-2]] = "/".join(segments[len(prefix):])
+        if best is None or len(prefix) > best[0]:
+            best = (len(prefix), res, params)
+    if best is None:
+        return None, None
+    return best[1], best[2]
+
+
+def _extract_lambda_ref_from_integration_uri(uri: str) -> str:
+    """Pull the Lambda reference out of an integration URI.
+
+    Supported URI formats:
+      1. arn:aws:apigateway:{region}:lambda:path/2015-03-31/functions/arn:aws:lambda:{region}:{acct}:function:{name}[:{qualifier}]/invocations
+      2. arn:aws:lambda:{region}:{acct}:function:{name}[:{qualifier}]
+      3. plain function name: MyFunction[:{qualifier}]
+    """
+    if not uri:
+        return ""
+    if "/functions/" in uri:
+        inner = uri.split("/functions/", 1)[1]
+        if "/invocations" in inner:
+            inner = inner.split("/invocations", 1)[0]
+        return inner
+    if uri.endswith("/invocations"):
+        return uri[: -len("/invocations")]
+    return uri
+
+
+async def _call_lambda_raw(function_ref, event, *, account_id=None, region=None):
+    """Invoke a Lambda function and return its uninterpreted execution record.
+
+    Returns ``(result, error_msg)`` where ``result["body"]`` is the payload
+    exactly as the function returned it. ``function_ref`` may be a name, partial
+    ARN, or full ARN; full ARNs are resolved through Lambda's scoped lookup so
+    region-qualified integration URIs invoke the function named in the ARN
+    instead of the request/default region.
+
+    Routed through the central ``_execute_function`` dispatcher so CloudWatch
+    Logs emission and Docker log output work for API Gateway invocations.
+
+    Non-proxy (custom) integrations need the raw payload; AWS_PROXY passes it
+    through :func:`_lambda_proxy_response`, which would rewrite a handler's
+    ``statusCode`` key into the HTTP status.
+    """
     from ministack.services import lambda_svc
 
-    func_data, func_config = lambda_svc._get_func_record_for_qualifier(func_name, qualifier)
-    if func_data is None:
-        label = f"{func_name}:{qualifier}" if qualifier else func_name
+    func_data, func_config, func_name = lambda_svc._get_func_record_for_ref_in_scope(
+        function_ref,
+        account_id=account_id,
+        region=region,
+    )
+    if func_data is None or func_config is None:
+        label = function_ref or func_name
         return None, f"Lambda function '{label}' not found"
 
-    # Route through the central _execute_function dispatcher so CloudWatch
-    # Logs emission and Docker log output work for API Gateway invocations.
-    # Response shaping (throttle→429, error→502, body→envelope) goes through
-    # the shared helper so v1/v2 stay consistent.
-    exec_record = {"config": func_config, "code_zip": func_data.get("code_zip")}
-    result = await asyncio.to_thread(lambda_svc._execute_function, exec_record, event)
+    exec_record = lambda_svc._execution_record_for_config(func_data, func_config)
+    result = await run_reentrant(lambda_svc._execute_function_with_config_scope, exec_record, event,
+                                 thread_name="ministack-apigw-invoke")
+    return result, None
+
+
+def _lambda_proxy_response(result):
+    """Shape a :func:`_call_lambda_raw` result into the AWS_PROXY response dict.
+
+    The shared response shaper (throttle→429, error→502, body→envelope) is what
+    keeps v1 and v2 consistent.
+    """
+    from ministack.services import lambda_svc
+
     lambda_response, _ = lambda_svc.lambda_execute_result_to_api_proxy_response(result)
-    # On error the helper returns {statusCode: 502, body: <msg>}; preserve
-    # the _call_lambda contract of (None, error_msg) so callers that check
-    # for error strings keep working.
+    # On error the helper returns {statusCode: 502, body: <msg>}; return it as
+    # (None, error_msg) so the caller answers with the error string.
     if result.get("error") and lambda_response and lambda_response.get("statusCode") == 502:
         return None, str(lambda_response.get("body") or "Lambda invocation error")
     return lambda_response, None
@@ -549,24 +822,284 @@ def get_state():
         "base_path_mappings": copy.deepcopy(_base_path_mappings),
         "v1_tags": copy.deepcopy(_v1_tags),
         "account_settings": copy.deepcopy(_account_settings),
+        "request_validators": copy.deepcopy(_request_validators),
+        "gateway_responses": copy.deepcopy(_gateway_responses),
+        "deployed_gateway_responses": copy.deepcopy(_deployed_gateway_responses),
+        "documentation_parts": copy.deepcopy(_documentation_parts),
+        "client_certificates": copy.deepcopy(_client_certificates),
+        "access_associations": copy.deepcopy(_access_associations),
     }
+
+
+def _region_from_existing_tag_arn(account_id, target_resource):
+    for (tag_account_id, resource_arn), _tags in _v1_tags._data.items():
+        if tag_account_id != account_id:
+            continue
+        try:
+            spec = parse_arn(resource_arn)
+        except ArnParseError:
+            continue
+        if (
+            spec.partition == "aws"
+            and spec.service == "apigateway"
+            and spec.account_id == ""
+            and spec.resource == target_resource
+        ):
+            return spec.region
+    return None
+
+
+def _region_from_domain_name_record(domain_name, domain_record, account_id):
+    tag_region = _region_from_existing_tag_arn(account_id, f"/domainnames/{domain_name}")
+    if tag_region:
+        return tag_region
+
+    regional_domain = domain_record.get("regionalDomainName", "")
+    if ".execute-api." in regional_domain:
+        region = regional_domain.rsplit(".execute-api.", 1)[1].split(".", 1)[0]
+        if region:
+            return region
+    return get_region()
+
+
+def _region_from_api_key_record(api_key_id, _api_key, account_id):
+    return _region_from_existing_tag_arn(account_id, f"/apikeys/{api_key_id}") or get_region()
+
+
+def _region_from_usage_plan_record(plan_id, _usage_plan, account_id):
+    return _region_from_existing_tag_arn(account_id, f"/usageplans/{plan_id}") or get_region()
+
+
+def _region_from_rest_api_record(api_id, _rest_api, account_id):
+    return _region_from_existing_tag_arn(account_id, f"/restapis/{api_id}") or get_region()
+
+
+def _legacy_account_items(restored):
+    if isinstance(restored, AccountScopedDict):
+        return restored._data.items()
+    if isinstance(restored, dict):
+        account_id = get_account_id()
+        return [((account_id, key), value) for key, value in restored.items()]
+    return ()
+
+
+def _legacy_region(region_store, account_id, key):
+    if isinstance(region_store, AccountScopedDict):
+        return region_store.get_scoped(account_id, None, key)
+    if isinstance(region_store, dict):
+        return region_store.get(key)
+    return None
+
+
+def _restore_top_level_store(store, restored, region_store, region_for_item):
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return {}
+
+    regions = {}
+    for (account_id, key), value in _legacy_account_items(restored):
+        region = _legacy_region(region_store, account_id, key)
+        if not region:
+            region = region_for_item(key, value, account_id)
+        store.set_scoped(account_id, region, key, value)
+        regions[(account_id, key)] = region
+    return regions
+
+
+def _restore_child_store(store, restored, parent_regions, parent_name_from_key=lambda key: key):
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return
+
+    boot_region = get_region()
+    for (account_id, key), value in _legacy_account_items(restored):
+        parent_name = parent_name_from_key(key)
+        region = parent_regions.get((account_id, parent_name), boot_region)
+        store.set_scoped(account_id, region, key, value)
+
+
+def find_api_owner(api_id):
+    """The account owning REST API ``api_id``, or None. Only for invoking it."""
+    for (stored_account, _region, stored_api_id), _api in _rest_apis.all_items():
+        if stored_api_id == api_id:
+            return stored_account
+    return None
+
+
+def find_api_scope(api_id):
+    """Return (account_id, region) owning api_id within the ambient account."""
+    account_id = get_account_id()
+    for (stored_account, region, stored_api_id), _api in _rest_apis.all_items():
+        if stored_account == account_id and stored_api_id == api_id:
+            return stored_account, region
+    return None
+
+
+def rest_api_policy_for_arn(resource_arn):
+    """The REST API's resource policy, ``execute-api:/`` expanded, and owner account, for the identity check."""
+    parts = resource_arn.split(":", 5)
+    if len(parts) < 6 or parts[2] != "execute-api":
+        return None
+    region, account_id, api_id = parts[3], parts[4], parts[5].split("/", 1)[0]
+    home = region
+    api = _rest_apis.get_scoped(account_id, region, api_id)
+    if api is None:
+        # Signed for another region than the API's: its policy still applies, read as the request's ARN.
+        scope = find_api_scope(api_id)
+        if scope is None:
+            return None
+        home = scope[1]
+        api = _rest_apis.get_scoped(account_id, home, api_id) or {}
+    policy = api.get("policy") or ""
+    if not isinstance(policy, str):
+        policy = json.dumps(policy)
+    prefix = f"arn:aws:execute-api:{region}:{account_id}:{api_id}/"
+    policy = policy.replace('"execute-api:/', f'"{prefix}')
+    if home != region:
+        policy = policy.replace(f"arn:aws:execute-api:{home}:{account_id}:{api_id}/", prefix)
+    return policy, account_id
+
+
+def _anonymous_policy_error(api_id, stage_name, method, path, account_id, region):
+    """ACCESS_DENIED for a call to a method without authorization that the REST API's resource policy does not allow."""
+    from ministack.app import AUTH
+    from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+
+    # Such a call is anonymous even when it is signed.
+    if not AUTH:
+        return None
+    arn = execute_api_arn(region, account_id, api_id, stage_name, method, path)
+    policy = (rest_api_policy_for_arn(arn) or ("",))[0]
+    ctx = EvalContext("*", "Anonymous", "", "execute-api:Invoke", arn, region)
+    decision = evaluate_resource_policy(policy, ctx).decision if policy else "Allow"
+    if decision == "Allow":
+        return None
+    reason = ("with an explicit deny in a resource-based policy" if decision == "Deny"
+              else "because no resource-based policy allows the execute-api:Invoke action")
+    shown = arn.replace(f":{account_id}:", f":********{account_id[-4:]}:", 1)
+    return _gw_error("ACCESS_DENIED",
+                     f"User: anonymous is not authorized to perform: execute-api:Invoke on resource: {shown} {reason}")
+
+
+def find_domain_scope(domain_name):
+    """Return (account_id, region, stored_name) owning a custom domain, the ambient account first.
+
+    Host headers are case-insensitive; ``stored_name`` is the exact key the control plane stored.
+    A request addressed by a custom domain carries no signed scope, so every account is searched."""
+    account_id = get_account_id()
+    wanted = domain_name.lower()
+    matches = [(stored_account, region, stored_domain)
+               for (stored_account, region, stored_domain), _rec in _domain_names.all_items()
+               if stored_domain.lower() == wanted]
+    return next((m for m in matches if m[0] == account_id), matches[0] if matches else None)
+
+
+def resolve_base_path_mapping(domain_name, path):
+    """Resolve ``(api_id, stage, execute_path)`` through a registered custom
+    domain's base-path mappings, or ``None``.
+
+    The longest matching base path wins; the ``"(none)"`` sentinel (or an
+    explicit empty base path) is the root mapping and matches everything.
+    A mapping that names a stage is authoritative — the whole remainder
+    belongs to the API. A stage-less mapping returns ``""`` as the stage and
+    the caller derives the stage from the returned path instead."""
+    scope = find_domain_scope(domain_name)
+    if scope is None:
+        return None
+    account_id, region, stored_name = scope
+    mappings = _base_path_mappings.get_scoped(account_id, region, stored_name, {})
+    best = None
+    for base_path, mapping in mappings.items():
+        if not base_path or base_path == "(none)":
+            candidate_len, rest = 0, path
+        else:
+            prefix = "/" + base_path
+            if path == prefix:
+                candidate_len, rest = len(base_path), "/"
+            elif path.startswith(prefix + "/"):
+                candidate_len, rest = len(base_path), path[len(prefix):]
+            else:
+                continue
+        if best is None or candidate_len > best[0]:
+            best = (candidate_len, mapping, rest)
+    if best is None:
+        return None
+    _, mapping, rest = best
+    return mapping["restApiId"], mapping["stage"], rest or "/"
+
+
+def stages_for_api(api_id):
+    """Return stages for api_id after resolving the v1 data-plane owner scope."""
+    scope = find_api_scope(api_id)
+    if scope is None:
+        return {}
+    account_id, region = scope
+    return _stages_v1.get_scoped(account_id, region, api_id, {})
 
 
 def load_persisted_state(data):
     """Restore module state from a previously persisted snapshot."""
-    _rest_apis.update(data.get("rest_apis", {}))
-    _resources.update(data.get("resources", {}))
-    _stages_v1.update(data.get("stages_v1", {}))
-    _deployments_v1.update(data.get("deployments_v1", {}))
-    _authorizers_v1.update(data.get("authorizers_v1", {}))
-    _models.update(data.get("models", {}))
-    _api_keys.update(data.get("api_keys", {}))
-    _usage_plans.update(data.get("usage_plans", {}))
-    _usage_plan_keys.update(data.get("usage_plan_keys", {}))
-    _domain_names.update(data.get("domain_names", {}))
-    _base_path_mappings.update(data.get("base_path_mappings", {}))
+    if not data:
+        return
+
     _v1_tags.update(data.get("v1_tags", {}))
-    _account_settings.update(data.get("account_settings", {}))
+    api_regions = _restore_top_level_store(
+        _rest_apis,
+        data.get("rest_apis", {}),
+        data.get("rest_api_regions", {}),
+        _region_from_rest_api_record,
+    )
+    plan_regions = _restore_top_level_store(
+        _usage_plans,
+        data.get("usage_plans", {}),
+        data.get("usage_plan_regions", {}),
+        _region_from_usage_plan_record,
+    )
+    _restore_top_level_store(
+        _api_keys,
+        data.get("api_keys", {}),
+        data.get("api_key_regions", {}),
+        _region_from_api_key_record,
+    )
+    domain_regions = _restore_top_level_store(
+        _domain_names,
+        data.get("domain_names", {}),
+        data.get("domain_name_regions", {}),
+        _region_from_domain_name_record,
+    )
+
+    if not api_regions:
+        api_regions = {
+            (account_id, api_id): region
+            for (account_id, region, api_id), _api in _rest_apis.all_items()
+        }
+    if not plan_regions:
+        plan_regions = {
+            (account_id, plan_id): region
+            for (account_id, region, plan_id), _plan in _usage_plans.all_items()
+        }
+    if not domain_regions:
+        domain_regions = {
+            (account_id, domain_name): region
+            for (account_id, region, domain_name), _domain in _domain_names.all_items()
+        }
+
+    _restore_child_store(_resources, data.get("resources", {}), api_regions)
+    _restore_child_store(_stages_v1, data.get("stages_v1", {}), api_regions)
+    _restore_child_store(_deployments_v1, data.get("deployments_v1", {}), api_regions)
+    _restore_child_store(_authorizers_v1, data.get("authorizers_v1", {}), api_regions)
+    _restore_child_store(_models, data.get("models", {}), api_regions)
+    _restore_child_store(_request_validators, data.get("request_validators", {}), api_regions)
+    _restore_child_store(_gateway_responses, data.get("gateway_responses", {}), api_regions)
+    _restore_child_store(
+        _deployed_gateway_responses, data.get("deployed_gateway_responses", {}), api_regions
+    )
+    _restore_child_store(_documentation_parts, data.get("documentation_parts", {}), api_regions)
+    _restore_child_store(_usage_plan_keys, data.get("usage_plan_keys", {}), plan_regions)
+    _restore_child_store(_base_path_mappings, data.get("base_path_mappings", {}), domain_regions)
+    _restore_child_store(_account_settings, data.get("account_settings", {}), {})
+    _restore_child_store(_client_certificates, data.get("client_certificates", {}), {})
+    _restore_child_store(_access_associations, data.get("access_associations", {}), {})
 
 
 def reset():
@@ -576,6 +1109,7 @@ def reset():
     _stages_v1.clear()
     _deployments_v1.clear()
     _authorizers_v1.clear()
+    _authorizer_cache.clear()
     _models.clear()
     _api_keys.clear()
     _usage_plans.clear()
@@ -584,6 +1118,12 @@ def reset():
     _base_path_mappings.clear()
     _v1_tags.clear()
     _account_settings.clear()
+    _request_validators.clear()
+    _gateway_responses.clear()
+    _deployed_gateway_responses.clear()
+    _documentation_parts.clear()
+    _client_certificates.clear()
+    _access_associations.clear()
 
 
 # ---- Control plane router ----
@@ -607,7 +1147,7 @@ async def handle_request(method, path, headers, body, query_params):
             return _get_account()
         if method == "PATCH":
             return _update_account(data)
-        return _v1_error("MethodNotAllowedException", f"Method not allowed: {method} /account", 405)
+        return _v1_error("BadRequestException", f"Method not allowed: {method} /account", 400)
 
     if top == "tags":
         # /tags/{resourceArn} — ARN may contain slashes
@@ -665,6 +1205,35 @@ async def handle_request(method, path, headers, body, query_params):
             if method == "PATCH":
                 return _update_usage_plan(plan_id, data)
 
+    if top == "clientcertificates":
+        cert_id = parts[1] if len(parts) > 1 else None
+        if not cert_id:
+            if method == "GET":
+                return _get_client_certificates(query_params)
+            if method == "POST":
+                return _generate_client_certificate(data)
+        else:
+            if method == "GET":
+                return _get_client_certificate(cert_id)
+            if method == "PATCH":
+                return _update_client_certificate(cert_id, data)
+            if method == "DELETE":
+                return _delete_client_certificate(cert_id)
+
+    if top == "domainnameaccessassociations":
+        association_arn = urllib.parse.unquote("/".join(parts[1:])) if len(parts) > 1 else None
+        if not association_arn:
+            if method == "GET":
+                return _get_access_associations(query_params)
+            if method == "POST":
+                return _create_access_association(data)
+        elif method == "DELETE":
+            return _delete_access_association(association_arn)
+
+    if top == "rejectdomainnameaccessassociations" and method == "POST":
+        return _reject_access_association(_qp(query_params, "domainNameAccessAssociationArn", ""),
+                                          _qp(query_params, "domainNameArn", ""))
+
     if top == "domainnames":
         domain_name = parts[1] if len(parts) > 1 else None
         sub = parts[2] if len(parts) > 2 else None
@@ -695,6 +1264,8 @@ async def handle_request(method, path, headers, body, query_params):
     if top == "restapis":
         # /restapis
         if len(parts) == 1:
+            if method == "POST" and _qp(query_params, "mode") == "import":
+                return _import_rest_api_request(body)
             if method == "POST":
                 return _create_rest_api(data)
             if method == "GET":
@@ -710,6 +1281,8 @@ async def handle_request(method, path, headers, body, query_params):
                 return _delete_rest_api(api_id)
             if method == "PATCH":
                 return _update_rest_api(api_id, data)
+            if method == "PUT":
+                return _put_rest_api(api_id, body, query_params)
 
         sub = parts[2] if len(parts) > 2 else None
 
@@ -809,12 +1382,17 @@ async def handle_request(method, path, headers, body, query_params):
         # /restapis/{id}/stages[/{stageName}]
         elif sub == "stages":
             stage_name = parts[3] if len(parts) > 3 else None
+            stage_sub = parts[4] if len(parts) > 4 else None
+            export_type = parts[5] if len(parts) > 5 else None
             if not stage_name:
                 if method == "POST":
                     return _create_stage(api_id, data)
                 if method == "GET":
                     return _get_stages(api_id)
-            else:
+            elif stage_sub == "exports":
+                if method == "GET" and export_type and len(parts) == 6:
+                    return _get_export(api_id, stage_name, export_type, headers, query_params)
+            elif stage_sub is None:
                 if method == "GET":
                     return _get_stage(api_id, stage_name)
                 if method == "PATCH":
@@ -838,6 +1416,22 @@ async def handle_request(method, path, headers, body, query_params):
                 if method == "DELETE":
                     return _delete_authorizer(api_id, auth_id)
 
+        # /restapis/{id}/requestvalidators[/{validatorId}]
+        elif sub == "requestvalidators":
+            validator_id = parts[3] if len(parts) > 3 else None
+            if not validator_id:
+                if method == "POST":
+                    return _create_request_validator(api_id, data)
+                if method == "GET":
+                    return _get_request_validators(api_id, query_params)
+            else:
+                if method == "GET":
+                    return _get_request_validator(api_id, validator_id)
+                if method == "PATCH":
+                    return _update_request_validator(api_id, validator_id, data)
+                if method == "DELETE":
+                    return _delete_request_validator(api_id, validator_id)
+
         # /restapis/{id}/models[/{modelName}]
         elif sub == "models":
             model_name = parts[3] if len(parts) > 3 else None
@@ -854,6 +1448,36 @@ async def handle_request(method, path, headers, body, query_params):
                 if method == "DELETE":
                     return _delete_model(api_id, model_name)
 
+        # /restapis/{id}/documentation/parts[/{partId}]
+        elif sub == "documentation" and len(parts) > 3 and parts[3] == "parts":
+            part_id = parts[4] if len(parts) > 4 else None
+            if part_id is None:
+                if method == "POST":
+                    return _create_documentation_part(api_id, data)
+                if method == "GET":
+                    return _get_documentation_parts(api_id, query_params)
+            else:
+                if method == "GET":
+                    return _get_documentation_part(api_id, part_id)
+                if method == "PATCH":
+                    return _update_documentation_part(api_id, part_id, data)
+                if method == "DELETE":
+                    return _delete_documentation_part(api_id, part_id)
+
+        # /restapis/{id}/gatewayresponses[/{responseType}]
+        elif sub == "gatewayresponses":
+            response_type = parts[3] if len(parts) > 3 else None
+            if response_type is None:
+                if method == "GET":
+                    return _get_gateway_responses(api_id)
+            else:
+                if method == "PUT":
+                    return _put_gateway_response(api_id, response_type, data)
+                if method == "GET":
+                    return _get_gateway_response(api_id, response_type)
+                if method == "DELETE":
+                    return _delete_gateway_response(api_id, response_type)
+
     return _v1_error("NotFoundException", f"Unknown API Gateway v1 path: {path}", 404)
 
 
@@ -861,37 +1485,1278 @@ async def handle_request(method, path, headers, body, query_params):
 
 async def handle_execute(api_id, stage_name, method, path, headers, body, query_params):
     """Execute a v1 REST API request through a deployed stage (data plane)."""
+    scope = find_api_scope(api_id)
+    if scope is None:
+        return 404, {"Content-Type": "application/json"}, json.dumps({"message": "Not Found"}).encode()
+    owner_account_id, owner_region = scope
+
+    from ministack.core.responses import _request_account_id, _request_region
+
+    account_token = _request_account_id.set(owner_account_id)
+    region_token = _request_region.set(owner_region)
+    try:
+        return await _handle_execute_in_scope(
+            api_id, stage_name, method, path, headers, body, query_params,
+            owner_account_id, owner_region,
+        )
+    finally:
+        _request_account_id.reset(account_token)
+        _request_region.reset(region_token)
+
+
+# ---- Data plane: Lambda authorizers (custom authorizers) ----
+
+
+def _header_ci(headers, name):
+    """Case-insensitive single header lookup returning a str (or '')."""
+    target = name.lower()
+    for k, v in (headers or {}).items():
+        if k.lower() == target:
+            return v if isinstance(v, str) else (v[-1] if v else "")
+    return ""
+
+
+class _GatewayError:
+    """An error API Gateway itself emits, answered through the gateway response
+    of ``response_type`` in the stage's deployment (see
+    :func:`_gateway_error_response`)."""
+
+    def __init__(self, response_type, message, error_type=None):
+        self.response_type = response_type
+        self.message = message
+        self.error_type = error_type
+
+
+def _gw_error(response_type, message):
+    return _GatewayError(response_type, message)
+
+
+def _deny_error(explicit):
+    """The 403 an authorizer denial produces. Explicit Deny vs. no-matching-Allow
+    differ only in the trailing clause."""
+    msg = (
+        "User is not authorized to access this resource with an explicit deny in an identity-based policy"
+        if explicit
+        else "User is not authorized to access this resource"
+    )
+    return _gw_error("ACCESS_DENIED", msg)
+
+
+def _gateway_request_value(source, request):
+    """Resolve a ``gatewayresponse.header.*`` mapping expression against the
+    request. None means the source is absent, which omits the header."""
+    if len(source) >= 2 and source[0] == source[-1] == "'":
+        return source[1:-1]
+    if source.startswith("method.request.header."):
+        target = source[len("method.request.header."):].lower()
+        for key, value in request["headers"].items():
+            if key.lower() == target:
+                return value if isinstance(value, str) else (value[-1] if value else "")
+        return None
+    if source.startswith("method.request.querystring."):
+        value = request["query_params"].get(source[len("method.request.querystring."):])
+        return value[0] if isinstance(value, list) and value else value
+    if source.startswith("method.request.path."):
+        return request["path_params"].get(source[len("method.request.path."):])
+    if source.startswith("stageVariables."):
+        return (request["stage"].get("variables") or {}).get(source[len("stageVariables."):])
+    if source == "context.requestId":
+        return request["request_id"]
+    return None
+
+
+def _gateway_error_response(error, request):
+    """Render a gateway error the way API Gateway does.
+
+    Precedence: the customized response for the type, else a customized
+    DEFAULT_4XX / DEFAULT_5XX (by the type's default status), else the built-in
+    default. The responses in effect are the ones captured by the stage's
+    deployment. The application/json template is used whatever the request
+    accepts.
+    """
+    api_id = request["api_id"]
+    customized = _deployed_gateway_responses.get(api_id, {}).get(request["stage"].get("deploymentId"))
+    if customized is None:
+        # A deployment restored from state written before snapshots existed.
+        customized = _gateway_responses.get(api_id, {})
+    response_type = error.response_type
+    response = _gateway_response_for_type(customized, response_type)
+    template = (response.get("responseTemplates") or {}).get("application/json")
+    if response_type == "ACCESS_DENIED" and not customized.keys() & {response_type, "DEFAULT_4XX"}:
+        # The built-in ACCESS_DENIED body carries a capitalised `Message` key.
+        template = '{"Message":$context.error.messageString}'
+    if template is None:
+        template = _DEFAULT_GATEWAY_RESPONSE_TEMPLATE
+
+    headers = {"Content-Type": "application/json"}
+    for dest, source in (response.get("responseParameters") or {}).items():
+        if not dest.startswith("gatewayresponse.header.") or not isinstance(source, str):
+            continue
+        value = _gateway_request_value(source, request)
+        if value is not None:
+            headers[dest[len("gatewayresponse.header."):]] = value
+    error_type = error.error_type or _GATEWAY_RESPONSE_ERROR_TYPES.get(response_type)
+    if error_type:
+        headers["x-amzn-ErrorType"] = error_type
+    headers["x-amzn-requestid"] = request["request_id"]
+
+    message = error.message
+    message_string = "null" if message is None else json.dumps(message)
+    rendered_type = response_type
+    if response_type in ("API_CONFIGURATION_ERROR", "AUTHORIZER_CONFIGURATION_ERROR",
+                         "BAD_REQUEST_BODY", "BAD_REQUEST_PARAMETERS", "DEFAULT_5XX"):
+        # AWS renders the messageString of these types with a leading space (measured).
+        message_string = " " + message_string
+    if response_type == "AUTHORIZER_CONFIGURATION_ERROR":
+        # Rendered as API_CONFIGURATION_ERROR; entry, status and error type stay AUTHORIZER_* (measured).
+        rendered_type = "API_CONFIGURATION_ERROR"
+    variables = {
+        "context.error.message": "" if message is None else message,
+        "context.error.messageString": message_string,
+        "context.error.responseType": rendered_type,
+        "context.requestId": request["request_id"],
+        "context.resourcePath": request["resource_path"],
+        "context.stage": request["stage_name"],
+        # No integration answered, so the status variable renders empty (measured).
+        "context.status": "",
+    }
+    body = _GATEWAY_TEMPLATE_VARIABLE.sub(
+        lambda m: variables.get(m.group(1) or m.group(2), m.group(0)), template
+    )
+    status = response.get("statusCode") or (403 if response_type == "DEFAULT_4XX" else 500)
+    return int(status), headers, body.encode("utf-8")
+
+
+# A failed SigV4 authentication of an execute-api caller: the gateway response and x-amzn-ErrorType.
+_AUTHENTICATION_GATEWAY_ERRORS = {
+    "SignatureDoesNotMatch": ("INVALID_SIGNATURE", "InvalidSignatureException"),
+    "RequestTimeTooSkewed": ("INVALID_SIGNATURE", "InvalidSignatureException"),
+    "ExpiredTokenException": ("EXPIRED_TOKEN", "ExpiredTokenException"),
+    "CredentialDateMismatch": ("INVALID_SIGNATURE", "InvalidSignatureException"),
+    "IncompleteSignature": ("DEFAULT_4XX", "IncompleteSignatureException"),
+    "MissingAuthorizationParameter": ("DEFAULT_4XX", "IncompleteSignatureException"),
+}
+
+
+def authentication_error_response(api_id, stage_name, error, headers, query_params):
+    """Answer a failed SigV4 authentication through a REST API stage's gateway responses, or None."""
+    scope = find_api_scope(api_id)
+    stage = stages_for_api(api_id).get(stage_name)
+    if scope is None or stage is None:
+        return None
+    response_type, error_type = _AUTHENTICATION_GATEWAY_ERRORS.get(
+        error.code, ("DEFAULT_4XX", "UnrecognizedClientException"))
+    request = {
+        "api_id": api_id, "stage_name": stage_name, "stage": stage, "headers": headers or {},
+        "query_params": query_params or {}, "path_params": {}, "resource_path": "", "request_id": new_uuid(),
+    }
+    with request_scope(*scope):
+        return _gateway_error_response(_GatewayError(response_type, error.message, error_type), request)
+
+
+def cross_account_denial_response(api_id, stage_name, denied, headers, query_params, owner_scope):
+    """AWS's 403 for another account's call no policy allows; None (an explicit Deny) keeps the default."""
+    if denied.decision == "Deny":
+        return None
+    with request_scope(*owner_scope):
+        stage = stages_for_api(api_id).get(stage_name)
+        if stage is None:
+            return None
+        request = {
+            "api_id": api_id, "stage_name": stage_name, "stage": stage, "headers": headers or {},
+            "query_params": query_params or {}, "path_params": {}, "resource_path": "", "request_id": new_uuid(),
+        }
+        message = f"User: {denied.principal_arn} is not authorized to access this resource"
+        return _gateway_error_response(_GatewayError("ACCESS_DENIED", message), request)
+
+
+def method_authorization_type(api_id, stage_name, method, path):
+    """The authorizationType of the method a REST API stage serves for this request, or None."""
+    scope = find_api_scope(api_id)
+    if scope is None:
+        return None
+    segments = [s for s in path.strip("/").split("/") if s]
+    with request_scope(*scope):
+        if stage_name not in _stages_v1.get(api_id, {}):
+            return None
+        resource, _ = _match_resource_tree(api_id, segments)
+        methods = (resource or {}).get("resourceMethods", {})
+        method_obj = methods.get(method) or methods.get("ANY")
+        if not method_obj:
+            resource, _ = _match_greedy_fallback(api_id, segments, method)
+            methods = (resource or {}).get("resourceMethods", {})
+            method_obj = methods.get(method) or methods.get("ANY")
+    return (method_obj.get("authorizationType") or "NONE").upper() if method_obj else None
+
+
+def _arn_matches(pattern, arn):
+    """Match an IAM policy Resource against a method ARN, honoring `*`/`?` globs."""
+    regex = "^" + re.escape(pattern).replace(r"\*", ".*").replace(r"\?", ".") + "$"
+    return re.match(regex, arn) is not None
+
+
+def _evaluate_policy(policy_doc, method_arn):
+    """Evaluate an authorizer IAM policy against the method ARN.
+
+    Returns "Deny" (explicit deny matched — always wins), "Allow" (an Allow
+    matched and no Deny did), or "NoMatch" (implicit deny — no statement matched).
+    """
+    if not isinstance(policy_doc, dict):
+        return "NoMatch"
+    statements = policy_doc.get("Statement") or []
+    if isinstance(statements, dict):
+        statements = [statements]
+    allow = False
+    for st in statements:
+        if not isinstance(st, dict):
+            continue
+        resources = st.get("Resource")
+        if isinstance(resources, str):
+            resources = [resources]
+        if not any(_arn_matches(r, method_arn) for r in (resources or [])):
+            continue
+        if st.get("Effect") == "Deny":
+            return "Deny"
+        if st.get("Effect") == "Allow":
+            allow = True
+    return "Allow" if allow else "NoMatch"
+
+
+def _stringify_context(context):
+    """Authorizer context reaches the backend with every value stringified;
+    booleans become JSON-style `true`/`false`."""
+    out = {}
+    for k, v in (context or {}).items():
+        if isinstance(v, bool):
+            out[k] = "true" if v else "false"
+        elif v is None:
+            continue
+        elif isinstance(v, (str, int, float)):
+            out[k] = str(v)
+        # nested dict/list values are not supported by API Gateway — dropped.
+    return out
+
+
+async def _invoke_authorizer_lambda(authorizer, event, account_id, region):
+    """Invoke the authorizer's Lambda and return its raw execution result dict."""
+    lambda_ref = _extract_lambda_ref_from_integration_uri(authorizer.get("authorizerUri", ""))
+    from ministack.services import lambda_svc
+
+    func_data, func_config, func_name = lambda_svc._get_func_record_for_ref_in_scope(
+        lambda_ref, account_id=account_id, region=region,
+    )
+    if func_data is None or func_config is None:
+        return None
+    exec_record = lambda_svc._execution_record_for_config(func_data, func_config)
+    return await run_reentrant(
+        lambda_svc._execute_function_with_config_scope, exec_record, event,
+        thread_name="ministack-apigw-authorizer",
+    )
+
+
+def _request_identity_sources(identity_source, headers, query_params, stage):
+    """Resolve a REQUEST authorizer's identitySource list to (all_present, values).
+
+    identitySource is a comma-separated list of `method.request.*` / stage-variable
+    mappings. Returns whether every source is present+non-empty and the ordered
+    values (used as the cache-key parts)."""
+    present = True
+    values = []
+    for raw in (identity_source or "").split(","):
+        src = raw.strip()
+        if not src:
+            continue
+        val = ""
+        if src.startswith("method.request.header."):
+            val = _header_ci(headers, src[len("method.request.header."):])
+        elif src.startswith("method.request.querystring."):
+            qn = src[len("method.request.querystring."):]
+            qv = (query_params or {}).get(qn)
+            val = (qv[0] if isinstance(qv, list) else qv) or ""
+        elif src.startswith("stageVariables."):
+            val = ((stage.get("variables") or {}).get(src[len("stageVariables."):])) or ""
+        elif src.startswith("context."):
+            val = ""  # context identity sources not modeled; treated as absent
+        values.append(val)
+        if not val:
+            present = False
+    return present, values
+
+
+def _authorizer_ttl(authorizer):
+    """``authorizerResultTtlInSeconds`` as a non-negative int.
+
+    CreateAuthorizer already defaults the field to ``_DEFAULT_AUTHORIZER_TTL``,
+    so a record reaching here without one was reshaped by UpdateAuthorizer —
+    which applies JSON Patch verbatim and never validates the value. Absent and
+    unparsable therefore mean the same thing and both fall back to the AWS
+    default, instead of silently disabling caching in one case and enabling it
+    in the other. An explicit 0 still disables it.
+    """
+    raw = authorizer.get("authorizerResultTtlInSeconds")
+    if raw is None or raw == "":
+        return _DEFAULT_AUTHORIZER_TTL
+    try:
+        return max(int(raw), 0)
+    except (TypeError, ValueError):
+        return _DEFAULT_AUTHORIZER_TTL
+
+
+def _cache_authorizer_result(key, expires_at, policy_doc, context):
+    """Store one authorizer result, keeping ``_authorizer_cache`` bounded.
+
+    Expired entries are dropped once the cap is reached; if that is not enough,
+    the oldest insertions are evicted.
+    """
+    if len(_authorizer_cache) >= _AUTHORIZER_CACHE_MAX:
+        now = time.time()
+        for stale in [k for k, v in _authorizer_cache.items() if v[0] <= now]:
+            del _authorizer_cache[stale]
+        while len(_authorizer_cache) >= _AUTHORIZER_CACHE_MAX:
+            del _authorizer_cache[next(iter(_authorizer_cache))]
+    _authorizer_cache[key] = (expires_at, policy_doc, context)
+
+
+def _iam_caller_identity(headers, query_params):
+    """The payload-1.0 ``requestContext.identity`` fields for an AWS_IAM method.
+
+    Key resolution only — signatures are never verified. Unknown/absent keys
+    return None and the event keeps its two-field identity (the documented
+    no-IAM behaviour). For a Cognito identity-pool session the cognito* fields
+    ride along, ``cognitoAuthenticationProvider`` in the documented
+    ``<provider>,<provider>:CognitoSignIn:<sub>`` format.
+    """
+    from ministack.core.iam_evaluator import resolve_caller_identity
+    from ministack.core.router import extract_access_key_id
+
+    info = resolve_caller_identity(extract_access_key_id(headers, query_params))
+    if not info:
+        return None
+    identity = {
+        "accessKey": info["accessKey"],
+        "accountId": info["accountId"],
+        "caller": info["userId"] or None,
+        "user": info["userId"] or None,
+        "userArn": info["userArn"] or None,
+        "principalOrgId": info.get("principalOrgId"),
+        "cognitoAuthenticationProvider": None,
+        "cognitoAuthenticationType": None,
+        "cognitoIdentityId": None,
+        "cognitoIdentityPoolId": None,
+    }
+    session = info.get("session") or {}
+    if session.get("_identity_id"):
+        identity.update({
+            "cognitoAuthenticationProvider": session.get("_cognito_auth_provider"),
+            "cognitoAuthenticationType": session.get("_cognito_auth_type"),
+            "cognitoIdentityId": session.get("_identity_id"),
+            "cognitoIdentityPoolId": session.get("_identity_pool_id"),
+        })
+    return identity
+
+
+def _cognito_pool_issuers(authorizer):
+    """The token issuers a COGNITO_USER_POOLS authorizer accepts.
+
+    Each ``providerARNs`` entry is a user-pool ARN
+    (``arn:aws:cognito-idp:{region}:{account}:userpool/{poolId}``) and the
+    issuer Cognito stamps into a token minted by that pool is
+    ``https://cognito-idp.{region}.amazonaws.com/{poolId}``. Unparsable and
+    non-``cognito-idp`` entries are skipped rather than raising: CreateAuthorizer
+    stores the list verbatim, so a malformed ARN only surfaces here and must not
+    take down the request handler.
+    """
+    issuers = []
+    for arn in authorizer.get("providerARNs") or []:
+        try:
+            parsed = parse_arn(arn)
+        except ArnParseError:
+            continue
+        if parsed.service != "cognito-idp" or not parsed.region:
+            continue
+        pool_id = parsed.resource.split("/", 1)[-1] if "/" in parsed.resource else ""
+        if pool_id:
+            issuers.append(f"https://cognito-idp.{parsed.region}.amazonaws.com/{pool_id}")
+    return issuers
+
+
+def _cognito_token_from_request(authorizer, headers, query_params, stage):
+    """The raw JWT named by a Cognito authorizer's ``identitySource``.
+
+    REST identity sources use the ``method.request.header.X`` syntax (not the
+    HTTP API's ``$request.header.X``), and AWS defaults the field to the
+    Authorization header. A ``Bearer `` prefix is tolerated — Cognito authorizers
+    accept the bare token, but clients routinely send the OAuth-style form.
+    """
+    source = authorizer.get("identitySource") or "method.request.header.Authorization"
+    present, values = _request_identity_sources(source, headers, query_params, stage)
+    if not present or not values:
+        return None
+    token = (values[0] or "").strip()
+    if token.lower().startswith("bearer "):
+        token = token.split(" ", 1)[1].strip()
+    return token or None
+
+
+def _stringify_claims(claims):
+    """Render JWT claims as the backend receives them.
+
+    API Gateway passes claims through as strings. A list-valued claim —
+    ``cognito:groups`` being the one that matters — arrives space-joined inside
+    square brackets (``"[admins staff]"``), which is why a handler cannot simply
+    index it as an array.
+    """
+    out = {}
+    for key, value in (claims or {}).items():
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            out[key] = "true" if value else "false"
+        elif isinstance(value, list):
+            out[key] = "[" + " ".join(str(v) for v in value) + "]"
+        elif isinstance(value, dict):
+            out[key] = json.dumps(value, separators=(",", ":"))
+        else:
+            out[key] = str(value)
+    return out
+
+
+def _token_scopes(claims):
+    """The OAuth scopes carried by an access token (``scope`` or ``scp``)."""
+    scopes = []
+    raw_scope = claims.get("scope")
+    raw_scp = claims.get("scp")
+    if isinstance(raw_scope, str):
+        scopes.extend([s for s in raw_scope.split(" ") if s])
+    if isinstance(raw_scp, list):
+        scopes.extend([str(s) for s in raw_scp])
+    elif isinstance(raw_scp, str):
+        scopes.extend([s for s in raw_scp.split(" ") if s])
+    return sorted(set(scopes))
+
+
+async def _validate_cognito_authorizer(authorizer, method_obj, headers, query_params, stage):
+    """Verify a user-pool token for a COGNITO_USER_POOLS method.
+
+    Returns ``(claims, error_response)``. Unlike the HTTP API's JWT authorizer
+    there is no audience to check: a REST Cognito authorizer is configured with
+    pool ARNs only, so AWS validates the signature, the standard time claims and
+    that ``iss`` names one of those pools — never the app client. Both ID and
+    access tokens are accepted, as on AWS.
+    """
+    issuers = _cognito_pool_issuers(authorizer)
+    if not issuers:
+        # An authorizer with no usable pool cannot authorize anything; AWS
+        # reports this as a configuration error rather than letting it through.
+        return None, _gw_error("AUTHORIZER_CONFIGURATION_ERROR", "Internal server error")
+
+    token = _cognito_token_from_request(authorizer, headers, query_params, stage)
+    if not token:
+        return None, _gw_error("UNAUTHORIZED", "Unauthorized")
+
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None, _gw_error("UNAUTHORIZED", "Unauthorized")
+    try:
+        header = json.loads(_b64url_decode(parts[0]))
+        claims = json.loads(_b64url_decode(parts[1]))
+    except (ValueError, json.JSONDecodeError):
+        return None, _gw_error("UNAUTHORIZED", "Unauthorized")
+    if not isinstance(claims, dict) or not isinstance(header, dict):
+        return None, _gw_error("UNAUTHORIZED", "Unauthorized")
+
+    issuer = claims.get("iss")
+    if issuer not in issuers:
+        return None, _gw_error("UNAUTHORIZED", "Unauthorized")
+
+    kid = header.get("kid")
+    jwks_url = await _resolve_jwks_url({"jwtConfiguration": {"issuer": issuer}})
+    if not kid or not jwks_url:
+        return None, _gw_error("UNAUTHORIZED", "Unauthorized")
+    try:
+        keys = ((await _fetch_jwks(jwks_url)).get("keys") or [])
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None, _gw_error("UNAUTHORIZED", "Unauthorized")
+    jwk = next((k for k in keys if k.get("kid") == kid), None)
+    if not jwk or not _verify_rs256_signature(token, jwk):
+        return None, _gw_error("UNAUTHORIZED", "Unauthorized")
+
+    now = int(time.time())
+    try:
+        if "exp" in claims and int(claims["exp"]) <= now:
+            return None, _gw_error("UNAUTHORIZED", "Unauthorized")
+        if "nbf" in claims and int(claims["nbf"]) > now:
+            return None, _gw_error("UNAUTHORIZED", "Unauthorized")
+        if "iat" in claims and int(claims["iat"]) > now:
+            return None, _gw_error("UNAUTHORIZED", "Unauthorized")
+    except (TypeError, ValueError):
+        return None, _gw_error("UNAUTHORIZED", "Unauthorized")
+
+    # authorizationScopes on the method turns the check into an OAuth one: the
+    # token must carry at least one of the listed scopes, and a token without
+    # scopes at all (an ID token) can never satisfy it.
+    required_scopes = method_obj.get("authorizationScopes") or []
+    if required_scopes:
+        granted = _token_scopes(claims)
+        if not any(scope in granted for scope in required_scopes):
+            return None, _gw_error("UNAUTHORIZED", "Unauthorized")
+
+    return claims, None
+
+
+async def _authorize_request_v1(
+    api_id, stage_name, method_obj, method, request_path, resource,
+    headers, body, query_params, path_params, stage,
+    owner_account_id, owner_region,
+):
+    """Enforce a method's authorization before the integration runs.
+
+    Returns ``(error_response, authorizer_context)``: when ``error_response`` is
+    not None the caller must short-circuit with it; otherwise ``authorizer_context``
+    (possibly None) is injected into the integration's ``requestContext.authorizer``.
+    """
+    auth_type = (method_obj.get("authorizationType") or "NONE").upper()
+    if auth_type in ("", "NONE"):
+        return _anonymous_policy_error(
+            api_id, stage_name, method, request_path, owner_account_id, owner_region), None
+    if auth_type == "AWS_IAM":
+        # Signatures are verified only under AUTH; here match AWS only to the extent
+        # that a request with no Authorization header is rejected as unauthenticated.
+        # Under AUTH a presigned request was verified before it got here.
+        from ministack.app import AUTH
+        from ministack.core.iam_evaluator import _query_signed
+        from ministack.core.router import extract_access_key_id
+
+        # A presigned call passes only when its query names a key, whose signature the router then verified.
+        if not _header_ci(headers, "authorization") and not (
+                AUTH and _query_signed(query_params or {}) and extract_access_key_id({}, query_params or {})):
+            return _gw_error("MISSING_AUTHENTICATION_TOKEN", "Missing Authentication Token"), None
+        return None, None
+    if auth_type == "COGNITO_USER_POOLS":
+        authorizer_id = method_obj.get("authorizerId")
+        authorizer = _authorizers_v1.get(api_id, {}).get(authorizer_id) if authorizer_id else None
+        if not authorizer:
+            return _gw_error("AUTHORIZER_CONFIGURATION_ERROR", "Internal server error"), None
+        claims, auth_error = await _validate_cognito_authorizer(
+            authorizer, method_obj, headers, query_params, stage
+        )
+        if auth_error:
+            return auth_error, None
+        return None, {"claims": _stringify_claims(claims)}
+    if auth_type != "CUSTOM":
+        # Any future authorization type: not enforced here (pass through).
+        return None, None
+
+    authorizer_id = method_obj.get("authorizerId")
+    authorizer = _authorizers_v1.get(api_id, {}).get(authorizer_id) if authorizer_id else None
+    if not authorizer:
+        return _gw_error("AUTHORIZER_CONFIGURATION_ERROR", "Internal server error"), None
+
+    method_arn = execute_api_arn(
+        owner_region, owner_account_id, api_id, stage_name, method, request_path
+    )
+    atype = (authorizer.get("type") or "TOKEN").upper()
+    ttl = _authorizer_ttl(authorizer)
+
+    if atype == "TOKEN":
+        identity_source = authorizer.get("identitySource") or "method.request.header.Authorization"
+        header_name = (
+            identity_source[len("method.request.header."):]
+            if identity_source.startswith("method.request.header.")
+            else "Authorization"
+        )
+        token = _header_ci(headers, header_name)
+        if not token:
+            return _gw_error("UNAUTHORIZED", "Unauthorized"), None
+        val_expr = authorizer.get("identityValidationExpression")
+        if val_expr:
+            try:
+                token_matches = re.fullmatch(val_expr, token) is not None
+            except re.error:
+                # CreateAuthorizer stores the expression verbatim, so an
+                # uncompilable one only surfaces here. That is a
+                # misconfiguration (AUTHORIZER_CONFIGURATION_ERROR), not an
+                # exception that should escape the request handler.
+                return _gw_error("AUTHORIZER_CONFIGURATION_ERROR", "Internal server error"), None
+            if not token_matches:
+                return _gw_error("UNAUTHORIZED", "Unauthorized"), None
+        identity_values = (token,)
+        event = {"type": "TOKEN", "authorizationToken": token, "methodArn": method_arn}
+    else:  # REQUEST
+        identity_source = authorizer.get("identitySource") or ""
+        all_present, id_values = _request_identity_sources(
+            identity_source, headers, query_params, stage
+        )
+        # With caching on and identity sources declared, a missing source is a
+        # 401 without invoking the authorizer (matches AWS).
+        if ttl > 0 and identity_source and not all_present:
+            return _gw_error("UNAUTHORIZED", "Unauthorized"), None
+        identity_values = tuple(id_values)
+        single_headers = {k: (v if isinstance(v, str) else v[-1]) for k, v in headers.items()}
+        multi_headers = {k: ([v] if isinstance(v, str) else list(v)) for k, v in headers.items()}
+        qs_params = {k: v[0] for k, v in query_params.items()} if query_params else None
+        mv_qs_params = {k: list(v) for k, v in query_params.items()} if query_params else None
+        event = {
+            "type": "REQUEST",
+            "methodArn": method_arn,
+            "resource": resource["path"],
+            "path": request_path,
+            "httpMethod": method,
+            "headers": single_headers,
+            "multiValueHeaders": multi_headers,
+            "queryStringParameters": qs_params,
+            "multiValueQueryStringParameters": mv_qs_params,
+            "pathParameters": path_params or None,
+            "stageVariables": stage.get("variables") or None,
+            "requestContext": {
+                "resourceId": resource["id"],
+                "stage": stage_name,
+                "resourcePath": resource["path"],
+                "httpMethod": method,
+                "apiId": api_id,
+                "accountId": owner_account_id,
+                # Same caller fields the AWS_PROXY event reports.
+                "identity": {
+                    "sourceIp": (_header_ci(headers, "x-forwarded-for") or "127.0.0.1").split(",")[0].strip(),
+                    "userAgent": _header_ci(headers, "user-agent") or "",
+                },
+            },
+        }
+
+    # TTL cache: a hit replays the authorizer's OUTPUT without invoking the
+    # Lambda, but never its verdict — the policy is evaluated below against this
+    # request's own method ARN. The stage and the identity values are part of the
+    # key for the same reason: the canonical `Resource: event['methodArn']` policy
+    # is issued for exactly one method on one stage.
+    ckey = (owner_account_id, owner_region, api_id, authorizer_id, stage_name, identity_values)
+    cached = None
+    if ttl > 0:
+        hit = _authorizer_cache.get(ckey)
+        if hit and hit[0] > time.time():
+            cached = (hit[1], hit[2])
+
+    if cached is None:
+        result = await _invoke_authorizer_lambda(
+            authorizer, event, owner_account_id, owner_region
+        )
+        if result is None:
+            # Authorizer Lambda unresolved / not found → connection failure.
+            return _gw_error("AUTHORIZER_CONFIGURATION_ERROR", "Internal server error"), None
+        if result.get("error"):
+            err_body = result.get("body") or {}
+            msg = err_body.get("errorMessage", "") if isinstance(err_body, dict) else str(err_body)
+            # A function that raises exactly "Unauthorized" maps to 401; any other
+            # uncaught error is an authorizer failure → 500 with a null message.
+            if isinstance(msg, str) and msg.strip().lower() == "unauthorized":
+                return _gw_error("UNAUTHORIZED", "Unauthorized"), None
+            return _gw_error("AUTHORIZER_FAILURE", None), None
+
+        policy = result.get("body")
+        if isinstance(policy, (str, bytes)):
+            if isinstance(policy, bytes):
+                policy = policy.decode("utf-8", errors="replace")
+            try:
+                policy = json.loads(policy)
+            except json.JSONDecodeError:
+                policy = None
+        if not isinstance(policy, dict):
+            return _gw_error("AUTHORIZER_CONFIGURATION_ERROR", "Internal server error"), None
+
+        principal_id = policy.get("principalId")
+        has_principal = principal_id is not None and str(principal_id) != ""
+        # AWS evaluates the policy of a TOKEN and of a REQUEST authorizer that
+        # returns no principalId (measured for both); it is not a configuration error.
+
+        policy_doc = policy.get("policyDocument")
+        if not isinstance(policy_doc, dict):
+            # Same AUTHORIZER_CONFIGURATION_ERROR shape: a response without a
+            # policyDocument is a misconfigured authorizer, not an implicit
+            # deny — and it must not be cached.
+            return _gw_error("AUTHORIZER_CONFIGURATION_ERROR", "Internal server error"), None
+
+        auth_ctx = _stringify_context(policy.get("context"))
+        if has_principal:
+            auth_ctx["principalId"] = str(principal_id)
+        # Only a well-formed response is cached; failures re-invoke next time.
+        cached = (policy_doc, auth_ctx)
+        if ttl > 0:
+            _cache_authorizer_result(ckey, time.time() + ttl, *cached)
+
+    policy_doc, auth_ctx = cached
+    decision = _evaluate_policy(policy_doc, method_arn)
+    if decision != "Allow":
+        return _deny_error(decision == "Deny"), None
+    return None, auth_ctx
+
+
+# $context.error.message per gateway response type.
+_GATEWAY_ERROR_MESSAGES = {
+    "INVALID_API_KEY": "Forbidden",
+    "THROTTLED": "Too Many Requests",
+    "QUOTA_EXCEEDED": "Limit Exceeded",  # not captured
+    "UNSUPPORTED_MEDIA_TYPE": "Unsupported Media Type",
+    "BAD_REQUEST_BODY": "Invalid request body",
+    "DEFAULT_5XX": "Internal server error",
+}
+
+# In-process only; a restart forgets them.
+_throttle_state = {}
+_quota_state = {}
+_QUOTA_PERIOD_SECONDS = {"DAY": 86400, "WEEK": 7 * 86400, "MONTH": 30 * 86400}
+
+
+def _api_key_from_request(headers):
+    return _header_ci(headers, "x-api-key")
+
+
+def _resolve_api_key(value):
+    """The enabled ApiKey record whose value matches, or None."""
+    if not value:
+        return None
+    for _scope, key in _api_keys.all_items():
+        if key.get("value") == value and key.get("enabled", True):
+            return key
+    return None
+
+
+def _usage_plans_for_key(key_id, api_id, stage_name):
+    """Every usage plan that carries this key and covers this api+stage."""
+    plans = []
+    for (account, region, plan_id), plan in list(_usage_plans.all_items()):
+        keys = _usage_plan_keys.get(plan_id, {}) or {}
+        if key_id not in keys:
+            continue
+        for entry in plan.get("apiStages") or []:
+            if entry.get("apiId") == api_id and entry.get("stage") == stage_name:
+                plans.append((plan_id, plan, entry))
+                break
+    return plans
+
+
+def _check_api_key(method_obj, api_id, stage_name, headers):
+    """(error, key_record) for a method with apiKeyRequired."""
+    if not method_obj.get("apiKeyRequired"):
+        return None, None
+    key = _resolve_api_key(_api_key_from_request(headers))
+    if key is None:
+        return _gw_error("INVALID_API_KEY",
+                         _GATEWAY_ERROR_MESSAGES["INVALID_API_KEY"]), None
+    if not _usage_plans_for_key(key["id"], api_id, stage_name):
+        return _gw_error("INVALID_API_KEY",
+                         _GATEWAY_ERROR_MESSAGES["INVALID_API_KEY"]), None
+    return None, key
+
+
+def _method_throttle_settings(stage, resource_path, http_method):
+    """The method override, else the stage-wide "*/*" entry."""
+    settings = stage.get("methodSettings") or {}
+    stripped = resource_path.lstrip("/")
+    # UpdateStage keeps the path's leading slash; accept either spelling.
+    for key in (f"/{stripped}/{http_method}", f"{stripped}/{http_method}", "*/*"):
+        entry = settings.get(key)
+        if isinstance(entry, dict) and (
+                "throttlingRateLimit" in entry or "throttlingBurstLimit" in entry):
+            return entry
+    return None
+
+
+def _take_token(slot, limits):
+    """Token bucket per slot: rate refills, burst caps, 0/0 refuses all."""
+    rate = limits.get("rateLimit")
+    burst = limits.get("burstLimit")
+    if rate is None and burst is None:
+        return True
+    rate = float(rate or 0)
+    burst = float(burst or 0)
+    if rate <= 0 and burst <= 0:
+        return False
+    now = time.time()
+    tokens, last = _throttle_state.get(slot, (burst, now))
+    tokens = min(burst, tokens + (now - last) * rate)
+    if tokens < 1:
+        _throttle_state[slot] = (tokens, now)
+        return False
+    _throttle_state[slot] = (tokens - 1, now)
+    return True
+
+
+def _check_throttle(stage, api_id, stage_name, resource_path, http_method, key):
+    """Usage-plan limits for the caller's key, then the stage method limit."""
+    buckets = []
+    if key is not None:
+        for plan_id, plan, entry in _usage_plans_for_key(key["id"], api_id, stage_name):
+            buckets.append((("plan", plan_id, key["id"]), plan.get("throttle") or {}))
+            method_limits = (entry.get("throttle") or {}).get(f"{resource_path}/{http_method}")
+            if method_limits:
+                buckets.append((("plan", plan_id, key["id"], api_id, stage_name, resource_path,
+                                 http_method), method_limits))
+    entry = _method_throttle_settings(stage, resource_path, http_method)
+    if entry is not None:
+        buckets.append((("stage", api_id, stage_name, resource_path, http_method), {
+            "rateLimit": entry.get("throttlingRateLimit"),
+            "burstLimit": entry.get("throttlingBurstLimit"),
+        }))
+    for slot, limits in buckets:
+        if not _take_token(slot, limits):
+            return _gw_error("THROTTLED", _GATEWAY_ERROR_MESSAGES["THROTTLED"])
+    return None
+
+
+def _check_quota(key, api_id, stage_name):
+    """Usage-plan quota, per key per plan period."""
+    if key is None:
+        return None
+    now = time.time()
+    for plan_id, plan, _entry in _usage_plans_for_key(key["id"], api_id, stage_name):
+        quota = plan.get("quota") or {}
+        limit = quota.get("limit")
+        if limit is None:
+            continue
+        period = _QUOTA_PERIOD_SECONDS.get(quota.get("period", "DAY"), 86400)
+        slot = (plan_id, key["id"])
+        used, window_start = _quota_state.get(slot, (0, now))
+        if now - window_start >= period:
+            used, window_start = 0, now
+        if used >= int(limit):
+            _quota_state[slot] = (used, window_start)
+            return _gw_error("QUOTA_EXCEEDED",
+                             _GATEWAY_ERROR_MESSAGES["QUOTA_EXCEEDED"])
+        _quota_state[slot] = (used + 1, window_start)
+    return None
+
+
+def _missing_request_parameters(method_obj, request, headers, query_params):
+    """The absent required request parameters, in declaration order."""
+    missing = []
+    for name, required in (method_obj.get("requestParameters") or {}).items():
+        if not required:
+            continue
+        if name.startswith("method.request.querystring."):
+            key = name[len("method.request.querystring."):]
+            value = (query_params or {}).get(key)
+            if value in (None, "", []):
+                missing.append(key)
+        elif name.startswith("method.request.header."):
+            key = name[len("method.request.header."):]
+            if not _header_ci(headers, key):
+                missing.append(key)
+        elif name.startswith("method.request.path."):
+            key = name[len("method.request.path."):]
+            if not (request.get("path_params") or {}).get(key):
+                missing.append(key)
+    return missing
+
+
+_JSON_TYPES = {
+    "object": lambda v: isinstance(v, dict),
+    "array": lambda v: isinstance(v, list),
+    "string": lambda v: isinstance(v, str),
+    "boolean": lambda v: isinstance(v, bool),
+    "null": lambda v: v is None,
+    "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
+    "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+}
+
+
+def _parse_date_time(value):
+    """Parse an RFC 3339 date-time, raising ValueError otherwise."""
+    match = re.fullmatch(r"(\d{4}-\d\d-\d\d)[Tt](\d\d:\d\d:\d\d)(\.\d+)?([Zz]|[+-]\d\d:\d\d)", value)
+    if not match:
+        raise ValueError(value)
+    datetime.datetime.strptime(match[1] + match[2], "%Y-%m-%d%H:%M:%S")
+
+
+def _parses(parse):
+    """A format check that holds when parse accepts the value."""
+    def check(value):
+        try:
+            parse(value)
+        except ValueError:
+            return False
+        return True
+    return check
+
+
+_HOST_LABEL = r"[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?"
+_JSON_FORMATS = {
+    "date-time": _parses(_parse_date_time),
+    "email": lambda v: re.fullmatch(r"[^@\s]+@[^@\s]+", v) is not None,
+    "hostname": lambda v: re.fullmatch(rf"{_HOST_LABEL}(?:\.{_HOST_LABEL})*", v) is not None,
+    "ipv4": _parses(ipaddress.IPv4Address),
+    "ipv6": _parses(ipaddress.IPv6Address),
+    "uri": lambda v: re.search(r"[\s<>\"{}|\\^`]", v) is None,
+}
+
+
+def _regex_search(pattern, text):
+    """Whether pattern matches somewhere in text; None when Python cannot compile it."""
+    try:
+        return re.search(pattern, text) is not None
+    except re.error:
+        return None
+
+
+def _multiple_of(value, divisor):
+    """Exact multipleOf on the decimal representations."""
+    try:
+        return decimal.Decimal(str(value)) % decimal.Decimal(str(divisor)) == 0
+    except (decimal.DecimalException, ValueError):
+        return True
+
+
+def _json_equal(a, b):
+    """JSON equality: booleans are not numbers."""
+    if isinstance(a, bool) != isinstance(b, bool):
+        return False
+    if isinstance(a, dict) and isinstance(b, dict):
+        return a.keys() == b.keys() and all(_json_equal(a[k], b[k]) for k in a)
+    if isinstance(a, list) and isinstance(b, list):
+        return len(a) == len(b) and all(map(_json_equal, a, b))
+    return a == b
+
+
+def _json_key(value):
+    """A hashable key, equal for two values exactly when _json_equal says so."""
+    if isinstance(value, bool):
+        return ("b", value)
+    if isinstance(value, (int, float)):
+        return ("n", decimal.Decimal(str(value)).normalize())
+    if isinstance(value, list):
+        return ("l", tuple(map(_json_key, value)))
+    if isinstance(value, dict):
+        return ("d", frozenset((k, _json_key(v)) for k, v in value.items()))
+    return ("v", value)
+
+
+@functools.lru_cache(maxsize=256)
+def _parse_schema(text):
+    """A parsed schema, shared per text so it keeps its identity across $refs; None if not JSON."""
+    try:
+        return json.loads(text or "{}")
+    except json.JSONDecodeError:
+        return None
+
+
+def _model_schema(api_id, model_name):
+    """The parsed schema of a model of the API, or None."""
+    schema = (_models.get(api_id, {}).get(model_name) or {}).get("schema")
+    return _parse_schema(schema) if isinstance(schema, str) else schema
+
+
+def _resolve_schema_ref(ref, root):
+    """The schema a $ref names, and the document its own refs resolve in."""
+    base, _, pointer = ref.partition("#")
+    if base:
+        match = re.search(r"/restapis/([^/]+)/models/([^/]+)$", base)
+        root = _model_schema(match[1], urllib.parse.unquote(match[2])) if match else None
+    target = root
+    for part in filter(None, pointer.split("/")):
+        part = urllib.parse.unquote(part).replace("~1", "/").replace("~0", "~")
+        if isinstance(target, list) and part.isdigit() and int(part) < len(target):
+            target = target[int(part)]
+        else:
+            target = target.get(part) if isinstance(target, dict) else None
+    return target, root
+
+
+# Bodies nested deeper than this are refused before the schema applies.
+_MAX_BODY_DEPTH = 1000
+
+
+def _json_depth(value):
+    """How deeply arrays and objects nest in a parsed JSON value."""
+    depth, level = 0, [value]
+    while level := [c for c in level if isinstance(c, (dict, list))]:
+        depth += 1
+        level = [v for c in level for v in (c.values() if isinstance(c, dict) else c)]
+    return depth
+
+
+class _SchemaLoop(Exception):
+    """A schema that applies itself to the same value again."""
+
+
+def _json_schema_valid(schema, value, root, seen=()):
+    """Whether value satisfies the JSON Schema draft 4 schema; _SchemaLoop on a validation loop."""
+    chain = set()
+    while isinstance(schema, dict) and isinstance(schema.get("$ref"), str):
+        if id(schema) in chain:
+            return True
+        chain.add(id(schema))
+        schema, root = _resolve_schema_ref(schema["$ref"], root)
+    if not isinstance(schema, dict):
+        return True
+    if id(schema) in seen:
+        raise _SchemaLoop
+    seen += (id(schema),)
+
+    def valid(sub):
+        return _json_schema_valid(sub, value, root, seen)
+
+    # Every subschema that applies to the same value runs, so any loop among them is found.
+    all_of = [valid(sub) for sub in schema.get("allOf") or []]
+    any_of = [valid(sub) for sub in schema.get("anyOf") or []]
+    one_of = [valid(sub) for sub in schema.get("oneOf") or []]
+    negated = "not" in schema and valid(schema["not"])
+    depends = [all(n in value for n in needs) if isinstance(needs, list) else valid(needs)
+               for name, needs in (schema.get("dependencies") or {}).items()
+               if isinstance(value, dict) and name in value]
+    if (not all(all_of + depends) or "anyOf" in schema and not any(any_of)
+            or "oneOf" in schema and sum(one_of) != 1 or negated):
+        return False
+    types = schema.get("type")
+    if types is not None and not any(
+            _JSON_TYPES.get(t, lambda v: True)(value)
+            for t in (types if isinstance(types, list) else [types])):
+        return False
+    if "enum" in schema and not any(_json_equal(value, e) for e in schema["enum"]):
+        return False
+    if _JSON_TYPES["number"](value):
+        if "minimum" in schema and (value <= schema["minimum"] if schema.get(
+                "exclusiveMinimum") else value < schema["minimum"]):
+            return False
+        if "maximum" in schema and (value >= schema["maximum"] if schema.get(
+                "exclusiveMaximum") else value > schema["maximum"]):
+            return False
+        if "multipleOf" in schema and not _multiple_of(value, schema["multipleOf"]):
+            return False
+    if isinstance(value, str):
+        if len(value) < schema.get("minLength", 0) or len(value) > schema.get("maxLength", len(value)):
+            return False
+        if "pattern" in schema and _regex_search(schema["pattern"], value) is False:
+            return False
+        if not _JSON_FORMATS.get(schema.get("format"), lambda v: True)(value):
+            return False
+    children = []
+    if isinstance(value, list):
+        if not schema.get("minItems", 0) <= len(value) <= schema.get("maxItems", len(value)):
+            return False
+        if schema.get("uniqueItems") and len({_json_key(v) for v in value}) != len(value):
+            return False
+        items = schema.get("items", {})
+        if isinstance(items, list):
+            extra = schema.get("additionalItems", True)
+            if extra is False and len(value) > len(items):
+                return False
+            subs = items + [extra if isinstance(extra, dict) else {}] * (len(value) - len(items))
+        else:
+            subs = [items] * len(value)
+        children = zip(subs, value)
+    if isinstance(value, dict):
+        if not schema.get("minProperties", 0) <= len(value) <= schema.get("maxProperties", len(value)):
+            return False
+        if any(name not in value for name in schema.get("required") or []):
+            return False
+        properties = schema.get("properties") or {}
+        patterns = schema.get("patternProperties") or {}
+        extra = schema.get("additionalProperties", True)
+        for name, item in value.items():
+            matched = [sub for pattern, sub in patterns.items() if _regex_search(pattern, name)]
+            if name in properties:
+                matched.append(properties[name])
+            elif not matched:
+                if extra is False:
+                    return False
+                matched.append(extra)
+            children += [(sub, item) for sub in matched]
+    # Once the value passes, every child runs, so a loop below a refused sibling is still found.
+    results = [_json_schema_valid(sub, item, root) for sub, item in children if sub]
+    return all(results)
+
+
+def _check_request_validation(method_obj, api_id, request, headers, body, query_params):
+    """The method's request validator: parameters first, then the body."""
+    validator_id = method_obj.get("requestValidatorId")
+    if not validator_id:
+        return None
+    validator = _request_validators.get(api_id, {}).get(validator_id)
+    if not validator:
+        return None
+    if validator.get("validateRequestParameters"):
+        missing = _missing_request_parameters(method_obj, request, headers, query_params)
+        if missing:
+            return _gw_error(
+                "BAD_REQUEST_PARAMETERS",
+                "Missing required request parameters: [" + ", ".join(missing) + "]")
+    if not validator.get("validateRequestBody"):
+        return None
+    content_type = (_header_ci(headers, "content-type") or "application/json")
+    model_name = (method_obj.get("requestModels") or {}).get(
+        content_type.split(";", 1)[0].strip()) or (
+        method_obj.get("requestModels") or {}).get("application/json")
+    if not model_name:
+        return None
+    schema = _model_schema(api_id, model_name)
+    if schema is None:
+        return None
+    try:
+        document = json.loads(body)
+    except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
+        return _gw_error("BAD_REQUEST_BODY",
+                         _GATEWAY_ERROR_MESSAGES["BAD_REQUEST_BODY"])
+    try:
+        valid = _json_depth(document) <= _MAX_BODY_DEPTH and _json_schema_valid(
+            schema, document, schema)
+    except _SchemaLoop:
+        return _gw_error("DEFAULT_5XX", _GATEWAY_ERROR_MESSAGES["DEFAULT_5XX"])
+    except (RecursionError, TypeError, AttributeError):
+        return None
+    if not valid:
+        return _gw_error("BAD_REQUEST_BODY",
+                         _GATEWAY_ERROR_MESSAGES["BAD_REQUEST_BODY"])
+    return None
+
+
+def _check_passthrough_behavior(integration, headers):
+    """NEVER rejects a content type no request template matches."""
+    behavior = (integration.get("passthroughBehavior") or "WHEN_NO_MATCH").upper()
+    if behavior != "NEVER":
+        return None
+    templates = integration.get("requestTemplates") or {}
+    if not templates:
+        return None
+    content_type = (_header_ci(headers, "content-type")
+                    or "application/json").split(";", 1)[0].strip().lower()
+    if any(key.split(";", 1)[0].strip().lower() == content_type for key in templates):
+        return None
+    return _gw_error("UNSUPPORTED_MEDIA_TYPE",
+                     _GATEWAY_ERROR_MESSAGES["UNSUPPORTED_MEDIA_TYPE"])
+
+
+async def _handle_execute_in_scope(
+    api_id, stage_name, method, path, headers, body, query_params,
+    owner_account_id, owner_region,
+):
+    # What a gateway response can map from; filled in as routing resolves it.
+    request = {
+        "api_id": api_id,
+        "stage_name": stage_name,
+        "stage": None,
+        "headers": headers or {},
+        "query_params": query_params or {},
+        "path_params": {},
+        "resource_path": "",
+        "request_id": new_uuid(),
+    }
+    response = await _execute_in_scope(
+        request, api_id, stage_name, method, path, headers, body, query_params,
+        owner_account_id, owner_region,
+    )
+    if isinstance(response, _GatewayError):
+        return _gateway_error_response(response, request)
+    return response
+
+
+async def _execute_in_scope(
+    request, api_id, stage_name, method, path, headers, body, query_params,
+    owner_account_id, owner_region,
+):
     api = _rest_apis.get(api_id)
     if not api:
         return 404, {"Content-Type": "application/json"}, json.dumps({"message": "Not Found"}).encode()
 
     stage = _stages_v1.get(api_id, {}).get(stage_name)
     if not stage:
-        return 404, {"Content-Type": "application/json"}, json.dumps({"message": f"Stage '{stage_name}' not found"}).encode()
+        # No gateway response applies: the request never reaches a deployment.
+        return (
+            403,
+            {"Content-Type": "application/json", "x-amzn-ErrorType": "ForbiddenException"},
+            b'{"message":"Forbidden"}',
+        )
+    request["stage"] = stage
 
     # Match path against resource tree
     segments = [s for s in path.strip("/").split("/") if s]
     resource, path_params = _match_resource_tree(api_id, segments)
 
     if not resource:
-        return 404, {"Content-Type": "application/json"}, json.dumps({"message": "Missing Authentication Token"}).encode()
+        # AWS returns 403 MISSING_AUTHENTICATION_TOKEN for an unsupported
+        # resource (an unmatched path), not 404.
+        return _gw_error("MISSING_AUTHENTICATION_TOKEN", "Missing Authentication Token")
 
     # Look up method
     resource_methods = resource.get("resourceMethods", {})
     method_obj = resource_methods.get(method) or resource_methods.get("ANY")
     if not method_obj:
-        return 405, {"Content-Type": "application/json"}, json.dumps({"message": "Method Not Allowed"}).encode()
+        # The path matched a resource, but that resource does not serve this
+        # verb. API Gateway routes on the resource+method PAIR, so the request
+        # falls through to a `{proxy+}` elsewhere in the tree; only an exact
+        # match keeps the request on the specific resource. Measured against
+        # real AWS (see this commit's message): a node with no methods at all,
+        # a node carrying only an `OPTIONS` preflight, and a node declaring a
+        # different verb all fall through.
+        fb_resource, fb_params = _match_greedy_fallback(api_id, segments, method)
+        if fb_resource is not None:
+            resource, path_params = fb_resource, fb_params
+            resource_methods = resource.get("resourceMethods", {})
+            method_obj = resource_methods.get(method) or resource_methods.get("ANY")
+    if not method_obj:
+        # Nothing in the tree serves this verb for this path.
+        return _gw_error("MISSING_AUTHENTICATION_TOKEN", "Missing Authentication Token")
+    request["resource_path"] = resource["path"]
+    request["path_params"] = path_params or {}
 
     integration = method_obj.get("methodIntegration")
     if not integration:
         return 500, {"Content-Type": "application/json"}, json.dumps({"message": "No integration configured"}).encode()
 
+    # Authorize before dispatching to the integration (custom Lambda authorizers,
+    # plus an Authorization-header presence check for AWS_IAM methods).
+    auth_error, authorizer_context = await _authorize_request_v1(
+        api_id, stage_name, method_obj, method, path, resource,
+        headers, body, query_params, path_params, stage,
+        owner_account_id, owner_region,
+    )
+    if auth_error is not None:
+        return auth_error
+
+    # API Gateway's own checks, in the order it runs them.
+    key_error, api_key = _check_api_key(method_obj, api_id, stage_name, headers)
+    if key_error is not None:
+        return key_error
+    throttle_error = _check_throttle(
+        stage, api_id, stage_name, resource["path"], method,
+        api_key or _resolve_api_key(_api_key_from_request(headers)))
+    if throttle_error is not None:
+        return throttle_error
+    quota_error = _check_quota(api_key, api_id, stage_name)
+    if quota_error is not None:
+        return quota_error
+    validation_error = _check_request_validation(
+        method_obj, api_id, request, headers, body, query_params)
+    if validation_error is not None:
+        return validation_error
+    media_error = _check_passthrough_behavior(integration, headers)
+    if media_error is not None:
+        return media_error
+
     int_type = integration.get("type", "")
 
     if int_type in ("AWS_PROXY", "AWS"):
-        return await _invoke_lambda_proxy_v1(
+        # AWS_PROXY hands the function a response envelope to interpret; the
+        # non-proxy `AWS` integration dispatches on the target service in the
+        # URI: `sqs:path/...` targets reach the SQS data plane, everything else
+        # takes the Lambda path (custom/"lambda" integrations return the
+        # handler's output as the body verbatim).
+        caller_identity = None
+        if (method_obj.get("authorizationType") or "").upper() == "AWS_IAM":
+            caller_identity = _iam_caller_identity(headers, query_params)
+        if int_type == "AWS_PROXY":
+            invoke = _invoke_lambda_proxy_v1
+        else:
+            spec = _parse_service_integration_uri(integration.get("uri", ""))
+            if spec and spec[1] == "sqs" and spec[2] == "path":
+                invoke = _invoke_sqs_v1
+            else:
+                invoke = _invoke_lambda_custom_v1
+        return await invoke(
             integration, api_id, stage_name, stage, resource, path, method,
-            headers, body, query_params, path_params
+            headers, body, query_params, path_params,
+            owner_account_id=owner_account_id,
+            owner_region=owner_region,
+            binary_media_types=api.get("binaryMediaTypes") or [],
+            authorizer_context=authorizer_context,
+            caller_identity=caller_identity,
         )
     elif int_type in ("HTTP_PROXY", "HTTP"):
         return await _invoke_http_proxy_v1(
@@ -903,22 +2768,49 @@ async def handle_execute(api_id, stage_name, method, path, headers, body, query_
         return 500, {"Content-Type": "application/json"}, json.dumps({"message": f"Unsupported integration type: {int_type}"}).encode()
 
 
-async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resource, request_path, method, headers, body, query_params, path_params):
-    """Invoke Lambda with API Gateway v1 payload format 1.0."""
-    uri = integration.get("uri", "")
-    # Supported URI formats:
-    #   1. arn:aws:apigateway:{region}:lambda:path/2015-03-31/functions/arn:aws:lambda:{region}:{acct}:function:{name}[:{qualifier}]/invocations
-    #   2. arn:aws:lambda:{region}:{acct}:function:{name}[:{qualifier}]
-    #   3. plain function name: MyFunction[:{qualifier}]
-    from ministack.services import lambda_svc as _lambda_svc
-    if "function:" in uri:
-        # Strip wrapper up through 'function:' and any trailing /invocations.
-        tail = uri.split("function:")[-1].split("/")[0]
-        # tail is now "<name>" or "<name>:<qualifier>".
-        func_name, qualifier = _lambda_svc._resolve_name_and_qualifier(tail)
-    else:
-        func_name, qualifier = _lambda_svc._resolve_name_and_qualifier(uri)
+def _media_type_matches(media_type, binary_media_types):
+    """Whether a request media type matches any configured ``binaryMediaTypes``.
 
+    Configured patterns may use wildcards (``*/*``, ``type/*``); the request
+    value is matched literally against them. A request value of ``*/*`` therefore
+    does NOT match a specific configured type — verified against real AWS.
+    """
+    mt = (media_type or "").split(";", 1)[0].strip().lower()
+    if not mt:
+        return False
+    for pat in binary_media_types or []:
+        pat = pat.strip().lower()
+        if pat == mt or pat == "*/*":
+            return True
+        if pat.endswith("/*") and "/" in mt and mt.split("/", 1)[0] == pat[:-2]:
+            return True
+    return False
+
+
+def _build_lambda_event_v1(
+    api_id,
+    stage_name,
+    stage,
+    resource,
+    request_path,
+    method,
+    headers,
+    body,
+    query_params,
+    path_params,
+    *,
+    binary_media_types=None,
+    authorizer_context=None,
+    caller_identity=None,
+):
+    """Build the API Gateway v1 payload format 1.0 event handed to Lambda.
+
+    Shared by the AWS_PROXY and the non-proxy (custom) AWS integration paths.
+    The two differ in how the *response* is interpreted, not in what the
+    function is invoked with: a non-proxy integration would normally reshape the
+    request through a `requestTemplates` mapping template, which is not modeled
+    here — the function receives the same synthesized event either way.
+    """
     qs_params = {k: v[0] for k, v in query_params.items()} if query_params else None
     mv_qs_params = {k: list(v) for k, v in query_params.items()} if query_params else None
 
@@ -929,6 +2821,17 @@ async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resour
     now_epoch_ms = int(time.time() * 1000)
     request_time = datetime.datetime.utcnow().strftime("%d/%b/%Y:%H:%M:%S +0000")
     request_id = new_uuid()
+
+    # A request body whose Content-Type matches a configured binaryMediaType is
+    # delivered base64-encoded with isBase64Encoded=true; otherwise as a UTF-8
+    # string. Verified against real AWS.
+    if body:
+        if _media_type_matches(headers.get("content-type"), binary_media_types):
+            req_body, req_is_base64 = base64.b64encode(body).decode("ascii"), True
+        else:
+            req_body, req_is_base64 = body.decode("utf-8", errors="replace"), False
+    else:
+        req_body, req_is_base64 = None, False
 
     event = {
         "version": "1.0",
@@ -961,24 +2864,687 @@ async def _invoke_lambda_proxy_v1(integration, api_id, stage_name, stage, resour
             "httpMethod": method,
             "apiId": api_id,
         },
-        "body": body.decode("utf-8", errors="replace") if body else None,
-        "isBase64Encoded": False,
+        "body": req_body,
+        "isBase64Encoded": req_is_base64,
     }
 
-    lambda_response, err = await _call_lambda(func_name, event, qualifier=qualifier)
+    # A custom authorizer's returned context (values stringified) plus its
+    # principalId reach the integration under requestContext.authorizer.
+    if caller_identity:
+        # AWS_IAM methods report the resolved caller: accessKey/accountId/
+        # caller/user/userArn, plus the cognito* fields for identity-pool
+        # sessions — per the payload 1.0 identity shape.
+        event["requestContext"]["identity"].update(caller_identity)
+    if authorizer_context is not None:
+        event["requestContext"]["authorizer"] = authorizer_context
+
+    return event
+
+
+async def _invoke_lambda_proxy_v1(
+    integration,
+    api_id,
+    stage_name,
+    stage,
+    resource,
+    request_path,
+    method,
+    headers,
+    body,
+    query_params,
+    path_params,
+    *,
+    owner_account_id=None,
+    owner_region=None,
+    binary_media_types=None,
+    authorizer_context=None,
+    caller_identity=None,
+):
+    """Invoke Lambda through an AWS_PROXY integration and interpret its
+    `{statusCode, headers, body}` response envelope."""
+    lambda_ref = _extract_lambda_ref_from_integration_uri(integration.get("uri", ""))
+
+    event = _build_lambda_event_v1(
+        api_id, stage_name, stage, resource, request_path, method,
+        headers, body, query_params, path_params,
+        binary_media_types=binary_media_types,
+        authorizer_context=authorizer_context,
+        caller_identity=caller_identity,
+    )
+
+    result, err = await _call_lambda_raw(
+        lambda_ref,
+        event,
+        account_id=owner_account_id,
+        region=owner_region,
+    )
+    if err:
+        # The integration names a function that does not exist.
+        return _gw_error("API_CONFIGURATION_ERROR", "Internal server error")
+    lambda_response, err = _lambda_proxy_response(result)
     if err:
         return 502, {"Content-Type": "application/json"}, json.dumps({"message": err}).encode()
 
     status = lambda_response.get("statusCode", 200)
     resp_headers = {"Content-Type": "application/json"}
-    resp_headers.update(lambda_response.get("headers", {}))
+    # Apply the Lambda's `headers` with case-insensitive override of any seeded
+    # default, the same way the multiValueHeaders merge below already case-folds
+    # collisions (added in #750 by @Nahuel990). HTTP field names are
+    # case-insensitive (RFC 9110 §5.1), so a lowercase `content-type` from the
+    # function must replace the default `Content-Type`, not ship alongside it.
+    for k, v in (lambda_response.get("headers") or {}).items():
+        lower_k = k.lower()
+        for existing in [h for h in resp_headers if h.lower() == lower_k]:
+            del resp_headers[existing]
+        resp_headers[k] = v
+    # Payload format 1.0 carries multi-value headers (notably Set-Cookie) in
+    # `multiValueHeaders`. AWS docs: "If you specify values for both `headers`
+    # and `multiValueHeaders`, API Gateway merges them into a single list. If
+    # the same key-value pair is specified in both, only the values from
+    # `multiValueHeaders` will appear in the merged list." HTTP headers are
+    # case-insensitive (RFC 7230 §3.2), so the collision check must compare
+    # case-folded — `Set-Cookie` in `headers` plus `set-cookie` in
+    # `multiValueHeaders` is the SAME header. Each list value is then expanded
+    # into one header line per entry by _send_response.
+    for k, v in (lambda_response.get("multiValueHeaders") or {}).items():
+        if not v:
+            continue
+        lower_k = k.lower()
+        for existing in list(resp_headers):
+            if existing.lower() == lower_k:
+                del resp_headers[existing]
+        resp_headers[k] = list(v)
     resp_body = lambda_response.get("body", "")
-    if isinstance(resp_body, str):
+    # A base64 response body (isBase64Encoded) is decoded to raw bytes only when
+    # the request Accept matches a configured binaryMediaType; otherwise the
+    # base64 string is passed through as text. Verified against real AWS.
+    if (lambda_response.get("isBase64Encoded") and isinstance(resp_body, str)
+            and _media_type_matches(headers.get("accept"), binary_media_types)):
+        resp_body = base64.b64decode(resp_body)
+    elif isinstance(resp_body, str):
         resp_body = resp_body.encode("utf-8")
     elif isinstance(resp_body, dict):
         resp_body = json.dumps(resp_body, ensure_ascii=False).encode("utf-8")
 
     return status, resp_headers, resp_body
+
+
+def _default_integration_response_status_v1(integration):
+    """The status code a successful non-proxy integration answers with.
+
+    AWS selects the integration response whose ``selectionPattern`` is empty —
+    the default mapping, which handles every invocation that did not fail — and
+    falls back to 200 when the method has no integration responses configured.
+    ``responseTemplates`` / ``responseParameters`` are not modeled; the payload
+    is passed through verbatim.
+    """
+    for code, resp in sorted((integration.get("integrationResponses") or {}).items()):
+        if not (resp or {}).get("selectionPattern"):
+            try:
+                return int((resp or {}).get("statusCode") or code)
+            except (TypeError, ValueError):
+                return 200
+    return 200
+
+
+async def _invoke_lambda_custom_v1(
+    integration,
+    api_id,
+    stage_name,
+    stage,
+    resource,
+    request_path,
+    method,
+    headers,
+    body,
+    query_params,
+    path_params,
+    *,
+    owner_account_id=None,
+    owner_region=None,
+    binary_media_types=None,
+    authorizer_context=None,
+    caller_identity=None,
+):
+    """Invoke Lambda through a non-proxy (custom) ``AWS`` integration.
+
+    Unlike AWS_PROXY there is no ``{statusCode, headers, body}`` envelope: the
+    function's return value IS the response body, serialized as JSON and sent
+    with the integration response's status code (200 by default). A handler that
+    happens to return a ``statusCode`` key therefore ships that key to the client
+    inside the body instead of having it promoted to the HTTP status.
+
+    A standard Lambda error (the function ran and threw) is returned through the
+    default integration response: 200 with the raw ``{errorMessage, errorType,
+    stackTrace}`` as the body, as AWS does when no ``selectionPattern`` is
+    configured (the only shape modeled here). A backend that cannot be invoked,
+    or a Lambda concurrency throttle, is an integration failure and answers 504.
+    """
+    lambda_ref = _extract_lambda_ref_from_integration_uri(integration.get("uri", ""))
+
+    event = _build_lambda_event_v1(
+        api_id, stage_name, stage, resource, request_path, method,
+        headers, body, query_params, path_params,
+        binary_media_types=binary_media_types,
+        authorizer_context=authorizer_context,
+        caller_identity=caller_identity,
+    )
+
+    result, err = await _call_lambda_raw(
+        lambda_ref,
+        event,
+        account_id=owner_account_id,
+        region=owner_region,
+    )
+    resp_headers = {"Content-Type": "application/json"}
+    # A backend that cannot be invoked, or a Lambda concurrency throttle, is an
+    # integration failure — API Gateway answers 504 (INTEGRATION_FAILURE). Never
+    # 429: THROTTLED/429 is API Gateway's own usage-plan/stage/account throttling,
+    # not the function's.
+    if err or result.get("throttle") or result.get("service_error"):
+        return 504, resp_headers, json.dumps({"message": "Internal server error"}).encode()
+
+    # A standard Lambda error (the function ran and threw) is NOT mapped to a 5xx
+    # here: with no integration-response selectionPattern configured — the only
+    # shape modeled — API Gateway returns it through the default (200) response
+    # with the raw {errorMessage, errorType, stackTrace} as the body.
+    payload = result.get("body")
+    if payload is None:
+        resp_body = b""
+    elif isinstance(payload, (bytes, bytearray)):
+        resp_body = bytes(payload)
+    else:
+        # The payload is a JSON document, so a bare string comes back quoted —
+        # matching what `lambda invoke` writes and what AWS passes through.
+        resp_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    return _default_integration_response_status_v1(integration), resp_headers, resp_body
+
+
+def _parse_service_integration_uri(uri: str):
+    """Split an ``arn:aws:apigateway:{region}:{service}:{verb}/{rest}`` URI.
+
+    Returns ``(region, service, verb, rest)`` — e.g. for
+    ``arn:aws:apigateway:us-east-1:sqs:path/123456789012/my-queue`` it returns
+    ``("us-east-1", "sqs", "path", "123456789012/my-queue")``. Returns ``None``
+    for URIs that are not service-integration ARNs (plain Lambda references,
+    HTTP endpoints); those keep their existing dispatch.
+    """
+    if not isinstance(uri, str):
+        return None
+    parts = uri.split(":", 5)
+    if len(parts) != 6 or parts[0] != "arn" or parts[2] != "apigateway":
+        return None
+    region, service, remainder = parts[3], parts[4], parts[5]
+    if "/" not in remainder:
+        return None
+    verb, rest = remainder.split("/", 1)
+    return region, service, verb, rest
+
+
+# ── Request-template (VTL) subset ────────────────────────────────────────
+#
+# Non-proxy AWS service integrations shape the backend call through a
+# `requestTemplates` mapping template. Modeled: `$input.body`,
+# `$input.json('<json-path>')` / `$input.path(...)`, `$input.params('name')`
+# (path > querystring > header, the precedence AWS documents),
+# `$util.urlEncode(...)`, `$context.authorizer.*` (Cognito claims included),
+# `#set` with Velocity 1.x newline gobbling, `##` / `#* *#` comments, quiet
+# `$!` references, and string literals ("..." interpolated with `""` escapes,
+# '...' as-is with `''` escapes). An unmodeled `$input` / `$util` / `$context`
+# reference renders as an empty string; any other `$` text passes through.
+
+_VTL_ROOTS = ("input", "util", "context")
+_VTL_IDENT = re.compile(r"[A-Za-z][A-Za-z0-9_]*")
+_VTL_SET = re.compile(r"#\{?set\}?[ \t]*\(")
+_VTL_SET_LHS = re.compile(r"\s*\$!?\{?([A-Za-z][A-Za-z0-9_]*)\}?\s*=(.*)", re.DOTALL)
+
+
+def _vtl_json_path(body_str: str, path: str):
+    """Evaluate the small ``$input.json('<path>')`` subset: ``$``, ``$.a.b``,
+    numeric indices. Returns "" for unparseable bodies or missing nodes."""
+    try:
+        node = json.loads(body_str)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return ""
+    path = path.strip()
+    if path in ("", "$", "'$'", '"$"'):
+        return node
+    for seg in path.lstrip("$").lstrip(".").split("."):
+        if not seg:
+            continue
+        if isinstance(node, dict):
+            node = node.get(seg)
+        elif isinstance(node, list) and seg.isdigit() and int(seg) < len(node):
+            node = node[int(seg)]
+        else:
+            return ""
+        if node is None:
+            return ""
+    return node
+
+
+def _vtl_close_paren(text: str, start: int):
+    """Index of the ``)`` matching the ``(`` at ``start``, skipping quoted
+    strings (a doubled quote pairs off as two adjacent strings); None if open."""
+    depth = 0
+    i = start
+    while i < len(text):
+        ch = text[i]
+        if ch in ("'", '"'):
+            close = text.find(ch, i + 1)
+            if close < 0:
+                return None
+            i = close + 1
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def _vtl_split_args(src: str) -> list:
+    args, depth, quote, current = [], 0, None, []
+    for ch in src:
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            args.append("".join(current))
+            current = []
+            continue
+        current.append(ch)
+    if "".join(current).strip():
+        args.append("".join(current))
+    return args
+
+
+def _vtl_parse_ref(text: str, i: int):
+    """Parse the reference starting at ``text[i] == "$"``.
+
+    Returns ``(end, quiet, root, steps)`` where each step is ``(name, args)``
+    and ``args`` is the raw argument source of a call or None for a property;
+    None when no identifier follows the ``$``.
+    """
+    j = i + 1
+    quiet = text.startswith("!", j)
+    if quiet:
+        j += 1
+    braced = text.startswith("{", j)
+    if braced:
+        j += 1
+    m = _VTL_IDENT.match(text, j)
+    if not m:
+        return None
+    root, j = m.group(0), m.end()
+    steps = []
+    while text.startswith(".", j):
+        m = _VTL_IDENT.match(text, j + 1)
+        if not m:
+            break
+        name, k = m.group(0), m.end()
+        if text.startswith("(", k):
+            close = _vtl_close_paren(text, k)
+            if close is None:
+                break
+            steps.append((name, text[k + 1:close]))
+            j = close + 1
+        else:
+            steps.append((name, None))
+            j = k
+    if braced:
+        if not text.startswith("}", j):
+            return None
+        j += 1
+    return j, quiet, root, steps
+
+
+def _vtl_str(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    return str(value)
+
+
+def _vtl_value(expr: str, st: dict):
+    """Evaluate an argument or ``#set`` right-hand side."""
+    expr = expr.strip()
+    if len(expr) >= 2 and expr[0] == expr[-1] == '"':
+        gobbled = st["gobbled"]
+        value = _vtl_render(expr[1:-1].replace('""', '"'), st)
+        st["gobbled"] = gobbled
+        return value
+    if len(expr) >= 2 and expr[0] == expr[-1] == "'":
+        return expr[1:-1].replace("''", "'")
+    if re.fullmatch(r"-?\d+", expr):
+        return int(expr)
+    if expr in ("true", "false"):
+        return expr == "true"
+    if expr.startswith("$"):
+        ref = _vtl_parse_ref(expr, 0)
+        if ref is not None and ref[0] == len(expr):
+            return _vtl_resolve(ref, st)
+    return None
+
+
+def _vtl_walk(node, steps, st):
+    for name, args in steps:
+        if not isinstance(node, dict):
+            return None
+        if args is None:
+            node = node.get(name)
+        elif name == "get":
+            arg = _vtl_split_args(args)
+            key = _vtl_value(arg[0], st) if arg else None
+            node = node.get(key) if isinstance(key, str) else None
+        else:
+            return None
+        if node is None:
+            return None
+    return node
+
+
+def _vtl_input(steps, st):
+    if not steps:
+        return None
+    (name, args), rest = steps[0], steps[1:]
+    if name == "body" and args is None:
+        value = st["body"]
+    elif name in ("json", "path") and args is not None:
+        arg = _vtl_split_args(args)
+        node = _vtl_json_path(st["body"], str(_vtl_value(arg[0], st)) if arg else "$")
+        if name == "path":
+            value = node
+        elif isinstance(node, (dict, list)):
+            value = json.dumps(node, separators=(",", ":"), ensure_ascii=False)
+        else:
+            value = "" if node is None else str(node)
+    elif name == "params":
+        arg = _vtl_split_args(args) if args is not None else []
+        if not arg:
+            value = dict(st["params"])
+        else:
+            value = str(st["params"].get(_vtl_str(_vtl_value(arg[0], st)), ""))
+    else:
+        return None
+    return _vtl_walk(value, rest, st) if rest else value
+
+
+def _vtl_util(steps, st):
+    if not steps:
+        return None
+    name, args = steps[0]
+    if name == "urlEncode" and args is not None:
+        arg = _vtl_split_args(args)
+        text = _vtl_str(_vtl_value(arg[0], st)) if arg else ""
+        # java.net.URLEncoder: application/x-www-form-urlencoded, as AWS documents.
+        return urllib.parse.quote_plus(text, safe="*").replace("~", "%7E")
+    return None
+
+
+def _vtl_resolve(ref, st):
+    _end, _quiet, root, steps = ref
+    if root == "input":
+        return _vtl_input(steps, st)
+    if root == "util":
+        return _vtl_util(steps, st)
+    if root == "context":
+        value = _vtl_walk(st["context"], steps, st)
+        # AWS: "Calling $context.authorizer.claims returns null."
+        return None if isinstance(value, dict) else value
+    if root in st["vars"]:
+        return _vtl_walk(st["vars"][root], steps, st) if steps else st["vars"][root]
+    return None
+
+
+def _vtl_set(inner: str, st: dict) -> None:
+    m = _VTL_SET_LHS.fullmatch(inner)
+    if not m:
+        return
+    value = _vtl_value(m.group(2), st)
+    if value is not None:  # Velocity leaves the variable as it was on null
+        st["vars"][m.group(1)] = value
+
+
+def _vtl_render(text: str, st: dict) -> str:
+    out = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "#":
+            if text.startswith("##", i):
+                newline = text.find("\n", i)
+                i = len(text) if newline < 0 else newline + 1
+                continue
+            if text.startswith("#*", i):
+                close = text.find("*#", i + 2)
+                i = len(text) if close < 0 else close + 2
+                continue
+            m = _VTL_SET.match(text, i)
+            close = _vtl_close_paren(text, m.end() - 1) if m else None
+            if close is not None:
+                if st["gobbled"]:
+                    while out and out[-1] in (" ", "\t"):
+                        out.pop()
+                _vtl_set(text[m.end():close], st)
+                i = close + 1
+                k = i
+                while k < len(text) and text[k] in " \t":
+                    k += 1
+                if text.startswith("\r\n", k):
+                    i, st["gobbled"] = k + 2, True
+                elif text.startswith("\n", k):
+                    i, st["gobbled"] = k + 1, True
+                continue
+        elif ch == "$":
+            ref = _vtl_parse_ref(text, i)
+            if ref is not None and (ref[2] in _VTL_ROOTS or ref[2] in st["vars"]):
+                value = _vtl_str(_vtl_resolve(ref, st))
+                out.append(value)
+                if value:
+                    st["gobbled"] = False
+                i = ref[0]
+                continue
+            if ref is not None and ref[1]:
+                i = ref[0]
+                continue
+        out.append(ch)
+        if ch not in (" ", "\t"):
+            st["gobbled"] = False
+        i += 1
+    return "".join(out)
+
+
+def _render_request_template_v1(template: str, body_str: str,
+                                params_map: dict, context=None) -> str:
+    """Render the VTL subset; bare text passes through unchanged."""
+    st = {"vars": {}, "context": context or {}, "body": body_str,
+          "params": params_map, "gobbled": False}
+    return _vtl_render(template, st)
+
+
+def _select_service_integration_response(integration, backend_status: int):
+    """Pick the integration response for a non-proxy service call.
+
+    For AWS back ends other than Lambda, ``selectionPattern`` matches the HTTP
+    status code; the entry with no pattern is the default.
+    """
+    responses = integration.get("integrationResponses") or {}
+    for resp in responses.values():
+        pattern = (resp or {}).get("selectionPattern")
+        if not pattern:
+            continue
+        try:
+            if re.fullmatch(pattern, str(backend_status)):
+                return resp
+        except re.error:
+            continue
+    for resp in responses.values():
+        if not (resp or {}).get("selectionPattern"):
+            return resp
+    return None
+
+
+def _service_integration_response(integration, backend_status: int,
+                                  backend_text: str, accept: str,
+                                  request_params: dict, context=None):
+    """Map a backend service result through the integration responses."""
+    # No match and no default answers 500, configured responses or not.
+    selected = _select_service_integration_response(integration, backend_status)
+    if selected is None:
+        return (500, {"Content-Type": "application/json"},
+                json.dumps({"message": "Internal server error"}).encode())
+    try:
+        status = int(selected.get("statusCode") or backend_status)
+    except (TypeError, ValueError):
+        status = backend_status
+    resp_headers = {"Content-Type": "application/json"}
+    for dest, src in (selected.get("responseParameters") or {}).items():
+        if not dest.startswith("method.response.header."):
+            continue
+        header = dest[len("method.response.header."):]
+        if isinstance(src, str) and len(src) >= 2 and src[0] == src[-1] == "'":
+            resp_headers[header] = src[1:-1]
+        else:
+            resp_headers[header] = src
+    templates = selected.get("responseTemplates") or {}
+    template = templates.get(accept) or templates.get("application/json")
+    if template is None and templates:
+        template = next(iter(templates.values()))
+    if template is not None:
+        body_out = _render_request_template_v1(
+            template, backend_text, request_params, context)
+        return status, resp_headers, body_out.encode()
+    return status, resp_headers, backend_text.encode()
+
+
+async def _invoke_sqs_v1(
+    integration,
+    api_id,
+    stage_name,
+    stage,
+    resource,
+    request_path,
+    method,
+    headers,
+    body,
+    query_params,
+    path_params,
+    *,
+    owner_account_id=None,
+    owner_region=None,
+    binary_media_types=None,
+    authorizer_context=None,
+    caller_identity=None,
+):
+    """Dispatch a non-proxy ``AWS`` integration whose URI targets SQS.
+
+    ``arn:aws:apigateway:{region}:sqs:path/{account}/{queue}`` renders the
+    request template for the request's Content-Type (the raw body passes
+    through when none matches, per WHEN_NO_MATCH/WHEN_NO_TEMPLATES), parses the
+    result as a form-encoded SQS Query call, and runs it in the scope the URI
+    names — the queue's own account and region, like the integration's
+    ``credentials`` role would on AWS. Backend errors flow through the
+    integration responses like successes do; nothing is a 504 here because the
+    queue lookup itself is part of the modeled call.
+    """
+    from ministack.services import sqs as _sqs_svc
+
+    spec = _parse_service_integration_uri(integration.get("uri", ""))
+    region = (spec[0] if spec else "") or owner_region or get_region()
+    account, queue_name = None, None
+    if spec and spec[1] == "sqs" and spec[2] == "path":
+        tail = spec[3].strip("/").split("/")
+        if len(tail) == 2:
+            account, queue_name = tail
+        elif len(tail) == 1:
+            account, queue_name = (owner_account_id or get_account_id(),
+                                   tail[0])
+    if not queue_name:
+        # A malformed sqs:path URI means the integration has no reachable
+        # backend — same failure class as an unresolvable Lambda reference.
+        return (504, {"Content-Type": "application/json"},
+                json.dumps({"message": "Internal server error"}).encode())
+
+    body_str = body.decode("utf-8", errors="replace") if body else ""
+    params_map = {}
+    for k, v in (headers or {}).items():
+        if isinstance(v, str):
+            params_map[k] = v
+    for k, v in (query_params or {}).items():
+        params_map[k] = v[0] if isinstance(v, (list, tuple)) else v
+    params_map.update(path_params or {})
+
+    content_type = (_header_ci(headers, "content-type") or "application/json")
+    content_type = content_type.split(";", 1)[0].strip().lower()
+    template = None
+    for key, value in (integration.get("requestTemplates") or {}).items():
+        if key.split(";", 1)[0].strip().lower() == content_type:
+            template = value
+            break
+    vtl_context = {"authorizer": authorizer_context} if authorizer_context else {}
+    rendered = (_render_request_template_v1(template, body_str, params_map, vtl_context)
+                if template is not None else body_str)
+    form = dict(urllib.parse.parse_qsl(rendered, keep_blank_values=True))
+    action = form.get("Action", "")
+
+    accept = (_header_ci(headers, "accept") or "application/json")
+    accept = accept.split(",", 1)[0].split(";", 1)[0].strip().lower()
+
+    if not action:
+        backend_status, _h, xbody = _sqs_svc._xml_err_resp(
+            "MissingAction", "Missing Action parameter", 400)
+        backend_text = xbody.decode("utf-8", errors="replace")
+        return _service_integration_response(
+            integration, backend_status, backend_text, accept, params_map,
+            vtl_context)
+
+    qurl = (_sqs_svc._queue_name_to_url.get_scoped(account, region, queue_name)
+            or _sqs_svc._queue_url_for_account(account, queue_name))
+    data = _sqs_svc._normalise(action, form)
+    data["QueueUrl"] = qurl
+    try:
+        with request_scope(account, region):
+            result = await _sqs_svc._dispatch(action, data, qurl)
+        if action == "SendMessage":
+            # API Gateway receives SQS's Query reply as JSON.
+            backend_status = 200
+            backend_text = json.dumps({"SendMessageResponse": {
+                "ResponseMetadata": {"RequestId": new_uuid()},
+                "SendMessageResult": {
+                    "MD5OfMessageAttributes": result.get("MD5OfMessageAttributes"),
+                    "MD5OfMessageBody": result.get("MD5OfMessageBody"),
+                    "MD5OfMessageSystemAttributes": result.get("MD5OfMessageSystemAttributes"),
+                    "MessageId": result.get("MessageId"),
+                    "SequenceNumber": result.get("SequenceNumber"),
+                },
+            }})
+        else:
+            backend_status, _h, xbody = _sqs_svc._to_xml(action, result)
+            backend_text = xbody.decode("utf-8", errors="replace")
+    except _sqs_svc._Err as e:
+        backend_status, _h, xbody = _sqs_svc._xml_err_resp(
+            e.code, e.message, e.status)
+        backend_text = xbody.decode("utf-8", errors="replace")
+    except Exception:
+        return (504, {"Content-Type": "application/json"},
+                json.dumps({"message": "Internal server error"}).encode())
+    return _service_integration_response(
+        integration, backend_status, backend_text, accept, params_map,
+            vtl_context)
 
 
 async def _invoke_http_proxy_v1(integration, path, method, headers, body, query_params, path_params=None):
@@ -1025,29 +3591,47 @@ async def _invoke_http_proxy_v1(integration, path, method, headers, body, query_
         return status, resp_headers, resp_body
     except urllib.error.HTTPError as e:
         return e.code, {"Content-Type": "application/json"}, e.read()
-    except Exception as ex:
-        return 502, {"Content-Type": "application/json"}, json.dumps({"message": str(ex)}).encode()
+    except Exception:
+        # An unresolvable or unreachable backend.
+        return _gw_error("API_CONFIGURATION_ERROR", "Internal server error")
 
 
 def _invoke_mock_v1(integration):
     """Return a MOCK integration response.
 
-    Selection: iterate integrationResponses in status-code order; the first
-    entry whose selectionPattern is empty (default) or matches "200" is used,
-    matching AWS behaviour for MOCK where the input is always treated as
-    successful (statusCode 200).
+    The request template's ``statusCode`` (200 when absent) is the integration
+    status: the response whose selectionPattern matches it is used, else an
+    explicit "200" entry, else the entry with an empty (default) pattern.
     """
     int_responses = integration.get("integrationResponses", {})
     if not int_responses:
         return 200, {"Content-Type": "application/json"}, b"{}"
 
-    # AWS selects the response whose selectionPattern matches the integration
-    # status code.  For MOCK the "status" is always 200 (success path).
+    template = (integration.get("requestTemplates") or {}).get("application/json") or ""
+    match = re.search(r'"statusCode"\s*:\s*(\d{3})', template)
+    status_code = match.group(1) if match else "200"
     selected = None
-    # Prefer an explicit "200" entry first
-    if "200" in int_responses:
+    matches = []
+    for resp in int_responses.values():
+        pattern = resp.get("selectionPattern")
+        try:
+            if pattern and re.fullmatch(pattern, status_code):
+                matches.append(resp)
+        except re.error:
+            continue
+    # Several patterns can match; the entry whose own status code is the
+    # integration status wins, so a catch-all on another entry does not
+    # shadow the exact one.
+    for resp in matches:
+        if str(resp.get("statusCode")) == status_code:
+            selected = resp
+            break
+    if selected is None and matches:
+        selected = matches[0]
+    if selected is None and "200" in int_responses:
+        # Prefer an explicit "200" entry
         selected = int_responses["200"]
-    else:
+    elif selected is None:
         # Fall back to the entry with an empty / catch-all selectionPattern
         for resp in int_responses.values():
             pattern = resp.get("selectionPattern", "")
@@ -1095,7 +3679,9 @@ def _resolve_custom_rest_api_id(tags: dict) -> tuple[str | None, tuple | None]:
     custom = tags.get("ms-custom-id")
     if not custom:
         return None, None
-    if custom in _rest_apis:
+    # Execute-api hosts identify REST APIs by id without a region segment, so
+    # caller-pinned ids must stay unique across every region in this account.
+    if find_api_scope(custom) is not None:
         return None, _v1_error(
             "ConflictException",
             f"REST API id '{custom}' (from ms-custom-id tag) is already in use",
@@ -1124,12 +3710,17 @@ def _create_rest_api(data):
         "tags": data.get("tags", {}),
         "disableExecuteApiEndpoint": data.get("disableExecuteApiEndpoint", False),
     }
+    for k in ("securityPolicy", "endpointAccessMode"):
+        if data.get(k):
+            api[k] = data[k]
     _rest_apis[api_id] = api
     _resources[api_id] = {}
     _stages_v1[api_id] = {}
     _deployments_v1[api_id] = {}
     _authorizers_v1[api_id] = {}
     _models[api_id] = {}
+    _gateway_responses[api_id] = {}
+    _documentation_parts[api_id] = {}
 
     # Create root resource "/"
     root_id = _new_id()[:8]
@@ -1175,8 +3766,585 @@ def _delete_rest_api(api_id):
     _deployments_v1.pop(api_id, None)
     _authorizers_v1.pop(api_id, None)
     _models.pop(api_id, None)
+    _gateway_responses.pop(api_id, None)
+    _deployed_gateway_responses.pop(api_id, None)
+    _documentation_parts.pop(api_id, None)
     _v1_tags.pop(_rest_api_arn(api_id), None)
     return 202, {}, b""
+
+
+# ---- OpenAPI parsing ----
+
+_OPENAPI_HTTP_METHODS = {
+    "get", "post", "put", "delete", "patch", "head", "options",
+}
+
+
+def _security_schemes(spec):
+    """Security schemes, from swagger 2.0 or OAS 3.0."""
+    schemes = spec.get("securityDefinitions")
+    if not isinstance(schemes, dict):
+        schemes = (spec.get("components") or {}).get("securitySchemes")
+    return schemes if isinstance(schemes, dict) else {}
+
+
+def _import_identity_source(scheme, extension):
+    """The ``method.request.*`` identity source a security scheme names.
+
+    A ``request`` authorizer carries its own ``identitySource``; the others
+    derive it from the scheme's ``name`` and ``in``, which is how SAM and the
+    console spell the header carrying the token."""
+    if extension.get("identitySource"):
+        return extension["identitySource"]
+    name = scheme.get("name") or "Authorization"
+    location = (scheme.get("in") or "header").lower()
+    prefix = "method.request.querystring." if location == "query" else "method.request.header."
+    return prefix + name
+
+
+def _import_security_schemes(api_id, spec):
+    """Create an authorizer per ``x-amazon-apigateway-authorizer`` scheme.
+
+    Returns a scheme name -> method authorization mapping; this is the only
+    mechanism by which SAM's ``Auth`` property reaches a method, since the
+    translator emits no AWS::ApiGateway::Authorizer resource."""
+    mapping = {}
+    for scheme_name, scheme in _security_schemes(spec).items():
+        if not isinstance(scheme, dict):
+            continue
+        extension = scheme.get("x-amazon-apigateway-authorizer")
+        auth_type = str(scheme.get("x-amazon-apigateway-authtype") or "").lower()
+        if not isinstance(extension, dict):
+            if auth_type == "awssigv4":
+                mapping[scheme_name] = {"authorizationType": "AWS_IAM"}
+            elif scheme.get("type") == "apiKey" and (scheme.get("name") or "").lower() == "x-api-key":
+                mapping[scheme_name] = {"apiKeyRequired": True}
+            continue
+        kind = str(extension.get("type") or "").lower()
+        data = {
+            "name": scheme_name,
+            "identitySource": _import_identity_source(scheme, extension),
+            "authType": auth_type or kind,
+        }
+        if kind == "cognito_user_pools":
+            data["type"] = "COGNITO_USER_POOLS"
+            data["providerARNs"] = extension.get("providerARNs") or []
+            method_auth = "COGNITO_USER_POOLS"
+        elif kind in ("token", "request"):
+            data["type"] = kind.upper()
+            data["authorizerUri"] = extension.get("authorizerUri", "")
+            data["authorizerCredentials"] = extension.get("authorizerCredentials")
+            data["identityValidationExpression"] = extension.get(
+                "identityValidationExpression", ""
+            )
+            if extension.get("authorizerResultTtlInSeconds") is not None:
+                data["authorizerResultTtlInSeconds"] = extension[
+                    "authorizerResultTtlInSeconds"
+                ]
+            method_auth = "CUSTOM"
+        else:
+            continue
+        _status, _headers, body = _create_authorizer(api_id, data)
+        if _status >= 400:
+            continue
+        mapping[scheme_name] = {
+            "authorizationType": method_auth,
+            "authorizerId": json.loads(body)["id"],
+        }
+    return mapping
+
+
+def _method_security(security, scheme_map):
+    """Resolve an operation's ``security`` list against the scheme map."""
+    data = {"authorizationType": "NONE"}
+    for requirement in security or []:
+        if not isinstance(requirement, dict):
+            continue
+        for scheme_name, scopes in requirement.items():
+            mapped = scheme_map.get(scheme_name)
+            if not mapped:
+                continue
+            if mapped.get("apiKeyRequired"):
+                data["apiKeyRequired"] = True
+                continue
+            if data["authorizationType"] != "NONE":
+                continue
+            data["authorizationType"] = mapped["authorizationType"]
+            if mapped.get("authorizerId"):
+                data["authorizerId"] = mapped["authorizerId"]
+            if isinstance(scopes, list) and scopes:
+                data["authorizationScopes"] = list(scopes)
+    return data
+
+
+def _import_rest_api(spec, base_data=None):
+    data = dict(base_data or {})
+    info = spec.get("info") or {}
+    if info.get("title") and not data.get("name"):
+        data["name"] = str(info["title"])
+    if info.get("version") and not data.get("version"):
+        data["version"] = str(info["version"])
+
+    _status, _headers, body = _create_rest_api(data)
+    api_id = json.loads(body)["id"]
+    _import_definition(api_id, spec)
+    return api_id
+
+
+def _import_definition(api_id, spec):
+    scheme_map = _import_security_schemes(api_id, spec)
+    default_security = spec.get("security")
+    for path, path_item in (spec.get("paths") or {}).items():
+        _import_path_item(api_id, path, path_item, scheme_map, default_security)
+
+
+def _parse_definition(body):
+    """The OpenAPI or Swagger document of an ImportRestApi/PutRestApi body (JSON or YAML), or None."""
+    try:
+        text = body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else (body or "")
+        spec = yaml.safe_load(text)
+    except (UnicodeDecodeError, yaml.YAMLError):
+        return None
+    return spec if isinstance(spec, dict) else None
+
+
+def _import_rest_api_request(body):
+    spec = _parse_definition(body)
+    if spec is None:
+        return _v1_error("BadRequestException", "Unable to determine OAS/Swagger version", 400)
+    api_id = _import_rest_api(spec)
+    return _v1_response(_rest_api_view(_rest_apis.get(api_id)), 201)
+
+
+def _put_rest_api(api_id, body, query_params):
+    """PutRestApi: merge (the default) adds the definition to the API; overwrite replaces its resources,
+    methods and authorizers with it."""
+    mode = _qp(query_params, "mode") or "merge"
+    if mode not in ("merge", "overwrite"):
+        return _v1_error("ValidationException",
+                         f"1 validation error detected: Value '{mode}' at 'mode' failed to satisfy constraint: "
+                         "Member must satisfy enum value set: [overwrite, merge]", 400)
+    api = _rest_apis.get(api_id)
+    if not api:
+        return _v1_error("NotFoundException", f"Invalid API identifier specified {get_account_id()}:{api_id}", 404)
+    spec = _parse_definition(body)
+    if spec is None:
+        return _v1_error("BadRequestException", "Unable to determine OAS/Swagger version", 400)
+    if mode == "overwrite":
+        root = next(r for r in _resources.get(api_id, {}).values() if r.get("path") == "/")
+        root["resourceMethods"] = {}
+        _resources[api_id] = {root["id"]: root}
+        _authorizers_v1[api_id] = {}
+    else:
+        replaced = set(_security_schemes(spec))
+        _authorizers_v1[api_id] = {aid: a for aid, a in _authorizers_v1.get(api_id, {}).items()
+                                   if a.get("name") not in replaced}
+    _import_definition(api_id, spec)
+    # The definition's info names and describes the API, in either mode.
+    info = spec.get("info") if isinstance(spec.get("info"), dict) else {}
+    if info.get("title"):
+        api["name"] = info["title"]
+    if info.get("description"):
+        api["description"] = info["description"]
+    else:
+        api.pop("description", None)
+    if info.get("version"):
+        api["version"] = str(info["version"])
+    return _v1_response(_rest_api_view(api))
+
+
+def _import_path_item(api_id, path, path_item, scheme_map=None, default_security=None):
+    resource_id = next(
+        rid for rid, res in _resources.get(api_id, {}).items()
+        if res.get("path") == "/"
+    )
+    if path != "/":
+        for segment in path.strip("/").split("/"):
+            child = next(
+                (rid for rid, res in _resources.get(api_id, {}).items()
+                 if res.get("parentId") == resource_id
+                 and res.get("pathPart") == segment),
+                None,
+            )
+            if child is None:
+                _status, _headers, body = _create_resource(
+                    api_id, resource_id, {"pathPart": segment}
+                )
+                child = json.loads(body)["id"]
+            resource_id = child
+
+    for method, operation in path_item.items():
+        if method == "x-amazon-apigateway-any-method":
+            http_method = "ANY"
+        elif method.lower() in _OPENAPI_HTTP_METHODS:
+            http_method = method.upper()
+        else:
+            continue
+        _import_operation(api_id, resource_id, http_method, operation,
+                          scheme_map, default_security)
+
+
+_OPENAPI_PARAM_SOURCES = {"path": "path", "query": "querystring", "header": "header"}
+
+
+def _import_operation(api_id, resource_id, http_method, operation,
+                      scheme_map=None, default_security=None):
+    security = (operation or {}).get("security")
+    if security is None:
+        security = default_security
+    method_data = _method_security(security, scheme_map or {})
+    request_params = {
+        f"method.request.{_OPENAPI_PARAM_SOURCES[param['in']]}.{param['name']}": bool(param.get("required"))
+        for param in (operation or {}).get("parameters") or []
+        if isinstance(param, dict) and param.get("in") in _OPENAPI_PARAM_SOURCES and param.get("name")
+    }
+    if request_params:
+        method_data["requestParameters"] = request_params
+    _put_method(api_id, resource_id, http_method, method_data)
+
+    integration = (operation or {}).get("x-amazon-apigateway-integration")
+    if integration:
+        int_type = integration.get("type")
+        _put_integration(api_id, resource_id, http_method, {
+            "type": int_type.upper() if int_type else None,
+            "httpMethod": integration.get("httpMethod"),
+            "uri": integration.get("uri"),
+        })
+
+
+def _schema_ref(model_name, export_type):
+    escaped_name = str(model_name).replace("~", "~0").replace("/", "~1")
+    container = "components/schemas" if export_type == "oas30" else "definitions"
+    return {"$ref": f"#/{container}/{escaped_name}"}
+
+
+def _export_model_schemas(api_id):
+    schemas = {}
+    for model_name, model in _models.get(api_id, {}).items():
+        schema = model.get("schema")
+        if isinstance(schema, dict):
+            schemas[model_name] = schema
+            continue
+        try:
+            schemas[model_name] = json.loads(schema or "{}")
+        except (TypeError, json.JSONDecodeError):
+            schemas[model_name] = {}
+    return schemas
+
+
+def _export_method_parameters(method_obj, export_type):
+    parameters = []
+    location_map = {"path": "path", "querystring": "query", "header": "header"}
+    for parameter_name, required in method_obj.get("requestParameters", {}).items():
+        parts = parameter_name.split(".", 3)
+        if len(parts) != 4 or parts[:2] != ["method", "request"]:
+            continue
+        location = location_map.get(parts[2])
+        if location is None:
+            continue
+        parameter = {
+            "name": parts[3],
+            "in": location,
+            "required": True if location == "path" else bool(required),
+        }
+        if export_type == "oas30":
+            parameter["schema"] = {"type": "string"}
+        else:
+            parameter["type"] = "string"
+        parameters.append(parameter)
+    return parameters
+
+
+def _export_method_responses(method_obj, export_type):
+    exported = {}
+    for status_code, response in method_obj.get("methodResponses", {}).items():
+        item = {"description": f"{status_code} response"}
+        response_models = response.get("responseModels", {})
+        response_parameters = response.get("responseParameters", {})
+
+        if export_type == "oas30":
+            content = {}
+            for content_type, model_name in response_models.items():
+                content[content_type] = {"schema": _schema_ref(model_name, export_type)}
+            if content:
+                item["content"] = content
+            headers = {}
+            for parameter_name in response_parameters:
+                prefix = "method.response.header."
+                if parameter_name.startswith(prefix):
+                    headers[parameter_name[len(prefix):]] = {"schema": {"type": "string"}}
+            if headers:
+                item["headers"] = headers
+        else:
+            if response_models:
+                model_name = response_models.get("application/json") or next(iter(response_models.values()))
+                item["schema"] = _schema_ref(model_name, export_type)
+            headers = {}
+            for parameter_name in response_parameters:
+                prefix = "method.response.header."
+                if parameter_name.startswith(prefix):
+                    headers[parameter_name[len(prefix):]] = {"type": "string"}
+            if headers:
+                item["headers"] = headers
+
+        exported[str(status_code)] = item
+
+    if not exported:
+        exported["200"] = {"description": "200 response"}
+    return exported
+
+
+def _export_integration(integration):
+    result = {
+        "type": str(integration.get("type", "aws_proxy")).lower(),
+        "httpMethod": integration.get("httpMethod"),
+        "uri": integration.get("uri"),
+        "connectionType": integration.get("connectionType"),
+        "requestParameters": integration.get("requestParameters", {}),
+        "requestTemplates": integration.get("requestTemplates", {}),
+        "passthroughBehavior": integration.get("passthroughBehavior"),
+        "cacheNamespace": integration.get("cacheNamespace"),
+        "cacheKeyParameters": integration.get("cacheKeyParameters", []),
+        "timeoutInMillis": integration.get("timeoutInMillis"),
+    }
+    for optional_key in ("credentials", "contentHandling"):
+        if integration.get(optional_key) is not None:
+            result[optional_key] = integration[optional_key]
+
+    responses = {}
+    for response in integration.get("integrationResponses", {}).values():
+        response_key = response.get("selectionPattern") or "default"
+        exported_response = {"statusCode": response.get("statusCode")}
+        for optional_key in ("responseParameters", "responseTemplates", "contentHandling"):
+            value = response.get(optional_key)
+            if value not in (None, {}, []):
+                exported_response[optional_key] = value
+        responses[response_key] = exported_response
+    if responses:
+        result["responses"] = responses
+
+    return {key: value for key, value in result.items() if value is not None}
+
+
+def _export_security_scheme(authorizer, include_authorizers):
+    """Security scheme for a TOKEN or REQUEST authorizer."""
+    source = authorizer.get("identitySource") or ""
+    authorizer_type = authorizer.get("type") or "TOKEN"
+    name = "Unused"
+    location = "header"
+    if "," not in source:
+        if source.startswith("method.request.header."):
+            name = source.removeprefix("method.request.header.")
+        elif source.startswith("method.request.querystring."):
+            name = source.removeprefix("method.request.querystring.")
+            location = "query"
+
+    scheme = {
+        "type": "apiKey",
+        "name": name,
+        "in": location,
+        "x-amazon-apigateway-authtype": authorizer.get("authType") or "custom",
+    }
+    if not include_authorizers:
+        return scheme
+
+    extension = {
+        "type": authorizer_type.lower(),
+        "authorizerUri": authorizer.get("authorizerUri", ""),
+        "authorizerResultTtlInSeconds": authorizer.get(
+            "authorizerResultTtlInSeconds", _DEFAULT_AUTHORIZER_TTL
+        ),
+    }
+    if authorizer_type == "REQUEST":
+        extension["identitySource"] = source
+    if authorizer_type == "TOKEN" and authorizer.get("identityValidationExpression"):
+        extension["identityValidationExpression"] = authorizer["identityValidationExpression"]
+    if authorizer.get("authorizerCredentials"):
+        extension["authorizerCredentials"] = authorizer["authorizerCredentials"]
+    scheme["x-amazon-apigateway-authorizer"] = extension
+    return scheme
+
+
+def _export_operation(method_obj, export_type, include_integrations, authorizer):
+    operation = {"responses": _export_method_responses(method_obj, export_type)}
+    if method_obj.get("operationName"):
+        operation["operationId"] = method_obj["operationName"]
+
+    parameters = _export_method_parameters(method_obj, export_type)
+    request_models = method_obj.get("requestModels", {})
+    if export_type == "oas30":
+        content = {
+            content_type: {"schema": _schema_ref(model_name, export_type)}
+            for content_type, model_name in request_models.items()
+        }
+        if content:
+            operation["requestBody"] = {"content": content}
+    elif request_models:
+        content_types = list(request_models)
+        model_name = request_models.get("application/json") or request_models[content_types[0]]
+        parameters.append({
+            "name": "body",
+            "in": "body",
+            "required": False,
+            "schema": _schema_ref(model_name, export_type),
+        })
+        operation["consumes"] = content_types
+
+    if parameters:
+        operation["parameters"] = parameters
+
+    response_models = method_obj.get("methodResponses", {}).values()
+    produced_types = {
+        content_type
+        for response in response_models
+        for content_type in response.get("responseModels", {})
+    }
+    if export_type == "swagger" and produced_types:
+        operation["produces"] = sorted(produced_types)
+
+    # One requirement object: the client must send all these schemes
+    requirement = {}
+    if authorizer:
+        requirement[authorizer["name"]] = []
+    if method_obj.get("apiKeyRequired"):
+        requirement["api_key"] = []
+    if requirement:
+        operation["security"] = [requirement]
+
+    integration = method_obj.get("methodIntegration")
+    if include_integrations and integration:
+        operation["x-amazon-apigateway-integration"] = _export_integration(integration)
+    return operation
+
+
+def _get_export_extensions(query_params):
+    # API Gateway's query-string map is flattened by botocore, so
+    # parameters={"extensions": "integrations"} is sent as
+    # ?extensions=integrations. Keep the bracketed form as a compatibility
+    # fallback for callers which serialize REST query maps that way.
+    raw = query_params.get("extensions") or query_params.get("parameters[extensions]", [])
+    if not raw:
+        return set()
+    if isinstance(raw, str):
+        raw = [raw]
+    return {
+        extension.strip().lower()
+        for value in raw
+        for extension in value.split(",")
+        if extension.strip()
+    }
+
+
+def _build_api_export(api_id, stage_name, export_type, include_integrations, include_authorizers):
+    api = _rest_apis[api_id]
+    version = api.get("version") or "1.0"
+    info = {"title": api.get("name", "unnamed"), "version": version}
+    if api.get("description"):
+        info["description"] = api["description"]
+
+    schemas = _export_model_schemas(api_id)
+    paths = {}
+    has_api_key_method = False
+    used_authorizers = {}
+    for resource in _resources.get(api_id, {}).values():
+        exported_methods = {}
+        for http_method, method_obj in resource.get("resourceMethods", {}).items():
+            method_key = (
+                "x-amazon-apigateway-any-method"
+                if http_method.upper() == "ANY"
+                else http_method.lower()
+            )
+            authorizer = None
+            if method_obj.get("authorizationType") == "CUSTOM":
+                authorizer = _authorizers_v1.get(api_id, {}).get(method_obj.get("authorizerId"))
+            if authorizer:
+                used_authorizers[authorizer["name"]] = authorizer
+            exported_methods[method_key] = _export_operation(
+                method_obj, export_type, include_integrations, authorizer
+            )
+            has_api_key_method = has_api_key_method or bool(method_obj.get("apiKeyRequired"))
+        if exported_methods:
+            paths[resource.get("path", "/")] = exported_methods
+
+    # AWS exports only the authorizers that methods use
+    security_schemes = {
+        name: _export_security_scheme(authorizer, include_authorizers)
+        for name, authorizer in used_authorizers.items()
+    }
+    if has_api_key_method:
+        security_schemes["api_key"] = {"type": "apiKey", "name": "x-api-key", "in": "header"}
+
+    region = get_region()
+    execute_url = f"https://{api_id}.execute-api.{region}.amazonaws.com/{stage_name}"
+    if export_type == "oas30":
+        components = {"schemas": schemas}
+        if security_schemes:
+            components["securitySchemes"] = security_schemes
+        return {
+            "openapi": "3.0.1",
+            "info": info,
+            "servers": [{"url": execute_url}],
+            "paths": paths,
+            "components": components,
+        }
+
+    document = {
+        "swagger": "2.0",
+        "info": info,
+        "host": f"{api_id}.execute-api.{region}.amazonaws.com",
+        "basePath": f"/{stage_name}",
+        "schemes": ["https"],
+        "paths": paths,
+        "definitions": schemas,
+    }
+    if security_schemes:
+        document["securityDefinitions"] = security_schemes
+    return document
+
+
+def _get_export(api_id, stage_name, export_type, headers, query_params):
+    if api_id not in _rest_apis:
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+    if stage_name not in _stages_v1.get(api_id, {}):
+        return _v1_error("NotFoundException", "Invalid Stage identifier specified", 404)
+
+    export_type = export_type.lower()
+    if export_type not in ("oas30", "swagger"):
+        return _v1_error(
+            "BadRequestException",
+            "Invalid export type. Supported types are 'oas30' and 'swagger'",
+            400,
+        )
+
+    accept = (headers.get("accept") or "application/json").split(",", 1)[0].split(";", 1)[0].strip().lower()
+    if accept == "application/json":
+        content_type = "application/json"
+        extension = "json"
+    elif accept in ("application/yaml", "application/x-yaml", "text/yaml"):
+        content_type = "application/yaml"
+        extension = "yaml"
+    else:
+        return _v1_error(
+            "BadRequestException",
+            "Invalid Accept header. Supported values are 'application/json' and 'application/yaml'",
+            400,
+        )
+
+    export_extensions = _get_export_extensions(query_params)
+    include_integrations = bool({"integrations", "apigateway"} & export_extensions)
+    include_authorizers = bool({"authorizers", "apigateway"} & export_extensions)
+    document = _build_api_export(api_id, stage_name, export_type, include_integrations, include_authorizers)
+    if extension == "json":
+        body = json.dumps(document, ensure_ascii=False).encode("utf-8")
+    else:
+        body = yaml.safe_dump(document, sort_keys=False).encode("utf-8")
+
+    api_name = re.sub(r"[^A-Za-z0-9._-]+", "-", _rest_apis[api_id].get("name", "api"))
+    filename = f"{api_name}-{stage_name}-{export_type}.{extension}"
+    return 200, {
+        "Content-Type": content_type,
+        "Content-Disposition": f'attachment; filename="{filename}"',
+    }, body
 
 
 # ---- Control plane: Resources ----
@@ -1247,10 +4415,12 @@ def _put_method(api_id, resource_id, http_method, data):
         "httpMethod": http_method,
         "authorizationType": data.get("authorizationType", "NONE"),
         "authorizerId": data.get("authorizerId"),
+        "authorizationScopes": data.get("authorizationScopes", []),
         "apiKeyRequired": data.get("apiKeyRequired", False),
         "operationName": data.get("operationName", ""),
         "requestParameters": data.get("requestParameters", {}),
         "requestModels": data.get("requestModels", {}),
+        "requestValidatorId": data.get("requestValidatorId"),
         "methodResponses": {},
         "methodIntegration": None,
     }
@@ -1357,6 +4527,9 @@ def _put_integration(api_id, resource_id, http_method, data):
         "contentHandling": data.get("contentHandling"),
         "integrationResponses": {},
     }
+    for k in ("connectionId", "tlsConfig", "responseTransferMode", "integrationTarget"):
+        if data.get(k) is not None:
+            integration[k] = data[k]
     method_obj["methodIntegration"] = integration
     # Real AWS returns HTTP 201 Created for PutIntegration.
     return _v1_response(integration, 201)
@@ -1452,7 +4625,7 @@ def _delete_integration_response(api_id, resource_id, http_method, status_code):
 # ---- Helpers ----
 
 def _build_api_summary(api_id):
-    """Build the apiSummary structure: {path: {httpMethod: {authorizationScopes, apiKeyRequired}}}."""
+    """Build the apiSummary structure: {path: {httpMethod: MethodSnapshot}}."""
     summary = {}
     for resource in _resources.get(api_id, {}).values():
         path = resource.get("path", "/")
@@ -1460,7 +4633,7 @@ def _build_api_summary(api_id):
             if path not in summary:
                 summary[path] = {}
             summary[path][http_method] = {
-                "authorizationScopes": [],
+                "authorizationType": method_obj.get("authorizationType", "NONE"),
                 "apiKeyRequired": method_obj.get("apiKeyRequired", False),
             }
     return summary
@@ -1479,33 +4652,47 @@ def _create_deployment(api_id, data):
         "apiSummary": _build_api_summary(api_id),
     }
     _deployments_v1.setdefault(api_id, {})[deployment_id] = deployment
+    # The data plane answers with the gateway responses of the stage's
+    # deployment: a Put or Delete takes effect with the next deployment only.
+    _deployed_gateway_responses.setdefault(api_id, {})[deployment_id] = copy.deepcopy(
+        _gateway_responses.get(api_id, {})
+    )
 
     # If stageName is provided, create/update the stage automatically
     stage_name = data.get("stageName")
     if stage_name:
-        existing_stage = _stages_v1.get(api_id, {}).get(stage_name)
-        if existing_stage:
-            existing_stage["deploymentId"] = deployment_id
-            existing_stage["lastUpdatedDate"] = _now_unix()
-        else:
-            stage = {
-                "stageName": stage_name,
-                "deploymentId": deployment_id,
-                "description": data.get("stageDescription", ""),
-                "createdDate": _now_unix(),
-                "lastUpdatedDate": _now_unix(),
-                "variables": data.get("variables", {}),
-                "methodSettings": {},
-                "accessLogSettings": {},
-                "cacheClusterEnabled": False,
-                "cacheClusterSize": None,
-                "tracingEnabled": False,
-                "tags": {},
-                "documentationVersion": None,
-            }
-            _stages_v1.setdefault(api_id, {})[stage_name] = stage
+        _deploy_to_stage(api_id, deployment_id, stage_name,
+                         data.get("stageDescription", ""), data.get("variables", {}))
 
     return _v1_response(deployment, 201)
+
+
+def _deploy_to_stage(api_id, deployment_id, stage_name, description="", variables=None):
+    """Point a stage at a deployment, creating the stage when it does not
+    exist — what CreateDeployment does for its stageName, and what an
+    AWS::ApiGateway::Deployment update does for a changed StageName."""
+    existing_stage = _stages_v1.get(api_id, {}).get(stage_name)
+    if existing_stage:
+        existing_stage["deploymentId"] = deployment_id
+        existing_stage["lastUpdatedDate"] = _now_unix()
+        return existing_stage
+    stage = {
+        "stageName": stage_name,
+        "deploymentId": deployment_id,
+        "description": description,
+        "createdDate": _now_unix(),
+        "lastUpdatedDate": _now_unix(),
+        "variables": variables or {},
+        "methodSettings": {},
+        "accessLogSettings": {},
+        "cacheClusterEnabled": False,
+        "cacheClusterSize": None,
+        "tracingEnabled": False,
+        "tags": {},
+        "documentationVersion": None,
+    }
+    _stages_v1.setdefault(api_id, {})[stage_name] = stage
+    return stage
 
 
 def _get_deployments(api_id, query_params):
@@ -1534,6 +4721,7 @@ def _delete_deployment(api_id, deployment_id):
     if deployment_id not in _deployments_v1.get(api_id, {}):
         return _v1_error("NotFoundException", "Invalid Deployment identifier specified", 404)
     _deployments_v1[api_id].pop(deployment_id, None)
+    _deployed_gateway_responses.get(api_id, {}).pop(deployment_id, None)
     return 202, {}, b""
 
 
@@ -1560,6 +4748,8 @@ def _create_stage(api_id, data):
         "tags": data.get("tags", {}),
         "documentationVersion": data.get("documentationVersion"),
     }
+    if data.get("canarySettings"):
+        stage["canarySettings"] = data["canarySettings"]
     _stages_v1.setdefault(api_id, {})[stage_name] = stage
     return _v1_response(stage, 201)
 
@@ -1582,6 +4772,9 @@ def _update_stage(api_id, stage_name, data):
     if not stage:
         return _v1_error("NotFoundException", "Invalid Stage identifier specified", 404)
     patch_ops = data.get("patchOperations", [])
+    for op in patch_ops:
+        if op.get("path") == "/clientCertificateId" and op.get("value") and op["value"] not in _client_certificates:
+            return _v1_error("BadRequestException", "Invalid client certificate id specified", 400)
     _apply_stage_patch(stage, patch_ops)
     stage["lastUpdatedDate"] = _now_unix()
     return _v1_response(stage)
@@ -1608,9 +4801,15 @@ def _create_authorizer(api_id, data):
         "authorizerCredentials": data.get("authorizerCredentials"),
         "identitySource": data.get("identitySource", "method.request.header.Authorization"),
         "identityValidationExpression": data.get("identityValidationExpression", ""),
-        "authorizerResultTtlInSeconds": data.get("authorizerResultTtlInSeconds", 300),
+        "authorizerResultTtlInSeconds": data.get(
+            "authorizerResultTtlInSeconds", _DEFAULT_AUTHORIZER_TTL
+        ),
         "providerARNs": data.get("providerARNs", []),
     }
+    if "authType" in data:
+        # An informational field (OpenAPI import/export); reported when set,
+        # as GetAuthorizer does.
+        authorizer["authType"] = data["authType"]
     _authorizers_v1.setdefault(api_id, {})[auth_id] = authorizer
     return _v1_response(authorizer, 201)
 
@@ -1645,6 +4844,60 @@ def _delete_authorizer(api_id, auth_id):
 
 
 # ---- Control plane: Models ----
+
+def _create_request_validator(api_id, data):
+    if api_id not in _rest_apis:
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+    validator = {
+        "id": _new_id()[:6],
+        "name": data.get("name", ""),
+        "validateRequestBody": bool(data.get("validateRequestBody", False)),
+        "validateRequestParameters": bool(data.get("validateRequestParameters", False)),
+    }
+    _request_validators.setdefault(api_id, {})[validator["id"]] = validator
+    return _v1_response(validator, 201)
+
+
+def _get_request_validators(api_id, query_params):
+    if api_id not in _rest_apis:
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+    return _v1_paginated_response(
+        list(_request_validators.get(api_id, {}).values()), query_params)
+
+
+def _get_request_validator(api_id, validator_id):
+    validator = _request_validators.get(api_id, {}).get(validator_id)
+    if not validator:
+        return _v1_error(
+            "NotFoundException", "Invalid Request Validator identifier specified", 404)
+    return _v1_response(validator)
+
+
+def _update_request_validator(api_id, validator_id, data):
+    validator = _request_validators.get(api_id, {}).get(validator_id)
+    if not validator:
+        return _v1_error(
+            "NotFoundException", "Invalid Request Validator identifier specified", 404)
+    for op in data.get("patchOperations", []) or []:
+        if op.get("op") != "replace":
+            continue
+        path = (op.get("path") or "").lstrip("/")
+        value = op.get("value")
+        if path == "name":
+            validator["name"] = value
+        elif path in ("validateRequestBody", "validateRequestParameters"):
+            validator[path] = str(value).lower() == "true"
+    return _v1_response(validator)
+
+
+def _delete_request_validator(api_id, validator_id):
+    validators = _request_validators.get(api_id, {})
+    if validator_id not in validators:
+        return _v1_error(
+            "NotFoundException", "Invalid Request Validator identifier specified", 404)
+    del validators[validator_id]
+    return 204, {}, b""
+
 
 def _create_model(api_id, data):
     if api_id not in _rest_apis:
@@ -1692,11 +4945,232 @@ def _delete_model(api_id, model_name):
     return 202, {}, b""
 
 
+# ---- Control plane: Documentation Parts ----
+
+def _validate_documentation_api(api_id):
+    if api_id not in _rest_apis:
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+    return None
+
+
+def _create_documentation_part(api_id, data):
+    error = _validate_documentation_api(api_id)
+    if error is not None:
+        return error
+
+    location = dict(data.get("location") or {})
+    location_type = location.get("type")
+    if location_type not in _DOCUMENTATION_LOCATION_TYPES:
+        return _v1_error(
+            "BadRequestException",
+            "Invalid documentation part location type specified",
+            400,
+        )
+    if data.get("properties") is None:
+        return _v1_error(
+            "BadRequestException",
+            "Documentation part properties must be specified",
+            400,
+        )
+
+    part_id = _new_id()
+    part = {
+        "id": part_id,
+        "location": location,
+        "properties": data["properties"],
+    }
+    _documentation_parts.setdefault(api_id, {})[part_id] = part
+    return _v1_response(part, 201)
+
+
+def _get_documentation_part(api_id, part_id):
+    error = _validate_documentation_api(api_id)
+    if error is not None:
+        return error
+    part = _documentation_parts.get(api_id, {}).get(part_id)
+    if part is None:
+        return _v1_error(
+            "NotFoundException",
+            "Invalid DocumentationPart identifier specified",
+            404,
+        )
+    return _v1_response(part)
+
+
+def _get_documentation_parts(api_id, query_params):
+    error = _validate_documentation_api(api_id)
+    if error is not None:
+        return error
+
+    parts = list(_documentation_parts.get(api_id, {}).values())
+    location_type = _qp(query_params, "type")
+    name_query = _qp(query_params, "name")
+    path = _qp(query_params, "path")
+    location_status = _qp(query_params, "locationStatus")
+    if location_type:
+        parts = [part for part in parts if part["location"].get("type") == location_type]
+    if name_query:
+        parts = [part for part in parts if name_query in part["location"].get("name", "")]
+    if path:
+        parts = [part for part in parts if part["location"].get("path") == path]
+    # Stored parts are documented by definition. API Gateway also synthesizes
+    # undocumented API entities for this filter; MiniStack has no need to
+    # materialize those placeholder records.
+    if location_status == "UNDOCUMENTED":
+        parts = []
+    return _v1_paginated_response(parts, query_params)
+
+
+def _update_documentation_part(api_id, part_id, data):
+    error = _validate_documentation_api(api_id)
+    if error is not None:
+        return error
+    part = _documentation_parts.get(api_id, {}).get(part_id)
+    if part is None:
+        return _v1_error(
+            "NotFoundException",
+            "Invalid DocumentationPart identifier specified",
+            404,
+        )
+    _apply_patch(part, data.get("patchOperations", []))
+    return _v1_response(part)
+
+
+def _delete_documentation_part(api_id, part_id):
+    error = _validate_documentation_api(api_id)
+    if error is not None:
+        return error
+    parts = _documentation_parts.get(api_id, {})
+    if part_id not in parts:
+        return _v1_error(
+            "NotFoundException",
+            "Invalid DocumentationPart identifier specified",
+            404,
+        )
+    parts.pop(part_id, None)
+    return 202, {}, b""
+
+
+# ---- Control plane: Gateway Responses ----
+
+def _default_gateway_response(response_type):
+    """Return the API Gateway-generated response used when no customization exists."""
+    response = {
+        "defaultResponse": True,
+        "responseType": response_type,
+        "responseParameters": {},
+        "responseTemplates": {
+            "application/json": _DEFAULT_GATEWAY_RESPONSE_TEMPLATE,
+        },
+    }
+    status_code = _DEFAULT_GATEWAY_RESPONSE_STATUS_CODES.get(response_type)
+    if status_code is not None:
+        response["statusCode"] = status_code
+    return response
+
+
+def _gateway_response_family(response_type):
+    """DEFAULT_4XX or DEFAULT_5XX by the type's default status (None for those two)."""
+    status_code = _DEFAULT_GATEWAY_RESPONSE_STATUS_CODES.get(response_type)
+    if status_code is None:
+        return None
+    return "DEFAULT_5XX" if status_code.startswith("5") else "DEFAULT_4XX"
+
+
+def _gateway_response_for_type(customized, response_type):
+    """The gateway response in effect for ``response_type``.
+
+    A customized entry wins. An uncustomized type inherits the parameters and
+    templates of a customized DEFAULT_4XX / DEFAULT_5XX, keeps its own status
+    code and still reports ``defaultResponse: true``.
+    """
+    if response_type in customized:
+        return customized[response_type]
+    response = _default_gateway_response(response_type)
+    inherited = customized.get(_gateway_response_family(response_type))
+    if inherited:
+        response["responseParameters"] = dict(inherited.get("responseParameters") or {})
+        response["responseTemplates"] = dict(inherited.get("responseTemplates") or {})
+    return response
+
+
+def _validate_gateway_response_target(api_id, response_type):
+    if api_id not in _rest_apis:
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+    if response_type not in _GATEWAY_RESPONSE_TYPES:
+        return _v1_error(
+            "BadRequestException",
+            f"Invalid gateway response type: {response_type}",
+            400,
+        )
+    return None
+
+
+def _put_gateway_response(api_id, response_type, data):
+    error = _validate_gateway_response_target(api_id, response_type)
+    if error is not None:
+        return error
+
+    status_code = data.get("statusCode")
+    if status_code is not None and not re.fullmatch(r"[1-5]\d\d", str(status_code)):
+        return _v1_error(
+            "BadRequestException",
+            "Invalid status code specified",
+            400,
+        )
+
+    response = _default_gateway_response(response_type)
+    response["defaultResponse"] = False
+    if status_code is not None:
+        response["statusCode"] = str(status_code)
+    response["responseParameters"] = dict(data.get("responseParameters") or {})
+    # Without responseTemplates AWS stores the default application/json template.
+    if data.get("responseTemplates"):
+        response["responseTemplates"] = dict(data["responseTemplates"])
+    _gateway_responses.setdefault(api_id, {})[response_type] = response
+    return _v1_response(response, 201)
+
+
+def _get_gateway_response(api_id, response_type):
+    error = _validate_gateway_response_target(api_id, response_type)
+    if error is not None:
+        return error
+    return _v1_response(
+        _gateway_response_for_type(_gateway_responses.get(api_id, {}), response_type)
+    )
+
+
+def _get_gateway_responses(api_id):
+    if api_id not in _rest_apis:
+        return _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+    customized = _gateway_responses.get(api_id, {})
+    responses = [
+        _gateway_response_for_type(customized, response_type)
+        for response_type in _GATEWAY_RESPONSE_TYPES
+    ]
+    # AWS returns the complete GatewayResponses collection and ignores the
+    # otherwise-standard API Gateway pagination parameters for this operation.
+    return _v1_response({"item": responses})
+
+
+def _delete_gateway_response(api_id, response_type):
+    error = _validate_gateway_response_target(api_id, response_type)
+    if error is not None:
+        return error
+    _gateway_responses.get(api_id, {}).pop(response_type, None)
+    return 202, {}, b""
+
+
 # ---- Control plane: API Keys ----
 
 def _create_api_key(data):
+    key_value = data.get("value")
+    if key_value is None:
+        key_value = new_uuid().replace("-", "")
+    elif len(str(key_value)) < 20:
+        return _v1_error("BadRequestException",
+                         "API Key value should be at least 20 characters", 400)
     key_id = _new_id()[:8]
-    key_value = new_uuid().replace("-", "")
     api_key = {
         "id": key_id,
         "name": data.get("name", ""),
@@ -1708,12 +5182,19 @@ def _create_api_key(data):
         "stageKeys": data.get("stageKeys", []),
         "tags": data.get("tags", {}),
     }
+    if data.get("customerId"):
+        api_key["customerId"] = data["customerId"]
     _api_keys[key_id] = api_key
     return _v1_response(api_key, 201)
 
 
 def _get_api_keys(query_params):
-    return _v1_paginated_response(list(_api_keys.values()), query_params)
+    keys = list(_api_keys.values())
+    name_query = _qp(query_params, "name")
+    if name_query:
+        # AWS returns the keys whose names start with nameQuery.
+        keys = [key for key in keys if key["name"].startswith(name_query)]
+    return _v1_paginated_response(keys, query_params)
 
 
 def _get_api_key(key_id):
@@ -1829,34 +5310,101 @@ def _create_domain_name(data):
     domain_name = data.get("domainName", "")
     if not domain_name:
         return _v1_error("BadRequestException", "Domain name is required", 400)
+    token = new_uuid().replace("-", "")
     dn = {
         "domainName": domain_name,
         "certificateName": data.get("certificateName", ""),
         "certificateArn": data.get("certificateArn", ""),
-        "distributionDomainName": f"{domain_name}.cloudfront.net",
-        "regionalDomainName": f"{domain_name}.execute-api.{get_region()}.amazonaws.com",
+        "certificateUploadDate": _now_unix(),
+        "regionalCertificateName": data.get("regionalCertificateName", ""),
+        "regionalCertificateArn": data.get("regionalCertificateArn", ""),
+        "distributionDomainName": f"d{token[:13]}.cloudfront.net",
+        "distributionHostedZoneId": "Z2FDTNDATAQYW2",
+        "regionalDomainName": f"d-{token[13:23]}.execute-api.{get_region()}.amazonaws.com",
         "regionalHostedZoneId": "Z1UJRXOUMOOFQ8",
         "endpointConfiguration": data.get("endpointConfiguration", {"types": ["REGIONAL"]}),
+        "endpointAccessMode": data.get("endpointAccessMode", ""),
+        "mutualTlsAuthentication": data.get("mutualTlsAuthentication", {}),
+        "ownershipVerificationCertificateArn": data.get("ownershipVerificationCertificateArn", ""),
+        "routingMode": data.get("routingMode", "BASE_PATH_MAPPING_ONLY"),
         # securityPolicy is an opaque enum at the wire level; AWS keeps adding
         # new values (e.g. SecurityPolicy-TLS13-1-2-FIPS-PFS-PQ-2025-09 in
         # 2026-03). Accept whatever the caller sends; default mirrors AWS.
         "securityPolicy": data.get("securityPolicy", "TLS_1_2"),
+        "domainNameStatus": "AVAILABLE",
         "tags": data.get("tags", {}),
     }
+    # Only a private custom domain name has an id, and its ARN carries the account and id.
+    if "PRIVATE" in (dn["endpointConfiguration"] or {}).get("types", []):
+        dn["endpointConfiguration"] = {"ipAddressType": "dualstack", **dn["endpointConfiguration"]}
+        dn["domainNameId"] = "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(10))
+        dn["domainNameArn"] = (f"arn:aws:apigateway:{get_region()}:{get_account_id()}:"
+                               f"/domainnames/{domain_name}+{dn['domainNameId']}")
+        if data.get("policy"):
+            dn["policy"] = _private_domain_policy(data["policy"], domain_name, dn["domainNameId"])
     _domain_names[domain_name] = dn
     _base_path_mappings[domain_name] = {}
-    return _v1_response(dn, 201)
+    return _v1_response(_domain_name_view(dn, with_tags=bool(dn["tags"])), 201)
+
+
+def _private_domain_policy(policy, domain_name, domain_name_id):
+    """The policy as AWS stores it: compact, with an "execute-api:/*" resource naming this domain."""
+    try:
+        doc = json.loads(policy)
+    except (TypeError, ValueError):
+        return policy
+    arn = f"arn:aws:execute-api:{get_region()}:{get_account_id()}:/domainnames/{domain_name}+{domain_name_id}"
+    for statement in doc.get("Statement", []) if isinstance(doc, dict) else []:
+        if isinstance(statement, dict) and statement.get("Resource") in ("execute-api:/*", ["execute-api:/*"]):
+            statement["Resource"] = arn
+    return json.dumps(doc, separators=(",", ":"))
+
+
+def _domain_name_view(dn, with_tags=True):
+    """The fields AWS returns for the domain's endpoint type, none empty (AWS capture, REGIONAL and PRIVATE)."""
+    endpoint = dict(dn.get("endpointConfiguration") or {"types": ["REGIONAL"]})
+    types = endpoint.get("types") or ["REGIONAL"]
+    endpoint.setdefault("ipAddressType", "ipv4")
+    name = dn["domainName"]
+    arn = dn.get("domainNameArn") or f"arn:aws:apigateway:{get_region()}::/domainnames/{name}"
+    view = {"domainName": name}
+    if dn.get("domainNameId"):
+        view["domainNameId"] = dn["domainNameId"]
+    view["domainNameArn"] = arn
+    for key in ("certificateName", "certificateArn", "certificateUploadDate"):
+        if dn.get(key):
+            view[key] = dn[key]
+    if "REGIONAL" in types:
+        for key in ("regionalDomainName", "regionalHostedZoneId", "regionalCertificateName", "regionalCertificateArn"):
+            if dn.get(key):
+                view[key] = dn[key]
+    if "EDGE" in types:
+        for key in ("distributionDomainName", "distributionHostedZoneId"):
+            if dn.get(key):
+                view[key] = dn[key]
+    view["endpointConfiguration"] = endpoint
+    view["domainNameStatus"] = "AVAILABLE"
+    view["securityPolicy"] = dn.get("securityPolicy") or "TLS_1_2"
+    for key in ("endpointAccessMode", "mutualTlsAuthentication", "ownershipVerificationCertificateArn", "policy"):
+        if dn.get(key):
+            view[key] = dn[key]
+    tags = dict(_v1_tags.get(arn) or dn.get("tags") or {})
+    if with_tags or tags:
+        view["tags"] = tags
+    view["routingMode"] = dn.get("routingMode") or "BASE_PATH_MAPPING_ONLY"
+    return view
 
 
 def _get_domain_names(query_params):
-    return _v1_paginated_response(list(_domain_names.values()), query_params)
+    return _v1_paginated_response([_domain_name_view(dn, with_tags=False) for dn in _domain_names.values()],
+                                  query_params)
 
 
 def _get_domain_name(domain_name):
     dn = _domain_names.get(domain_name)
     if not dn:
         return _v1_error("NotFoundException", "Invalid domain name identifier specified", 404)
-    return _v1_response(dn)
+    return _v1_response(_domain_name_view(dn))
 
 
 def _delete_domain_name(domain_name):
@@ -1864,6 +5412,149 @@ def _delete_domain_name(domain_name):
         return _v1_error("NotFoundException", "Invalid domain name identifier specified", 404)
     _domain_names.pop(domain_name, None)
     _base_path_mappings.pop(domain_name, None)
+    return 202, {}, b""
+
+
+# ---- Control plane: Client certificates ----
+
+_CLIENT_CERTIFICATE_NOT_FOUND = "Invalid client certificate id specified"
+
+
+def _client_certificate_arn(cert_id):
+    return f"arn:aws:apigateway:{get_region()}::/clientcertificates/{cert_id}"
+
+
+def _client_certificate_view(cert):
+    return {**cert, "tags": dict(_v1_tags.get(_client_certificate_arn(cert["clientCertificateId"]), {}))}
+
+
+def _generate_client_certificate(data):
+    from ministack.core import x509_utils
+
+    cert_id = "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(6))
+    created = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+    try:
+        expires = created.replace(year=created.year + 1)
+    except ValueError:  # Feb 29
+        expires = created.replace(year=created.year + 1, day=28)
+    cert = {"clientCertificateId": cert_id, "description": data.get("description", ""),
+            "createdDate": created.timestamp(), "expirationDate": expires.timestamp()}
+    if x509_utils.HAS_CRYPTO:
+        # AWS: self-signed C=US, L=Seattle, CN=ApiGateway, PEM with CRLF line endings
+        pem = x509_utils.generate_self_signed("US", "Seattle", "ApiGateway", created, expires)
+        cert["pemEncodedCertificate"] = pem.strip().replace("\n", "\r\n")
+    _client_certificates[cert_id] = cert
+    _v1_tags[_client_certificate_arn(cert_id)] = dict(data.get("tags") or {})
+    return _v1_response(_client_certificate_view(cert), 201)
+
+
+def _get_client_certificate(cert_id):
+    cert = _client_certificates.get(cert_id)
+    if not cert:
+        return _v1_error("NotFoundException", _CLIENT_CERTIFICATE_NOT_FOUND, 404)
+    return _v1_response(_client_certificate_view(cert))
+
+
+def _get_client_certificates(query_params):
+    return _v1_paginated_response([_client_certificate_view(c) for c in _client_certificates.values()],
+                                  query_params)
+
+
+def _update_client_certificate(cert_id, data):
+    cert = _client_certificates.get(cert_id)
+    if not cert:
+        return _v1_error("NotFoundException", _CLIENT_CERTIFICATE_NOT_FOUND, 404)
+    for op in data.get("patchOperations", []):
+        if op.get("path") != "/description":
+            return _v1_error("BadRequestException", f"Invalid patch path  '{op.get('path')}' specified for op "
+                             f"'{op.get('op')}'. Must be one of: [/description]", 400)
+    for op in data.get("patchOperations", []):
+        if op.get("op") in ("replace", "add"):
+            cert["description"] = op.get("value", "")
+    return _v1_response(_client_certificate_view(cert))
+
+
+def _delete_client_certificate(cert_id):
+    if cert_id not in _client_certificates:
+        return _v1_error("NotFoundException", _CLIENT_CERTIFICATE_NOT_FOUND, 404)
+    _client_certificates.pop(cert_id, None)
+    _v1_tags.pop(_client_certificate_arn(cert_id), None)
+    return 202, {}, b""
+
+
+# ---- Control plane: Domain name access associations (private custom domains) ----
+
+def _private_domain_by_arn(domain_name_arn):
+    for name, dn in _domain_names.items():
+        if dn.get("domainNameArn") == domain_name_arn:
+            return name, dn
+    return None, None
+
+
+def _vpc_endpoint_exists(vpce_id):
+    from ministack.services import ec2
+    return vpce_id in ec2._vpc_endpoints
+
+
+def _access_association_view(association):
+    arn = association["domainNameAccessAssociationArn"]
+    return {**association, "tags": dict(_v1_tags.get(arn, {}))}
+
+
+def _create_access_association(data):
+    domain_name_arn = data.get("domainNameArn", "")
+    source_type = data.get("accessAssociationSourceType", "")
+    source = data.get("accessAssociationSource", "")
+    if source_type != "VPCE":
+        return _v1_error("BadRequestException", f"Invalid accessAssociationSourceType: {source_type}", 400)
+    name, dn = _private_domain_by_arn(domain_name_arn)
+    if name is None:
+        return _v1_error("BadRequestException", "Domain not found", 400)
+    if not _vpc_endpoint_exists(source):
+        return _v1_error("BadRequestException", f"{source} is not a valid VPC endpoint id", 400)
+    arn = (f"arn:aws:apigateway:{get_region()}:{get_account_id()}:/domainnameaccessassociations/"
+           f"domainname/{name}+{dn['domainNameId']}/vpcesource/{source}")
+    if arn in _access_associations:
+        return _v1_error("BadRequestException",
+                         "The domain name access association between this VPC endpoint and domain name already exists.",
+                         400)
+    association = {"domainNameAccessAssociationArn": arn, "domainNameArn": domain_name_arn,
+                   "accessAssociationSourceType": source_type, "accessAssociationSource": source}
+    _access_associations[arn] = association
+    _v1_tags[arn] = dict(data.get("tags") or {})
+    return _v1_response(_access_association_view(association), 201)
+
+
+def _get_access_associations(query_params):
+    owner = _qp(query_params, "resourceOwner") or "SELF"
+    if owner == "OTHER_ACCOUNTS":
+        # Associations other accounts made to this account's domains; MiniStack's are all made by the owner.
+        items = []
+    else:
+        items = [_access_association_view(a) for a in _access_associations.values()]
+    return _v1_paginated_response(items, query_params)
+
+
+_NO_ACCESS_ASSOCIATIONS = "This private custom domain name doesn't have any domain name access associations."
+
+
+def _delete_access_association(association_arn):
+    if association_arn not in _access_associations:
+        return _v1_error("NotFoundException", _NO_ACCESS_ASSOCIATIONS, 404)
+    _access_associations.pop(association_arn, None)
+    _v1_tags.pop(association_arn, None)
+    return 202, {}, b""
+
+
+def _reject_access_association(association_arn, domain_name_arn):
+    association = _access_associations.get(association_arn)
+    # The owner's own associations are not rejectable: AWS answers 404 and keeps them.
+    if (not association or association.get("domainNameArn") != domain_name_arn
+            or _private_domain_by_arn(domain_name_arn)[0] is None
+            or association_arn.split(":")[4] == get_account_id()):
+        return _v1_error("NotFoundException", _NO_ACCESS_ASSOCIATIONS, 404)
+    _access_associations.pop(association_arn, None)
+    _v1_tags.pop(association_arn, None)
     return 202, {}, b""
 
 
@@ -1880,17 +5571,23 @@ def _create_base_path_mapping(domain_name, data):
     return _v1_response(mapping, 201)
 
 
+def _public_mapping(mapping):
+    """A base path mapping without the API Gateway v2 mapping id."""
+    return {k: v for k, v in mapping.items() if not k.startswith("_")}
+
+
 def _get_base_path_mappings(domain_name, query_params):
     if domain_name not in _domain_names:
         return _v1_error("NotFoundException", "Invalid domain name identifier specified", 404)
-    return _v1_paginated_response(list(_base_path_mappings.get(domain_name, {}).values()), query_params)
+    return _v1_paginated_response(
+        [_public_mapping(m) for m in _base_path_mappings.get(domain_name, {}).values()], query_params)
 
 
 def _get_base_path_mapping(domain_name, base_path):
     mapping = _base_path_mappings.get(domain_name, {}).get(base_path)
     if not mapping:
         return _v1_error("NotFoundException", "Invalid base path mapping identifier specified", 404)
-    return _v1_response(mapping)
+    return _v1_response(_public_mapping(mapping))
 
 
 def _delete_base_path_mapping(domain_name, base_path):
@@ -1900,19 +5597,95 @@ def _delete_base_path_mapping(domain_name, base_path):
 
 # ---- Control plane: Tags ----
 
+def _resolve_v1_tag_resource_arn(resource_arn):
+    try:
+        spec = parse_arn(resource_arn)
+    except ArnParseError:
+        return None, _v1_error("BadRequestException", "Invalid resource ARN specified", 400)
+
+    if (spec.service == "apigateway" and spec.account_id == get_account_id() and spec.region == get_region()
+            and spec.resource.startswith("/domainnameaccessassociations/")):
+        if resource_arn not in _access_associations:
+            return None, _v1_error("NotFoundException", "Invalid resource identifier specified", 404)
+        return resource_arn, None
+
+    if (
+        spec.partition != "aws"
+        or spec.service != "apigateway"
+        or spec.region != get_region()
+        or spec.account_id
+    ):
+        return None, _v1_error("BadRequestException", "Invalid resource ARN specified", 400)
+
+    parts = spec.resource.split("/")
+    account_id = get_account_id()
+    if len(parts) == 3 and parts[0] == "" and parts[2]:
+        resource_type = parts[1]
+        resource_id = parts[2]
+        if resource_type == "restapis":
+            if not _rest_apis.contains_scoped(account_id, spec.region, resource_id):
+                return None, _v1_error("NotFoundException", "Invalid API identifier specified", 404)
+            return _rest_api_arn(resource_id), None
+        if resource_type == "apikeys":
+            if not _api_keys.contains_scoped(account_id, spec.region, resource_id):
+                return None, _v1_error("NotFoundException", "Invalid resource identifier specified", 404)
+            return f"arn:aws:apigateway:{spec.region}::/apikeys/{resource_id}", None
+        if resource_type == "usageplans":
+            if not _usage_plans.contains_scoped(account_id, spec.region, resource_id):
+                return None, _v1_error("NotFoundException", "Invalid resource identifier specified", 404)
+            return f"arn:aws:apigateway:{spec.region}::/usageplans/{resource_id}", None
+        if resource_type == "domainnames":
+            if not _domain_names.contains_scoped(account_id, spec.region, resource_id):
+                return None, _v1_error("NotFoundException", "Invalid resource identifier specified", 404)
+            return f"arn:aws:apigateway:{spec.region}::/domainnames/{resource_id}", None
+        if resource_type == "clientcertificates":
+            if not _client_certificates.contains_scoped(account_id, spec.region, resource_id):
+                return None, _v1_error("NotFoundException", "Invalid resource identifier specified", 404)
+            return f"arn:aws:apigateway:{spec.region}::/clientcertificates/{resource_id}", None
+        return None, _v1_error("BadRequestException", "Invalid resource ARN specified", 400)
+
+    if (
+        len(parts) == 5
+        and parts[0] == ""
+        and parts[1] == "restapis"
+        and parts[2]
+        and parts[3] == "stages"
+        and parts[4]
+    ):
+        api_id = parts[2]
+        stage_name = parts[4]
+        if (
+            not _rest_apis.contains_scoped(account_id, spec.region, api_id)
+            or stage_name not in _stages_v1.get_scoped(account_id, spec.region, api_id, {})
+        ):
+            return None, _v1_error("NotFoundException", "Invalid Stage identifier specified", 404)
+        return f"arn:aws:apigateway:{spec.region}::/restapis/{api_id}/stages/{stage_name}", None
+
+    return None, _v1_error("BadRequestException", "Invalid resource ARN specified", 400)
+
+
 def _get_v1_tags(resource_arn):
-    tags = _v1_tags.get(resource_arn, {})
+    tag_key, err = _resolve_v1_tag_resource_arn(resource_arn)
+    if err is not None:
+        return err
+    tags = _v1_tags.get(tag_key, {})
     return _v1_response({"tags": tags})
 
 
 def _tag_v1_resource(resource_arn, data):
+    tag_key, err = _resolve_v1_tag_resource_arn(resource_arn)
+    if err is not None:
+        return err
     tags = data.get("tags", {})
-    _v1_tags.setdefault(resource_arn, {}).update(tags)
+    _v1_tags.setdefault(tag_key, {}).update(tags)
     return 204, {}, b""
 
 
 def _untag_v1_resource(resource_arn, tag_keys):
-    existing = _v1_tags.get(resource_arn, {})
+    tag_key, err = _resolve_v1_tag_resource_arn(resource_arn)
+    if err is not None:
+        return err
+    existing = _v1_tags.get(tag_key, {})
     for key in tag_keys:
         existing.pop(key, None)
     return 204, {}, b""

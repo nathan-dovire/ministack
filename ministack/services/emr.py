@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 EMR (Elastic MapReduce) Service Emulator.
 JSON protocol via X-Amz-Target: ElasticMapReduce.{Operation}
@@ -14,6 +16,7 @@ Supports:
   Block Public Access: GetBlockPublicAccessConfiguration, PutBlockPublicAccessConfiguration
 """
 
+import base64
 import copy
 import json
 import logging
@@ -22,14 +25,14 @@ import random
 import string
 import time
 
-from ministack.core.persistence import PERSIST_STATE, load_state
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
     get_region,
     json_response,
-    new_uuid,
+    to_output_shape,
 )
 
 logger = logging.getLogger("emr")
@@ -40,12 +43,29 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # State
 # ---------------------------------------------------------------------------
 
-_clusters = AccountScopedDict()   # cluster_id -> cluster record
-_steps = AccountScopedDict()      # cluster_id -> [step records]
-_block_public_access: dict = {
-    "BlockPublicSecurityGroupRules": False,
-    "PermittedPublicSecurityGroupRuleRanges": [],
-}
+_clusters = AccountRegionScopedDict()   # cluster_id -> cluster record
+_steps = AccountRegionScopedDict()      # cluster_id -> [step records]
+_block_public_access = AccountRegionScopedDict()
+_BLOCK_PUBLIC_ACCESS_KEY = "configuration"
+
+
+def _default_block_public_access():
+    return {
+        "BlockPublicSecurityGroupRules": False,
+        "PermittedPublicSecurityGroupRuleRanges": [],
+    }
+
+
+def _get_block_public_access():
+    if _BLOCK_PUBLIC_ACCESS_KEY not in _block_public_access:
+        _block_public_access[_BLOCK_PUBLIC_ACCESS_KEY] = _default_block_public_access()
+    return _block_public_access[_BLOCK_PUBLIC_ACCESS_KEY]
+
+
+def _clear_state():
+    _clusters.clear()
+    _steps.clear()
+    _block_public_access.clear()
 
 
 def get_state():
@@ -56,21 +76,66 @@ def get_state():
     })
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
+    if not data:
+        return
+    _clear_state()
     _clusters.update(data.get("_clusters", {}))
-    _steps.update(data.get("_steps", {}))
-    _block_public_access.update(data.get("_block_public_access", {}))
+    cluster_regions = {
+        (account_id, cluster_id): region
+        for (account_id, region, cluster_id), _cluster in _clusters.all_items()
+    }
+    _restore_steps(data.get("_steps", {}), cluster_regions)
+    _restore_block_public_access(data.get("_block_public_access", {}))
 
 
-try:
-    _restored = load_state("emr")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
+def _restore_steps(restored, cluster_regions):
+    """Adopt legacy step lists into their parent cluster's region."""
+    if isinstance(restored, AccountRegionScopedDict):
+        _steps.update(restored)
+        return
+
+    if isinstance(restored, AccountScopedDict):
+        items = restored._data.items()
+    else:
+        account_id = get_account_id()
+        items = (((account_id, key), value) for key, value in restored.items())
+
+    for (account_id, cluster_id), value in items:
+        # Step arguments can contain unrelated regional ARNs, so an orphaned
+        # step list stays in the boot region instead of inferring from content.
+        region = cluster_regions.get(
+            (account_id, cluster_id),
+            get_region(),
+        )
+        _steps.set_scoped(account_id, region, cluster_id, value)
+
+
+def _restore_block_public_access(restored):
+    if isinstance(restored, AccountRegionScopedDict):
+        _block_public_access.update(restored)
+        return
+
+    if isinstance(restored, AccountScopedDict):
+        for (account_id, key), value in restored._data.items():
+            _block_public_access.set_scoped(account_id, get_region(), key, value)
+        return
+
+    if "BlockPublicSecurityGroupRules" in restored:
+        _block_public_access[_BLOCK_PUBLIC_ACCESS_KEY] = {
+            "BlockPublicSecurityGroupRules": restored.get(
+                "BlockPublicSecurityGroupRules", False
+            ),
+            "PermittedPublicSecurityGroupRuleRanges": restored.get(
+                "PermittedPublicSecurityGroupRuleRanges", []
+            ),
+        }
+
+
 
 # ---------------------------------------------------------------------------
 # ID generators
@@ -92,8 +157,23 @@ def _group_id():
     chars = string.ascii_uppercase + string.digits
     return "ig-" + "".join(random.choices(chars, k=13))
 
-def _now_iso():
-    return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+def _now_epoch():
+    return round(time.time(), 3)
+
+def _instance_group_extras(ig):
+    extras = {k: ig[k] for k in ("BidPrice", "Configurations", "CustomAmiId") if k in ig}
+    ebs = ig.get("EbsConfiguration")
+    if ebs:
+        devices = []
+        for cfg in ebs.get("EbsBlockDeviceConfigs", []):
+            for _ in range(cfg.get("VolumesPerInstance", 1)):
+                devices.append({"VolumeSpecification": cfg.get("VolumeSpecification", {}),
+                                "Device": f"/dev/sd{chr(ord('b') + len(devices))}"})
+        extras["EbsBlockDevices"] = devices
+        if "EbsOptimized" in ebs:
+            extras["EbsOptimized"] = ebs["EbsOptimized"]
+    return extras
+
 
 # ---------------------------------------------------------------------------
 # Handlers
@@ -117,7 +197,7 @@ def _run_job_flow(data):
     job_flow_role = data.get("JobFlowRole", "EMR_EC2_DefaultRole")
     visible_to_all = data.get("VisibleToAllUsers", True)
     termination_protected = instances.get("TerminationProtected", False)
-    now = _now_iso()
+    now = _now_epoch()
 
     # Derive initial state: WAITING if keep_alive, else TERMINATED (no real execution)
     initial_state = "WAITING" if keep_alive else "TERMINATED"
@@ -150,6 +230,7 @@ def _run_job_flow(data):
                 "RequestedInstanceCount": ig.get("InstanceCount", 1),
                 "RunningInstanceCount": ig.get("InstanceCount", 1),
                 "Status": {"State": "RUNNING", "StateChangeReason": {}, "Timeline": {"CreationDateTime": now}},
+                **_instance_group_extras(ig),
             })
     else:
         # Simple mode: MasterInstanceType / SlaveInstanceType / InstanceCount
@@ -182,6 +263,26 @@ def _run_job_flow(data):
 
     collection_type = "INSTANCE_FLEET" if instance_fleets else "INSTANCE_GROUP"
 
+    placement = instances.get("Placement") or {}
+    requested_azs = placement.get("AvailabilityZones") or []
+    ec2_attrs = {
+        "Ec2KeyName": instances.get("Ec2KeyName", ""),
+        "Ec2SubnetId": instances.get("Ec2SubnetId") or (instances.get("Ec2SubnetIds") or [""])[0],
+        "Ec2AvailabilityZone": placement.get("AvailabilityZone")
+        or (requested_azs[0] if requested_azs else f"{get_region()}a"),
+        "IamInstanceProfile": job_flow_role,
+        "EmrManagedMasterSecurityGroup": instances.get("EmrManagedMasterSecurityGroup", ""),
+        "EmrManagedSlaveSecurityGroup": instances.get("EmrManagedSlaveSecurityGroup", ""),
+    }
+    if "Ec2SubnetIds" in instances:
+        ec2_attrs["RequestedEc2SubnetIds"] = instances["Ec2SubnetIds"]
+    if requested_azs:
+        ec2_attrs["RequestedEc2AvailabilityZones"] = requested_azs
+    for key in ("ServiceAccessSecurityGroup", "AdditionalMasterSecurityGroups",
+                "AdditionalSlaveSecurityGroups"):
+        if key in instances:
+            ec2_attrs[key] = instances[key]
+
     _clusters[cluster_id] = {
         "Id": cluster_id,
         "Name": name,
@@ -191,14 +292,7 @@ def _run_job_flow(data):
             "StateChangeReason": {"Code": "", "Message": ""},
             "Timeline": {"CreationDateTime": now, "ReadyDateTime": now},
         },
-        "Ec2InstanceAttributes": {
-            "Ec2KeyName": instances.get("Ec2KeyName", ""),
-            "Ec2SubnetId": instances.get("Ec2SubnetId", ""),
-            "Ec2AvailabilityZone": f"{get_region()}a",
-            "IamInstanceProfile": job_flow_role,
-            "EmrManagedMasterSecurityGroup": instances.get("EmrManagedMasterSecurityGroup", ""),
-            "EmrManagedSlaveSecurityGroup": instances.get("EmrManagedSlaveSecurityGroup", ""),
-        },
+        "Ec2InstanceAttributes": ec2_attrs,
         "InstanceCollectionType": collection_type,
         "LogUri": log_uri,
         "ReleaseLabel": release_label,
@@ -215,6 +309,22 @@ def _run_job_flow(data):
         "InstanceFleets": instance_fleets,
         "InstanceGroups": instance_groups,
     }
+    cluster = _clusters[cluster_id]
+    for key in ("LogEncryptionKmsKeyId", "Configurations", "SecurityConfiguration",
+                "AutoScalingRole", "ScaleDownBehavior", "CustomAmiId", "EbsRootVolumeSize",
+                "EbsRootVolumeIops", "EbsRootVolumeThroughput", "RepoUpgradeOnBoot",
+                "KerberosAttributes", "OSReleaseLabel", "ExtendedSupport",
+                "MonitoringConfiguration", "SessionEnabled"):
+        if key in data:
+            cluster[key] = data[key]
+    if "CustomAmiId" in data:
+        cluster.setdefault("RepoUpgradeOnBoot", "SECURITY")
+    if "AmiVersion" in data:
+        cluster["RequestedAmiVersion"] = data["AmiVersion"]
+    if "PlacementGroupConfigs" in data:
+        cluster["PlacementGroups"] = data["PlacementGroupConfigs"]
+    if "UnhealthyNodeReplacement" in instances:
+        cluster["UnhealthyNodeReplacement"] = instances["UnhealthyNodeReplacement"]
 
     # Steps passed at creation time
     steps_in = data.get("Steps", [])
@@ -231,7 +341,19 @@ def _describe_cluster(data):
     if not cluster:
         return error_response_json("InvalidRequestException",
                                    f"Cluster id '{cluster_id}' is not valid.", 400)
-    return json_response({"Cluster": cluster})
+    return json_response(to_output_shape("emr", "DescribeClusterOutput", {"Cluster": cluster}))
+
+
+def _page50(data, items, key):
+    try:
+        start = max(int(base64.b64decode(data.get("Marker") or "", validate=True).decode() or 0), 0)
+    except ValueError:
+        start = 0
+    end = start + 50
+    out = {key: items[start:end]}
+    if end < len(items):
+        out["Marker"] = base64.b64encode(str(end).encode()).decode()
+    return out
 
 
 def _list_clusters(data):
@@ -248,7 +370,7 @@ def _list_clusters(data):
             "NormalizedInstanceHours": c["NormalizedInstanceHours"],
             "ClusterArn": c["ClusterArn"],
         })
-    return json_response({"Clusters": result})
+    return json_response(_page50(data, result, "Clusters"))
 
 
 def _terminate_job_flows(data):
@@ -274,7 +396,12 @@ def _modify_cluster(data):
                                    f"Cluster id '{cluster_id}' is not valid.", 400)
     if "StepConcurrencyLevel" in data:
         cluster["StepConcurrencyLevel"] = data["StepConcurrencyLevel"]
-    return json_response({"StepConcurrencyLevel": cluster["StepConcurrencyLevel"]})
+    if "ExtendedSupport" in data:
+        cluster["ExtendedSupport"] = data["ExtendedSupport"]
+    out = {"StepConcurrencyLevel": cluster["StepConcurrencyLevel"]}
+    if "ExtendedSupport" in cluster:
+        out["ExtendedSupport"] = cluster["ExtendedSupport"]
+    return json_response(out)
 
 
 def _set_termination_protection(data):
@@ -300,7 +427,7 @@ def _set_visible_to_all_users(data):
 # ---------------------------------------------------------------------------
 
 def _make_step(step_config):
-    now = _now_iso()
+    now = _now_epoch()
     return {
         "Id": _step_id(),
         "Name": step_config.get("Name", ""),
@@ -348,7 +475,7 @@ def _list_steps(data):
     steps = _steps.get(cluster_id, [])
     if state_filter:
         steps = [s for s in steps if s["Status"]["State"] in state_filter]
-    return json_response({"Steps": steps})
+    return json_response(_page50(data, steps, "Steps"))
 
 
 def _cancel_steps(data):
@@ -376,7 +503,7 @@ def _add_instance_fleet(data):
         return error_response_json("InvalidRequestException",
                                    f"Cluster id '{cluster_id}' is not valid.", 400)
     fleet = data.get("InstanceFleet", {})
-    now = _now_iso()
+    now = _now_epoch()
     fleet_id = _fleet_id()
     record = {
         "Id": fleet_id,
@@ -432,7 +559,7 @@ def _add_instance_groups(data):
     if not cluster:
         return error_response_json("InvalidRequestException",
                                    f"Cluster id '{cluster_id}' is not valid.", 400)
-    now = _now_iso()
+    now = _now_epoch()
     group_ids = []
     for ig in data.get("InstanceGroups", []):
         gid = _group_id()
@@ -445,6 +572,7 @@ def _add_instance_groups(data):
             "RequestedInstanceCount": ig.get("InstanceCount", 1),
             "RunningInstanceCount": ig.get("InstanceCount", 1),
             "Status": {"State": "RUNNING", "StateChangeReason": {}, "Timeline": {"CreationDateTime": now}},
+            **_instance_group_extras(ig),
         }
         cluster["InstanceGroups"].append(record)
         group_ids.append(gid)
@@ -537,9 +665,9 @@ def _remove_tags(data):
 
 def _get_block_public_access_configuration(data):
     return json_response({
-        "BlockPublicAccessConfiguration": _block_public_access,
+        "BlockPublicAccessConfiguration": _get_block_public_access(),
         "BlockPublicAccessConfigurationMetadata": {
-            "CreationDateTime": _now_iso(),
+            "CreationDateTime": _now_epoch(),
             "CreatedByArn": f"arn:aws:iam::{get_account_id()}:root",
         },
     })
@@ -547,10 +675,11 @@ def _get_block_public_access_configuration(data):
 
 def _put_block_public_access_configuration(data):
     config = data.get("BlockPublicAccessConfiguration", {})
-    _block_public_access["BlockPublicSecurityGroupRules"] = config.get(
+    scoped_config = _get_block_public_access()
+    scoped_config["BlockPublicSecurityGroupRules"] = config.get(
         "BlockPublicSecurityGroupRules", False
     )
-    _block_public_access["PermittedPublicSecurityGroupRuleRanges"] = config.get(
+    scoped_config["PermittedPublicSecurityGroupRuleRanges"] = config.get(
         "PermittedPublicSecurityGroupRuleRanges", []
     )
     return json_response({})
@@ -606,7 +735,4 @@ async def handle_request(method, path, headers, body, query_params):
 # ---------------------------------------------------------------------------
 
 def reset():
-    _clusters.clear()
-    _steps.clear()
-    _block_public_access["BlockPublicSecurityGroupRules"] = False
-    _block_public_access["PermittedPublicSecurityGroupRuleRanges"] = []
+    _clear_state()

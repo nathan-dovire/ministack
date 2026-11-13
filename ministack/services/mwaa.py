@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 MWAA (Managed Workflows for Apache Airflow) Service Emulator.
 REST API (path-based routing) for the MWAA control plane.
@@ -21,15 +23,19 @@ import socket
 import threading
 import time
 
-from ministack.core.persistence import load_state
+from ministack.core import container_reaper
+from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import run_offloop
 from ministack.core.responses import (
-    AccountScopedDict,
+    AccountRegionScopedDict,
     apply_image_prefix,
     error_response_json,
     get_account_id,
     get_region,
     json_response,
     new_uuid,
+    set_request_account_id,
+    set_request_region,
 )
 
 logger = logging.getLogger("mwaa")
@@ -39,7 +45,7 @@ MWAA_PERSIST = os.environ.get("MWAA_PERSIST", "0").lower() in ("1", "true", "yes
 DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
 DEFAULT_AIRFLOW_IMAGE = os.environ.get("MWAA_AIRFLOW_IMAGE", "apache/airflow:3.0.6")
 
-_environments = AccountScopedDict()
+_environments = AccountRegionScopedDict()
 _port_counter = [BASE_PORT]
 _allocated_ports: set[int] = set()
 _freed_ports: list[int] = []
@@ -55,37 +61,83 @@ def get_state():
     return {"environments": envs}
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     if not data:
         return
     envs_data = data.get("environments")
-    if not envs_data:
+    if envs_data is None:
         return
-    names_to_restart = []
-    if isinstance(envs_data, AccountScopedDict):
-        for key, env in list(envs_data._data.items()):
-            env["_docker_container_id"] = None
-            env["Status"] = "CREATING"
-            _environments._data[key] = env
-            names_to_restart.append((env.get("Name", key), env))
-    else:
-        for name, env in envs_data.items():
-            env["_docker_container_id"] = None
-            env["Status"] = "CREATING"
-            _environments[name] = env
-            names_to_restart.append((name, env))
+
+    if not isinstance(envs_data, AccountRegionScopedDict):
+        # Pre-regional snapshots used unqualified named volumes. Persist those
+        # names on the migrated environment so this and later regional boots
+        # continue mounting the existing Airflow metadata and DAG contents.
+        legacy_items = (
+            envs_data._data.items()
+            if hasattr(envs_data, "_data")
+            else envs_data.items()
+        )
+        for key, env in legacy_items:
+            env_name = key[-1] if isinstance(key, tuple) else key
+            env.setdefault(
+                "_docker_dags_volume_name",
+                f"ministack-mwaa-{env_name}-dags",
+            )
+            env.setdefault(
+                "_docker_db_volume_name",
+                f"ministack-mwaa-{env_name}-db",
+            )
+
+    _environments.update(envs_data)
 
     # Re-spin containers for persisted environments
-    for name, env in names_to_restart:
-        threading.Thread(target=_start_airflow_container, args=(name, env), daemon=True).start()
+    for (account_id, region, name), env in list(_environments.all_items()):
+        env["_docker_container_id"] = None
+        env["Status"] = "CREATING"
+        threading.Thread(
+            target=_start_airflow_container,
+            args=(account_id, region, name, env),
+            daemon=True,
+        ).start()
 
 
-try:
-    _restored = load_state("mwaa")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted state; continuing with fresh store")
+
+
+def _s3_bucket_from_arn(bucket_arn: str) -> str:
+    try:
+        spec = parse_arn(bucket_arn)
+    except ArnParseError as exc:
+        raise ValueError("SourceBucketArn must be an S3 bucket ARN.") from exc
+
+    if (
+        spec.service != "s3"
+        or spec.region
+        or spec.account_id
+        or not spec.resource
+        or "/" in spec.resource
+        or ":" in spec.resource
+    ):
+        raise ValueError("SourceBucketArn must be an S3 bucket ARN.")
+    return spec.resource
+
+
+def _validate_source_bucket_arn(bucket_arn: str):
+    if not bucket_arn:
+        return None
+    try:
+        _s3_bucket_from_arn(bucket_arn)
+    except ValueError as exc:
+        return error_response_json("ValidationException", str(exc), 400)
+    return None
+
+
+# Cap any single Docker daemon call. docker-py defaults to 60s, which turns a
+# slow or wedged daemon into a minutes-long stall on a request path.
+_DOCKER_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
 
 
 def _get_docker():
@@ -93,7 +145,7 @@ def _get_docker():
     if _docker is None:
         try:
             import docker
-            _docker = docker.from_env()
+            _docker = docker.from_env(timeout=_DOCKER_TIMEOUT)
         except Exception:
             pass
     return _docker
@@ -123,8 +175,11 @@ def _next_port():
         if _freed_ports:
             port = _freed_ports.pop()
         else:
+            from ministack.services.rds import _is_host_port_free
             port = _port_counter[0]
-            _port_counter[0] += 1
+            while not _is_host_port_free(port):  # another container may already publish it
+                port += 1
+            _port_counter[0] = port + 1
         _allocated_ports.add(port)
     return port
 
@@ -180,7 +235,7 @@ def _sync_dags_from_s3(env, docker_client, container):
     try:
         from ministack.services import s3 as s3_svc
         bucket_arn = env.get("SourceBucketArn", "")
-        bucket_name = bucket_arn.split(":")[-1] if bucket_arn else ""
+        bucket_name = _s3_bucket_from_arn(bucket_arn) if bucket_arn else ""
         dag_path = env.get("DagS3Path", "dags/")
 
         if not bucket_name:
@@ -231,7 +286,41 @@ def _sync_dags_from_s3(env, docker_client, container):
         logger.exception("MWAA: failed to sync DAGs from S3")
 
 
-def _start_airflow_container(env_name, env):
+def _ensure_volume(docker_client, volume_name, labels):
+    """Create a labelled named volume so the shutdown sweep can find it; an existing one keeps its data."""
+    try:
+        docker_client.volumes.get(volume_name)
+    except Exception:
+        try:
+            docker_client.volumes.create(name=volume_name, labels=labels)
+        except Exception as e:
+            logger.warning("MWAA: could not create volume %s: %s", volume_name, e)
+
+
+def _remove_volumes(docker_client, env):
+    for field in ("_docker_dags_volume_name", "_docker_db_volume_name"):
+        volume_name = env.get(field)
+        if not volume_name:
+            continue
+        try:
+            docker_client.volumes.get(volume_name).remove()
+        except Exception as e:
+            logger.debug("MWAA: volume removal for %s: %s", volume_name, e)
+
+
+def _start_airflow_container(account_id, region, env_name, env):
+    previous_account = get_account_id()
+    previous_region = get_region()
+    set_request_account_id(account_id)
+    set_request_region(region)
+    try:
+        _start_airflow_container_in_scope(account_id, region, env_name, env)
+    finally:
+        set_request_account_id(previous_account)
+        set_request_region(previous_region)
+
+
+def _start_airflow_container_in_scope(account_id, region, env_name, env):
     docker_client = _get_docker()
     if not docker_client:
         logger.warning("MWAA: Docker not available — environment %s will be stub-only", env_name)
@@ -280,26 +369,52 @@ def _start_airflow_container(env_name, env):
         container_env[f"AIRFLOW__{env_key}"] = value
 
     try:
+        container_name = f"ministack-mwaa-{account_id}-{region}-{env_name}"
+        legacy_container_names = (f"ministack-mwaa-{region}-{env_name}", f"ministack-mwaa-{env_name}")
+
+        # Remove stale current and earlier-scheme containers before binding the
+        # environment's host port. A container left by a previous naming
+        # scheme can otherwise survive an upgrade and block the current one.
+        for stale_name in (container_name, *legacy_container_names):
+            try:
+                existing = docker_client.containers.get(stale_name)
+                existing.remove(force=True, v=True)
+            except Exception:
+                pass
+
         container_kwargs = dict(
             image=image,
             detach=True,
             command="standalone",
             environment=container_env,
-            ports={f"{container_port}/tcp": host_port},
-            name=f"ministack-mwaa-{env_name}",
-            labels={"ministack": "mwaa", "env_name": env_name},
+            ports={f"{container_port}/tcp": container_reaper.published_port(host_port)},
+            name=container_name,
+            labels=container_reaper.own_labels("mwaa", region=region, env_name=env_name, account_id=account_id),
         )
 
         if ms_network:
             container_kwargs["network"] = ms_network
 
         if MWAA_PERSIST:
+            dags_volume_name = env.setdefault(
+                "_docker_dags_volume_name",
+                f"{container_name}-dags",
+            )
+            db_volume_name = env.setdefault(
+                "_docker_db_volume_name",
+                f"{container_name}-db",
+            )
+            for volume_name in (dags_volume_name, db_volume_name):
+                _ensure_volume(docker_client, volume_name, container_reaper.own_labels(
+                    "mwaa", region=region, env_name=env_name, account_id=account_id))
             container_kwargs["volumes"] = {
-                f"ministack-mwaa-{env_name}-dags": {"bind": "/opt/airflow/dags", "mode": "rw"},
-                f"ministack-mwaa-{env_name}-db": {"bind": "/opt/airflow", "mode": "rw"},
+                dags_volume_name: {"bind": "/opt/airflow/dags", "mode": "rw"},
+                db_volume_name: {"bind": "/opt/airflow", "mode": "rw"},
             }
 
-        container = docker_client.containers.run(**container_kwargs)
+        container, host_port = container_reaper.run_on_free_port(
+            docker_client, lambda kwargs: docker_client.containers.run(**kwargs), container_kwargs, _next_port)
+        env["_host_port"] = host_port
         env["_docker_container_id"] = container.id
 
         internal_host = "localhost"
@@ -316,27 +431,35 @@ def _start_airflow_container(env_name, env):
         env["WebserverUrl"] = f"{internal_host}:{internal_port}"
 
         def _bg_init():
-            if _wait_for_port(internal_host, internal_port, timeout=120):
-                logger.info("MWAA: Airflow container for %s ready at %s:%s",
-                            env_name, internal_host, internal_port)
-                env["Status"] = "AVAILABLE"
-                # Sync DAGs from S3 once Airflow is ready
-                _sync_dags_from_s3(env, docker_client, container)
-                # Airflow 2 standalone generates a random admin password and
-                # writes it to standalone_admin_password.txt. Capture it so
-                # _invoke_rest_api can authenticate against /api/v1/ — basic
-                # auth `admin:admin` from the env vars only takes effect
-                # outside standalone mode. v3 uses Simple Auth Manager with
-                # ALL_ADMINS=true so no token is needed.
-                if not is_v3:
-                    _capture_v2_admin_password(env, container)
-            else:
-                logger.warning("MWAA: Airflow container for %s not ready after timeout", env_name)
-                env["Status"] = "CREATE_FAILED"
-                env.setdefault("LastUpdate", {})["Error"] = {
-                    "ErrorCode": "CONTAINER_STARTUP_TIMEOUT",
-                    "ErrorMessage": "Airflow container did not become healthy within 120s",
-                }
+            previous_account = get_account_id()
+            previous_region = get_region()
+            set_request_account_id(account_id)
+            set_request_region(region)
+            try:
+                if _wait_for_port(internal_host, internal_port, timeout=120):
+                    logger.info("MWAA: Airflow container for %s ready at %s:%s",
+                                env_name, internal_host, internal_port)
+                    env["Status"] = "AVAILABLE"
+                    # Sync DAGs from S3 once Airflow is ready
+                    _sync_dags_from_s3(env, docker_client, container)
+                    # Airflow 2 standalone generates a random admin password and
+                    # writes it to standalone_admin_password.txt. Capture it so
+                    # _invoke_rest_api can authenticate against /api/v1/ — basic
+                    # auth `admin:admin` from the env vars only takes effect
+                    # outside standalone mode. v3 uses Simple Auth Manager with
+                    # ALL_ADMINS=true so no token is needed.
+                    if not is_v3:
+                        _capture_v2_admin_password(env, container)
+                else:
+                    logger.warning("MWAA: Airflow container for %s not ready after timeout", env_name)
+                    env["Status"] = "CREATE_FAILED"
+                    env.setdefault("LastUpdate", {})["Error"] = {
+                        "ErrorCode": "CONTAINER_STARTUP_TIMEOUT",
+                        "ErrorMessage": "Airflow container did not become healthy within 120s",
+                    }
+            finally:
+                set_request_account_id(previous_account)
+                set_request_region(previous_region)
 
         threading.Thread(target=_bg_init, daemon=True).start()
 
@@ -359,16 +482,30 @@ def _build_env_response(env):
 # ── API Handlers ──────────────────────────────────────────────────────────────
 
 
+_OPTIONAL_ENV_FIELDS = (
+    "PluginsS3Path", "PluginsS3ObjectVersion", "RequirementsS3Path",
+    "RequirementsS3ObjectVersion", "StartupScriptS3Path", "StartupScriptS3ObjectVersion",
+    "WeeklyMaintenanceWindowStart",
+)
+
+
 def _create_environment(method, path, headers, body, query_params):
     data = json.loads(body) if body else {}
     name = path.strip("/").split("/")[-1]
 
     if name in _environments:
-        return error_response_json("ResourceAlreadyExistsException",
-                                   f"Environment {name} already exists", 409)
+        # AWS MWAA service model has no ResourceAlreadyExistsException — the
+        # documented errors for CreateEnvironment are ValidationException,
+        # InternalServerException, and ServiceUnavailableException only.
+        return error_response_json("ValidationException",
+                                   f"Environment {name} already exists", 400)
 
     account_id = get_account_id()
     region = get_region()
+    source_bucket_arn = data.get("SourceBucketArn", "")
+    validation_error = _validate_source_bucket_arn(source_bucket_arn)
+    if validation_error:
+        return validation_error
 
     env = {
         "Name": name,
@@ -377,7 +514,7 @@ def _create_environment(method, path, headers, body, query_params):
         "AirflowVersion": data.get("AirflowVersion", "3.0.6"),
         "EnvironmentClass": data.get("EnvironmentClass", "mw1.small"),
         "WebserverAccessMode": data.get("WebserverAccessMode", "PUBLIC_ONLY"),
-        "SourceBucketArn": data.get("SourceBucketArn", ""),
+        "SourceBucketArn": source_bucket_arn,
         "DagS3Path": data.get("DagS3Path", "dags/"),
         "ExecutionRoleArn": data.get("ExecutionRoleArn", ""),
         "NetworkConfiguration": data.get("NetworkConfiguration", {}),
@@ -395,11 +532,18 @@ def _create_environment(method, path, headers, body, query_params):
         "ServiceRoleArn": f"arn:aws:iam::{account_id}:role/aws-service-role/airflow.amazonaws.com/AWSServiceRoleForAmazonMWAA",
         "_docker_container_id": None,
     }
+    for field in _OPTIONAL_ENV_FIELDS + ("KmsKey", "EndpointManagement"):
+        if field in data:
+            env[field] = data[field]
 
     _environments[name] = env
 
     # Start container in background
-    threading.Thread(target=_start_airflow_container, args=(name, env), daemon=True).start()
+    threading.Thread(
+        target=_start_airflow_container,
+        args=(account_id, region, name, env),
+        daemon=True,
+    ).start()
 
     return json_response({"Arn": env["Arn"]}, status=200)
 
@@ -427,9 +571,12 @@ def _delete_environment(method, path, headers, body, query_params):
             try:
                 container = docker_client.containers.get(container_id)
                 container.stop(timeout=5)
-                container.remove(force=True)
+                container.remove(force=True, v=True)
             except Exception:
                 logger.debug("MWAA: container cleanup for %s failed (may be already gone)", name)
+    if env.get("_docker_dags_volume_name") or env.get("_docker_db_volume_name"):
+        if docker_client := _get_docker():
+            _remove_volumes(docker_client, env)
 
     _release_port(env.get("_host_port"))
     del _environments[name]
@@ -444,20 +591,47 @@ def _update_environment(method, path, headers, body, query_params):
         return error_response_json("ResourceNotFoundException",
                                    f"Environment {name} not found", 404)
 
+    if "SourceBucketArn" in data:
+        validation_error = _validate_source_bucket_arn(data["SourceBucketArn"])
+        if validation_error:
+            return validation_error
+
     for field in ("AirflowConfigurationOptions", "LoggingConfiguration",
                   "MaxWorkers", "MinWorkers", "Schedulers",
                   "EnvironmentClass", "ExecutionRoleArn", "SourceBucketArn",
-                  "DagS3Path", "NetworkConfiguration", "WebserverAccessMode"):
+                  "DagS3Path", "WebserverAccessMode",
+                  "AirflowVersion", "MaxWebservers", "MinWebservers") + _OPTIONAL_ENV_FIELDS:
         if field in data:
             env[field] = data[field]
+
+    if "NetworkConfiguration" in data:
+        env["NetworkConfiguration"] = {**env.get("NetworkConfiguration", {}),
+                                       **data["NetworkConfiguration"]}
 
     env["LastUpdate"] = {"Status": "SUCCESS"}
     return json_response({"Arn": env["Arn"]})
 
 
+def _page(items, limit, token):
+    try:
+        start = max(int(token), 0) if token else 0
+    except (TypeError, ValueError):
+        start = 0
+    try:
+        limit = int(limit) if limit else 0
+    except (TypeError, ValueError):
+        limit = 0
+    end = start + limit if limit > 0 else len(items)
+    return items[start:end], (str(end) if end < len(items) else None)
+
+
 def _list_environments(method, path, headers, body, query_params):
-    names = list(_environments.keys())
-    return json_response({"Environments": names})
+    q = {k: (v[0] if isinstance(v, list) else v) for k, v in (query_params or {}).items()}
+    names, nxt = _page(list(_environments.keys()), q.get("MaxResults"), q.get("NextToken"))
+    resp = {"Environments": names}
+    if nxt:
+        resp["NextToken"] = nxt
+    return json_response(resp)
 
 
 def _create_web_login_token(method, path, headers, body, query_params):
@@ -561,8 +735,12 @@ async def _invoke_rest_api(method, path, headers, body, query_params):
             "RestApiStatusCode": resp.status_code,
             "RestApiResponse": payload,
         })
-    except Exception as e:
-        return error_response_json("InternalServerException", str(e)[:500], 500)
+    except Exception:
+        logger.exception("MWAA InvokeRestApi failure")
+        # AWS doesn't leak the underlying Python exception text. The
+        # InternalServerException message is opaque to the caller.
+        return error_response_json("InternalServerException",
+            "InternalServerException: An internal error has occurred.", 500)
 
 
 # ── Request Router ────────────────────────────────────────────────────────────
@@ -607,29 +785,45 @@ async def handle_request(method, path, headers, body, query_params):
     # CRUD on /environments/{Name}
     if clean_path.startswith("/environments/"):
         if method == "PUT":
-            return _create_environment(method, path, headers, body, query_params)
+            # Spawns the Airflow container: a heavyweight image, slow start.
+            # Off-loop; Airflow does not call back into MiniStack.
+            return await run_offloop(_create_environment, method, path, headers, body, query_params)
         if method == "GET":
             return _get_environment(method, path, headers, body, query_params)
         if method == "PATCH":
-            return _update_environment(method, path, headers, body, query_params)
+            return await run_offloop(_update_environment, method, path, headers, body, query_params)
         if method == "DELETE":
-            return _delete_environment(method, path, headers, body, query_params)
+            return await run_offloop(_delete_environment, method, path, headers, body, query_params)
 
-    return error_response_json("InvalidRequestException",
+    return error_response_json("ValidationException",
                                f"Unknown MWAA path: {method} {path}", 400)
 
 
 def reset():
     """Stop all containers and clear state."""
     docker_client = _get_docker()
-    for name, env in list(_environments.items()):
+    for (_, _, name), env in list(_environments.all_items()):
         container_id = env.get("_docker_container_id")
         if container_id and docker_client:
             try:
                 container = docker_client.containers.get(container_id)
                 container.stop(timeout=5)
-                container.remove(force=True)
+                container.remove(force=True, v=True)
             except Exception:
                 pass
+        if docker_client:
+            _remove_volumes(docker_client, env)
         _release_port(env.get("_host_port"))
     _environments.clear()
+
+
+def _live_container_ids():
+    ids = set()
+    for _key, env in _environments.all_items():
+        cid = env.get("_docker_container_id")
+        if cid:
+            ids.add(cid)
+    return ids
+
+
+container_reaper.register_live_ids("mwaa", _live_container_ids)

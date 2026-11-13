@@ -11,24 +11,50 @@ Tests are split into two sections:
   - Event recording: LookupEvents and filter variants (require recording enabled)
 """
 
+import json
+import os
 import time
+from datetime import datetime, timedelta, timezone
 
 import boto3
 import pytest
 import requests
 from botocore.exceptions import ClientError
 
-ENDPOINT = "http://localhost:4566"
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 REGION = "us-east-1"
+WEST_REGION = "us-west-2"
+DEFAULT_EVENT_SELECTORS = [
+    {"ReadWriteType": "All", "IncludeManagementEvents": True, "DataResources": [], "ExcludeManagementEventSources": []}
+]
+MANAGEMENT_ADVANCED_SELECTORS = [
+    {
+        "Name": "writes",
+        "FieldSelectors": [
+            {"Field": "eventCategory", "Equals": ["Management"]},
+            {"Field": "readOnly", "Equals": ["false"]},
+        ],
+    }
+]
 
 
-def _client(service):
+EMPTY_DEPRECATED_STATUS = {
+    "LatestDeliveryAttemptSucceeded": "",
+    "LatestDeliveryAttemptTime": "",
+    "LatestNotificationAttemptSucceeded": "",
+    "LatestNotificationAttemptTime": "",
+    "TimeLoggingStarted": "",
+    "TimeLoggingStopped": "",
+}
+
+
+def _client(service, region=REGION):
     return boto3.client(
         service,
         endpoint_url=ENDPOINT,
         aws_access_key_id="test",
         aws_secret_access_key="test",
-        region_name=REGION,
+        region_name=region,
     )
 
 
@@ -36,6 +62,21 @@ def _uid():
     import uuid
 
     return uuid.uuid4().hex[:8]
+
+
+def _raw_body(client, method, **params):
+    """Call an operation and return its JSON body before the SDK drops unmodeled members."""
+    bodies = []
+    event = f"before-parse.cloudtrail.{client.meta.method_to_api_mapping[method]}"
+    handler_id = f"raw-body-{_uid()}"
+    client.meta.events.register(
+        event, lambda response_dict, **_: bodies.append(json.loads(response_dict["body"])), unique_id=handler_id
+    )
+    try:
+        getattr(client, method)(**params)
+    finally:
+        client.meta.events.unregister(event, unique_id=handler_id)
+    return bodies[0]
 
 
 @pytest.fixture(scope="module")
@@ -83,6 +124,21 @@ def test_create_trail(ct):
     assert f"/{name}" in resp["TrailARN"]
 
 
+def test_create_trail_recursive_logging_defaults_to_true(ct):
+    name = f"trail-recursive-{_uid()}"
+    assert ct.create_trail(Name=name, S3BucketName="bucket")["RecursiveLogging"] is True
+    assert ct.get_trail(Name=name)["Trail"]["RecursiveLogging"] is True
+    assert ct.describe_trails(trailNameList=[name])["trailList"][0]["RecursiveLogging"] is True
+
+
+def test_create_trail_stores_recursive_logging_false(ct):
+    name = f"trail-recursive-off-{_uid()}"
+    resp = ct.create_trail(Name=name, S3BucketName="bucket", RecursiveLogging=False)
+    assert resp["RecursiveLogging"] is False
+    assert ct.get_trail(Name=name)["Trail"]["RecursiveLogging"] is False
+    assert ct.describe_trails(trailNameList=[name])["trailList"][0]["RecursiveLogging"] is False
+
+
 def test_create_trail_duplicate(ct):
     name = f"trail-dup-{_uid()}"
     ct.create_trail(Name=name, S3BucketName="bucket")
@@ -99,10 +155,218 @@ def test_get_trail(ct):
     assert "TrailARN" in resp["Trail"]
 
 
+def test_get_trail_and_describe_trails_return_the_trail_shape(ct):
+    name = f"trail-shape-{_uid()}"
+    created = ct.create_trail(Name=name, S3BucketName="bucket")
+    ct.start_logging(Name=name)
+    ct.stop_logging(Name=name)
+    expected = {
+        "Name": name,
+        "S3BucketName": "bucket",
+        "IncludeGlobalServiceEvents": True,
+        "IsMultiRegionTrail": False,
+        "LogFileValidationEnabled": False,
+        "HomeRegion": REGION,
+        "TrailARN": created["TrailARN"],
+        "HasCustomEventSelectors": False,
+        "HasInsightSelectors": False,
+        "IsOrganizationTrail": False,
+        "RecursiveLogging": True,
+    }
+    assert _raw_body(ct, "get_trail", Name=name)["Trail"] == expected
+    assert _raw_body(ct, "describe_trails", trailNameList=[name])["trailList"] == [expected]
+
+
+def test_get_trail_by_arn(ct):
+    name = f"trail-get-arn-{_uid()}"
+    created = ct.create_trail(Name=name, S3BucketName="bucket")
+    resp = ct.get_trail(Name=created["TrailARN"])
+    assert resp["Trail"]["Name"] == name
+
+
+def test_get_trail_rejects_wrong_service_arn(ct):
+    name = f"trail-wrong-service-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket")
+    with pytest.raises(ClientError) as exc:
+        ct.get_trail(Name=f"arn:aws:sns:{REGION}:000000000000:trail/{name}")
+    assert exc.value.response["Error"]["Code"] == "CloudTrailARNInvalidException"
+
+
+def test_get_trail_rejects_malformed_arn_identifier(ct):
+    with pytest.raises(ClientError) as exc:
+        ct.get_trail(Name="arn:nope")
+    assert exc.value.response["Error"]["Code"] == "CloudTrailARNInvalidException"
+
+
+@pytest.mark.parametrize("partition", ["aws-cn", "notaws"])
+def test_get_trail_rejects_non_aws_partition_as_invalid_trail_name(ct, partition):
+    arn = f"arn:{partition}:cloudtrail:{REGION}:000000000000:trail/missing-{_uid()}"
+    with pytest.raises(ClientError) as exc:
+        ct.get_trail(Name=arn)
+    assert exc.value.response["Error"]["Code"] == "InvalidTrailNameException"
+
+
+def test_get_trail_does_not_resolve_foreign_region_arn_by_tail(ct):
+    name = f"trail-foreign-region-{_uid()}"
+    arn = ct.create_trail(Name=name, S3BucketName="bucket")["TrailARN"]
+    foreign_arn = arn.replace(f":{REGION}:", ":us-west-2:")
+    with pytest.raises(ClientError) as exc:
+        ct.get_trail(Name=foreign_arn)
+    assert exc.value.response["Error"]["Code"] == "TrailNotFoundException"
+
+
+def test_read_trail_by_arn_from_different_request_region(ct):
+    name = f"trail-cross-region-read-{_uid()}"
+    arn = ct.create_trail(Name=name, S3BucketName="bucket")["TrailARN"]
+    west_ct = _client("cloudtrail", region=WEST_REGION)
+
+    get_resp = west_ct.get_trail(Name=arn)
+    assert get_resp["Trail"]["Name"] == name
+
+    status_resp = west_ct.get_trail_status(Name=arn)
+    assert status_resp["IsLogging"] is False
+
+    desc_resp = west_ct.describe_trails(trailNameList=[arn])
+    assert [trail["TrailARN"] for trail in desc_resp["trailList"]] == [arn]
+
+
+def test_single_region_trail_is_visible_only_from_home_region_by_name(ct):
+    name = f"trail-sr-scope-{_uid()}"
+    arn = ct.create_trail(Name=name, S3BucketName="bucket")["TrailARN"]
+    west_ct = _client("cloudtrail", region=WEST_REGION)
+
+    with pytest.raises(ClientError) as exc:
+        west_ct.get_trail(Name=name)
+    assert exc.value.response["Error"]["Code"] == "TrailNotFoundException"
+
+    assert not any(t["Name"] == name for t in west_ct.describe_trails()["trailList"])
+    assert not any(t["Name"] == name for t in west_ct.list_trails()["Trails"])
+    assert west_ct.describe_trails(trailNameList=[name])["trailList"] == []
+
+    # A full ARN is unambiguous and remains readable across regions.
+    assert west_ct.get_trail(Name=arn)["Trail"]["Name"] == name
+
+
+def test_multi_region_trail_is_shadow_visible_from_peer_region(ct):
+    name = f"trail-mr-scope-{_uid()}"
+    arn = ct.create_trail(
+        Name=name,
+        S3BucketName="bucket",
+        IsMultiRegionTrail=True,
+    )["TrailARN"]
+    selectors = [{**DEFAULT_EVENT_SELECTORS[0], "ReadWriteType": "WriteOnly"}]
+    ct.put_event_selectors(TrailName=name, EventSelectors=selectors)
+    west_ct = _client("cloudtrail", region=WEST_REGION)
+
+    assert west_ct.get_trail(Name=name)["Trail"]["HomeRegion"] == REGION
+    assert west_ct.get_trail_status(Name=name)["IsLogging"] is False
+    assert west_ct.describe_trails(trailNameList=[name])["trailList"][0]["TrailARN"] == arn
+    assert any(t["TrailARN"] == arn for t in west_ct.describe_trails()["trailList"])
+    assert any(t["TrailARN"] == arn for t in west_ct.list_trails()["Trails"])
+    assert west_ct.get_event_selectors(TrailName=name)["EventSelectors"] == selectors
+
+
+def test_describe_trails_can_exclude_multi_region_shadow_trails(ct):
+    name = f"trail-mr-shadow-{_uid()}"
+    arn = ct.create_trail(
+        Name=name,
+        S3BucketName="bucket",
+        IsMultiRegionTrail=True,
+    )["TrailARN"]
+    west_ct = _client("cloudtrail", region=WEST_REGION)
+
+    assert any(t["TrailARN"] == arn for t in west_ct.describe_trails()["trailList"])
+    assert west_ct.describe_trails(includeShadowTrails=False)["trailList"] == []
+    assert west_ct.describe_trails(
+        trailNameList=[name], includeShadowTrails=False
+    )["trailList"] == []
+
+
+def test_mutations_from_peer_region_follow_home_region_rules(ct):
+    mr_name = f"trail-mr-mutate-{_uid()}"
+    sr_name = f"trail-sr-mutate-{_uid()}"
+    mr_arn = ct.create_trail(
+        Name=mr_name,
+        S3BucketName="bucket",
+        IsMultiRegionTrail=True,
+    )["TrailARN"]
+    ct.create_trail(Name=sr_name, S3BucketName="bucket")
+    west_ct = _client("cloudtrail", region=WEST_REGION)
+
+    for operation, kwargs in (
+        (west_ct.update_trail, {"Name": mr_name, "S3BucketName": "west"}),
+        (west_ct.stop_logging, {"Name": mr_name}),
+        (
+            west_ct.put_event_selectors,
+            {
+                "TrailName": mr_name,
+                "EventSelectors": [{"ReadWriteType": "All", "IncludeManagementEvents": True}],
+            },
+        ),
+        (west_ct.delete_trail, {"Name": mr_name}),
+    ):
+        with pytest.raises(ClientError) as exc:
+            operation(**kwargs)
+        assert exc.value.response["Error"]["Code"] == "InvalidHomeRegionException"
+
+    with pytest.raises(ClientError) as exc:
+        west_ct.update_trail(Name=mr_arn, S3BucketName="west")
+    assert exc.value.response["Error"]["Code"] == "InvalidHomeRegionException"
+
+    with pytest.raises(ClientError) as exc:
+        west_ct.update_trail(Name=sr_name, S3BucketName="west")
+    assert exc.value.response["Error"]["Code"] == "TrailNotFoundException"
+
+    ct.update_trail(Name=mr_name, S3BucketName="east")
+    assert ct.get_trail(Name=mr_name)["Trail"]["S3BucketName"] == "east"
+
+
+def test_multi_region_trail_name_reserves_all_regions(ct):
+    name = f"trail-name-scope-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket", IsMultiRegionTrail=True)
+    west_ct = _client("cloudtrail", region=WEST_REGION)
+
+    with pytest.raises(ClientError) as exc:
+        west_ct.create_trail(Name=name, S3BucketName="bucket")
+    assert exc.value.response["Error"]["Code"] == "TrailAlreadyExistsException"
+
+    single_region_name = f"trail-sr-name-scope-{_uid()}"
+    east_arn = ct.create_trail(Name=single_region_name, S3BucketName="east")["TrailARN"]
+    west_arn = west_ct.create_trail(Name=single_region_name, S3BucketName="west")["TrailARN"]
+
+    assert east_arn != west_arn
+    assert ct.get_trail(Name=single_region_name)["Trail"]["S3BucketName"] == "east"
+    assert west_ct.get_trail(Name=single_region_name)["Trail"]["S3BucketName"] == "west"
+
+    west_ct.delete_trail(Name=single_region_name)
+    assert ct.get_trail(Name=single_region_name)["Trail"]["TrailARN"] == east_arn
+
+
+def test_update_trail_to_multi_region_rejects_peer_region_name_collision(ct):
+    name = f"trail-convert-collision-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="east")
+    west_ct = _client("cloudtrail", region=WEST_REGION)
+    west_ct.create_trail(Name=name, S3BucketName="west")
+
+    with pytest.raises(ClientError) as exc:
+        ct.update_trail(Name=name, IsMultiRegionTrail=True)
+    assert exc.value.response["Error"]["Code"] == "TrailAlreadyExistsException"
+
+    assert ct.get_trail(Name=name)["Trail"]["IsMultiRegionTrail"] is False
+    assert west_ct.get_trail(Name=name)["Trail"]["S3BucketName"] == "west"
+
+
 def test_get_trail_not_found(ct):
     with pytest.raises(ClientError) as exc:
         ct.get_trail(Name=f"nonexistent-{_uid()}")
     assert "TrailNotFoundException" in str(exc.value)
+
+
+def test_get_trail_missing_aws_partition_arn_returns_not_found(ct):
+    arn = f"arn:aws:cloudtrail:{REGION}:000000000000:trail/missing-{_uid()}"
+    with pytest.raises(ClientError) as exc:
+        ct.get_trail(Name=arn)
+    assert exc.value.response["Error"]["Code"] == "TrailNotFoundException"
 
 
 def test_delete_trail(ct):
@@ -143,7 +407,36 @@ def test_get_trail_status(ct):
     name = f"trail-status-{_uid()}"
     ct.create_trail(Name=name, S3BucketName="bucket")
     resp = ct.get_trail_status(Name=name)
-    assert resp["IsLogging"] is True
+    assert resp["IsLogging"] is False
+
+
+def test_new_trail_is_not_logging_until_started(ct):
+    name = f"trail-new-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket")
+    status = ct.get_trail_status(Name=name)
+    status.pop("ResponseMetadata")
+    assert status == {"IsLogging": False, **EMPTY_DEPRECATED_STATUS}
+
+    ct.start_logging(Name=name)
+    status = ct.get_trail_status(Name=name)
+    status.pop("ResponseMetadata")
+    assert status.keys() == {"IsLogging", "StartLoggingTime", *EMPTY_DEPRECATED_STATUS}
+    assert status["IsLogging"] is True
+
+
+def test_get_trail_status_returns_the_deprecated_string_members(ct):
+    name = f"trail-deprecated-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket")
+    ct.start_logging(Name=name)
+    ct.stop_logging(Name=name)
+    status = ct.get_trail_status(Name=name)
+    assert {key: status[key] for key in EMPTY_DEPRECATED_STATUS} == {
+        **EMPTY_DEPRECATED_STATUS,
+        "TimeLoggingStarted": status["StartLoggingTime"].astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "TimeLoggingStopped": status["StopLoggingTime"].astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    raw = _raw_body(ct, "get_trail_status", Name=name)
+    assert all(isinstance(raw[key], int) for key in ("StartLoggingTime", "StopLoggingTime"))
 
 
 def test_get_trail_status_not_found(ct):
@@ -164,6 +457,7 @@ def test_start_stop_logging_flips_is_logging_state(ct):
     aws_cloudtrail data source asserts on this."""
     name = f"trail-state-{_uid()}"
     ct.create_trail(Name=name, S3BucketName="bucket")
+    ct.start_logging(Name=name)
     assert ct.get_trail_status(Name=name)["IsLogging"] is True
 
     ct.stop_logging(Name=name)
@@ -173,6 +467,38 @@ def test_start_stop_logging_flips_is_logging_state(ct):
 
     ct.start_logging(Name=name)
     assert ct.get_trail_status(Name=name)["IsLogging"] is True
+
+
+def test_restarted_trail_keeps_stop_logging_time(ct):
+    name = f"trail-restart-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket")
+    ct.start_logging(Name=name)
+    ct.stop_logging(Name=name)
+    stopped = ct.get_trail_status(Name=name)
+
+    ct.start_logging(Name=name)
+    status = ct.get_trail_status(Name=name)
+    assert status["IsLogging"] is True
+    assert status["StopLoggingTime"] == stopped["StopLoggingTime"]
+    assert status["StartLoggingTime"] >= stopped["StartLoggingTime"]
+
+
+def test_stop_logging_records_a_stop_only_on_a_logging_trail(ct):
+    name = f"trail-stop-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket")
+    ct.stop_logging(Name=name)
+    status = ct.get_trail_status(Name=name)
+    assert "StopLoggingTime" not in status
+    assert status["TimeLoggingStopped"] == ""
+
+    ct.start_logging(Name=name)
+    ct.stop_logging(Name=name)
+    stopped = ct.get_trail_status(Name=name)
+    time.sleep(1.1)
+    ct.stop_logging(Name=name)
+    status = ct.get_trail_status(Name=name)
+    assert status["StopLoggingTime"] == stopped["StopLoggingTime"]
+    assert status["TimeLoggingStopped"] == stopped["TimeLoggingStopped"]
 
 
 def test_list_trails_returns_summaries(ct):
@@ -201,6 +527,96 @@ def test_update_trail_persists_fields(ct):
     assert desc["IsMultiRegionTrail"] is True
 
 
+def test_update_trail_sets_and_keeps_recursive_logging(ct):
+    name = f"trail-update-recursive-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket")
+    assert ct.update_trail(Name=name, RecursiveLogging=False)["RecursiveLogging"] is False
+    assert ct.get_trail(Name=name)["Trail"]["RecursiveLogging"] is False
+    # An update that leaves the member out keeps the stored value.
+    assert ct.update_trail(Name=name, IncludeGlobalServiceEvents=False)["RecursiveLogging"] is False
+    assert ct.describe_trails(trailNameList=[name])["trailList"][0]["RecursiveLogging"] is False
+    assert ct.update_trail(Name=name, RecursiveLogging=True)["RecursiveLogging"] is True
+    assert ct.get_trail(Name=name)["Trail"]["RecursiveLogging"] is True
+
+
+def test_create_trail_persists_kms_key_id(ct):
+    """CreateTrail persists KmsKeyId so DescribeTrails/GetTrail echo it. Without this a
+    CMK-encrypted trail reads back with no KmsKeyId, so Terraform's aws_cloudtrail does
+    not converge in one apply (the value only lands via a later UpdateTrail)."""
+    name = f"trail-kms-{_uid()}"
+    kms_arn = f"arn:aws:kms:{REGION}:000000000000:key/{_uid()}"
+    resp = ct.create_trail(Name=name, S3BucketName="bucket", KmsKeyId=kms_arn)
+    assert resp["KmsKeyId"] == kms_arn
+
+    desc = ct.describe_trails(trailNameList=[name])["trailList"][0]
+    assert desc["KmsKeyId"] == kms_arn
+
+    got = ct.get_trail(Name=name)["Trail"]
+    assert got["KmsKeyId"] == kms_arn
+
+
+def test_create_trail_normalizes_bare_kms_key_id(ct):
+    """A bare KMS key id is returned as a full key ARN, matching real AWS, which
+    always echoes the CMK as an ARN — so a trail created with a key id shows no diff."""
+    name = f"trail-kmsid-{_uid()}"
+    key_id = f"{_uid()}-{_uid()}"
+    resp = ct.create_trail(Name=name, S3BucketName="bucket", KmsKeyId=key_id)
+    assert resp["KmsKeyId"] == f"arn:aws:kms:{REGION}:000000000000:key/{key_id}"
+    desc = ct.describe_trails(trailNameList=[name])["trailList"][0]
+    assert desc["KmsKeyId"] == resp["KmsKeyId"]
+
+
+def test_create_trail_without_cmk_omits_kms_key_id(ct):
+    """A trail created without a CMK omits KmsKeyId entirely rather than returning "".
+    Real AWS omits unset optional fields; emitting an empty string for an ARN-typed
+    field makes the Terraform aws provider fail (`parsing ... ARN (): arn: invalid
+    prefix`), so guard that neither the create response nor the read-back carries one."""
+    name = f"trail-nocmk-{_uid()}"
+    resp = ct.create_trail(Name=name, S3BucketName="bucket")
+    assert "KmsKeyId" not in resp
+    assert "SnsTopicARN" not in resp
+
+    desc = ct.describe_trails(trailNameList=[name])["trailList"][0]
+    assert "KmsKeyId" not in desc
+    assert "SnsTopicARN" not in desc
+
+
+def test_create_trail_keeps_kms_alias(ct):
+    """An ``alias/...`` reference is echoed verbatim — real AWS resolves it to the
+    target key ARN, but the emulator keeps the caller's value rather than fabricate a
+    wrong ARN (resolving the alias would need a KMS lookup it does not do)."""
+    name = f"trail-alias-{_uid()}"
+    alias = f"alias/ct-{_uid()}"
+    resp = ct.create_trail(Name=name, S3BucketName="bucket", KmsKeyId=alias)
+    assert resp["KmsKeyId"] == alias
+    assert ct.describe_trails(trailNameList=[name])["trailList"][0]["KmsKeyId"] == alias
+
+
+def test_update_trail_normalizes_kms_key_id(ct):
+    """UpdateTrail normalizes KmsKeyId the same way CreateTrail does: a bare key id
+    becomes a full key ARN; an already-full ARN is left as-is."""
+    name = f"trail-upkms-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket")
+    key_id = f"{_uid()}-{_uid()}"
+    out = ct.update_trail(Name=name, KmsKeyId=key_id)
+    assert out["KmsKeyId"] == f"arn:aws:kms:{REGION}:000000000000:key/{key_id}"
+    assert ct.describe_trails(trailNameList=[name])["trailList"][0]["KmsKeyId"] == out["KmsKeyId"]
+    full = f"arn:aws:kms:{REGION}:000000000000:key/{_uid()}"
+    assert ct.update_trail(Name=name, KmsKeyId=full)["KmsKeyId"] == full
+
+
+def test_update_trail_without_cmk_omits_kms_key_id(ct):
+    """UpdateTrail on a trail with no CMK omits KmsKeyId rather than returning "".
+    AWS omits unset optional fields; an empty ARN makes the Terraform aws provider fail
+    (`parsing ... ARN (): arn: invalid prefix`), so neither the UpdateTrail response nor
+    the read-back may carry one — matching CreateTrail and DescribeTrails/GetTrail."""
+    name = f"trail-upnocmk-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket")
+    out = ct.update_trail(Name=name, S3KeyPrefix="logs/")
+    assert "KmsKeyId" not in out
+    assert "KmsKeyId" not in ct.describe_trails(trailNameList=[name])["trailList"][0]
+
+
 def test_start_logging_not_found(ct):
     with pytest.raises(ClientError) as exc:
         ct.start_logging(Name=f"nonexistent-{_uid()}")
@@ -214,23 +630,114 @@ def test_stop_logging_not_found(ct):
 
 
 def test_put_get_event_selectors(ct):
+    """Omitted members of a basic selector read back with their defaults."""
     name = f"trail-sel-{_uid()}"
     ct.create_trail(Name=name, S3BucketName="bucket")
-    selectors = [{"ReadWriteType": "All", "IncludeManagementEvents": True, "DataResources": []}]
-    put_resp = ct.put_event_selectors(TrailName=name, EventSelectors=selectors)
+    selectors = [{**DEFAULT_EVENT_SELECTORS[0], "ReadWriteType": "WriteOnly"}]
+    put_resp = ct.put_event_selectors(TrailName=name, EventSelectors=[{"ReadWriteType": "WriteOnly"}])
     assert "TrailARN" in put_resp
     assert put_resp["EventSelectors"] == selectors
 
     get_resp = ct.get_event_selectors(TrailName=name)
     assert get_resp["EventSelectors"] == selectors
-    assert get_resp["AdvancedEventSelectors"] == []
+    assert "AdvancedEventSelectors" not in get_resp
 
 
-def test_get_event_selectors_empty(ct):
-    name = f"trail-nosel-{_uid()}"
+def test_put_event_selectors_rejects_foreign_region_trail_arn(ct):
+    name = f"trail-sel-foreign-{_uid()}"
+    arn = ct.create_trail(Name=name, S3BucketName="bucket")["TrailARN"]
+    foreign_arn = arn.replace(f":{REGION}:", ":us-west-2:")
+    selectors = [{"ReadWriteType": "All", "IncludeManagementEvents": True, "DataResources": []}]
+
+    with pytest.raises(ClientError) as exc:
+        ct.put_event_selectors(TrailName=foreign_arn, EventSelectors=selectors)
+    assert exc.value.response["Error"]["Code"] == "TrailNotFoundException"
+
+    assert ct.get_event_selectors(TrailName=name)["EventSelectors"] == DEFAULT_EVENT_SELECTORS
+
+
+def test_get_event_selectors_by_arn_from_different_request_region(ct):
+    name = f"trail-sel-cross-region-{_uid()}"
+    arn = ct.create_trail(Name=name, S3BucketName="bucket")["TrailARN"]
+    selectors = [{**DEFAULT_EVENT_SELECTORS[0], "ReadWriteType": "WriteOnly"}]
+    ct.put_event_selectors(TrailName=name, EventSelectors=selectors)
+
+    west_ct = _client("cloudtrail", region="us-west-2")
+    resp = west_ct.get_event_selectors(TrailName=arn)
+    assert resp["TrailARN"] == arn
+    assert resp["EventSelectors"] == selectors
+
+
+def test_put_get_advanced_event_selectors(ct):
+    """Advanced selectors are stored and returned without EventSelectors, and basic ones replace them."""
+    name = f"trail-adv-{_uid()}"
     ct.create_trail(Name=name, S3BucketName="bucket")
-    resp = ct.get_event_selectors(TrailName=name)
-    assert resp["EventSelectors"] == []
+    put_resp = ct.put_event_selectors(TrailName=name, AdvancedEventSelectors=MANAGEMENT_ADVANCED_SELECTORS)
+    assert put_resp["AdvancedEventSelectors"] == MANAGEMENT_ADVANCED_SELECTORS
+    assert "EventSelectors" not in put_resp
+    get_resp = ct.get_event_selectors(TrailName=name)
+    assert get_resp["AdvancedEventSelectors"] == MANAGEMENT_ADVANCED_SELECTORS
+    assert "EventSelectors" not in get_resp
+
+    ct.put_event_selectors(TrailName=name, EventSelectors=DEFAULT_EVENT_SELECTORS)
+    get_resp = ct.get_event_selectors(TrailName=name)
+    assert get_resp["EventSelectors"] == DEFAULT_EVENT_SELECTORS
+    assert "AdvancedEventSelectors" not in get_resp
+
+
+def test_put_event_selectors_sets_has_custom_event_selectors(ct):
+    """HasCustomEventSelectors is true for any selectors other than the default one."""
+    name = f"trail-sel-custom-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket")
+    all_management = [{"FieldSelectors": [{"Field": "eventCategory", "Equals": ["Management"]}]}]
+    for kwargs, custom in (
+        ({"EventSelectors": [{"ReadWriteType": "WriteOnly"}]}, True),
+        ({"EventSelectors": [{}]}, False),
+        ({"AdvancedEventSelectors": all_management}, True),
+    ):
+        ct.put_event_selectors(TrailName=name, **kwargs)
+        assert ct.get_trail(Name=name)["Trail"]["HasCustomEventSelectors"] is custom
+        assert ct.describe_trails(trailNameList=[name])["trailList"][0]["HasCustomEventSelectors"] is custom
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        (
+            {"EventSelectors": DEFAULT_EVENT_SELECTORS, "AdvancedEventSelectors": MANAGEMENT_ADVANCED_SELECTORS},
+            "You can select events by using either EventSelectors or AdvancedEventSelectors, but not both.",
+        ),
+        (
+            {},
+            "You must select events by using either EventSelectors or AdvancedEventSelectors, but you cannot use both.",
+        ),
+        ({"EventSelectors": []}, "Specify a valid number of selectors (1 to 5) for your trail"),
+        (
+            {"EventSelectors": DEFAULT_EVENT_SELECTORS * 6},
+            "Specify a valid number of selectors (1 to 5) for your trail",
+        ),
+        ({"AdvancedEventSelectors": []}, "Specify between 1 and 500 selectors for your trail."),
+    ],
+    ids=["both", "neither", "no-basic", "six-basic", "no-advanced"],
+)
+def test_put_event_selectors_rejects_invalid_selector_lists(ct, kwargs, message):
+    """PutEventSelectors takes one to five basic selectors or at least one advanced selector."""
+    name = f"trail-sel-invalid-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket")
+    with pytest.raises(ClientError) as exc:
+        ct.put_event_selectors(TrailName=name, **kwargs)
+    assert exc.value.response["Error"]["Code"] == "InvalidEventSelectorsException"
+    assert exc.value.response["Error"]["Message"] == message
+    assert ct.get_event_selectors(TrailName=name)["EventSelectors"] == DEFAULT_EVENT_SELECTORS
+
+
+@pytest.mark.parametrize("region", [REGION, WEST_REGION])
+def test_get_event_selectors_defaults_to_all_management_events(ct, region):
+    """A trail without PutEventSelectors reports the default selector, also from a peer region."""
+    name = f"trail-nosel-{_uid()}"
+    ct.create_trail(Name=name, S3BucketName="bucket", IsMultiRegionTrail=True)
+    resp = _client("cloudtrail", region=region).get_event_selectors(TrailName=name)
+    assert resp["EventSelectors"] == DEFAULT_EVENT_SELECTORS
 
 
 def test_add_list_remove_tags(ct):
@@ -249,6 +756,73 @@ def test_add_list_remove_tags(ct):
     tags2 = {t["Key"]: t["Value"] for item in list_resp2["ResourceTagList"] for t in item["TagsList"]}
     assert "env" not in tags2
     assert tags2["team"] == "ops"
+
+
+def test_add_tags_rejects_malformed_trail_arn(ct):
+    with pytest.raises(ClientError) as exc:
+        ct.add_tags(ResourceId="not-an-arn", TagsList=[{"Key": "env", "Value": "test"}])
+    assert exc.value.response["Error"]["Code"] == "CloudTrailARNInvalidException"
+
+
+@pytest.mark.parametrize("partition", ["aws-cn", "notaws"])
+def test_add_tags_rejects_non_aws_partition_trail_arn(ct, partition):
+    arn = f"arn:{partition}:cloudtrail:{REGION}:000000000000:trail/missing-{_uid()}"
+    with pytest.raises(ClientError) as exc:
+        ct.add_tags(ResourceId=arn, TagsList=[{"Key": "env", "Value": "test"}])
+    assert exc.value.response["Error"]["Code"] == "CloudTrailARNInvalidException"
+
+
+def test_add_tags_missing_aws_partition_trail_arn_returns_resource_not_found(ct):
+    arn = f"arn:aws:cloudtrail:{REGION}:000000000000:trail/missing-{_uid()}"
+    with pytest.raises(ClientError) as exc:
+        ct.add_tags(ResourceId=arn, TagsList=[{"Key": "env", "Value": "test"}])
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_add_tags_rejects_foreign_region_trail_arn(ct):
+    name = f"trail-tags-foreign-{_uid()}"
+    arn = ct.create_trail(Name=name, S3BucketName="bucket")["TrailARN"]
+    foreign_arn = arn.replace(f":{REGION}:", f":{WEST_REGION}:")
+
+    with pytest.raises(ClientError) as exc:
+        ct.add_tags(ResourceId=foreign_arn, TagsList=[{"Key": "env", "Value": "test"}])
+    assert exc.value.response["Error"]["Code"] == "CloudTrailARNInvalidException"
+
+
+def test_list_tags_rejects_wrong_service_trail_arn(ct):
+    with pytest.raises(ClientError) as exc:
+        ct.list_tags(ResourceIdList=[f"arn:aws:sns:{REGION}:000000000000:trail/not-a-trail"])
+    assert exc.value.response["Error"]["Code"] == "CloudTrailARNInvalidException"
+
+
+@pytest.mark.parametrize("partition", ["aws-cn", "notaws"])
+def test_list_tags_rejects_non_aws_partition_trail_arn(ct, partition):
+    arn = f"arn:{partition}:cloudtrail:{REGION}:000000000000:trail/missing-{_uid()}"
+    with pytest.raises(ClientError) as exc:
+        ct.list_tags(ResourceIdList=[arn])
+    assert exc.value.response["Error"]["Code"] == "CloudTrailARNInvalidException"
+
+
+def test_list_tags_missing_aws_partition_trail_arn_returns_resource_not_found(ct):
+    arn = f"arn:aws:cloudtrail:{REGION}:000000000000:trail/missing-{_uid()}"
+    with pytest.raises(ClientError) as exc:
+        ct.list_tags(ResourceIdList=[arn])
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+@pytest.mark.parametrize("partition", ["aws-cn", "notaws"])
+def test_remove_tags_rejects_non_aws_partition_trail_arn(ct, partition):
+    arn = f"arn:{partition}:cloudtrail:{REGION}:000000000000:trail/missing-{_uid()}"
+    with pytest.raises(ClientError) as exc:
+        ct.remove_tags(ResourceId=arn, TagsList=[{"Key": "env"}])
+    assert exc.value.response["Error"]["Code"] == "CloudTrailARNInvalidException"
+
+
+def test_remove_tags_missing_aws_partition_trail_arn_returns_resource_not_found(ct):
+    arn = f"arn:aws:cloudtrail:{REGION}:000000000000:trail/missing-{_uid()}"
+    with pytest.raises(ClientError) as exc:
+        ct.remove_tags(ResourceId=arn, TagsList=[{"Key": "env"}])
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +935,6 @@ def test_lookup_no_match(ct):
 
 def test_lookup_time_range_match(ct, s3):
     bucket = f"ct-time-{_uid()}"
-    from datetime import datetime, timezone, timedelta
 
     before = datetime.now(timezone.utc) - timedelta(seconds=2)
     s3.create_bucket(Bucket=bucket)
@@ -376,8 +949,6 @@ def test_lookup_time_range_match(ct, s3):
 
 
 def test_lookup_time_range_future_empty(ct):
-    from datetime import datetime, timezone, timedelta
-
     future_start = datetime.now(timezone.utc) + timedelta(hours=1)
     future_end = datetime.now(timezone.utc) + timedelta(hours=2)
     resp = ct.lookup_events(StartTime=future_start, EndTime=future_end)
@@ -389,6 +960,37 @@ def test_lookup_max_results(ct, s3):
         s3.create_bucket(Bucket=f"ct-maxr-{_uid()}")
     resp = ct.lookup_events(MaxResults=3)
     assert len(resp["Events"]) <= 3
+
+
+def test_lookup_events_are_region_scoped(ct):
+    east_queue = f"ct-east-{_uid()}"
+    west_queue = f"ct-west-{_uid()}"
+    east_sqs = _client("sqs", region=REGION)
+    west_sqs = _client("sqs", region=WEST_REGION)
+    west_ct = _client("cloudtrail", region=WEST_REGION)
+
+    east_sqs.create_queue(QueueName=east_queue)
+    west_sqs.create_queue(QueueName=west_queue)
+
+    east_events = ct.lookup_events(
+        LookupAttributes=[{"AttributeKey": "EventName", "AttributeValue": "CreateQueue"}]
+    )["Events"]
+    west_events = west_ct.lookup_events(
+        LookupAttributes=[{"AttributeKey": "EventName", "AttributeValue": "CreateQueue"}]
+    )["Events"]
+
+    def event_regions_for_queue(events, queue_name):
+        regions = set()
+        for event in events:
+            payload = json.loads(event["CloudTrailEvent"])
+            if payload.get("requestParameters", {}).get("QueueName") == queue_name:
+                regions.add(payload["awsRegion"])
+        return regions
+
+    assert event_regions_for_queue(east_events, east_queue) == {REGION}
+    assert event_regions_for_queue(east_events, west_queue) == set()
+    assert event_regions_for_queue(west_events, west_queue) == {WEST_REGION}
+    assert event_regions_for_queue(west_events, east_queue) == set()
 
 
 def test_lookup_newest_first(ct, s3):
@@ -493,6 +1095,25 @@ def test_cloudtrail_calls_not_self_recorded(ct):
     assert len(after) == len(before)
 
 
+def test_recording_enabled_through_config_records_before_any_cloudtrail_call(monkeypatch):
+    import asyncio
+
+    import ministack.app as app
+    from ministack.core.responses import AccountRegionScopedDict
+    from ministack.services import cloudtrail
+
+    monkeypatch.delenv("CLOUDTRAIL_RECORDING", raising=False)
+    monkeypatch.setattr(app, "_loaded_modules", {})
+    monkeypatch.setattr(cloudtrail, "_recording_enabled", False)
+    monkeypatch.setattr(cloudtrail, "_events", AccountRegionScopedDict())
+    body = json.dumps({"cloudtrail._recording_enabled": "true"}).encode()
+    asyncio.run(app._handle_admin_config_request("/_ministack/config", "POST", body))
+
+    headers = {"x-amz-target": "AmazonSQS.ListQueues"}
+    app._maybe_record_cloudtrail("sqs", "POST", "/", headers, b"{}", {}, "req-1", REGION)
+    assert [event["EventName"] for event in cloudtrail._get_event_queue()] == ["ListQueues"]
+
+
 def test_recording_disabled_no_new_events(ct, s3):
     """Disabling recording stops new events from being appended."""
     requests.post(
@@ -512,3 +1133,10 @@ def test_recording_disabled_no_new_events(ct, s3):
             f"{ENDPOINT}/_ministack/config",
             json={"cloudtrail._recording_enabled": "true"},
         )
+
+
+def test_trail_not_found_is_http_400(ct):
+    with pytest.raises(ClientError) as exc:
+        ct.get_trail(Name=f"missing-{_uid()}")
+    assert exc.value.response["Error"]["Code"] == "TrailNotFoundException"
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400

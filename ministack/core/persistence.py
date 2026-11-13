@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 State persistence for MiniStack services.
 When PERSIST_STATE=1, service state is saved to STATE_DIR on shutdown
@@ -8,18 +10,80 @@ import ast
 import json
 import logging
 import os
-import tempfile
 
-from ministack.core.responses import AccountScopedDict
+from ministack.core.responses import AccountRegionScopedDict, AccountScopedDict
 
 logger = logging.getLogger("persistence")
 
 PERSIST_STATE = os.environ.get("PERSIST_STATE", "0") == "1"
 STATE_DIR = os.environ.get("STATE_DIR", "/tmp/ministack-state")
 
+# On-disk state format versions. Files are wrapped as
+#   {"__ministack_format__": N, "payload": <service state>}
+# load_state refuses a file whose version is NEWER than this binary understands
+# rather than mis-parsing it (the downgrade-corruption guard). Version 2 is the
+# default and introduced region-scoped (AccountRegionScopedDict) stores.
+# Services regionalized after v2 use version 3 so a v2 rollback refuses their
+# incompatible snapshots. Legacy unwrapped files (implicit v1, account-scoped)
+# still load and migrate. (U4)
+STATE_FORMAT_VERSION = 2
+# SSM is intentionally omitted: it was regionalized in v1.4.0 (03ff785)
+# alongside the version machinery itself (98fdacc), so the v2 default already
+# covers it; stamping v3 would only add needless rollback refusal.
+SERVICE_STATE_FORMAT_VERSIONS = {
+    "apigateway": 3,
+    "apigateway_v1": 3,
+    "appsync": 3,
+    "appsync_events": 3,
+    "autoscaling": 3,
+    "backup": 3,
+    "bedrock_agentcore": 3,
+    "lambda_microvms": 3,
+    "acm": 3,
+    "alb": 3,
+    "athena": 3,
+    "elasticache": 3,
+    "emr": 3,
+    "eks": 3,
+    "eventbridge": 3,
+    "firehose": 3,
+    "inspector2": 3,
+    "iot": 3,
+    "kinesis": 3,
+    "kms": 3,
+    "efs": 3,
+    "glue": 3,
+    "mediaconnect": 3,
+    "pipes": 3,
+    "s3files": 3,
+    "scheduler": 3,
+    "sns": 3,
+    "batch": 3,
+    "ecs": 3,
+    "resource_groups": 3,
+    "codebuild": 3,
+    "cloudwatch_logs": 3,
+    "ec2": 3,
+    "ecr": 3,
+    "cloudtrail": 3,
+    "cognito": 3,
+    "waf": 3,
+    "mq": 3,
+    "mwaa": 3,
+    "opensearch": 3,
+    "servicediscovery": 3,
+    "ses": 3,
+    "ses_v2": 3,
+    "transfer": 3,
+}
+
+
+def _state_format_version(service: str) -> int:
+    return SERVICE_STATE_FORMAT_VERSIONS.get(service, STATE_FORMAT_VERSION)
+
 
 def _json_default(obj):
-    """JSON encoder fallback for AccountScopedDict, tuple keys, and bytes.
+    """JSON encoder fallback for scoped dicts, tuple keys, and bytes.
 
     Historically, several S3 (and other service) stores held raw request
     bodies as ``bytes``. ``json.dump`` raised ``TypeError`` and
@@ -27,6 +91,13 @@ def _json_default(obj):
     absent on disk (issue #422). Bytes are now serialized as base64 inside a
     tagged dict so round-trip fidelity is preserved even for non-UTF-8
     payloads."""
+    if isinstance(obj, AccountRegionScopedDict):
+        # Serialize all accounts' and regions' data with string keys
+        result = {}
+        for k, v in obj._data.items():
+            # k is (account_id, region, original_key) tuple
+            result[f"{k[0]}\x00{k[1]}\x00{k[2]!r}"] = v
+        return {"__account_region_scoped__": True, "data": result}
     if isinstance(obj, AccountScopedDict):
         # Serialize all accounts' data with string keys
         result = {}
@@ -41,7 +112,18 @@ def _json_default(obj):
 
 
 def _json_object_hook(obj):
-    """JSON decoder hook to restore AccountScopedDict and bytes from serialized form."""
+    """JSON decoder hook to restore scoped dicts and bytes from serialized form."""
+    if obj.get("__account_region_scoped__"):
+        arsd = AccountRegionScopedDict()
+        for k, v in obj["data"].items():
+            account_id, region, key_repr = k.split("\x00", 2)
+            # Restore the original key (was serialized with repr())
+            try:
+                original_key = ast.literal_eval(key_repr)
+            except (ValueError, SyntaxError):
+                original_key = key_repr
+            arsd._data[(account_id, region, original_key)] = v
+        return arsd
     if obj.get("__scoped__"):
         asd = AccountScopedDict()
         for k, v in obj["data"].items():
@@ -68,7 +150,10 @@ def save_state(service: str, data: dict) -> None:
         tmp = path + ".tmp"
         try:
             with open(tmp, "w") as f:
-                json.dump(data, f, default=_json_default)
+                json.dump(
+                    {"__ministack_format__": _state_format_version(service), "payload": data},
+                    f, default=_json_default,
+                )
             os.replace(tmp, path)
         except BaseException:
             # Clean up temp file on any failure to avoid stale partial writes
@@ -91,6 +176,21 @@ def load_state(service: str) -> dict | None:
     try:
         with open(path) as f:
             data = json.load(f, object_hook=_json_object_hook)
+        # Versioned wrapper (current format). A legacy file (no wrapper) is an
+        # implicit v1 payload, returned as-is for backward-compatible migration.
+        # A file from a NEWER binary is refused rather than mis-parsed — loading
+        # it would corrupt state on downgrade. (U4)
+        if isinstance(data, dict) and "__ministack_format__" in data:
+            version = data.get("__ministack_format__")
+            supported_version = _state_format_version(service)
+            if isinstance(version, int) and version > supported_version:
+                logger.error(
+                    "Persistence: %s state is format v%s but this MiniStack only "
+                    "understands v%s — refusing to load (downgrade not supported)",
+                    service, version, supported_version,
+                )
+                return None
+            data = data.get("payload")
         logger.info("Persistence: loaded %s state from %s", service, path)
         return data
     except (json.JSONDecodeError, OSError) as e:
@@ -99,9 +199,21 @@ def load_state(service: str) -> dict | None:
 
 
 def save_all(services: dict) -> None:
-    """Save all service states. services = {name: get_state_fn}"""
+    """Save all service states. services = {name: get_state_fn}
+
+    A service that returns None has nothing to save and is skipped. That is not
+    the same as returning empty state: a module that failed to import has no
+    state to report, and writing its empty dict would destroy whatever was
+    persisted from the last run that worked.
+    """
     for name, get_state in services.items():
         try:
-            save_state(name, get_state())
+            state = get_state()
         except Exception as e:
             logger.error("Persistence: error getting state for %s: %s", name, e)
+            continue
+        if state is None:
+            logger.debug("Persistence: %s reported no state; leaving %s.json alone",
+                         name, name)
+            continue
+        save_state(name, state)

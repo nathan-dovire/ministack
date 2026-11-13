@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 Resource Groups Tagging API emulator.
 
@@ -12,7 +14,7 @@ Architecture:
   given ARN. Used by TagResources. Writers raise ``_ResourceNotFound`` when
   the ARN points at a resource that does not exist in the caller's account;
   the entry point catches it and surfaces the ARN in ``FailedResourcesMap``
-  with ``InvalidParameterException``, matching AWS.
+  with ``ResourceNotFound``, matching AWS.
 - **Removers** do the inverse for UntagResources.
 
 Each service keeps its own tag format (S3 flat dict, DynamoDB key/value list,
@@ -23,19 +25,33 @@ denormalise on write.
 
 import json
 import logging
-import os
 
+from ministack.core.arn import Arn, ArnParseError, parse_arn
 from ministack.core.responses import get_region
 
 logger = logging.getLogger("tagging")
-REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
+
+
+_GLOBAL_RESOURCE_SERVICES = {"cloudfront", "s3"}
 
 
 class _ResourceNotFound(Exception):
     """Raised by a writer/remover when the target ARN refers to a resource
     that does not exist in the caller's account. Caught by the TagResources /
     UntagResources entry points and surfaced in ``FailedResourcesMap`` with
-    ``InvalidParameterException`` (matches real AWS behaviour)."""
+    ``ResourceNotFound`` (matches real AWS behaviour)."""
+
+
+class _InvalidResourceArn(Exception):
+    """Raised when an ARN cannot be parsed or is not valid for this operation."""
+
+
+class _WrongAccountArn(Exception):
+    """Raised when a parsed ARN belongs to a different account."""
+
+
+class _WrongRegionArn(Exception):
+    """Raised when a parsed ARN belongs to a different region."""
 
 
 # ── Tag format normalisation ──────────────────────────────────────────────────
@@ -64,8 +80,12 @@ def _normalise_ecs(tag_list):
 
 def _collect_s3():
     import ministack.services.s3 as svc
+    region = get_region()
     for name, tags in svc._bucket_tags.items():
-        yield f"arn:aws:s3:::{name}", _normalise_flat(tags)
+        # Bucket ARNs carry no region, but GetResources only lists buckets
+        # homed in the region it is called in.
+        if svc.bucket_region(name) == region:
+            yield f"arn:aws:s3:::{name}", _normalise_flat(tags)
 
 
 def _collect_lambda():
@@ -136,6 +156,12 @@ def _collect_ecs():
 def _collect_glue():
     import ministack.services.glue as svc
     for arn, tags in svc._tags.items():
+        try:
+            spec = parse_arn(arn)
+        except ArnParseError:
+            continue
+        if spec.region != get_region():
+            continue
         yield arn, _normalise_flat(tags)
 
 
@@ -152,6 +178,12 @@ def _collect_cognito():
 def _collect_appsync():
     import ministack.services.appsync as svc
     for arn, tags in svc._tags.items():
+        try:
+            spec = parse_arn(arn)
+        except ArnParseError:
+            continue
+        if spec.region != get_region():
+            continue
         yield arn, _normalise_flat(tags)
 
 
@@ -187,6 +219,12 @@ def _collect_backup():
         yield arn, _normalise_flat(p.get("Tags", {}))
 
 
+def _collect_elasticache():
+    import ministack.services.elasticache as svc
+    for arn, tags in svc._tags.items():
+        yield arn, _normalise_list(tags)
+
+
 # ResourceTypeFilter prefix -> collector
 _COLLECTORS = {
     # Phase 1
@@ -208,7 +246,57 @@ _COLLECTORS = {
     "cloudfront":        _collect_cloudfront,
     "elasticfilesystem": _collect_efs,
     "backup":            _collect_backup,
+    "elasticache":       _collect_elasticache,
 }
+
+
+def _collect_iam():
+    import ministack.services.iam as svc
+    for store in (svc._users, svc._roles):
+        for entity in store.values():
+            yield entity.get("Arn", ""), _normalise_list(entity.get("Tags"))
+
+
+def _collect_ssm():
+    import ministack.services.ssm as svc
+    for arn, tags in svc._tags.items():
+        yield arn, _normalise_flat(tags)
+
+
+def _collect_secretsmanager():
+    import ministack.services.secretsmanager as svc
+    for secret in svc._secrets.values():
+        yield secret.get("ARN", ""), _normalise_list(secret.get("Tags"))
+
+
+def _collect_iot():
+    import ministack.services.iot as svc
+    for arn, tags in svc._tags.items():
+        yield arn, _normalise_flat(tags)
+
+
+# ARN service -> collector, for resolving aws:ResourceTag
+_RESOURCE_TAG_COLLECTORS = {
+    "dynamodb": _collect_dynamodb,
+    "iam": _collect_iam,
+    "iot": _collect_iot,
+    "kms": _collect_kms,
+    "lambda": _collect_lambda,
+    "secretsmanager": _collect_secretsmanager,
+    "sns": _collect_sns,
+    "sqs": _collect_sqs,
+    "ssm": _collect_ssm,
+}
+
+
+def resource_tags(arn: str) -> dict[str, str] | None:
+    """The tags of the resource *arn* names, or None when it is not a known resource."""
+    parts = arn.split(":", 5)
+    collect = _RESOURCE_TAG_COLLECTORS.get(parts[2]) if len(parts) == 6 else None
+    for candidate, tags in collect() if collect else ():
+        if candidate == arn:
+            return {t["Key"]: t["Value"] for t in tags}
+    return None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -221,9 +309,20 @@ def _account():
 def _matches_type_filters(arn, type_filters):
     if not type_filters:
         return True
+    parts = arn.split(":", 5)
+    arn_service = parts[2] if len(parts) > 2 else ""
+    resource = parts[5] if len(parts) > 5 else ""
+    if "/" in resource:
+        arn_resource_type = resource.split("/", 1)[0]
+    else:
+        arn_resource_type = resource.split(":", 1)[0]
+
     for tf in type_filters:
-        svc_prefix = tf.split(":")[0]
-        if f"::{svc_prefix}:" in arn or f":{svc_prefix}:" in arn:
+        tf_parts = tf.split(":", 1)
+        svc_prefix = tf_parts[0]
+        if svc_prefix != arn_service:
+            continue
+        if len(tf_parts) == 1 or not tf_parts[1] or tf_parts[1] == arn_resource_type:
             return True
     return False
 
@@ -243,33 +342,209 @@ def _matches_tag_filters(tags, tag_filters):
     return True
 
 
-def _service_key_from_arn(arn):
-    """Extract service segment from ARN (e.g. 'arn:aws:s3:::...' → 's3')."""
-    parts = arn.split(":")
-    return parts[2] if len(parts) >= 3 else ""
+def _parse_resource_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError as exc:
+        raise _InvalidResourceArn(f"{arn} is not a valid AmazonResourceName (ARN)") from exc
+    if (
+        spec.service in _COLLECTORS
+        and spec.service not in _GLOBAL_RESOURCE_SERVICES
+        and (not spec.region or not spec.account_id)
+    ):
+        raise _InvalidResourceArn(f"{arn} is not a valid AmazonResourceName (ARN)")
+    return spec
+
+
+def _parse_resource_arn_list(arn_list):
+    return [(arn, _parse_resource_arn(arn)) for arn in arn_list]
+
+
+def _resource_tail(spec: Arn, arn: str, prefix: str) -> str:
+    if not spec.resource.startswith(prefix):
+        raise _ResourceNotFound(arn)
+    tail = spec.resource[len(prefix):]
+    if not tail:
+        raise _ResourceNotFound(arn)
+    return tail
+
+
+def _s3_bucket_name(spec: Arn, arn: str) -> str:
+    if spec.region or spec.account_id or not spec.resource or "/" in spec.resource:
+        raise _ResourceNotFound(arn)
+    return spec.resource
+
+
+def _require_resource_scope(spec: Arn, arn: str) -> None:
+    if spec.service == "s3":
+        if spec.region or spec.account_id:
+            raise _ResourceNotFound(arn)
+        return
+    if spec.service == "cloudfront":
+        if spec.region or spec.account_id != _account():
+            raise _WrongAccountArn(arn)
+        return
+    if spec.region and spec.region != get_region():
+        raise _WrongRegionArn(arn)
+    if spec.account_id != _account():
+        raise _WrongAccountArn(arn)
+
+
+def _reject_foreign_region_arn(spec: Arn, arn: str, action: str) -> None:
+    if spec.service in _COLLECTORS and spec.region and spec.region != get_region():
+        raise _WrongRegionArn(
+            f"Region in the ARN {arn} does not match with the region in which {action} API is invoked"
+        )
+
+
+def _json(data, status=200):
+    return status, {"Content-Type": "application/x-amz-json-1.1"}, json.dumps(data).encode()
+
+
+def _invalid_parameter(message):
+    return 400, {
+        "Content-Type": "application/x-amz-json-1.1",
+        "x-amzn-errortype": "InvalidParameterException",
+    }, json.dumps({
+        "__type": "InvalidParameterException",
+        "message": message,
+    }).encode()
+
+
+def _failed_resource(error_code, message, status_code):
+    return {
+        "ErrorCode": error_code,
+        "ErrorMessage": message,
+        "StatusCode": status_code,
+    }
+
+
+def _dynamodb_table_name(spec: Arn, arn: str) -> str:
+    return _resource_tail(spec, arn, "table/")
+
+
+def _eventbridge_resource_exists(spec: Arn, arn: str) -> bool:
+    import ministack.services.eventbridge as svc
+    resource = spec.resource
+    if resource.startswith("event-bus/"):
+        name = _resource_tail(spec, arn, "event-bus/")
+        if name == "default":
+            svc._ensure_default_bus()
+        return name in svc._event_buses
+    if resource.startswith("rule/"):
+        tail = _resource_tail(spec, arn, "rule/")
+        if "/" in tail:
+            bus, name = tail.rsplit("/", 1)
+        else:
+            bus, name = "default", tail
+        return svc._rule_key(name, bus) in svc._rules
+    if resource.startswith("archive/"):
+        return _resource_tail(spec, arn, "archive/") in svc._archives
+    if resource.startswith("replay/"):
+        return _resource_tail(spec, arn, "replay/") in svc._replays
+    if resource.startswith("endpoint/"):
+        return _resource_tail(spec, arn, "endpoint/") in svc._endpoints
+    if resource.startswith("connection/"):
+        return _resource_tail(spec, arn, "connection/") in svc._connections
+    if resource.startswith("api-destination/"):
+        return _resource_tail(spec, arn, "api-destination/") in svc._api_destinations
+    return False
+
+
+def _ecs_resource_exists(arn: str) -> bool:
+    import ministack.services.ecs as svc
+    return (
+        any(c.get("clusterArn") == arn for c in svc._clusters.values())
+        or any(td.get("taskDefinitionArn") == arn for td in svc._task_defs.values())
+        or any(s.get("serviceArn") == arn for s in svc._services.values())
+        or any(t.get("taskArn") == arn for t in svc._tasks.values())
+        or any(cp.get("capacityProviderArn") == arn for cp in svc._capacity_providers.values())
+    )
+
+
+def _glue_resource_exists(spec: Arn, arn: str) -> bool:
+    import ministack.services.glue as svc
+    resource = spec.resource
+    if resource.startswith("database/"):
+        return _resource_tail(spec, arn, "database/") in svc._databases
+    if resource.startswith("table/"):
+        return _resource_tail(spec, arn, "table/") in svc._tables
+    if resource.startswith("crawler/"):
+        return _resource_tail(spec, arn, "crawler/") in svc._crawlers
+    if resource.startswith("job/"):
+        return _resource_tail(spec, arn, "job/") in svc._jobs
+    if resource.startswith("connection/"):
+        return _resource_tail(spec, arn, "connection/") in svc._connections
+    if resource.startswith("trigger/"):
+        return _resource_tail(spec, arn, "trigger/") in svc._triggers
+    if resource.startswith("workflow/"):
+        return _resource_tail(spec, arn, "workflow/") in svc._workflows
+    return arn in svc._tags
+
+
+def _appsync_resource_exists(spec: Arn, arn: str) -> bool:
+    import ministack.services.appsync as svc
+    if not spec.resource.startswith("apis/"):
+        return False
+    return _resource_tail(spec, arn, "apis/") in svc._apis
+
+
+def _scheduler_resource_exists(spec: Arn, arn: str) -> bool:
+    import ministack.services.scheduler as svc
+    if spec.resource.startswith("schedule/"):
+        tail = _resource_tail(spec, arn, "schedule/")
+        parts = tail.split("/", 1)
+        if len(parts) != 2:
+            return False
+        return f"{parts[0]}/{parts[1]}" in svc._schedules
+    if spec.resource.startswith("schedule-group/"):
+        name = _resource_tail(spec, arn, "schedule-group/")
+        if name == "default":
+            svc._ensure_default_group()
+        return name in svc._schedule_groups
+    return False
+
+
+def _cloudfront_resource_exists(spec: Arn, arn: str) -> bool:
+    import ministack.services.cloudfront as svc
+    if spec.resource.startswith("distribution/"):
+        return _resource_tail(spec, arn, "distribution/") in svc._distributions
+    if spec.resource.startswith("distribution-tenant/"):
+        return _resource_tail(spec, arn, "distribution-tenant/") in svc._distribution_tenants
+    if spec.resource.startswith("connection-group/"):
+        return _resource_tail(spec, arn, "connection-group/") in svc._connection_groups
+    if spec.resource.startswith("function/"):
+        return _resource_tail(spec, arn, "function/") in svc._functions
+    if spec.resource.startswith("key-value-store/"):
+        return _resource_tail(spec, arn, "key-value-store/") in svc._kvstores
+    return arn in svc._tags
 
 
 # ── Per-service tag writers ───────────────────────────────────────────────────
 
-def _write_s3(arn, tags):
+def _write_s3(spec, arn, tags):
     import ministack.services.s3 as svc
-    name = arn.split(":::")[-1]
+    name = _s3_bucket_name(spec, arn)
+    if name not in svc._buckets:
+        raise _ResourceNotFound(arn)
     svc._bucket_tags.setdefault(name, {}).update(tags)
 
 
-def _write_lambda(arn, tags):
+def _write_lambda(spec, arn, tags):
     """Merge ``tags`` into the Lambda function's ``tags`` field.
 
     Raises ``_ResourceNotFound`` if the function does not exist in the caller's
     account (AWS returns InvalidParameterException in that case)."""
     import ministack.services.lambda_svc as svc
-    name = arn.split("function:")[-1]
-    if name not in svc._functions:
+    name = _resource_tail(spec, arn, "function:")
+    base_name = name.split(":", 1)[0]
+    func = svc._functions.get(base_name)
+    if func is None:
         raise _ResourceNotFound(arn)
-    svc._functions[name].setdefault("tags", {}).update(tags)
+    func.setdefault("tags", {}).update(tags)
 
 
-def _write_sqs(arn, tags):
+def _write_sqs(_spec, arn, tags):
     """Merge ``tags`` into the SQS queue keyed by ``QueueArn``.
 
     Raises ``_ResourceNotFound`` if no queue in the caller's account matches."""
@@ -281,7 +556,7 @@ def _write_sqs(arn, tags):
     raise _ResourceNotFound(arn)
 
 
-def _write_sns(arn, tags):
+def _write_sns(_spec, arn, tags):
     """Merge ``tags`` into the SNS topic at ``arn``.
 
     Raises ``_ResourceNotFound`` if the topic does not exist in the caller's
@@ -292,111 +567,165 @@ def _write_sns(arn, tags):
     svc._topics[arn].setdefault("tags", {}).update(tags)
 
 
-def _write_dynamodb(arn, tags):
+def _write_dynamodb(spec, arn, tags):
     import ministack.services.dynamodb as svc
+    table_name = _dynamodb_table_name(spec, arn)
+    if table_name not in svc._tables:
+        raise _ResourceNotFound(arn)
     existing = {t["Key"]: t["Value"] for t in svc._tags.get(arn, [])}
     existing.update(tags)
     svc._tags[arn] = [{"Key": k, "Value": v} for k, v in existing.items()]
 
 
-def _write_eventbridge(arn, tags):
+def _write_eventbridge(spec, arn, tags):
     import ministack.services.eventbridge as svc
+    if not _eventbridge_resource_exists(spec, arn):
+        raise _ResourceNotFound(arn)
     svc._tags.setdefault(arn, {}).update(tags)
 
 
-def _write_kms(arn, tags):
+def _write_kms(spec, arn, tags):
     import ministack.services.kms as svc
-    key_id = arn.split("/")[-1]
-    if key_id in svc._keys:
-        existing = {t["TagKey"]: t["TagValue"] for t in svc._keys[key_id].get("Tags", [])}
-        existing.update(tags)
-        svc._keys[key_id]["Tags"] = [{"TagKey": k, "TagValue": v} for k, v in existing.items()]
+    _resource_tail(spec, arn, "key/")
+    key = svc._resolve_key(arn)
+    if key is None:
+        raise _ResourceNotFound(arn)
+    existing = {t["TagKey"]: t["TagValue"] for t in key.get("Tags", [])}
+    existing.update(tags)
+    key["Tags"] = [{"TagKey": k, "TagValue": v} for k, v in existing.items()]
 
 
-def _write_ecr(arn, tags):
+def _write_ecr(spec, arn, tags):
     import ministack.services.ecr as svc
-    name = arn.split("repository/")[-1]
-    if name in svc._repositories:
-        existing = {t["Key"]: t["Value"] for t in svc._repositories[name].get("tags", [])}
-        existing.update(tags)
-        svc._repositories[name]["tags"] = [{"Key": k, "Value": v} for k, v in existing.items()]
+    name = _resource_tail(spec, arn, "repository/")
+    if name not in svc._repositories:
+        raise _ResourceNotFound(arn)
+    existing = {t["Key"]: t["Value"] for t in svc._repositories[name].get("tags", [])}
+    existing.update(tags)
+    svc._repositories[name]["tags"] = [{"Key": k, "Value": v} for k, v in existing.items()]
 
 
-def _write_ecs(arn, tags):
+def _write_ecs(_spec, arn, tags):
     import ministack.services.ecs as svc
+    if not _ecs_resource_exists(arn):
+        raise _ResourceNotFound(arn)
     existing = {t["key"]: t["value"] for t in svc._tags.get(arn, [])}
     existing.update(tags)
     svc._tags[arn] = [{"key": k, "value": v} for k, v in existing.items()]
 
 
-def _write_glue(arn, tags):
+def _write_glue(spec, arn, tags):
     import ministack.services.glue as svc
+    if not _glue_resource_exists(spec, arn):
+        raise _ResourceNotFound(arn)
     svc._tags.setdefault(arn, {}).update(tags)
 
 
-def _write_cognito_idp(arn, tags):
+def _write_cognito_idp(spec, arn, tags):
     """Merge ``tags`` into the Cognito user pool's ``UserPoolTags`` field.
 
     Raises ``_ResourceNotFound`` if the pool does not exist in the caller's
     account."""
     import ministack.services.cognito as svc
-    pool_id = arn.split("userpool/")[-1]
+    pool_id = _resource_tail(spec, arn, "userpool/")
     if pool_id not in svc._user_pools:
         raise _ResourceNotFound(arn)
     svc._user_pools[pool_id].setdefault("UserPoolTags", {}).update(tags)
 
 
-def _write_cognito_identity(arn, tags):
+def _write_cognito_identity(spec, arn, tags):
     import ministack.services.cognito as svc
-    pool_id = arn.split("identitypool/")[-1]
+    pool_id = _resource_tail(spec, arn, "identitypool/")
+    if pool_id not in svc._identity_pools:
+        raise _ResourceNotFound(arn)
     svc._identity_tags.setdefault(pool_id, {}).update(tags)
 
 
-def _write_appsync(arn, tags):
+def _write_appsync(spec, arn, tags):
     import ministack.services.appsync as svc
+    if not _appsync_resource_exists(spec, arn):
+        raise _ResourceNotFound(arn)
     svc._tags.setdefault(arn, {}).update(tags)
 
 
-def _write_scheduler(arn, tags):
+def _write_scheduler(spec, arn, tags):
     import ministack.services.scheduler as svc
+    if not _scheduler_resource_exists(spec, arn):
+        raise _ResourceNotFound(arn)
     svc._tags.setdefault(arn, {}).update(tags)
 
 
-def _write_cloudfront(arn, tags):
+def _write_cloudfront(spec, arn, tags):
     import ministack.services.cloudfront as svc
+    if not _cloudfront_resource_exists(spec, arn):
+        raise _ResourceNotFound(arn)
     existing = {t["Key"]: t["Value"] for t in svc._tags.get(arn, [])}
     existing.update(tags)
     svc._tags[arn] = [{"Key": k, "Value": v} for k, v in existing.items()]
 
 
-def _write_efs(arn, tags):
+def _write_efs(spec, arn, tags):
     import ministack.services.efs as svc
-    if ":file-system/" in arn:
-        resource = svc._file_systems.get(arn.split("file-system/")[-1])
+    if spec.resource.startswith("file-system/"):
+        resource = svc._file_systems.get(_resource_tail(spec, arn, "file-system/"))
     else:
-        resource = svc._access_points.get(arn.split("access-point/")[-1])
-    if resource is not None:
-        existing = {t["Key"]: t["Value"] for t in resource.get("Tags", [])}
-        existing.update(tags)
-        resource["Tags"] = [{"Key": k, "Value": v} for k, v in existing.items()]
+        resource = svc._access_points.get(_resource_tail(spec, arn, "access-point/"))
+    if resource is None:
+        raise _ResourceNotFound(arn)
+    existing = {t["Key"]: t["Value"] for t in resource.get("Tags", [])}
+    existing.update(tags)
+    resource["Tags"] = [{"Key": k, "Value": v} for k, v in existing.items()]
 
 
-def _write_backup(arn, tags):
+def _write_backup(spec, arn, tags):
     import ministack.services.backup as svc
-    if ":backup-vault:" in arn:
-        name = arn.split(":")[-1]
+    if spec.resource.startswith("backup-vault:"):
+        name = _resource_tail(spec, arn, "backup-vault:")
         v = svc._vaults.get(name)
         if v is None:
             raise _ResourceNotFound(arn)
         v.setdefault("BackupVaultTags", {}).update(tags)
-    elif ":backup-plan:" in arn:
-        pid = arn.split(":")[-1]
+    elif spec.resource.startswith("backup-plan:"):
+        pid = _resource_tail(spec, arn, "backup-plan:")
         p = svc._plans.get(pid)
         if p is None:
             raise _ResourceNotFound(arn)
         p.setdefault("Tags", {}).update(tags)
     else:
         raise _ResourceNotFound(arn)
+
+
+def _resolve_elasticache_resource(svc, arn):
+    """Check that an ElastiCache ARN refers to an existing resource."""
+    resource_part = arn.split(":", 5)[-1] if arn.count(":") >= 5 else ""
+    if ":" not in resource_part:
+        raise _ResourceNotFound(arn)
+    resource_type, resource_id = resource_part.split(":", 1)
+    match resource_type:
+        case "cluster":
+            store = svc._clusters
+        case "replicationgroup":
+            store = svc._replication_groups
+        case "subnetgroup":
+            store = svc._subnet_groups
+        case "parametergroup":
+            store = svc._param_groups
+        case "snapshot":
+            store = svc._snapshots
+        case "user":
+            store = svc._users
+        case "usergroup":
+            store = svc._user_groups
+        case _:
+            raise _ResourceNotFound(arn)
+    if resource_id not in store:
+        raise _ResourceNotFound(arn)
+
+
+def _write_elasticache(_spec, arn, tags):
+    import ministack.services.elasticache as svc
+    _resolve_elasticache_resource(svc, arn)
+    svc._merge_tags_for_arn(arn, [{"Key": k, "Value": v} for k, v in tags.items()])
 
 
 _WRITERS = {
@@ -407,32 +736,38 @@ _WRITERS = {
     "cognito-identity": _write_cognito_identity, "appsync": _write_appsync,
     "scheduler": _write_scheduler, "cloudfront": _write_cloudfront,
     "elasticfilesystem": _write_efs, "backup": _write_backup,
+    "elasticache": _write_elasticache,
 }
 
 
 # ── Per-service tag removers ──────────────────────────────────────────────────
 
-def _remove_s3(arn, keys):
+def _remove_s3(spec, arn, keys):
     import ministack.services.s3 as svc
-    tags = svc._bucket_tags.get(arn.split(":::")[-1], {})
+    name = _s3_bucket_name(spec, arn)
+    if name not in svc._buckets:
+        raise _ResourceNotFound(arn)
+    tags = svc._bucket_tags.get(name, {})
     for k in keys:
         tags.pop(k, None)
 
 
-def _remove_lambda(arn, keys):
+def _remove_lambda(spec, arn, keys):
     """Remove ``keys`` from the Lambda function's ``tags`` field.
 
     Raises ``_ResourceNotFound`` if the function does not exist."""
     import ministack.services.lambda_svc as svc
-    name = arn.split("function:")[-1]
-    if name not in svc._functions:
+    name = _resource_tail(spec, arn, "function:")
+    base_name = name.split(":", 1)[0]
+    func = svc._functions.get(base_name)
+    if func is None:
         raise _ResourceNotFound(arn)
-    tags = svc._functions[name].get("tags", {})
+    tags = func.get("tags", {})
     for k in keys:
         tags.pop(k, None)
 
 
-def _remove_sqs(arn, keys):
+def _remove_sqs(_spec, arn, keys):
     """Remove ``keys`` from the SQS queue's tags. Raises ``_ResourceNotFound``."""
     import ministack.services.sqs as svc
     for q in svc._queues.values():
@@ -444,7 +779,7 @@ def _remove_sqs(arn, keys):
     raise _ResourceNotFound(arn)
 
 
-def _remove_sns(arn, keys):
+def _remove_sns(_spec, arn, keys):
     """Remove ``keys`` from the SNS topic's tags. Raises ``_ResourceNotFound``."""
     import ministack.services.sns as svc
     if arn not in svc._topics:
@@ -454,52 +789,62 @@ def _remove_sns(arn, keys):
         tags.pop(k, None)
 
 
-def _remove_dynamodb(arn, keys):
+def _remove_dynamodb(spec, arn, keys):
     import ministack.services.dynamodb as svc
+    table_name = _dynamodb_table_name(spec, arn)
+    if table_name not in svc._tables:
+        raise _ResourceNotFound(arn)
     svc._tags[arn] = [t for t in svc._tags.get(arn, []) if t["Key"] not in keys]
 
 
-def _remove_eventbridge(arn, keys):
+def _remove_eventbridge(spec, arn, keys):
     import ministack.services.eventbridge as svc
+    if not _eventbridge_resource_exists(spec, arn):
+        raise _ResourceNotFound(arn)
     tags = svc._tags.get(arn, {})
     for k in keys:
         tags.pop(k, None)
 
 
-def _remove_kms(arn, keys):
+def _remove_kms(spec, arn, keys):
     import ministack.services.kms as svc
-    key_id = arn.split("/")[-1]
-    if key_id in svc._keys:
-        svc._keys[key_id]["Tags"] = [
-            t for t in svc._keys[key_id].get("Tags", []) if t["TagKey"] not in keys
-        ]
+    _resource_tail(spec, arn, "key/")
+    key = svc._resolve_key(arn)
+    if key is None:
+        raise _ResourceNotFound(arn)
+    key["Tags"] = [t for t in key.get("Tags", []) if t["TagKey"] not in keys]
 
 
-def _remove_ecr(arn, keys):
+def _remove_ecr(spec, arn, keys):
     import ministack.services.ecr as svc
-    name = arn.split("repository/")[-1]
-    if name in svc._repositories:
-        svc._repositories[name]["tags"] = [
-            t for t in svc._repositories[name].get("tags", []) if t["Key"] not in keys
-        ]
+    name = _resource_tail(spec, arn, "repository/")
+    if name not in svc._repositories:
+        raise _ResourceNotFound(arn)
+    svc._repositories[name]["tags"] = [
+        t for t in svc._repositories[name].get("tags", []) if t["Key"] not in keys
+    ]
 
 
-def _remove_ecs(arn, keys):
+def _remove_ecs(_spec, arn, keys):
     import ministack.services.ecs as svc
+    if not _ecs_resource_exists(arn):
+        raise _ResourceNotFound(arn)
     svc._tags[arn] = [t for t in svc._tags.get(arn, []) if t["key"] not in keys]
 
 
-def _remove_glue(arn, keys):
+def _remove_glue(spec, arn, keys):
     import ministack.services.glue as svc
+    if not _glue_resource_exists(spec, arn):
+        raise _ResourceNotFound(arn)
     tags = svc._tags.get(arn, {})
     for k in keys:
         tags.pop(k, None)
 
 
-def _remove_cognito_idp(arn, keys):
+def _remove_cognito_idp(spec, arn, keys):
     """Remove ``keys`` from a Cognito user pool's tags. Raises ``_ResourceNotFound``."""
     import ministack.services.cognito as svc
-    pool_id = arn.split("userpool/")[-1]
+    pool_id = _resource_tail(spec, arn, "userpool/")
     if pool_id not in svc._user_pools:
         raise _ResourceNotFound(arn)
     tags = svc._user_pools[pool_id].get("UserPoolTags", {})
@@ -507,53 +852,74 @@ def _remove_cognito_idp(arn, keys):
         tags.pop(k, None)
 
 
-def _remove_cognito_identity(arn, keys):
+def _remove_cognito_identity(spec, arn, keys):
     import ministack.services.cognito as svc
-    pool_id = arn.split("identitypool/")[-1]
+    pool_id = _resource_tail(spec, arn, "identitypool/")
+    if pool_id not in svc._identity_pools:
+        raise _ResourceNotFound(arn)
     tags = svc._identity_tags.get(pool_id, {})
     for k in keys:
         tags.pop(k, None)
 
 
-def _remove_appsync(arn, keys):
+def _remove_appsync(spec, arn, keys):
     import ministack.services.appsync as svc
+    if not _appsync_resource_exists(spec, arn):
+        raise _ResourceNotFound(arn)
     tags = svc._tags.get(arn, {})
     for k in keys:
         tags.pop(k, None)
 
 
-def _remove_scheduler(arn, keys):
+def _remove_scheduler(spec, arn, keys):
     import ministack.services.scheduler as svc
+    if not _scheduler_resource_exists(spec, arn):
+        raise _ResourceNotFound(arn)
     tags = svc._tags.get(arn, {})
     for k in keys:
         tags.pop(k, None)
 
 
-def _remove_cloudfront(arn, keys):
+def _remove_cloudfront(spec, arn, keys):
     import ministack.services.cloudfront as svc
+    if not _cloudfront_resource_exists(spec, arn):
+        raise _ResourceNotFound(arn)
     svc._tags[arn] = [t for t in svc._tags.get(arn, []) if t["Key"] not in keys]
 
 
-def _remove_efs(arn, keys):
+def _remove_efs(spec, arn, keys):
     import ministack.services.efs as svc
-    if ":file-system/" in arn:
-        resource = svc._file_systems.get(arn.split("file-system/")[-1])
+    if spec.resource.startswith("file-system/"):
+        resource = svc._file_systems.get(_resource_tail(spec, arn, "file-system/"))
     else:
-        resource = svc._access_points.get(arn.split("access-point/")[-1])
-    if resource is not None:
-        resource["Tags"] = [t for t in resource.get("Tags", []) if t["Key"] not in keys]
+        resource = svc._access_points.get(_resource_tail(spec, arn, "access-point/"))
+    if resource is None:
+        raise _ResourceNotFound(arn)
+    resource["Tags"] = [t for t in resource.get("Tags", []) if t["Key"] not in keys]
 
 
-def _remove_backup(arn, keys):
+def _remove_backup(spec, arn, keys):
     import ministack.services.backup as svc
-    if ":backup-vault:" in arn:
-        tags = svc._vaults.get(arn.split(":")[-1], {}).get("BackupVaultTags", {})
-    elif ":backup-plan:" in arn:
-        tags = svc._plans.get(arn.split(":")[-1], {}).get("Tags", {})
+    if spec.resource.startswith("backup-vault:"):
+        vault = svc._vaults.get(_resource_tail(spec, arn, "backup-vault:"))
+        if vault is None:
+            raise _ResourceNotFound(arn)
+        tags = vault.get("BackupVaultTags", {})
+    elif spec.resource.startswith("backup-plan:"):
+        plan = svc._plans.get(_resource_tail(spec, arn, "backup-plan:"))
+        if plan is None:
+            raise _ResourceNotFound(arn)
+        tags = plan.get("Tags", {})
     else:
-        return
+        raise _ResourceNotFound(arn)
     for k in keys:
         tags.pop(k, None)
+
+
+def _remove_elasticache(_spec, arn, keys):
+    import ministack.services.elasticache as svc
+    _resolve_elasticache_resource(svc, arn)
+    svc._remove_tag_keys_for_arn(arn, keys)
 
 
 _REMOVERS = {
@@ -564,6 +930,7 @@ _REMOVERS = {
     "cognito-identity": _remove_cognito_identity, "appsync": _remove_appsync,
     "scheduler": _remove_scheduler, "cloudfront": _remove_cloudfront,
     "elasticfilesystem": _remove_efs, "backup": _remove_backup,
+    "elasticache": _remove_elasticache,
 }
 
 
@@ -572,6 +939,25 @@ _REMOVERS = {
 def _get_resources(data):
     tag_filters = data.get("TagFilters", [])
     type_filters = data.get("ResourceTypeFilters", [])
+    arn_list = data.get("ResourceARNList", [])
+    if arn_list:
+        exclusive_params = {
+            "ExcludeCompliantResources",
+            "IncludeComplianceDetails",
+            "PaginationToken",
+            "ResourceTypeFilters",
+            "ResourcesPerPage",
+            "TagFilters",
+            "TagsPerPage",
+        }
+        if any(param in data for param in exclusive_params):
+            return _invalid_parameter(
+                "ResourceARNList cannot be specified with filters, compliance details, or pagination parameters"
+            )
+    try:
+        requested_arns = {arn for arn, _spec in _parse_resource_arn_list(arn_list)} if arn_list else None
+    except _InvalidResourceArn as exc:
+        return _invalid_parameter(str(exc))
 
     if type_filters:
         type_prefixes = {tf.split(":")[0] for tf in type_filters}
@@ -586,6 +972,8 @@ def _get_resources(data):
     for collector in dict.fromkeys(active.values()):
         try:
             for arn, tags in collector():
+                if requested_arns is not None and arn not in requested_arns:
+                    continue
                 if not _matches_type_filters(arn, type_filters):
                     continue
                 if not _matches_tag_filters(tags, tag_filters):
@@ -594,10 +982,10 @@ def _get_resources(data):
         except Exception:
             pass  # service not yet initialised — skip silently
 
-    return 200, {"Content-Type": "application/x-amz-json-1.1"}, json.dumps({
+    return _json({
         "ResourceTagMappingList": results,
         "PaginationToken": "",
-    }).encode()
+    })
 
 
 def _get_tag_keys(data):
@@ -609,10 +997,10 @@ def _get_tag_keys(data):
                     keys.add(t["Key"])
         except Exception:
             pass
-    return 200, {"Content-Type": "application/x-amz-json-1.1"}, json.dumps({
+    return _json({
         "TagKeys": sorted(keys),
         "PaginationToken": "",
-    }).encode()
+    })
 
 
 def _get_tag_values(data):
@@ -626,10 +1014,10 @@ def _get_tag_values(data):
                         values.add(t["Value"])
         except Exception:
             pass
-    return 200, {"Content-Type": "application/x-amz-json-1.1"}, json.dumps({
+    return _json({
         "TagValues": sorted(values),
         "PaginationToken": "",
-    }).encode()
+    })
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -639,41 +1027,53 @@ def _tag_resources(data):
 
     Per ARN, failures are reported in ``FailedResourcesMap``:
       - Unknown service segment → ``InvalidParameterException`` (400).
-      - Resource not found in caller's account → ``InvalidParameterException`` (400).
+      - Resource not found in caller's account → ``ResourceNotFound`` (404).
       - Anything else raised by the writer → ``InternalServiceException`` (500).
     The top-level response is always 200 with a (possibly empty) map, matching AWS."""
     arn_list = data.get("ResourceARNList", [])
     tags = data.get("Tags", {})
     failed = {}
 
-    for arn in arn_list:
-        svc_key = _service_key_from_arn(arn)
+    try:
+        parsed_arns = _parse_resource_arn_list(arn_list)
+        for arn, spec in parsed_arns:
+            _reject_foreign_region_arn(spec, arn, "TagResources")
+    except (_InvalidResourceArn, _WrongRegionArn) as exc:
+        return _invalid_parameter(str(exc))
+
+    for arn, spec in parsed_arns:
+        svc_key = spec.service
         writer = _WRITERS.get(svc_key)
         if writer is None:
-            failed[arn] = {
-                "ErrorCode": "InvalidParameterException",
-                "ErrorMessage": f"Unsupported resource type: {svc_key}",
-                "StatusCode": 400,
-            }
+            failed[arn] = _failed_resource(
+                "InvalidParameterException",
+                "Unrecognized service or resource type for tagging",
+                400,
+            )
             continue
         try:
-            writer(arn, tags)
+            _require_resource_scope(spec, arn)
+            writer(spec, arn, tags)
+        except _WrongAccountArn:
+            failed[arn] = _failed_resource(
+                "InvalidClientTokenId",
+                "No account found for the given parameters",
+                403,
+            )
+        except _WrongRegionArn as exc:
+            return _invalid_parameter(str(exc))
         except _ResourceNotFound:
-            failed[arn] = {
-                "ErrorCode": "InvalidParameterException",
-                "ErrorMessage": f"Resource not found: {arn}",
-                "StatusCode": 400,
-            }
+            # A well-formed, same-service ARN whose target resource does not exist.
+            # AWS RGTA reports this in FailedResourcesMap as InvalidParameterException
+            # (the ErrorCode enum is limited to InternalServiceException /
+            # InvalidParameterException — there is no ResourceNotFound code here).
+            failed[arn] = _failed_resource("InvalidParameterException", "Resource does not exist", 400)
         except Exception as exc:
-            failed[arn] = {
-                "ErrorCode": "InternalServiceException",
-                "ErrorMessage": str(exc),
-                "StatusCode": 500,
-            }
+            failed[arn] = _failed_resource("InternalServiceException", str(exc), 500)
 
-    return 200, {"Content-Type": "application/x-amz-json-1.1"}, json.dumps({
+    return _json({
         "FailedResourcesMap": failed,
-    }).encode()
+    })
 
 
 def _untag_resources(data):
@@ -685,34 +1085,46 @@ def _untag_resources(data):
     tag_keys = data.get("TagKeys", [])
     failed = {}
 
-    for arn in arn_list:
-        svc_key = _service_key_from_arn(arn)
+    try:
+        parsed_arns = _parse_resource_arn_list(arn_list)
+        for arn, spec in parsed_arns:
+            _reject_foreign_region_arn(spec, arn, "UntagResources")
+    except (_InvalidResourceArn, _WrongRegionArn) as exc:
+        return _invalid_parameter(str(exc))
+
+    for arn, spec in parsed_arns:
+        svc_key = spec.service
         remover = _REMOVERS.get(svc_key)
         if remover is None:
-            failed[arn] = {
-                "ErrorCode": "InvalidParameterException",
-                "ErrorMessage": f"Unsupported resource type: {svc_key}",
-                "StatusCode": 400,
-            }
+            failed[arn] = _failed_resource(
+                "InvalidParameterException",
+                "Unrecognized service or resource type for tagging",
+                400,
+            )
             continue
         try:
-            remover(arn, tag_keys)
+            _require_resource_scope(spec, arn)
+            remover(spec, arn, tag_keys)
+        except _WrongAccountArn:
+            failed[arn] = _failed_resource(
+                "InvalidClientTokenId",
+                "No account found for the given parameters",
+                403,
+            )
+        except _WrongRegionArn as exc:
+            return _invalid_parameter(str(exc))
         except _ResourceNotFound:
-            failed[arn] = {
-                "ErrorCode": "InvalidParameterException",
-                "ErrorMessage": f"Resource not found: {arn}",
-                "StatusCode": 400,
-            }
+            # A well-formed, same-service ARN whose target resource does not exist.
+            # AWS RGTA reports this in FailedResourcesMap as InvalidParameterException
+            # (the ErrorCode enum is limited to InternalServiceException /
+            # InvalidParameterException — there is no ResourceNotFound code here).
+            failed[arn] = _failed_resource("InvalidParameterException", "Resource does not exist", 400)
         except Exception as exc:
-            failed[arn] = {
-                "ErrorCode": "InternalServiceException",
-                "ErrorMessage": str(exc),
-                "StatusCode": 500,
-            }
+            failed[arn] = _failed_resource("InternalServiceException", str(exc), 500)
 
-    return 200, {"Content-Type": "application/x-amz-json-1.1"}, json.dumps({
+    return _json({
         "FailedResourcesMap": failed,
-    }).encode()
+    })
 
 
 _HANDLERS = {
@@ -747,4 +1159,12 @@ async def handle_request(method, path, headers, body, query_params):
 
 
 def reset():
+    pass
+
+
+def get_state() -> dict:
+    return {}
+
+
+def load_persisted_state(data: dict) -> None:
     pass

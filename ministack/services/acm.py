@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 ACM (Certificate Manager) Service Emulator.
 JSON-based API via X-Amz-Target.
@@ -8,13 +10,16 @@ Supports: RequestCertificate, DescribeCertificate, ListCertificates,
 """
 
 import copy
+import datetime
+import hashlib
 import json
 import logging
 import os
 import time
 
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
@@ -28,7 +33,8 @@ logger = logging.getLogger("acm")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-_certificates = AccountScopedDict()  # arn -> certificate dict
+_certificates = AccountRegionScopedDict()  # arn -> certificate dict (region-scoped)
+_CERTIFICATE_RESOURCE_PREFIX = "certificate/"
 
 
 def get_state():
@@ -60,10 +66,7 @@ def _synthetic_pem(domain):
     parser. The requested domain lives in DomainName / SubjectAlternative
     Names metadata, not embedded in the PEM payload.
 
-    Defined above the import-time `restore_state` block (rather than
-    next to its other call site in `_request_certificate`) so the
-    backfill path doesn't NameError when the load_state try block
-    fires at module import."""
+    """
     _ = domain  # represented in cert metadata, not the base64 block
     return (
         "-----BEGIN CERTIFICATE-----\n"
@@ -72,8 +75,41 @@ def _synthetic_pem(domain):
     )
 
 
-def restore_state(data):
-    _certificates.update(data.get("_certificates", {}))
+def _region_from_arn(value, fallback):
+    if not isinstance(value, str) or not value.startswith("arn:"):
+        return fallback
+    try:
+        return parse_arn(value).region or fallback
+    except ArnParseError:
+        return fallback
+
+
+def _restore_certificates(restored):
+    """Region-scope certificates on restore. New state is already region-scoped;
+    legacy account-scoped state is re-homed by mining the region from the
+    certificate ARN key (each cert lives in exactly one region)."""
+    if isinstance(restored, AccountRegionScopedDict):
+        _certificates.update(restored)
+        return
+    boot_region = get_region()
+    if isinstance(restored, AccountScopedDict):
+        entries = restored._data.items()
+    elif isinstance(restored, dict):
+        account_id = get_account_id()
+        entries = (((account_id, arn), cert) for arn, cert in restored.items())
+    else:
+        _certificates.update(restored)
+        return
+    for (account_id, arn), cert in entries:
+        _certificates.set_scoped(account_id, _region_from_arn(arn, boot_region), arn, cert)
+
+
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
+    _restore_certificates(data.get("_certificates", {}))
     # Backwards compat: pre-fix snapshots have certificates without
     # `_pem_body` / `_pem_chain` (the old GetCertificate path returned
     # a hard-coded literal regardless of stored data). Without backfill,
@@ -88,15 +124,6 @@ def restore_state(data):
             cert["_pem_chain"] = ""
 
 
-try:
-    _restored = load_state("acm")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 def _future_iso(seconds):
@@ -104,11 +131,16 @@ def _future_iso(seconds):
 
 
 def _epoch(iso_or_epoch):
-    """Convert ISO timestamp to epoch float if needed. ACM API returns epoch floats."""
+    """Convert ISO timestamp to epoch float if needed. ACM API returns epoch
+    floats. The seconds-only format this used to parse does not match the
+    millisecond timestamps ``now_iso`` writes, so ``CreatedAt`` and
+    ``IssuedAt`` fell through to the fallback and every certificate answered
+    the time of the call, which made each read look like a fresh issue."""
     if isinstance(iso_or_epoch, (int, float)):
         return float(iso_or_epoch)
     try:
-        return time.mktime(time.strptime(iso_or_epoch, "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
+        return datetime.datetime.fromisoformat(
+            str(iso_or_epoch).replace("Z", "+00:00")).timestamp()
     except (ValueError, TypeError):
         return time.time()
 
@@ -117,37 +149,137 @@ def _cert_arn():
     return f"arn:aws:acm:{get_region()}:{get_account_id()}:certificate/{new_uuid()}"
 
 
+def _is_local_certificate_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return False
+    if (
+        spec.partition != "aws"
+        or spec.service != "acm"
+        or spec.account_id != get_account_id()
+        or spec.region != get_region()
+    ):
+        return False
+    if not spec.resource.startswith(_CERTIFICATE_RESOURCE_PREFIX):
+        return False
+    certificate_id = spec.resource[len(_CERTIFICATE_RESOURCE_PREFIX):]
+    return bool(certificate_id) and "/" not in certificate_id
+
+
+def _get_local_certificate(arn):
+    if not _is_local_certificate_arn(arn):
+        return None
+    return _certificates.get(arn)
+
+
+def _certificate_not_found(arn):
+    return error_response_json("ResourceNotFoundException", f"Certificate {arn} not found", 400)
+
+
+# CertificateOptions members in model order (the order deserialization checks them), each with its wire
+# name and allowed values. Field validation reports them in _OPTION_VALIDATION_ORDER instead.
+_OPTION_ENUMS = {
+    "CertificateTransparencyLoggingPreference": ("certificateTransparencyLoggingPreference", ("ENABLED", "DISABLED")),
+    "Export": ("export", ("ENABLED", "DISABLED")),
+    "ValidationMethod": ("validationMethod", ("HTTP", "DNS", "EMAIL")),
+}
+_OPTION_VALIDATION_ORDER = ("ValidationMethod", "CertificateTransparencyLoggingPreference", "Export")
+# The options DescribeCertificate shows; ValidationMethod is validated but not shown.
+_STORED_OPTIONS = ("CertificateTransparencyLoggingPreference", "Export")
+
+
+def _serialization_error(message):
+    return error_response_json("SerializationException", message, 400, message_key="Message")
+
+
+def _string_member_serialization_error(value):
+    """A string member sent as another JSON type fails to deserialize (null counts as not sent)."""
+    if value is None or isinstance(value, str):
+        return None
+    if isinstance(value, bool):
+        return _serialization_error(f"{'TRUE' if value else 'FALSE'}_VALUE can not be converted to a String")
+    if isinstance(value, (int, float)):
+        return _serialization_error("NUMBER_VALUE can not be converted to a String")
+    if isinstance(value, dict):
+        return _serialization_error("Start of structure or map found where not expected.")
+    return _serialization_error("Start of list found where not expected")
+
+
+def _options_serialization_error(options):
+    if options is None:
+        return None
+    if isinstance(options, list):
+        return _serialization_error("Start of list found where not expected")
+    if not isinstance(options, dict):
+        return _serialization_error("Expected null")
+    for field in _OPTION_ENUMS:
+        invalid = _string_member_serialization_error(options.get(field))
+        if invalid:
+            return invalid
+    return None
+
+
+def _options_errors(options):
+    errors = []
+    for field in _OPTION_VALIDATION_ORDER:
+        wire, allowed = _OPTION_ENUMS[field]
+        value = options.get(field)
+        if value is not None and value not in allowed:
+            errors.append(f"Value of the input at 'options.{wire}' failed to satisfy constraint: "
+                          f"Member must satisfy enum value set: [{', '.join(allowed)}]")
+    return errors
+
+
+def _validation_error(errors):
+    count = "1 validation error" if len(errors) == 1 else f"{len(errors)} validation errors"
+    return error_response_json("ValidationException", f"{count} detected: {'; '.join(errors)}", 400)
+
+
 def _validation_options(domain, method):
+    # A wildcard SAN validates through the same DNS record as its base domain:
+    # real ACM strips the leading "*." so "*.example.com" and "example.com"
+    # both resolve to a single _acme-challenge.example.com CNAME whose name AND
+    # value are identical. Terraform's aws_route53_record for_each keyed by
+    # domain_validation_options then collapses the two onto one record, and
+    # aws_acm_certificate_validation finds the FQDN it created (#1250). The
+    # value is derived from the base domain so the wildcard/apex pair match.
+    base = domain[2:] if domain.startswith("*.") else domain
+    digest = hashlib.sha256(base.encode("utf-8")).hexdigest()[:8]
     return {
         "DomainName": domain,
         "ValidationMethod": method,
         "ValidationStatus": "SUCCESS",
         "ResourceRecord": {
-            "Name": f"_acme-challenge.{domain}.",
+            "Name": f"_acme-challenge.{base}.",
             "Type": "CNAME",
-            "Value": f"fake-validation-{new_uuid()[:8]}.acm.amazonaws.com.",
+            "Value": f"fake-validation-{digest}.acm.amazonaws.com.",
         },
     }
 
 
 def _cert_shape(cert):
-    return {
+    shape = {
         "CertificateArn": cert["CertificateArn"],
         "DomainName": cert["DomainName"],
         "SubjectAlternativeNames": cert.get("SubjectAlternativeNames", [cert["DomainName"]]),
         "Status": cert["Status"],
         "Type": cert.get("Type", "AMAZON_ISSUED"),
-        "KeyAlgorithm": "RSA_2048",
+        "KeyAlgorithm": cert.get("KeyAlgorithm", "RSA_2048"),
         "SignatureAlgorithm": "SHA256WITHRSA",
-        "InUseBy": cert.get("InUseBy", []),
+        "InUseBy": cert.get("InUseBy", []) + _signing_profiles_using(cert["CertificateArn"]),
         "CreatedAt": _epoch(cert["CreatedAt"]),
         "IssuedAt": _epoch(cert.get("IssuedAt", cert["CreatedAt"])),
         "NotBefore": _epoch(cert.get("NotBefore", cert["CreatedAt"])),
         "NotAfter": _epoch(cert.get("NotAfter", _future_iso(365 * 24 * 3600))),
         "DomainValidationOptions": cert.get("DomainValidationOptions", []),
         "Options": cert.get("Options", {}),
-        "Tags": cert.get("Tags", []),
     }
+    if cert.get("CertificateAuthorityArn"):
+        shape["CertificateAuthorityArn"] = cert["CertificateAuthorityArn"]
+    if cert.get("ManagedBy"):
+        shape["ManagedBy"] = cert["ManagedBy"]
+    return shape
 
 
 async def handle_request(method, path, headers, body, query_params):
@@ -180,18 +312,29 @@ async def handle_request(method, path, headers, body, query_params):
     return handler(data)
 
 
-# (`_synthetic_pem` is defined near `restore_state` above so the
-# import-time backfill path doesn't NameError.)
-
-
 def _request_certificate(data):
-    domain = data.get("DomainName", "")
-    if not domain:
-        return error_response_json("InvalidParameterException", "DomainName is required", 400)
+    domain = data.get("DomainName")
+    options = data.get("Options")
+    invalid = _string_member_serialization_error(domain) or _options_serialization_error(options)
+    if invalid:
+        return invalid
+    options = options or {}
+    errors = []
+    if domain is None:
+        errors.append("Value null at 'domainName' failed to satisfy constraint: Member must not be null")
+    elif domain == "":
+        errors += [f"Value of the input at 'domainName' failed to satisfy constraint: {constraint}" for constraint in (
+            "Member must satisfy regular expression pattern: "
+            "(\\*\\.)?(((?!-)[A-Za-z0-9-]{0,62}[A-Za-z0-9])\\.)+((?!-)[A-Za-z0-9-]{1,62}[A-Za-z0-9])",
+            "Member must have length greater than or equal to 1")]
+    errors += _options_errors(options)
+    if errors:
+        return _validation_error(errors)
     method = data.get("ValidationMethod", "DNS")
     sans = data.get("SubjectAlternativeNames", [domain])
     if domain not in sans:
         sans = [domain] + sans
+    ca_arn = data.get("CertificateAuthorityArn")
     arn = _cert_arn()
     now = now_iso()
     _certificates[arn] = {
@@ -199,15 +342,22 @@ def _request_certificate(data):
         "DomainName": domain,
         "SubjectAlternativeNames": sans,
         "Status": "ISSUED",
-        "Type": "AMAZON_ISSUED",
+        "Type": "PRIVATE" if ca_arn else "AMAZON_ISSUED",
         "CreatedAt": now,
         "IssuedAt": now,
         "NotBefore": now,
         "NotAfter": _future_iso(365 * 24 * 3600),
-        "DomainValidationOptions": [_validation_options(d, method) for d in sans],
+        "DomainValidationOptions": [] if ca_arn else [_validation_options(d, method) for d in sans],
         "ValidationMethod": method,
         "Tags": data.get("Tags", []),
-        "Options": {},
+        "Options": {
+            "CertificateTransparencyLoggingPreference":
+                options.get("CertificateTransparencyLoggingPreference") or "ENABLED",
+            "Export": options.get("Export") or "DISABLED",
+        },
+        "KeyAlgorithm": data.get("KeyAlgorithm", "RSA_2048"),
+        "CertificateAuthorityArn": ca_arn,
+        "ManagedBy": data.get("ManagedBy"),
         "_pem_body": _synthetic_pem(domain),
         "_pem_chain": "",
         "_private_key": "",
@@ -218,16 +368,31 @@ def _request_certificate(data):
 
 def _describe_certificate(data):
     arn = data.get("CertificateArn", "")
-    cert = _certificates.get(arn)
+    cert = _get_local_certificate(arn)
     if not cert:
-        return error_response_json("ResourceNotFoundException", f"Certificate {arn} not found", 400)
+        return _certificate_not_found(arn)
     return json_response({"Certificate": _cert_shape(cert)})
+
+
+def _page(items, limit, token):
+    try:
+        start = max(int(token), 0) if token else 0
+    except (TypeError, ValueError):
+        start = 0
+    try:
+        limit = int(limit) if limit else 0
+    except (TypeError, ValueError):
+        limit = 0
+    end = start + limit if limit > 0 else len(items)
+    return items[start:end], (str(end) if end < len(items) else None)
 
 
 def _list_certificates(data):
     statuses = data.get("CertificateStatuses", [])
     summaries = []
     for arn, cert in _certificates.items():
+        if not _is_local_certificate_arn(arn):
+            continue
         if statuses and cert["Status"] not in statuses:
             continue
         summaries.append({
@@ -235,19 +400,29 @@ def _list_certificates(data):
             "DomainName": cert["DomainName"],
             "Status": cert["Status"],
         })
-    # Real AWS omits NextToken when there's no next page. boto3 strips
-    # null fields client-side so it tolerates `"NextToken": null`, but
-    # other SDKs (Java, Go, raw HTTP) and pagination loops checking
-    # `if "NextToken" in response` see the literal null and loop
-    # forever. ACM emulator currently emits a single page, so always
-    # omit the key.
-    return json_response({"CertificateSummaryList": summaries})
+    page, nxt = _page(summaries, data.get("MaxItems"), data.get("NextToken"))
+    resp = {"CertificateSummaryList": page}
+    if nxt:
+        resp["NextToken"] = nxt
+    return json_response(resp)
+
+
+def _signing_profiles_using(arn):
+    """ARNs of the Active Signer signing profiles whose signing material is this certificate."""
+    from ministack.services import signer
+
+    return [profile["arn"] for profile in signer._profiles.values()
+            if profile.get("status") == "Active"
+            and (profile.get("signingMaterial") or {}).get("certificateArn") == arn]
 
 
 def _delete_certificate(data):
     arn = data.get("CertificateArn", "")
-    if arn not in _certificates:
-        return error_response_json("ResourceNotFoundException", f"Certificate {arn} not found", 400)
+    if _get_local_certificate(arn) is None:
+        return _certificate_not_found(arn)
+    if _signing_profiles_using(arn):
+        return error_response_json(
+            "ResourceInUseException", f"Certificate {arn} in account {get_account_id()} is in use.", 400)
     del _certificates[arn]
     return json_response({})
 
@@ -277,9 +452,9 @@ def _decode_pem_field(value):
 
 def _get_certificate(data):
     arn = data.get("CertificateArn", "")
-    cert = _certificates.get(arn)
+    cert = _get_local_certificate(arn)
     if cert is None:
-        return error_response_json("ResourceNotFoundException", f"Certificate {arn} not found", 400)
+        return _certificate_not_found(arn)
     # PrivateKey is intentionally never returned — real AWS only exposes
     # it via ExportCertificate (passphrase-protected).
     return json_response({
@@ -289,7 +464,15 @@ def _get_certificate(data):
 
 
 def _import_certificate(data):
+    if not data.get("PrivateKey"):
+        constraint = ("Member must not be null" if data.get("PrivateKey") is None
+                      else "Member must have length greater than or equal to 1")
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value at 'privateKey' failed to satisfy constraint: {constraint}", 400)
     arn = data.get("CertificateArn") or _cert_arn()
+    if data.get("CertificateArn") and not _is_local_certificate_arn(arn):
+        return _certificate_not_found(arn)
     now = now_iso()
     cert_body = _decode_pem_field(data.get("Certificate"))
     cert_chain = _decode_pem_field(data.get("CertificateChain"))
@@ -313,7 +496,7 @@ def _import_certificate(data):
         "NotAfter": _future_iso(365 * 24 * 3600),
         "DomainValidationOptions": [],
         "Tags": data.get("Tags", existing.get("Tags", [])),
-        "Options": existing.get("Options", {}),
+        "Options": {"CertificateTransparencyLoggingPreference": "DISABLED", "Export": "DISABLED"},
         "_pem_body": cert_body,
         "_pem_chain": cert_chain,
         "_private_key": private_key,
@@ -323,9 +506,9 @@ def _import_certificate(data):
 
 def _add_tags(data):
     arn = data.get("CertificateArn", "")
-    cert = _certificates.get(arn)
+    cert = _get_local_certificate(arn)
     if not cert:
-        return error_response_json("ResourceNotFoundException", f"Certificate {arn} not found", 400)
+        return _certificate_not_found(arn)
     existing = {t["Key"]: t for t in cert.get("Tags", [])}
     for tag in data.get("Tags", []):
         existing[tag["Key"]] = tag
@@ -335,9 +518,9 @@ def _add_tags(data):
 
 def _remove_tags(data):
     arn = data.get("CertificateArn", "")
-    cert = _certificates.get(arn)
+    cert = _get_local_certificate(arn)
     if not cert:
-        return error_response_json("ResourceNotFoundException", f"Certificate {arn} not found", 400)
+        return _certificate_not_found(arn)
     remove_keys = {t["Key"] for t in data.get("Tags", [])}
     cert["Tags"] = [t for t in cert.get("Tags", []) if t["Key"] not in remove_keys]
     return json_response({})
@@ -345,32 +528,60 @@ def _remove_tags(data):
 
 def _list_tags(data):
     arn = data.get("CertificateArn", "")
-    cert = _certificates.get(arn)
+    cert = _get_local_certificate(arn)
     if not cert:
-        return error_response_json("ResourceNotFoundException", f"Certificate {arn} not found", 400)
+        return _certificate_not_found(arn)
     return json_response({"Tags": cert.get("Tags", [])})
 
 
 def _update_options(data):
-    arn = data.get("CertificateArn", "")
-    cert = _certificates.get(arn)
+    arn = data.get("CertificateArn")
+    options = data.get("Options")
+    invalid = _options_serialization_error(options)
+    if invalid:
+        return invalid
+    errors = []
+    if arn is None:
+        errors.append("Value null at 'certificateArn' failed to satisfy constraint: Member must not be null")
+    if options is None:
+        errors.append("Value null at 'options' failed to satisfy constraint: Member must not be null")
+    else:
+        errors += _options_errors(options)
+    if errors:
+        return _validation_error(errors)
+    options = {field: options[field] for field in _OPTION_ENUMS if options.get(field) is not None}
+    if not options:
+        # Nothing to change: AWS answers 200 even when no such certificate exists. (It still rejects an ARN
+        # that fails its ARN pattern; MiniStack doesn't validate the ARN pattern.)
+        return json_response({})
+    cert = _get_local_certificate(arn)
     if not cert:
-        return error_response_json("ResourceNotFoundException", f"Certificate {arn} not found", 400)
-    cert["Options"] = data.get("Options", {})
+        return _certificate_not_found(arn)
+    if cert.get("Type") == "IMPORTED":
+        if "ValidationMethod" in options and len(options) == 1:
+            return error_response_json(
+                "ValidationException", "UpdateCertificate can only be used for public certificates.", 400)
+        return error_response_json(
+            "InvalidStateException",
+            "The UpdateCertificateOptions command is not permitted for imported certificates.", 400)
+    current = cert.get("Options", {})
+    if "Export" in options and options["Export"] != current.get("Export", "DISABLED"):
+        return error_response_json("ValidationException", "Export option for certificates cannot be updated", 400)
+    cert["Options"] = {**current, **{field: options[field] for field in _STORED_OPTIONS if field in options}}
     return json_response({})
 
 
 def _renew_certificate(data):
     arn = data.get("CertificateArn", "")
-    if arn not in _certificates:
-        return error_response_json("ResourceNotFoundException", f"Certificate {arn} not found", 400)
+    if _get_local_certificate(arn) is None:
+        return _certificate_not_found(arn)
     return json_response({})
 
 
 def _resend_validation_email(data):
     arn = data.get("CertificateArn", "")
-    if arn not in _certificates:
-        return error_response_json("ResourceNotFoundException", f"Certificate {arn} not found", 400)
+    if _get_local_certificate(arn) is None:
+        return _certificate_not_found(arn)
     return json_response({})
 
 

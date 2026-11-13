@@ -2,18 +2,40 @@
 Pytest fixtures for MiniStack integration tests.
 """
 
+import concurrent.futures
 import contextlib
+import io
+import json
 import os
 import socket
+import statistics
+import threading
+import time
 import urllib.request
-from urllib.parse import urlparse
+import uuid
+import zipfile
+from types import SimpleNamespace
+from urllib.parse import unquote, urlparse
 
 import boto3
 import pytest
 from botocore.config import Config
 
+from ministack.core.responses import install_docker_hub_fallback
+
+# Fixtures that pull images themselves get the same Docker Hub fallback as the server.
+install_docker_hub_fallback()
+
 ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 ENDPOINT_HOST = urlparse(ENDPOINT).hostname
+# The port the services advertise themselves on, read the way they read it: an
+# `or` chain, so an empty string falls through exactly as it does in
+# ministack/app.py. A test asserting on a value a service built from this has
+# to use the same source. MINISTACK_ENDPOINT above can be set independently, so
+# deriving the port from it would agree only by coincidence. Note that some
+# services read GATEWAY_PORT alone, without the EDGE_PORT fallback; this
+# constant is for the ones that render an advertised endpoint.
+GATEWAY_PORT = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
 REGION = "us-east-1"
 
 _default_kwargs = dict(
@@ -41,8 +63,10 @@ def patch_endpoint_dns():
         return _real_getaddrinfo(host, port, *args, **kwargs)
 
     socket.getaddrinfo = _patched
-    yield
-    socket.getaddrinfo = _real_getaddrinfo
+    try:
+        yield
+    finally:
+        socket.getaddrinfo = _real_getaddrinfo
 
 
 def make_client(service, additional_config_kwargs=None):
@@ -51,20 +75,267 @@ def make_client(service, additional_config_kwargs=None):
     return boto3.client(service, **_default_kwargs, config=Config(**_default_config_kwargs, **additional_config_kwargs))
 
 
+def sqs_policy_allow_s3(queue_arn, bucket, account):
+    """Queue policy document letting one S3 bucket notify the queue.
+
+    The AWS shape (service principal + SourceArn/SourceAccount conditions);
+    real S3 refuses a notification config whose queue lacks it.
+    """
+    return {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "s3-notify", "Effect": "Allow",
+            "Principal": {"Service": "s3.amazonaws.com"},
+            "Action": "sqs:SendMessage", "Resource": queue_arn,
+            "Condition": {
+                "ArnLike": {"aws:SourceArn": f"arn:aws:s3:*:*:{bucket}"},
+                "StringEquals": {"aws:SourceAccount": account}}}]}
+
+
+def sqs_policy_allow_sns(queue_arn, topic_arn):
+    """Queue policy document letting one SNS topic fan out to the queue.
+
+    The AWS shape (service principal + SourceArn condition); without it SNS
+    cannot deliver, even in the same account.
+    """
+    return {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "sns-fanout", "Effect": "Allow",
+            "Principal": {"Service": "sns.amazonaws.com"},
+            "Action": "sqs:SendMessage", "Resource": queue_arn,
+            "Condition": {"ArnEquals": {"aws:SourceArn": topic_arn}}}]}
+
+
+def ses_events_to_log_group(*, account=None, region=REGION, suffix=None, default=True):
+    """The AWS setup that sends SES sending events to a CloudWatch Logs log group.
+
+    In an account of its own unless one is given: a log group with a resource
+    policy letting EventBridge write, a rule sending every ``aws.ses`` event to
+    it, a configuration set with an enabled EventBridge event destination for
+    Send, Delivery, Bounce and Complaint, and a domain identity whose default
+    set it is (unless ``default`` is False). ``published()`` reads back the
+    events in the log group, one per line; ``configuration_set()`` adds a set.
+    """
+    account = account or f"{uuid.uuid4().int % 10**12:012d}"
+    suffix = suffix or uuid.uuid4().hex[:8]
+
+    def client(service):
+        return boto3.client(service, endpoint_url=ENDPOINT, aws_access_key_id=account,
+                            aws_secret_access_key="test", region_name=region,
+                            config=Config(region_name=region, retries={"mode": "standard"}))
+
+    sesv2, logs, events = client("sesv2"), client("logs"), client("events")
+
+    def configuration_set(name, matching=("SEND", "DELIVERY", "BOUNCE", "COMPLAINT"), enabled=True):
+        sesv2.create_configuration_set(ConfigurationSetName=name)
+        sesv2.create_configuration_set_event_destination(
+            ConfigurationSetName=name, EventDestinationName="eventbridge",
+            EventDestination={"Enabled": enabled, "MatchingEventTypes": list(matching), "EventBridgeDestination": {
+                "EventBusArn": f"arn:aws:events:{region}:{account}:event-bus/default"}})
+        return name
+
+    group, domain = f"/aws/events/ses-{suffix}", f"ses-{suffix}.example.com"
+    logs.create_log_group(logGroupName=group)
+    group_arn = logs.describe_log_groups(logGroupNamePrefix=group)["logGroups"][0]["arn"]
+    logs.put_resource_policy(policyName=f"ses-events-{suffix}", policyDocument=json.dumps({
+        "Version": "2012-10-17",
+        "Statement": [{"Effect": "Allow",
+                       "Principal": {"Service": ["events.amazonaws.com", "delivery.logs.amazonaws.com"]},
+                       "Action": ["logs:CreateLogStream", "logs:PutLogEvents"], "Resource": group_arn}]}))
+    events.put_rule(Name=f"ses-events-{suffix}", EventPattern=json.dumps({"source": ["aws.ses"]}))
+    events.put_targets(Rule=f"ses-events-{suffix}", Targets=[{"Id": "logs", "Arn": group_arn.removesuffix(":*")}])
+    config_set = configuration_set(f"ses-events-{suffix}")
+    sesv2.create_email_identity(EmailIdentity=domain)
+    if default:
+        sesv2.put_email_identity_configuration_set_attributes(EmailIdentity=domain, ConfigurationSetName=config_set)
+
+    def published():
+        return [json.loads(e["message"]) for e in logs.filter_log_events(logGroupName=group)["events"]]
+
+    return SimpleNamespace(account=account, region=region, suffix=suffix, ses=client("ses"), sesv2=sesv2, logs=logs,
+                           group=group, config_set=config_set, domain=domain, sender=f"sender@{domain}",
+                           configuration_set=configuration_set, published=published)
+
+
+def iot_test_ca(registration_code, common_name="ministack-test-ca"):
+    """A fresh CA as ``(ca_pem, ca_key_pem, verification_pem)``, the verification certificate carrying ``registration_code`` as its CN."""
+    from ministack.core.x509_utils import generate_ca, sign_leaf_certificate
+
+    ca_pem, ca_key_pem = generate_ca(common_name=common_name)
+    verification_pem = sign_leaf_certificate(ca_pem, ca_key_pem, common_name=registration_code)[0]
+    return ca_pem, ca_key_pem, verification_pem
+
+
+@pytest.fixture(scope="session")
+def auth_enabled():
+    """Verify the running server's IAM mode before exercising auth contracts."""
+    expected = os.environ.get("AUTH", "false").lower()
+    if expected not in {"true", "false"}:
+        pytest.fail("Auth contracts require AUTH=true or AUTH=false.", pytrace=False)
+    try:
+        with urllib.request.urlopen(f"{ENDPOINT.rstrip('/')}/_ministack/health", timeout=5) as response:
+            actual = json.load(response).get("auth")
+    except (OSError, ValueError) as exc:
+        pytest.fail(f"Cannot read MiniStack auth mode at {ENDPOINT}: {exc}", pytrace=False)
+    if actual not in ("enabled", "disabled"):
+        pytest.fail("MiniStack health response lacks auth=enabled/disabled; restart with current code.", pytrace=False)
+    expected_state = "enabled" if expected == "true" else "disabled"
+    if actual != expected_state:
+        pytest.fail(
+            f"Auth mode mismatch: tests expect AUTH={expected}, but {ENDPOINT} reports "
+            f"auth={actual}. Restart the server with the expected mode.",
+            pytrace=False,
+        )
+    return actual == "enabled"
+
+
+@pytest.fixture(autouse=True)
+def _verify_auth_contract_mode(request):
+    # Verify even marked tests that don't need different expectations per mode.
+    if request.node.get_closest_marker("auth_contract"):
+        request.getfixturevalue("auth_enabled")
+
+
+@pytest.fixture
+def iam_user(auth_enabled):
+    """Factory for API-created IAM users; no permissions unless explicitly supplied.
+
+    Returns an object with name, arn, and client(service, region=..., config=...).
+    Only this fixture's users, keys, policies, and clients are cleaned up.
+    """
+    with contextlib.ExitStack() as cleanup:
+        admin = make_client("iam")
+        cleanup.callback(admin.close)
+
+        def create(*, policy=None):
+            name = f"auth-user-{uuid.uuid4().hex}"
+            user = admin.create_user(UserName=name)["User"]
+            cleanup.callback(admin.delete_user, UserName=name)
+            key = admin.create_access_key(UserName=name)["AccessKey"]
+            cleanup.callback(admin.delete_access_key, UserName=name, AccessKeyId=key["AccessKeyId"])
+            if policy is not None:
+                admin.put_user_policy(UserName=name, PolicyName="test-policy", PolicyDocument=json.dumps(policy))
+                cleanup.callback(admin.delete_user_policy, UserName=name, PolicyName="test-policy")
+
+            session = boto3.Session(
+                aws_access_key_id=key["AccessKeyId"],
+                aws_secret_access_key=key["SecretAccessKey"],
+                region_name=REGION,
+            )
+
+            def client(service, *, region=REGION, config=None):
+                defaults = Config(retries={"total_max_attempts": 1}, connect_timeout=5, read_timeout=10)
+                result = session.client(
+                    service, endpoint_url=ENDPOINT, region_name=region,
+                    config=defaults.merge(config) if config is not None else defaults,
+                )
+                cleanup.callback(result.close)
+                return result
+
+            return SimpleNamespace(name=name, arn=user["Arn"], client=client)
+
+        yield create
+
+
+@contextlib.contextmanager
+def second_access_key(user):
+    """A second access key of an ``iam_user`` user, to sign raw requests with; deleted on exit."""
+    iam = make_client("iam")
+    key = iam.create_access_key(UserName=user.name)["AccessKey"]
+    try:
+        yield key["AccessKeyId"], key["SecretAccessKey"]
+    finally:
+        iam.delete_access_key(UserName=user.name, AccessKeyId=key["AccessKeyId"])
+
+
+def inprocess_iam_user(identity_policy=None):
+    """An in-process IAM user with an access key in the default account: ``((key id, secret), arn)``."""
+    from ministack.core.responses import get_account_id, request_scope
+    from ministack.services import iam as iam_svc
+
+    name = f"user-{uuid.uuid4().hex[:8]}"
+    key = ("AKIA" + uuid.uuid4().hex[:16].upper(), uuid.uuid4().hex)
+    arn = f"arn:aws:iam::{get_account_id()}:user/{name}"
+    with request_scope(get_account_id(), REGION):
+        iam_svc._users[name] = {"UserName": name, "Arn": arn, "UserId": "AIDA" + key[0][4:],
+                                "CreateDate": "2026-01-01", "Path": "/", "AttachedPolicies": [], "Tags": []}
+        iam_svc._access_keys[key[0]] = {"UserName": name, "AccessKeyId": key[0], "SecretAccessKey": key[1],
+                                        "Status": "Active", "CreateDate": "2026-01-01"}
+        if identity_policy:
+            iam_svc._user_inline_policies[name] = {"p": json.dumps(identity_policy)}
+    return key, arn
+
+
+@pytest.fixture
+def auth(monkeypatch):
+    """AUTH=true for the in-process app."""
+    import ministack.app as app_mod
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+
+
+def routed_request(key, service, method, path, body=b"", headers=None, host="localhost:4566"):
+    """One in-process request through the whole app, SigV4-signed with *key* ``(key id, secret)`` unless it is None."""
+    import asyncio
+
+    from botocore.auth import S3SigV4Auth, SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    import ministack.app as app_mod
+
+    request = AWSRequest(method, f"http://{host}{path}", data=body, headers={"host": host, **(headers or {})})
+    if key:
+        (S3SigV4Auth if service == "s3" else SigV4Auth)(Credentials(*key), service, REGION).add_auth(request)
+    sent = []
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(app_mod.app({
+        "type": "http", "method": method, "path": unquote(path), "raw_path": path.encode(), "query_string": b"",
+        "headers": [(k.lower().encode(), v.encode()) for k, v in request.headers.items()]}, receive, send))
+    return (sent[0]["status"], {k.decode().lower(): v.decode() for k, v in sent[0].get("headers", [])},
+            b"".join(m.get("body", b"") for m in sent[1:]))
+
+
 _SERIAL_TESTS = {
+    "tests/test_rds.py::test_rds_cluster_password_reset_does_not_leak_to_a_recreated_cluster",
+    "tests/test_rds.py::test_rds_cluster_password_reset_is_visible_before_it_settles",
+    "tests/test_rds.py::test_rds_cluster_password_reset_on_stopped_cluster_is_rejected",
+    "tests/test_athena.py::test_athena_queries_glue_backed_parquet",
+    "tests/test_rds.py::test_rds_pg_two_replicating_readers_provision_source_once",
     "tests/test_athena.py::test_athena_engine_mock_via_config",
+    "tests/test_athena.py::test_athena_mixed_glue_and_s3_uri",
+    "tests/test_athena.py::test_athena_resolves_quoted_and_catalog_qualified_tables",
+    "tests/test_athena.py::test_athena_header_row_only_on_first_page",
+    "tests/test_athena.py::test_athena_create_and_drop_table_apply_to_glue",
+    "tests/test_athena.py::test_athena_reads_a_parquet_table_created_without_classification",
     "tests/test_ec2.py::test_ec2_create_default_vpc",
     "tests/test_eks.py::test_eks_cfn_cluster",
     "tests/test_eks.py::test_eks_create_describe_delete_cluster",
+    "tests/test_eks.py::test_eks_restore_state_normalizes_endpoint_to_localhost",
     "tests/test_lambda.py::test_lambda_reset_terminates_workers",
+    "tests/test_lambda.py::test_lambda_dynamodb_stream_esm_latest_processes_first_record",
     "tests/test_ministack.py::test_ministack_config_invalid_key_ignored",
     "tests/test_ses.py::test_ses_messages_endpoint_reset",
     "tests/test_ses.py::test_ses_messages_endpoint_account_filter",
+    "tests/test_ses.py::test_ses_events_setup_is_cleared_by_a_reset",
     "tests/test_stepfunctions.py::test_sfn_mock_config_return",
     "tests/test_stepfunctions.py::test_sfn_mock_config_throw",
+    "tests/test_stepfunctions.py::test_sfn_mock_config_throw_routes_to_catch",
+    "tests/test_stepfunctions.py::test_sfn_mock_config_jsonata_assign_applied",
     "tests/test_stepfunctions.py::test_sfn_wait_scale_zero_does_not_timeout_lambda_tasks",
     "tests/test_stepfunctions.py::test_sfn_wait_scale_zero_skips_wait",
     "tests/test_rds.py::test_rds_lambda_network_connectivity",
+    # Docker-executor Lambda timeout (skipped unless LAMBDA_EXECUTOR=docker):
+    # cold-starts a container and asserts a wall-clock bound (< 9s for a
+    # Timeout=3 function), which parallel container churn breaks.
+    "tests/test_lambda.py::test_lambda_docker_timeout_returns_task_timed_out_promptly",
     "tests/test_elasticache.py::test_elasticache_lambda_network_connectivity",
     # API Gateway execute-api → Lambda invoke under tight urlopen / WS recv
     # timeouts. These pass cleanly when run serially but are sensitive to
@@ -78,6 +349,191 @@ _SERIAL_TESTS = {
     "tests/test_apigatewayv2.py::test_apigwv1_path_based_restapi_legacy_user_request",
     "tests/test_apigatewayv2.py::test_apigwv2_named_stage_still_requires_prefix",
     "tests/test_apigatewayv2.py::test_apigwv2_integration_wrapped_function_arn",
+    # Non-proxy (custom) AWS integration tests: same execute-api → Lambda
+    # cold-start shape as the ones above, one function created per test.
+    "tests/test_apigatewayv1.py::test_apigwv1_execute_lambda_custom_returns_raw_output",
+    "tests/test_apigatewayv1.py::test_apigwv1_execute_lambda_custom_function_error_is_502",
+    "tests/test_apigatewayv1.py::test_apigwv1_execute_lambda_custom_without_integration_responses_is_200",
+    "tests/test_apigatewayv1.py::test_apigwv1_execute_lambda_proxy_envelope_still_interpreted",
+    # v1 Lambda-authorizer cache tests. Same cold-start-burst sensitivity as the
+    # apigw tests above, doubled: every guarded request cold-starts TWO Lambdas
+    # (the authorizer and the backend), and the invocation-count assertions that
+    # prove a cache hit or miss leave no slack for a retry.
+    "tests/test_apigatewayv1.py::test_apigwv1_authorizer_cache_is_scoped_per_method_arn",
+    "tests/test_apigatewayv1.py::test_apigwv1_authorizer_cache_is_scoped_per_stage",
+    "tests/test_apigatewayv1.py::test_apigwv1_authorizer_invalid_validation_expression_is_500",
+    "tests/test_apigatewayv1.py::test_apigwv1_authorizer_without_principal_id_is_500_and_not_cached",
+    "tests/test_apigatewayv1.py::test_apigwv1_authorizer_without_policy_document_is_500_and_not_cached",
+    "tests/test_apigatewayv1.py::test_apigwv1_authorizer_unparsable_ttl_falls_back_to_the_default",
+    # v2 REQUEST-authorizer cache tests. Same cold-start-burst sensitivity as
+    # the apigw tests above, doubled: every guarded request cold-starts TWO
+    # Lambdas (the authorizer and the integration), and the invocation-count
+    # assertions that prove a cache hit or miss leave no slack for a retry.
+    "tests/test_apigatewayv2.py::test_apigwv2_authorizer_cache_is_scoped_per_route_arn",
+    "tests/test_apigatewayv2.py::test_apigwv2_authorizer_cache_is_scoped_per_stage",
+    "tests/test_apigatewayv2.py::test_apigwv2_authorizer_simple_response_cache_covers_routes",
+    "tests/test_apigatewayv2.py::test_apigwv2_authorizer_without_policy_document_is_500_and_not_cached",
+    "tests/test_apigatewayv2.py::test_apigwv2_authorizer_simple_response_non_boolean_is_500",
+    "tests/test_apigatewayv2.py::test_apigwv2_authorizer_unparsable_ttl_falls_back_to_the_default",
+    "tests/test_apigatewayv2.py::test_apigwv2_authorizer_without_identity_source_does_not_cache",
+    # {proxy+} fallthrough tests: each request cold-starts a Lambda (the bypass
+    # test wires three), with the same cold-start-under-xdist flakiness as the
+    # apigw tests above.
+    "tests/test_apigatewayv1.py::test_apigwv1_methodless_resource_falls_through_to_proxy",
+    "tests/test_apigatewayv1.py::test_apigwv1_proxy_fallthrough_cannot_bypass_a_guarded_sibling",
+    # AppSync Lambda-resolver event-shape tests cold-start Lambdas under a 10s
+    # urlopen timeout (Test 6 spawns two functions). Same cold-start-under-xdist
+    # flakiness as the apigw Lambda tests above — run them in the serial phase.
+    "tests/test_appsync.py::test_appsync_lambda_event_field_name",
+    "tests/test_appsync.py::test_appsync_lambda_event_arguments",
+    "tests/test_appsync.py::test_appsync_lambda_event_api_key_header",
+    "tests/test_appsync.py::test_appsync_lambda_event_custom_headers_forwarded",
+    "tests/test_appsync.py::test_appsync_lambda_event_no_identity_in_api_key_mode",
+    "tests/test_appsync.py::test_appsync_lambda_event_identity_from_authorizer",
+    "tests/test_appsync.py::test_appsync_lambda_not_found_no_crash",
+    "tests/test_appsync.py::test_appsync_lambda_returns_errors",
+    "tests/test_appsync.py::test_appsync_lambda_event_source_empty_for_root",
+    "tests/test_appsync.py::test_appsync_lambda_event_variables_substituted",
+    "tests/test_appsync.py::test_appsync_lambda_unhandled_exception_becomes_error",
+    "tests/test_appsync.py::test_appsync_lambda_authorizer_rejection_returns_unauthorized",
+    "tests/test_appsync.py::test_appsync_lambda_authorizer_wrong_region_arn_does_not_fallback",
+    "tests/test_appsync.py::test_appsync_lambda_missing_authorizer_returns_unauthorized",
+    "tests/test_appsync.py::test_appsync_lambda_failing_authorizer_returns_unauthorized",
+    # AppSync Events service mutations; shared state racing under xdist.
+    "tests/test_appsync_events.py::test_publish_with_appsync_sigv4_scope_on_events_vhost",
+    # Credential report reflects all users in the account; run serially to avoid
+    # parallel-test interference on the account-global CSV snapshot.
+    "tests/test_iam.py::test_iam_credential_report_mfa_and_password",
+    "tests/test_iam.py::test_iam_credential_report_header",
+    # Account-global mutations (password policy, alias); must run serially.
+    "tests/test_iam.py::test_iam_password_policy_absent_then_set",
+    "tests/test_iam.py::test_iam_account_alias_crud",
+    # Recursive-loop detection. The two chain tests cold-start 16+ Lambdas
+    # each and poll CloudWatch Logs until the chain stops changing; the other
+    # two assert on wall clock (a dropped invocation must come back long
+    # before the handler's timeout could have elapsed). Both shapes tip over
+    # under xdist load, so run them in the serial phase.
+    "tests/test_lambda.py::test_lambda_recursive_loop_terminates_self_invoking_chain",
+    "tests/test_lambda.py::test_lambda_recursive_loop_allow_lets_the_chain_through",
+    "tests/test_lambda.py::test_lambda_recursive_loop_drop_is_recursive_invocation_exception",
+    "tests/test_lambda.py::test_lambda_nested_invoke_below_limit_is_unaffected",
+    # DeleteRegistrationCode discards the one code the account/region holds, and
+    # the test asserts the next GetRegistrationCode mints a different one — a
+    # parallel worker calling GetRegistrationCode either side of the delete sees
+    # the code change under it. Same account-global mutation class as above.
+    "tests/test_iot.py::test_iot_registration_code_stable_until_deleted",
+    # IoT topic-rule Lambda-action tests: each creates one Lambda per test,
+    # cold-starts its container, and polls an SQS sink under a bounded timeout.
+    # Same cold-start-burst-under-xdist shape as the apigw Lambda tests above —
+    # they pass serially (~3.5s each) but the tail ones lose the cold start
+    # against _poll_sink's 12s window on the shared CI runner. Surfaced when the
+    # device-shadow work lengthened the test_iot_data.py shard; the tests
+    # themselves are correct, so run them in the serial phase.
+    "tests/test_iot_data.py::test_iot_topic_rule_routes_publish_to_lambda",
+    "tests/test_iot_data.py::test_iot_basic_ingest_routes_to_lambda",
+    "tests/test_iot_data.py::test_iot_disabled_rule_does_not_fire",
+    "tests/test_iot_data.py::test_iot_rule_encode_base64_projection_basic_ingest",
+    "tests/test_iot_data.py::test_iot_rule_encode_base64_projection_topic_filter",
+    "tests/test_iot_data.py::test_iot_rule_attribute_projection",
+    "tests/test_iot_data.py::test_iot_rule_where_clause_gates_dispatch",
+    "tests/test_iot_data.py::test_iot_rule_where_topic_function_under_basic_ingest",
+    "tests/test_iot_data.py::test_iot_rule_where_or_clause_dispatches_either_branch",
+    # IoT Jobs data-plane routing test: a raw urllib GET with the advertised
+    # `{prefix}.jobs.iot.{region}` Host and a tight 5s timeout, so cross-file
+    # xdist pressure on the shared event loop makes it time out at random.
+    "tests/test_iot_jobs_data.py::test_iot_jobs_endpoint_host_reaches_the_data_plane",
+    # ECS service task-spawn: with a Docker daemon present (CI has one) a task
+    # whose container fails to start/exits under parallel container churn is set
+    # STOPPED, so list_tasks (RUNNING-only) sees fewer than desiredCount. Passes
+    # serially; run it in the serial phase.
+    "tests/test_ecs.py::test_ecs_service_spawns_tasks",
+    # Cluster task counts use the same Docker-backed service startup and can
+    # remain PENDING behind unrelated container churn. Run serially as well.
+    "tests/test_ecs.py::test_ecs_cluster_task_counts",
+    # SSM Run Command provisions real EC2-agent containers. Keeping these
+    # together avoids Docker API timeouts after the parallel container-heavy
+    # phase.
+    "tests/test_ssm.py::test_ssm_run_command_health_probe",
+    "tests/test_ssm.py::test_ssm_run_command_probe_can_fail",
+    "tests/test_ssm.py::test_ssm_send_command_accepts_a_managed_instance",
+    "tests/test_ssm.py::test_ssm_command_lookup_filters_and_errors",
+    # WS/MQTT-broker tests (MQTT-over-WebSocket connect/publish/subscribe,
+    # device shadows over MQTT, fleet-index connectivity). They drive the
+    # single-event-loop broker over real WebSocket connections with tight
+    # ready-event / delivery-window timing, so cross-file xdist pressure on the
+    # shared server slips a handshake or a delivery and one of them fails at
+    # random. Correct serially; run them in the dedicated serial phase.
+    "tests/test_iot_data.py::test_iot_lambda_publishes_browser_subscribes_e2e",
+    "tests/test_iot_data.py::test_iot_ws_publish_isolated_between_regions",
+    "tests/test_iot_data.py::test_iot_ws_credential_region_wildcards_cannot_bypass_isolation",
+    "tests/test_iot_data.py::test_iot_ws_topic_isolation_between_accounts",
+    "tests/test_iot_data.py::test_iot_ws_same_account_publish_delivers",
+    "tests/test_iot_data.py::test_iot_rule_republish_where_gated_ws_subscriber",
+    "tests/test_iot_data.py::test_search_index_finds_connected_thing_and_loses_it_on_disconnect",
+    "tests/test_iot_data.py::test_search_index_connectivity_timestamp_moves_on_disconnect",
+    "tests/test_iot_data.py::test_search_index_connectivity_is_tied_to_the_client_id",
+    "tests/test_iot_data.py::test_search_index_connectivity_reports_a_dropped_transport",
+    "tests/test_iot_data.py::test_search_index_reports_duplicate_client_id_after_a_takeover",
+    "tests/test_iot_data.py::test_search_index_connectivity_is_isolated_across_accounts_and_regions",
+    "tests/test_iot_data.py::test_shadow_update_over_mqtt_emits_accepted_delta_documents",
+    "tests/test_iot_data.py::test_named_shadow_update_over_mqtt",
+    "tests/test_iot_data.py::test_shadow_get_missing_over_mqtt_rejected_404",
+    "tests/test_iot_data.py::test_shadow_accepted_drives_topic_rule_republish",
+    "tests/test_iot_data.py::test_mqtt5_connect_is_accepted_with_properties",
+    "tests/test_iot_data.py::test_mqtt311_connack_is_byte_identical",
+    "tests/test_iot_data.py::test_unsupported_protocol_level_is_refused",
+    "tests/test_iot_data.py::test_mqtt5_empty_client_id_gets_assigned_identifier",
+    "tests/test_iot_data.py::test_mqtt5_unknown_property_is_ignored",
+    "tests/test_iot_data.py::test_mqtt5_subscribe_options_byte_gets_v5_suback",
+    "tests/test_iot_data.py::test_mqtt5_publish_round_trip_forwards_properties",
+    "tests/test_iot_data.py::test_mqtt311_publisher_reaches_mqtt5_subscriber",
+    "tests/test_iot_data.py::test_mqtt5_publisher_reaches_mqtt311_subscriber",
+    "tests/test_iot_data.py::test_mqtt5_qos1_puback_carries_reason_code",
+    "tests/test_iot_data.py::test_mqtt311_qos1_puback_stays_two_bytes",
+    "tests/test_iot_data.py::test_mqtt5_unsuback_reason_codes_follow_the_actual_removal",
+    "tests/test_iot_data.py::test_mqtt311_unsuback_stays_two_bytes",
+    "tests/test_iot_data.py::test_mqtt5_disconnect_with_reason_code_closes_cleanly",
+    "tests/test_iot_data.py::test_mqtt5_property_value_running_past_the_block_is_refused",
+    "tests/test_iot_data.py::test_mqtt5_property_block_truncated_at_the_packet_end_is_refused",
+    "tests/test_iot_data.py::test_mqtt5_malformed_connect_is_refused_with_a_connack_reason_code",
+    "tests/test_iot_data.py::test_mqtt5_property_block_longer_than_127_bytes_round_trips",
+    "tests/test_iot_data.py::test_mqtt5_no_local_still_delivers_a_publisher_its_own_message",
+    "tests/test_iot_data.py::test_mqtt5_retain_as_published_keeps_the_publishers_retain_flag",
+    "tests/test_iot_data.py::test_mqtt5_retain_handling_2_suppresses_the_retained_replay",
+    "tests/test_iot_data.py::test_mqtt5_retain_handling_1_replays_only_for_a_new_subscription",
+    "tests/test_iot_data.py::test_mqtt5_will_with_properties_fires_on_transport_drop",
+    "tests/test_iot_data.py::test_mqtt5_malformed_will_properties_answer_connack_0x81",
+    # The mTLS MQTT listener tests (in test_iot_data.py, with the rest of the
+    # broker) drive private MiniStack subprocesses on their own ports rather
+    # than the shared server — the same reason test_tls.py runs its subprocess
+    # tests serially. Several of them time a process's startup, rebind or
+    # shutdown, which is exactly what xdist load makes unreliable.
+    "tests/test_iot_data.py::test_mtls_on_by_default",
+    "tests/test_iot_data.py::test_mtls_disabled_by_env",
+    "tests/test_iot_data.py::test_mtls_connect_and_connack",
+    "tests/test_iot_data.py::test_mtls_subscribe_receives_http_publish",
+    "tests/test_iot_data.py::test_mtls_publish_is_brokered",
+    "tests/test_iot_data.py::test_mtls_no_client_cert_uses_default_account",
+    "tests/test_iot_data.py::test_mtls_unregistered_cert_gets_connack_5",
+    "tests/test_iot_data.py::test_mtls_mqtt5_refusal_is_v5_connack",
+    "tests/test_iot_data.py::test_mtls_inactive_cert_refused",
+    "tests/test_iot_data.py::test_mtls_auth_refusal_closes_without_connack",
+    "tests/test_iot_data.py::test_mtls_ambiguous_cert_is_refused",
+    "tests/test_iot_data.py::test_mtls_registered_cert_connects_whatever_its_ca",
+    "tests/test_iot_data.py::test_mtls_registered_ca_chain_connects",
+    "tests/test_iot_data.py::test_mtls_provisioning_claim_connects_and_provisions",
+    "tests/test_iot_data.py::test_mtls_auth_provisioning_claim_is_held_to_its_templates_topics",
+    "tests/test_iot_data.py::test_mtls_provisioning_hook_names_the_thing",
+    "tests/test_iot_data.py::test_mtls_jitr_certificate_is_listed_by_its_ca",
+    "tests/test_iot_data.py::test_mtls_jitr_auto_registers_an_unknown_cert_without_connack",
+    "tests/test_iot_data.py::test_mtls_jitr_under_an_sni_only_ca_needs_sni",
+    "tests/test_iot_data.py::test_mtls_account_scoped_delivery",
+    "tests/test_iot_data.py::test_mtls_garbage_bytes_dropped",
+    "tests/test_iot_data.py::test_mtls_duplicate_client_id_evicts_first_connection",
+    "tests/test_iot_data.py::test_mtls_listener_survives_reset",
+    "tests/test_iot_data.py::test_mtls_reset_rebinds_with_a_device_connected",
+    "tests/test_iot_data.py::test_mtls_shutdown_completes_with_a_device_connected",
+    "tests/test_iot_data.py::test_mtls_auth_evaluates_iot_connect",
 }
 
 
@@ -93,6 +549,25 @@ def pytest_collection_modifyitems(config, items):
         nodeid = item.nodeid.split("[", 1)[0]
         if nodeid in _SERIAL_TESTS:
             item.add_marker("serial")
+
+
+@pytest.fixture(autouse=True)
+def _reset_request_context():
+    """Reset the request-scoped account/region contextvars to their defaults
+    before every test.
+
+    Multi-tenancy tests set these in-process via ``set_request_account_id`` /
+    ``set_request_region``. Without a per-test reset, a test that sets a
+    non-default account (e.g. ``111111111111``) and doesn't restore it leaks
+    that account to later tests on the same xdist worker — so an
+    account-sensitive assertion (e.g. an ARN's "wrong account" that happens to
+    equal the leaked real account) fails intermittently. ``reset_server`` only
+    clears server state over HTTP; it never touches these contextvars.
+    """
+    from ministack.core.responses import set_request_account_id, set_request_region
+    set_request_account_id("")   # non-12-digit -> MINISTACK_ACCOUNT_ID / 000000000000
+    set_request_region(None)     # -> MINISTACK_REGION / us-east-1
+    yield
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -196,13 +671,21 @@ def sts_as_role(sts):
 
 
 @pytest.fixture(scope="session")
+def backup():
+    return make_client("backup")
+
+
+@pytest.fixture(scope="session")
 def sm():
     return make_client("secretsmanager")
 
 
 @pytest.fixture(scope="session")
 def logs():
-    return make_client("logs")
+    # StartLiveTail uses hostPrefix ``stream-``; with a custom endpoint that
+    # becomes ``stream-127.0.0.1`` which does not resolve. Disable injection so
+    # Live Tail hits the same MiniStack listener as every other Logs API.
+    return make_client("logs", additional_config_kwargs={"inject_host_prefix": False})
 
 
 @pytest.fixture(scope="session")
@@ -241,6 +724,11 @@ def ses():
 
 
 @pytest.fixture(scope="session")
+def signer():
+    return make_client("signer")
+
+
+@pytest.fixture(scope="session")
 def sfn():
     return make_client("stepfunctions")
 
@@ -253,6 +741,11 @@ def ecs():
 @pytest.fixture(scope="session")
 def rds():
     return make_client("rds")
+
+
+@pytest.fixture(scope="session")
+def docdb():
+    return make_client("docdb")
 
 
 @pytest.fixture(scope="session")
@@ -354,6 +847,16 @@ def iot_data_client():
 
 
 @pytest.fixture(scope="session")
+def iot_jobs_data():
+    return make_client("iot-jobs-data")
+
+
+@pytest.fixture(scope="session")
+def iotwireless():
+    return make_client("iotwireless")
+
+
+@pytest.fixture(scope="session")
 def wafv2():
     return make_client("wafv2")
 
@@ -366,6 +869,16 @@ def sesv2():
 @pytest.fixture(scope="session")
 def cfn():
     return make_client("cloudformation")
+
+
+@pytest.fixture(scope="session")
+def opensearch():
+    return make_client("opensearch")
+
+
+@pytest.fixture(scope="session")
+def aoss():
+    return make_client("opensearchserverless")
 
 
 @pytest.fixture(scope="session")
@@ -491,3 +1004,220 @@ def tagging():
 @pytest.fixture(scope="session")
 def cur():
     return make_client("cur")
+
+
+@pytest.fixture(scope="session")
+def budgets():
+    return make_client("budgets")
+
+
+@pytest.fixture(scope="session")
+def kinesisanalyticsv2():
+    return make_client("kinesisanalyticsv2")
+
+
+@pytest.fixture(scope="session")
+def inspector2():
+    return make_client("inspector2")
+
+
+@pytest.fixture(scope="session")
+def mq():
+    return make_client("mq")
+
+
+@pytest.fixture(scope="session")
+def dsql():
+    return make_client("dsql")
+
+
+@pytest.fixture(scope="session")
+def s3tables():
+    return make_client("s3tables")
+
+
+@pytest.fixture(scope="session")
+def transcribe():
+    return make_client("transcribe")
+
+
+@pytest.fixture(scope="session")
+def translate():
+    return make_client("translate")
+
+
+@pytest.fixture(scope="session")
+def location():
+    # The location model puts `cp.tracking.` / `tracking.` host prefixes in
+    # front of the endpoint; against localhost those subdomains need not
+    # resolve, so disable injection (same as the logs fixture) — routing then
+    # rides on the `geo` credential scope.
+    return make_client("location", additional_config_kwargs={"inject_host_prefix": False})
+
+
+class FakeDockerContainer:
+    """Container double for tests that observe lifecycle without a daemon."""
+
+    def __init__(self, daemon, name, labels):
+        self.daemon, self.name, self.labels = daemon, name, dict(labels or {})
+        self.id = f"cid-{name}"
+        self.status = "running"
+        self.attrs = {"Config": {"Labels": self.labels}, "State": {}, "Created": ""}
+
+    def stop(self, timeout=None):
+        self.status = "exited"
+
+    def remove(self, force=False, v=False):
+        self.daemon.removed.append(self.name)
+        self.daemon.containers._by_name.pop(self.name, None)
+
+    def reload(self):
+        pass
+
+
+class _FakeContainers:
+    def __init__(self, daemon):
+        self.daemon = daemon
+        self._by_name = {}
+
+    def run(self, image=None, command=None, name=None, labels=None, **kw):
+        self._by_name[name] = FakeDockerContainer(self.daemon, name, labels)
+        return self._by_name[name]
+
+    def get(self, key):
+        for c in self._by_name.values():
+            if key in (c.name, c.id):
+                return c
+        raise RuntimeError(f"no such container: {key}")
+
+    def list(self, all=False, filters=None, sparse=False):
+        want = (filters or {}).get("label") or []
+        want = [want] if isinstance(want, str) else want
+        out = []
+        for c in self._by_name.values():
+            ok = True
+            for sel in want:
+                if "=" in sel:
+                    k, v = sel.split("=", 1)
+                    ok = ok and c.labels.get(k) == v
+                else:
+                    ok = ok and sel in c.labels
+            if ok:
+                out.append(c)
+        return out
+
+
+class FakeDockerDaemon:
+    """Enough of the Docker API to assert which containers survive.
+
+    ``images.get`` always raises, so services that check whether an image is
+    cached take their deferred/background provisioning path.
+    """
+
+    def __init__(self):
+        self.containers = _FakeContainers(self)
+        self.removed = []
+        self.images = self
+
+    def get(self, image):
+        raise RuntimeError("image not present")
+
+    def live(self):
+        return sorted(self.containers._by_name)
+
+
+@pytest.fixture
+def fake_docker():
+    return FakeDockerDaemon()
+
+
+# ---------------------------------------------------------------------------
+# Concurrency probes — shared by the per-service re-entrancy tests
+# ---------------------------------------------------------------------------
+
+# Enough callers to exhaust a misclassified bounded pool without being slow.
+CONCURRENCY_N = 12
+# The nested-invoke probe has to exceed the shared worker pool (default 64) or
+# starvation never shows: below the pool size every caller gets a slot and a
+# broken build passes. Verified — at N=12 the probe passes against 1.4.17,
+# which has the bug.
+CONCURRENCY_N_NESTED = 70
+# Judged on the *median*, never the max. A single slow sample says nothing about
+# the event loop: the probe competes with the burst for client connections and
+# CI runner CPU, so the worst sample is dominated by queueing on our side.
+# Measured spread — a build with the bug blocks the loop for the whole burst and
+# every sample is slow (1.4.17: median 6905ms), while a healthy one absorbs it
+# (median 118ms, with an occasional multi-second outlier under a saturated
+# connection pool). The median separates those by ~60x; the max does not
+# separate them at all.
+MEDIAN_LOOP_STALL_MS = 2000
+
+
+class LoopProbe:
+    """Polls /_ministack/health through a burst to detect a blocked event loop.
+
+    Used by the re-entrancy tests: work that can call back into MiniStack must
+    run on a dedicated thread, and work that blocks must never run on the loop.
+    Both failures show up here as the health endpoint going slow or silent.
+    """
+
+    MIN_SAMPLES = 3   # below this an outlier decides the median; too short to judge
+
+    def __init__(self):
+        self.samples = []
+        self._stop = threading.Event()
+        self._thread = None
+
+    def __enter__(self):
+        def poll():
+            while not self._stop.is_set():
+                t0 = time.perf_counter()
+                try:
+                    urllib.request.urlopen(f"{ENDPOINT}/_ministack/health", timeout=15).read()
+                    self.samples.append((time.perf_counter() - t0) * 1000)
+                except Exception:
+                    self.samples.append(None)
+                time.sleep(0.05)
+
+        self._thread = threading.Thread(target=poll, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=5)
+
+    def assert_responsive(self, what: str):
+        served = [s for s in self.samples if s is not None]
+        assert served, f"{what}: health never responded — the event loop was blocked"
+        if len(served) < self.MIN_SAMPLES:
+            return
+        median = statistics.median(served)
+        assert median < MEDIAN_LOOP_STALL_MS, (
+            f"{what}: event loop median {median:.0f}ms "
+            f"(worst {max(served):.0f}ms, n={len(self.samples)}, "
+            f"unanswered={len(self.samples) - len(served)}) — "
+            f"a blocking call is running on the loop"
+        )
+
+
+def concurrent_burst(fn, items=None, n=CONCURRENCY_N):
+    """Run `fn` concurrently over `items` (or over range(n)); return all results."""
+    work = list(items) if items is not None else list(range(n))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(work))) as ex:
+        return list(ex.map(fn, work))
+
+
+def make_probe_lambda(lam, src: str, timeout: int = 30) -> str:
+    """Deploy a throwaway Python function and return its name."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("index.py", src)
+    name = f"conc-{uuid.uuid4().hex[:10]}"
+    lam.create_function(
+        FunctionName=name, Runtime="python3.11",
+        Role="arn:aws:iam::000000000000:role/lambda-role", Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()}, Timeout=timeout,
+    )
+    return name

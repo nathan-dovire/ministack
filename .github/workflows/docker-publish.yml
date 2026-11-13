@@ -8,10 +8,21 @@ on:
 env:
   DOCKERHUB_IMAGE: nahuelnucera/ministack
   DOCKERHUB_IMAGE_ORG: ministackorg/ministack
+  # Free-to-pull mirror on the GitHub Container Registry. Repo-scoped under
+  # the same org as Docker Hub so `ghcr.io/ministackorg/ministack:<tag>` is a
+  # drop-in pull. Anonymous pulls are free; rate limits are per-IP and much
+  # higher than Docker Hub's, which is the reason this mirror exists.
+  GHCR_IMAGE: ghcr.io/ministackorg/ministack
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    # `packages: write` lets GITHUB_TOKEN push to ghcr.io for this repo's
+    # org-scoped package; `contents: read` is the standard default kept
+    # explicit since we now set permissions at the job level.
+    permissions:
+      contents: read
+      packages: write
 
     steps:
       - uses: actions/checkout@v4
@@ -28,6 +39,13 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       # ── Regular (Alpine) image — :latest, :{version}, :{major}.{minor} ──
       - name: Extract metadata (regular)
         id: meta
@@ -36,24 +54,11 @@ jobs:
           images: |
             ${{ env.DOCKERHUB_IMAGE }}
             ${{ env.DOCKERHUB_IMAGE_ORG }}
+            ${{ env.GHCR_IMAGE }}
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
-
-      - name: Build and push (regular)
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            MINISTACK_VERSION=${{ steps.meta.outputs.version }}
-          cache-from: type=gha,scope=regular
-          cache-to: type=gha,mode=max,scope=regular
 
       # ── Full (Debian/glibc) image — :full, :{version}-full, :{major}.{minor}-full ──
       # Adds DuckDB (Athena engine), psycopg2-binary, pymysql. Larger
@@ -67,6 +72,7 @@ jobs:
           images: |
             ${{ env.DOCKERHUB_IMAGE }}
             ${{ env.DOCKERHUB_IMAGE_ORG }}
+            ${{ env.GHCR_IMAGE }}
           flavor: |
             latest=false
           tags: |
@@ -75,6 +81,7 @@ jobs:
             type=raw,value=full
 
       - name: Build and push (full)
+        id: build_full
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -87,3 +94,18 @@ jobs:
             MINISTACK_VERSION=${{ steps.meta.outputs.version }}
           cache-from: type=gha,scope=full
           cache-to: type=gha,mode=max,scope=full
+
+      - name: Build and push (regular)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            MINISTACK_VERSION=${{ steps.meta.outputs.version }}
+            PLUGIN_DONOR_IMAGE=ghcr.io/ministackorg/ministack@${{ steps.build_full.outputs.digest }}
+          cache-from: type=gha,scope=regular
+          cache-to: type=gha,mode=max,scope=regular

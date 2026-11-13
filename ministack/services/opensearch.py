@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 Amazon OpenSearch Service emulator.
 
@@ -14,11 +16,13 @@ Operations:
 - ListVersions, GetCompatibleVersions
 - AddTags, ListTags, RemoveTags
 
-State is account-scoped via AccountScopedDict so per-tenant isolation matches
-the rest of ministack.
+State is account- and region-scoped via AccountRegionScopedDict, except tags
+which stay account-scoped because their ARN keys embed region.
 """
 
+import contextvars
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -26,15 +30,23 @@ import re
 import threading
 import time
 
+from ministack.core import container_reaper
+from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import resource_lock, run_offloop, spawn_background
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     apply_image_prefix,
     get_account_id,
     get_region,
     new_uuid,
+    set_request_account_id,
+    set_request_region,
 )
 
 logger = logging.getLogger("opensearch")
+
+_MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -52,10 +64,12 @@ DASHBOARDS_IMAGE = os.environ.get(
 ENDPOINT_OVERRIDE = os.environ.get("MINISTACK_OPENSEARCH_ENDPOINT", "")
 
 # Versions returned by ListVersions / used by GetCompatibleVersions. Mirrors the
-# subset AWS still supports for new domains (managed-service availability page,
-# 2026-Q1).
+# versions AWS OpenSearch Service currently supports for new domains
+# (managed-service availability page).
 _SUPPORTED_VERSIONS = [
-    "OpenSearch_2.15", "OpenSearch_2.13", "OpenSearch_2.11", "OpenSearch_2.9",
+    "OpenSearch_3.5", "OpenSearch_3.3", "OpenSearch_3.1",
+    "OpenSearch_2.19", "OpenSearch_2.17", "OpenSearch_2.15",
+    "OpenSearch_2.13", "OpenSearch_2.11", "OpenSearch_2.9",
     "OpenSearch_2.7", "OpenSearch_2.5", "OpenSearch_2.3", "OpenSearch_1.3",
     "OpenSearch_1.2", "OpenSearch_1.1", "OpenSearch_1.0",
     "Elasticsearch_7.10", "Elasticsearch_7.9", "Elasticsearch_7.8",
@@ -64,21 +78,53 @@ _SUPPORTED_VERSIONS = [
     "Elasticsearch_6.4", "Elasticsearch_6.3", "Elasticsearch_6.2",
     "Elasticsearch_6.0", "Elasticsearch_5.6", "Elasticsearch_5.5",
     "Elasticsearch_5.3", "Elasticsearch_5.1",
+    "Elasticsearch_2.3", "Elasticsearch_1.5",
 ]
 
-_DEFAULT_VERSION = "OpenSearch_2.15"
+_DEFAULT_VERSION = "OpenSearch_3.5"
+
+_MODELED_DOMAIN_PROPERTIES = (
+    "EngineVersion",
+    "ClusterConfig",
+    "EBSOptions",
+    "AccessPolicies",
+    "SnapshotOptions",
+    "CognitoOptions",
+    "EncryptionAtRestOptions",
+    "NodeToNodeEncryptionOptions",
+    "AdvancedOptions",
+    "DomainEndpointOptions",
+    "AdvancedSecurityOptions",
+    "VPCOptions",
+    "AutoTuneOptions",
+    "OffPeakWindowOptions",
+    "SoftwareUpdateOptions",
+)
+
+_OPTIONAL_DOMAIN_OPTIONS = (
+    "IPAddressType",
+    "LogPublishingOptions",
+    "IdentityCenterOptions",
+    "AIMLOptions",
+    "DeploymentStrategyOptions",
+    "AutomatedSnapshotPauseOptions",
+    "UseCase",
+    "EngineMode",
+)
 
 # AWS allows lowercase letters, digits, hyphens; first character must be
 # lowercase letter; 3-28 chars.
 _NAME_RE = re.compile(r"^[a-z][a-z0-9\-]{2,27}$")
 
 # ---------------------------------------------------------------------------
-# State (account-scoped)
+# State
 # ---------------------------------------------------------------------------
 
-_domains = AccountScopedDict()        # name -> DomainStatus dict (+ private _* fields)
-_tags = AccountScopedDict()           # arn -> [{Key, Value}, ...]
-_change_progress = AccountScopedDict()  # name -> change progress record
+_domains = AccountRegionScopedDict()        # name -> DomainStatus dict (+ private _* fields)
+_tags = AccountScopedDict()                 # ARN key embeds region; account scoping is sufficient.
+_change_progress = AccountRegionScopedDict()  # name -> change progress record
+_packages = AccountRegionScopedDict()       # PackageID -> PackageDetails (+ private _* fields)
+_domain_packages = AccountRegionScopedDict()  # "PackageID:DomainName" -> DomainPackageDetails
 
 # Port counter and Docker handle are process-global (data plane is shared).
 _port_counter = [BASE_PORT]
@@ -87,19 +133,31 @@ _state_lock = threading.Lock()
 _docker_client = None
 
 
+class OpenSearchServiceError(ValueError):
+    """Actionable service error shared by HTTP and internal callers."""
+
+    def __init__(self, status, code, message):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+
+
 def reset():
     _domains.clear()
     _tags.clear()
     _change_progress.clear()
+    _packages.clear()
+    _domain_packages.clear()
     docker = _get_docker()
     if docker is not None:
-        for c in docker.containers.list(
-            all=True,
-            filters={"label": "com.ministack.service=opensearch"},
-        ):
+        for c in docker.containers.list(all=True, filters={"label": [
+            "com.ministack.service=opensearch",
+            f"{container_reaper.INSTANCE_LABEL}={container_reaper.instance_id()}",
+        ]}):
             try:
                 c.stop(timeout=2)
-                c.remove(force=True)
+                c.remove(force=True, v=True)
             except Exception:
                 pass
 
@@ -109,20 +167,97 @@ def get_state():
         "domains": copy.deepcopy(_domains),
         "tags": copy.deepcopy(_tags),
         "change_progress": copy.deepcopy(_change_progress),
+        "packages": copy.deepcopy(_packages),
+        "domain_packages": copy.deepcopy(_domain_packages),
     }
 
 
-def restore_state(data):
+def load_persisted_state(data) -> None:
+    _restore_state(data)
+    _restore_domain_dataplanes()
+
+
+def _restore_state(data):
     if not data:
         return
-    for store, key in (
-        (_domains, "domains"),
-        (_tags, "tags"),
-        (_change_progress, "change_progress"),
-    ):
-        store.clear()
-        for k, v in (data.get(key) or {}).items():
-            store[k] = v
+    # No `or {}` on any of these: a scoped dict holding only other accounts'
+    # entries is falsy, and the loader runs at boot with no request scope, so
+    # the guard would drop every account's state but the default one's.
+    _domains.update(data.get("domains", {}))
+    domain_regions = {
+        (account_id, name): region
+        for (account_id, region, name), _rec in _domains.all_items()
+    }
+    _restore_domain_child_store(
+        _change_progress,
+        data.get("change_progress", {}),
+        domain_regions,
+        key_to_domain=lambda key: key,
+    )
+    domain_packages = data.get("domain_packages", {})
+    _restore_domain_child_store(
+        _domain_packages,
+        domain_packages,
+        domain_regions,
+        key_to_domain=lambda key: key.split(":", 1)[-1],
+    )
+    package_regions = _package_regions_from_domain_packages(
+        domain_packages, domain_regions
+    )
+    _restore_package_store(_packages, data.get("packages", {}), package_regions)
+    _tags.update(data.get("tags", {}))
+
+
+def _legacy_items(restored):
+    if isinstance(restored, AccountScopedDict):
+        return restored._data.items()
+    if isinstance(restored, dict):
+        account_id = get_account_id()
+        return [((account_id, key), value) for key, value in restored.items()]
+    return ()
+
+
+def _package_regions_from_domain_packages(restored, domain_regions):
+    package_regions = {}
+    if isinstance(restored, AccountRegionScopedDict):
+        for (account_id, region, key), value in restored.all_items():
+            package_id = value.get("PackageID") or key.split(":", 1)[0]
+            package_regions.setdefault((account_id, package_id), set()).add(region)
+        return package_regions
+
+    for (account_id, key), value in _legacy_items(restored):
+        domain_name = value.get("DomainName") or key.split(":", 1)[-1]
+        package_id = value.get("PackageID") or key.split(":", 1)[0]
+        region = domain_regions.get((account_id, domain_name))
+        if region:
+            package_regions.setdefault((account_id, package_id), set()).add(region)
+    return package_regions
+
+
+def _restore_package_store(store, restored, package_regions):
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return
+
+    boot_region = get_region()
+    for (account_id, key), value in _legacy_items(restored):
+        regions = package_regions.get((account_id, key)) or {boot_region}
+        for region in regions:
+            store.set_scoped(account_id, region, key, copy.deepcopy(value))
+
+
+def _restore_domain_child_store(store, restored, domain_regions, key_to_domain):
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return
+
+    for (account_id, key), value in _legacy_items(restored):
+        domain_name = key_to_domain(key)
+        region = domain_regions.get(
+            (account_id, domain_name),
+            store._region_for_legacy_value(key, value),
+        )
+        store.set_scoped(account_id, region, key, value)
 
 
 # ---------------------------------------------------------------------------
@@ -144,13 +279,44 @@ def _arn(name):
     return f"arn:aws:es:{get_region()}:{get_account_id()}:domain/{name}"
 
 
+def _resolve_taggable_opensearch_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None, _error(400, "ValidationException", f"Invalid ARN: {arn}")
+
+    if (
+        spec.partition != "aws"
+        or spec.service != "es"
+        or spec.region != get_region()
+        or spec.account_id != get_account_id()
+    ):
+        return None, _error(400, "ValidationException", f"Invalid ARN: {arn}")
+
+    prefix = "domain/"
+    if not spec.resource.startswith(prefix):
+        return None, _error(400, "ValidationException", f"Invalid ARN: {arn}")
+
+    name = spec.resource[len(prefix):]
+    rec = _domains.get(name)
+    if not rec or rec.get("ARN") != arn:
+        return None, _error(409, "ResourceNotFoundException", f"Domain not found: {name}")
+    return arn, None
+
+
 def _engine_type(version: str) -> str:
     return "Elasticsearch" if version.lower().startswith("elasticsearch") else "OpenSearch"
 
 
 def _public(d: dict) -> dict:
     """Strip internal _-prefixed bookkeeping fields before serialising."""
-    out = {k: v for k, v in d.items() if not k.startswith("_")}
+    out = copy.deepcopy({k: v for k, v in d.items() if not k.startswith("_")})
+    # MasterUserOptions is an input-only shape and may contain a plaintext
+    # password. AWS does not return it from DescribeDomain, and neither should
+    # MiniStack's raw JSON response.
+    advanced_security = out.get("AdvancedSecurityOptions")
+    if isinstance(advanced_security, dict):
+        advanced_security.pop("MasterUserOptions", None)
     if not out.get("VPCOptions"):
         out.pop("VPCOptions", None)
     return out
@@ -160,27 +326,143 @@ def _now() -> int:
     return int(time.time())
 
 
+def _auto_tune_input(rec: dict) -> dict:
+    stored = rec.get("_AutoTuneInput")
+    if stored is None:
+        stored = {"DesiredState": (rec.get("AutoTuneOptions") or {}).get("State", "DISABLED")}
+    return stored
+
+
+def _set_auto_tune(rec: dict, options) -> None:
+    """Store AutoTuneOptions(Input) and derive the DomainStatus AutoTuneOptionsOutput."""
+    merged = {**_auto_tune_input(rec), **copy.deepcopy(options or {})}
+    merged.setdefault("DesiredState", "DISABLED")
+    rec["_AutoTuneInput"] = merged
+    output = {"State": merged["DesiredState"]}
+    if "UseOffPeakWindow" in merged:
+        output["UseOffPeakWindow"] = merged["UseOffPeakWindow"]
+    rec["AutoTuneOptions"] = output
+
+
 # ---------------------------------------------------------------------------
 # Docker container management
 # ---------------------------------------------------------------------------
+
+# Cap any single Docker daemon call. docker-py defaults to 60s, which turns a
+# slow or wedged daemon into a minutes-long stall on a request path.
+_DOCKER_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
+
 
 def _get_docker():
     global _docker_client
     if _docker_client is None:
         try:
             import docker
-            _docker_client = docker.from_env()
+            _docker_client = docker.from_env(timeout=_DOCKER_TIMEOUT)
         except Exception:
             pass
     return _docker_client
 
 
+def _scope() -> str:
+    # A short account+region hash, as RDS names its containers: Dashboards reaches
+    # the data container by name, a single DNS label of at most 63 characters.
+    return hashlib.sha1(f"{get_account_id()}:{get_region()}".encode()).hexdigest()[:12]
+
+
 def _container_name(domain_name: str) -> str:
-    return f"ministack-opensearch-{domain_name}"
+    return f"ministack-opensearch-{_scope()}-{domain_name}"
 
 
 def _dashboards_container_name(domain_name: str) -> str:
-    return f"ministack-opensearch-dashboards-{domain_name}"
+    return f"ministack-opensearch-dashboards-{_scope()}-{domain_name}"
+
+
+def _image_is_local(docker_client, image: str) -> bool:
+    """True when the image is already pulled.
+
+    ``containers.run`` auto-pulls on ImageNotFound, so a cold cache would block
+    CreateDomain for the length of the pull — the OpenSearch image is ~1 GB.
+    AWS reports ``Processing`` and provisions asynchronously.
+    """
+    try:
+        docker_client.images.get(image)
+        return True
+    except Exception:
+        return False
+
+
+def _remove_container_by_id(cid: str) -> None:
+    """Best-effort teardown of a container we started but no longer own."""
+    docker = _get_docker()
+    if not docker or not cid:
+        return
+    try:
+        c = docker.containers.get(cid)
+        c.stop(timeout=2)
+        c.remove(force=True, v=True)
+    except Exception:
+        pass
+
+
+def _next_free_port(counter):
+    from ministack.services.rds import _is_host_port_free
+    with _state_lock:
+        port = counter[0]
+        while not _is_host_port_free(port):  # another container may already publish it
+            port += 1
+        counter[0] = port + 1
+        return port
+
+
+def start_engine_container(docker, name: str, labels: dict, host_port=None, volumes=None):
+    """Run one single-node OpenSearch engine container.
+
+    Returns ``(container_id, host, port)`` for reaching its HTTP API. With
+    ``host_port=None`` Docker picks the published port. ``volumes``, if given,
+    is passed through to ``containers.run`` unchanged (a named volume bound to
+    the data dir, so data survives a container restart). Raises on failure.
+    Shared with the OpenSearch Serverless data plane.
+    """
+    run_kwargs = dict(
+        image=apply_image_prefix(DEFAULT_IMAGE), detach=True,
+        ports={"9200/tcp": container_reaper.published_port(host_port)},
+        name=name,
+        labels=labels,
+        environment={
+            "discovery.type": "single-node",
+            # Disable security plugin so test code can talk to the cluster
+            # without bootstrapping a CA chain. Real AWS requires HTTPS+IAM;
+            # matching that here would block every smoke test.
+            "DISABLE_SECURITY_PLUGIN": "true",
+            "OPENSEARCH_INITIAL_ADMIN_PASSWORD": "MinIstack-Admin-1!",
+            # The heap OpenSearch's own sample docker-compose uses, instead of the image's 1 GB per container.
+            "OPENSEARCH_JAVA_OPTS": "-Xms512m -Xmx512m",
+        },
+        ulimits=[{"Name": "memlock", "Soft": -1, "Hard": -1}],
+    )
+    if volumes is not None:
+        run_kwargs["volumes"] = volumes
+    if DOCKER_NETWORK:
+        run_kwargs["network"] = DOCKER_NETWORK
+    container, host_port = container_reaper.run_on_free_port(
+        docker, lambda kwargs: docker.containers.run(**kwargs), run_kwargs, lambda: _next_free_port(_port_counter))
+    try:
+        host, port = _MINISTACK_HOST, host_port
+        if DOCKER_NETWORK or host_port is None:
+            container.reload()
+            settings = container.attrs.get("NetworkSettings", {})
+        if DOCKER_NETWORK:
+            ip = settings.get("Networks", {}).get(DOCKER_NETWORK, {}).get("IPAddress", "")
+            if ip:
+                host, port = ip, 9200
+        if port is None:
+            bindings = (settings.get("Ports") or {}).get("9200/tcp") or []
+            port = int(bindings[0]["HostPort"])
+    except Exception:
+        _remove_container_by_id(container.id)
+        raise
+    return container.id, host, port
 
 
 def _spawn_dataplane(domain_name: str, engine_version: str):
@@ -190,7 +472,7 @@ def _spawn_dataplane(domain_name: str, engine_version: str):
     On any failure returns the stub endpoint shape so the management plane
     still works without a real cluster.
     """
-    stub_host = f"{domain_name}.ministack.local"
+    stub_host = f"{domain_name}.{get_region()}.ministack.local"
     stub_port = 9200
     if ENDPOINT_OVERRIDE:
         host, _, port_s = ENDPOINT_OVERRIDE.partition(":")
@@ -207,52 +489,25 @@ def _spawn_dataplane(domain_name: str, engine_version: str):
         )
         return stub_host, stub_port, None, None, None
 
-    with _state_lock:
-        host_port = _port_counter[0]
-        _port_counter[0] += 1
-        dash_host_port = _dashboards_port_counter[0]
-        _dashboards_port_counter[0] += 1
+    host_port = _next_free_port(_port_counter)
+    dash_host_port = _next_free_port(_dashboards_port_counter)
 
-    image = apply_image_prefix(DEFAULT_IMAGE)
     labels = {
+        # Standard label so the boot/shutdown orphan reap finds these; the
+        # com.ministack.* keys below are what the service's own lookups use.
+        **container_reaper.own_labels("opensearch"),
         "com.ministack.service": "opensearch",
         "com.ministack.domain": domain_name,
+        "com.ministack.region": get_region(),
         "com.docker.compose.project": "ministack",
     }
-    env_vars = {
-        "discovery.type": "single-node",
-        # Disable security plugin so test code can talk to the cluster
-        # without bootstrapping a CA chain. Real AWS requires HTTPS+IAM;
-        # matching that here would block every smoke test.
-        "DISABLE_SECURITY_PLUGIN": "true",
-        "OPENSEARCH_INITIAL_ADMIN_PASSWORD": "MinIstack-Admin-1!",
-    }
-    run_kwargs = dict(
-        image=image, detach=True,
-        ports={"9200/tcp": host_port},
-        name=_container_name(domain_name),
-        labels=labels,
-        environment=env_vars,
-        ulimits=[{"Name": "memlock", "Soft": -1, "Hard": -1}],
-    )
-    if DOCKER_NETWORK:
-        run_kwargs["network"] = DOCKER_NETWORK
-
-    cid = None
-    endpoint_host, endpoint_port = "localhost", host_port
     try:
-        container = docker.containers.run(**run_kwargs)
-        cid = container.id
-        if DOCKER_NETWORK:
-            container.reload()
-            networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
-            ip = networks.get(DOCKER_NETWORK, {}).get("IPAddress", "")
-            if ip:
-                endpoint_host = ip
-                endpoint_port = 9200
+        cid, endpoint_host, endpoint_port = start_engine_container(
+            docker, _container_name(domain_name), labels, host_port
+        )
         logger.info(
-            "OpenSearch: started container %s at %s:%s (image=%s)",
-            domain_name, endpoint_host, endpoint_port, image,
+            "OpenSearch: started container %s at %s:%s",
+            domain_name, endpoint_host, endpoint_port,
         )
     except Exception as e:
         logger.warning("OpenSearch: Docker failed for %s: %s", domain_name, e)
@@ -264,7 +519,7 @@ def _spawn_dataplane(domain_name: str, engine_version: str):
             dash_kwargs = dict(
                 image=apply_image_prefix(DASHBOARDS_IMAGE),
                 detach=True,
-                ports={"5601/tcp": dash_host_port},
+                ports={"5601/tcp": container_reaper.published_port(dash_host_port)},
                 name=_dashboards_container_name(domain_name),
                 labels={**labels, "com.ministack.role": "dashboards"},
                 environment={
@@ -274,9 +529,11 @@ def _spawn_dataplane(domain_name: str, engine_version: str):
             )
             if DOCKER_NETWORK:
                 dash_kwargs["network"] = DOCKER_NETWORK
-            dash_container = docker.containers.run(**dash_kwargs)
+            dash_container, dash_host_port = container_reaper.run_on_free_port(
+                docker, lambda kwargs: docker.containers.run(**kwargs), dash_kwargs,
+                lambda: _next_free_port(_dashboards_port_counter))
             dash_cid = dash_container.id
-            dash_endpoint = f"localhost:{dash_host_port}"
+            dash_endpoint = f"{_MINISTACK_HOST}:{dash_host_port}"
             logger.info(
                 "OpenSearch Dashboards: started %s on port %s",
                 domain_name, dash_host_port,
@@ -297,9 +554,51 @@ def _teardown_dataplane(rec: dict) -> None:
         try:
             c = docker.containers.get(cid)
             c.stop(timeout=2)
-            c.remove(force=True)
+            c.remove(force=True, v=True)
         except Exception:
             pass
+
+
+def _teardown_named_dataplane(domain_name: str) -> None:
+    """Best-effort cleanup for a create that failed before returning a record."""
+    docker = _get_docker()
+    if docker is None:
+        return
+    for name in (_container_name(domain_name), _dashboards_container_name(domain_name)):
+        try:
+            c = docker.containers.get(name)
+            c.stop(timeout=2)
+            c.remove(force=True, v=True)
+        except Exception:
+            pass
+
+
+def _restore_domain_dataplanes() -> None:
+    original_account = get_account_id()
+    original_region = get_region()
+    try:
+        for (account_id, region, name), rec in list(_domains.all_items()):
+            if rec.get("Deleted"):
+                continue
+            set_request_account_id(account_id)
+            set_request_region(region)
+            _teardown_dataplane(rec)
+            _teardown_named_dataplane(name)
+            rec.pop("_ContainerId", None)
+            rec.pop("_DashboardsContainerId", None)
+            rec.pop("DashboardEndpoint", None)
+            host, port, cid, dash_endpoint, dash_cid = _spawn_dataplane(
+                name, rec.get("EngineVersion", _DEFAULT_VERSION)
+            )
+            rec["_Endpoint"] = f"{host}:{port}"
+            rec["_ContainerId"] = cid
+            rec["_DashboardsContainerId"] = dash_cid
+            if dash_endpoint:
+                rec["DashboardEndpoint"] = dash_endpoint
+            _set_vpc_options(rec, rec.get("VPCOptions"))
+    finally:
+        set_request_account_id(original_account)
+        set_request_region(original_region)
 
 
 # ---------------------------------------------------------------------------
@@ -368,13 +667,23 @@ def _set_vpc_options(rec: dict, options) -> None:
         rec["Endpoint"] = endpoint
 
 
+
+
 def _new_domain_record(name, payload):
     engine_version = payload.get("EngineVersion", _DEFAULT_VERSION)
     cluster_cfg = _default_cluster_config(payload.get("ClusterConfig"))
     ebs_opts = _default_ebs_options(payload.get("EBSOptions"))
     access_policies = payload.get("AccessPolicies", "")
 
-    host, port, cid, dash_endpoint, dash_cid = _spawn_dataplane(name, engine_version)
+    _dc = _get_docker() if DATAPLANE_ENABLED else None
+    _deferred = bool(_dc) and not _image_is_local(_dc, apply_image_prefix(DEFAULT_IMAGE))
+    if _deferred:
+        # Cold image cache: the OpenSearch image is ~1 GB and pulling it inside
+        # CreateDomain would block the API for minutes. AWS reports
+        # Processing=True and provisions asynchronously; do the same.
+        host, port, cid, dash_endpoint, dash_cid = "localhost", BASE_PORT, None, None, None
+    else:
+        host, port, cid, dash_endpoint, dash_cid = _spawn_dataplane(name, engine_version)
     endpoint = f"{host}:{port}"
 
     rec = {
@@ -384,13 +693,15 @@ def _new_domain_record(name, payload):
         "Created": True,
         "Deleted": False,
         "Endpoint": endpoint,
-        "Processing": False,
+        "Processing": _deferred,
         "UpgradeProcessing": False,
         "EngineVersion": engine_version,
         "ClusterConfig": cluster_cfg,
         "EBSOptions": ebs_opts,
         "AccessPolicies": access_policies,
-        "SnapshotOptions": {"AutomatedSnapshotStartHour": 0},
+        "SnapshotOptions": payload.get(
+            "SnapshotOptions", {"AutomatedSnapshotStartHour": 0}
+        ),
         "CognitoOptions": payload.get("CognitoOptions", {"Enabled": False}),
         "EncryptionAtRestOptions": payload.get(
             "EncryptionAtRestOptions", {"Enabled": False}
@@ -417,10 +728,13 @@ def _new_domain_record(name, payload):
             "AdvancedSecurityOptions",
             {"Enabled": False, "InternalUserDatabaseEnabled": False},
         ),
-        "AutoTuneOptions": {"State": "DISABLED"},
         "ChangeProgressDetails": {},
-        "OffPeakWindowOptions": {"Enabled": False},
-        "SoftwareUpdateOptions": {"AutoSoftwareUpdateEnabled": False},
+        "OffPeakWindowOptions": payload.get(
+            "OffPeakWindowOptions", {"Enabled": False}
+        ),
+        "SoftwareUpdateOptions": payload.get(
+            "SoftwareUpdateOptions", {"AutoSoftwareUpdateEnabled": False}
+        ),
         "_Endpoint": endpoint,
         "_CreatedTime": _now(),
         "_UpdatedTime": _now(),
@@ -428,8 +742,53 @@ def _new_domain_record(name, payload):
         "_DashboardsContainerId": dash_cid,
     }
     _set_vpc_options(rec, payload.get("VPCOptions"))
+    rec["_AutoTuneInput"] = {}
+    _set_auto_tune(rec, payload.get("AutoTuneOptions"))
+    for key in _OPTIONAL_DOMAIN_OPTIONS:
+        if key in payload:
+            rec[key] = copy.deepcopy(payload[key])
     if dash_endpoint:
         rec["DashboardEndpoint"] = dash_endpoint
+    if _deferred:
+        # Pull + start off the request path. The domain reports Processing=True
+        # until this lands, exactly as AWS does.
+        created_record = rec
+
+        def _finish_domain_start():
+            try:
+                h, pt, cid2, _dep, _dcid = _spawn_dataplane(name, engine_version)
+            except Exception:
+                logger.warning("OpenSearch: deferred dataplane start failed for %s", name)
+                h = pt = cid2 = None
+            # Publish under the lock: a DeleteDomain must not land between the
+            # existence check and the write. Identity, not truthiness — a domain
+            # recreated under the same name is a different resource.
+            with resource_lock("opensearch", name):
+                live = _domains.get(name)
+                orphaned = live is not created_record or live.get("_deleting")
+                if not orphaned:
+                    if h:
+                        # Both keys. Readers prefer `_Endpoint`, and create left
+                        # it at the `localhost:BASE_PORT` placeholder, so
+                        # writing only `Endpoint` left Describe reporting an
+                        # address nothing listens on — the same defect reported
+                        # against ElastiCache.
+                        endpoint = f"{h}:{pt}"
+                        live["Endpoint"] = endpoint
+                        live["_Endpoint"] = endpoint
+                        live["_ContainerId"] = cid2
+                    live["Processing"] = False
+            if orphaned and cid2:
+                # Nothing references it and the reaper never touches a running
+                # container. Outside the lock: Docker calls never hold it.
+                _remove_container_by_id(cid2)
+
+        # Handed to the caller rather than started here: this function builds
+        # the record, and `_domains[name]` is not assigned until afterwards. A
+        # finisher started now can win that race, find no record, and tear down
+        # the container it just created — the domain then never becomes
+        # available. Started once the record is registered.
+        rec["_deferred_start"] = _finish_domain_start
     return rec
 
 
@@ -463,15 +822,223 @@ def _domain_config(rec: dict) -> dict:
         "NodeToNodeEncryptionOptions": wrap(rec["NodeToNodeEncryptionOptions"]),
         "AdvancedOptions": wrap(rec["AdvancedOptions"]),
         "DomainEndpointOptions": wrap(rec["DomainEndpointOptions"]),
-        "AdvancedSecurityOptions": wrap(rec["AdvancedSecurityOptions"]),
-        "AutoTuneOptions": wrap(rec["AutoTuneOptions"]),
+        "AdvancedSecurityOptions": wrap({
+            k: copy.deepcopy(v)
+            for k, v in rec["AdvancedSecurityOptions"].items()
+            if k != "MasterUserOptions"
+        }),
+        "AutoTuneOptions": {
+            "Options": copy.deepcopy(_auto_tune_input(rec)),
+            "Status": {"CreationDate": create, "UpdateDate": update, "UpdateVersion": 1,
+                       "State": rec["AutoTuneOptions"].get("State", "DISABLED"),
+                       "PendingDeletion": False},
+        },
         "ChangeProgressDetails": rec.get("ChangeProgressDetails", {}),
         "OffPeakWindowOptions": wrap(rec["OffPeakWindowOptions"]),
         "SoftwareUpdateOptions": wrap(rec["SoftwareUpdateOptions"]),
     }
     if rec.get("VPCOptions"):
         config["VPCOptions"] = wrap(rec["VPCOptions"])
+    for key in _OPTIONAL_DOMAIN_OPTIONS:
+        if key in rec:
+            config[key] = wrap(copy.deepcopy(rec[key]))
     return config
+
+
+def _normalise_tags(tag_list):
+    """Return an exact, detached tag set with the last value winning by key."""
+    by_key = {}
+    for tag in tag_list or []:
+        detached = copy.deepcopy(tag)
+        by_key[detached.get("Key", "")] = detached
+    return list(by_key.values())
+
+
+def _desired_modeled_configuration(payload):
+    """Expand a full create-shaped payload into the desired domain state."""
+    return {
+        "EngineVersion": copy.deepcopy(payload.get("EngineVersion", _DEFAULT_VERSION)),
+        "ClusterConfig": _default_cluster_config(copy.deepcopy(payload.get("ClusterConfig"))),
+        "EBSOptions": _default_ebs_options(copy.deepcopy(payload.get("EBSOptions"))),
+        "AccessPolicies": copy.deepcopy(payload.get("AccessPolicies", "")),
+        "SnapshotOptions": copy.deepcopy(payload.get(
+            "SnapshotOptions", {"AutomatedSnapshotStartHour": 0}
+        )),
+        "CognitoOptions": copy.deepcopy(payload.get("CognitoOptions", {"Enabled": False})),
+        "EncryptionAtRestOptions": copy.deepcopy(payload.get(
+            "EncryptionAtRestOptions", {"Enabled": False}
+        )),
+        "NodeToNodeEncryptionOptions": copy.deepcopy(payload.get(
+            "NodeToNodeEncryptionOptions", {"Enabled": False}
+        )),
+        "AdvancedOptions": copy.deepcopy(payload.get("AdvancedOptions", {})),
+        "DomainEndpointOptions": copy.deepcopy(payload.get(
+            "DomainEndpointOptions",
+            {"EnforceHTTPS": True, "TLSSecurityPolicy": "Policy-Min-TLS-1-2-2019-07"},
+        )),
+        "AdvancedSecurityOptions": copy.deepcopy(payload.get(
+            "AdvancedSecurityOptions",
+            {"Enabled": False, "InternalUserDatabaseEnabled": False},
+        )),
+        "VPCOptions": _normalise_vpc_options(copy.deepcopy(payload.get("VPCOptions"))),
+        "AutoTuneOptions": copy.deepcopy(payload.get("AutoTuneOptions", {"State": "DISABLED"})),
+        "OffPeakWindowOptions": copy.deepcopy(payload.get(
+            "OffPeakWindowOptions", {"Enabled": False}
+        )),
+        "SoftwareUpdateOptions": copy.deepcopy(payload.get(
+            "SoftwareUpdateOptions", {"AutoSoftwareUpdateEnabled": False}
+        )),
+    }
+
+
+def create_domain_record(payload, compatibility_properties=None):
+    """Create a domain through the shared management-plane lifecycle.
+
+    Internal callers receive the live private record. HTTP handlers pass it
+    through ``_public`` before serialising it.
+    """
+    detached_payload = copy.deepcopy(payload or {})
+    name = detached_payload.get("DomainName")
+    if not name:
+        raise OpenSearchServiceError(400, "ValidationException", "DomainName is required")
+    if not _NAME_RE.match(name):
+        raise OpenSearchServiceError(
+            400,
+            "ValidationException",
+            "DomainName must start with a lowercase letter, contain only "
+            "lowercase letters, digits, and hyphens, and be 3-28 characters",
+        )
+    if name in _domains:
+        raise OpenSearchServiceError(
+            409, "ResourceAlreadyExistsException", f"Domain already exists: {name}"
+        )
+
+    rec = None
+    try:
+        rec = _new_domain_record(name, detached_payload)
+        if compatibility_properties is not None:
+            rec["_CloudFormationCompatibility"] = copy.deepcopy(
+                compatibility_properties
+            )
+        _domains[name] = rec
+        tags = _normalise_tags(detached_payload.get("TagList"))
+        if tags:
+            _tags[rec["ARN"]] = tags
+        else:
+            _tags.pop(rec["ARN"], None)
+        _record_change(name, rec, [])
+        # Only now — the finisher looks the record up by name and reclaims what
+        # it started if it is not there, so it must not run before this.
+        deferred_start = rec.pop("_deferred_start", None)
+        if deferred_start is not None:
+            spawn_background(contextvars.copy_context().run, deferred_start,
+                             thread_name=f"ministack-opensearch-start-{name}")
+        return rec
+    except Exception:
+        if rec is not None:
+            _teardown_dataplane(rec)
+        _teardown_named_dataplane(name)
+        _domains.pop(name, None)
+        _tags.pop(_arn(name), None)
+        _change_progress.pop(name, None)
+        raise
+
+
+def update_domain_from_cloudformation(name, payload, compatibility_properties):
+    """Apply a complete CloudFormation desired state to an existing domain."""
+    rec = _domains.get(name)
+    if not rec:
+        raise OpenSearchServiceError(
+            409, "ResourceNotFoundException", f"Domain not found: {name}"
+        )
+
+    detached_payload = copy.deepcopy(payload or {})
+    desired = _desired_modeled_configuration(detached_payload)
+    detached_compatibility = copy.deepcopy(compatibility_properties or {})
+    desired_tags = _normalise_tags(detached_payload.get("TagList"))
+    current_tags = _normalise_tags(_tags.get(rec["ARN"]) or [])
+
+    changed_properties = []
+    for key in _MODELED_DOMAIN_PROPERTIES:
+        wanted = desired[key]
+        current = rec.get(key)
+        if key == "VPCOptions":
+            current = rec.get("VPCOptions")
+        if current != wanted:
+            changed_properties.append(key)
+            if key == "VPCOptions":
+                _set_vpc_options(rec, wanted)
+            else:
+                rec[key] = copy.deepcopy(wanted)
+                if key == "AutoTuneOptions":
+                    rec.pop("_AutoTuneInput", None)
+                if key == "EngineVersion":
+                    rec["ServiceSoftwareOptions"]["CurrentVersion"] = wanted
+
+    if rec.get("_CloudFormationCompatibility", {}) != detached_compatibility:
+        rec["_CloudFormationCompatibility"] = detached_compatibility
+        changed_properties.append("CompatibilityProperties")
+
+    if current_tags != desired_tags:
+        if desired_tags:
+            _tags[rec["ARN"]] = desired_tags
+        else:
+            _tags.pop(rec["ARN"], None)
+
+    if changed_properties:
+        rec["_UpdatedTime"] = _now()
+        _record_change(name, rec, changed_properties)
+    return rec
+
+
+def _record_change(name, rec, completed_properties):
+    """Record a completed configuration change, reported by DescribeDomainChangeProgress and
+    summarized on the domain's ChangeProgressDetails under the same ChangeId. Earlier changes
+    stay readable by their ChangeId (real AWS, us-west-2)."""
+    now = _now()
+    change_id = new_uuid()
+    _change_progress[name] = {
+        "ChangeId": change_id,
+        "StartTime": now,
+        "LastUpdatedTime": now,
+        "Status": "COMPLETED",
+        "PendingProperties": [],
+        "CompletedProperties": completed_properties,
+        "TotalNumberOfStages": 0,
+        "ConfigChangeStatus": "Completed",
+        "InitiatedBy": "CUSTOMER",
+    }
+    rec.setdefault("_Changes", {})[change_id] = _change_progress[name]
+    rec["ChangeProgressDetails"] = {
+        "ChangeId": change_id,
+        "ConfigChangeStatus": "Completed",
+        "InitiatedBy": "CUSTOMER",
+        "StartTime": now,
+        "LastUpdatedTime": now,
+    }
+
+
+def delete_domain_record(name, missing_ok=False):
+    """Delete all domain-owned state and containers, optionally idempotently."""
+    # Claim under the lock so a deferred start cannot publish into a record we
+    # are removing. Teardown itself stays outside — it calls Docker.
+    with resource_lock("opensearch", name):
+        rec = _domains.pop(name, None)
+        if rec:
+            rec["_deleting"] = True
+    if not rec and not missing_ok:
+        raise OpenSearchServiceError(
+            409, "ResourceNotFoundException", f"Domain not found: {name}"
+        )
+    if rec:
+        _teardown_dataplane(rec)
+        arn = rec.get("ARN", _arn(name))
+    else:
+        arn = _arn(name)
+    _teardown_named_dataplane(name)
+    _tags.pop(arn, None)
+    _change_progress.pop(name, None)
+    return rec
 
 
 # ---------------------------------------------------------------------------
@@ -486,6 +1053,19 @@ _VERSIONS_RE = re.compile(r"^/2021-01-01/(?:opensearch/)?versions/?$")
 _COMPAT_RE = re.compile(r"^/2021-01-01/(?:opensearch/)?compatibleVersions/?$")
 _TAGS_RE = re.compile(r"^/2021-01-01/tags/?$")
 _TAGS_REMOVAL_RE = re.compile(r"^/2021-01-01/tags-removal/?$")
+# Package management. The literal sub-paths (update/describe/associate/
+# dissociate) are matched before the generic ``packages/{PackageID}`` so those
+# segments aren't captured as an id.
+_PACKAGES_RE = re.compile(r"^/2021-01-01/packages/?$")
+_PACKAGES_UPDATE_RE = re.compile(r"^/2021-01-01/packages/update/?$")
+_PACKAGES_DESCRIBE_RE = re.compile(r"^/2021-01-01/packages/describe/?$")
+_PACKAGES_ASSOCIATE_RE = re.compile(
+    r"^/2021-01-01/packages/associate/(?P<pid>[^/]+)/(?P<domain>[^/]+)/?$")
+_PACKAGES_DISSOCIATE_RE = re.compile(
+    r"^/2021-01-01/packages/dissociate/(?P<pid>[^/]+)/(?P<domain>[^/]+)/?$")
+_PACKAGE_RE = re.compile(r"^/2021-01-01/packages/(?P<pid>[^/]+)/?$")
+_DOMAIN_PACKAGES_RE = re.compile(
+    r"^/2021-01-01/(?:opensearch/)?domain/(?P<name>[^/]+)/packages/?$")
 
 
 def _qp(query_params, key) -> str:
@@ -502,38 +1082,25 @@ def _qp(query_params, key) -> str:
 # ---------------------------------------------------------------------------
 
 def _create_domain(payload):
-    name = payload.get("DomainName")
-    if not name:
-        return _error(400, "ValidationException", "DomainName is required")
-    if not _NAME_RE.match(name):
-        return _error(400, "ValidationException",
-                      "DomainName must start with a lowercase letter, contain only "
-                      "lowercase letters, digits, and hyphens, and be 3-28 characters")
-    if name in _domains:
-        return _error(409, "ResourceAlreadyExistsException",
-                      f"Domain already exists: {name}")
-    rec = _new_domain_record(name, payload)
-    _domains[name] = rec
-    tag_list = payload.get("TagList") or []
-    if tag_list:
-        _tags[_arn(name)] = list(tag_list)
+    try:
+        rec = create_domain_record(payload)
+    except OpenSearchServiceError as exc:
+        return _error(exc.status, exc.code, exc.message)
     return _json(200, {"DomainStatus": _public(rec)})
 
 
 def _describe_domain(name):
     rec = _domains.get(name)
     if not rec:
-        return _error(404, "ResourceNotFoundException", f"Domain not found: {name}")
+        return _error(409, "ResourceNotFoundException", f"Domain not found: {name}")
     return _json(200, {"DomainStatus": _public(rec)})
 
 
 def _delete_domain(name):
-    rec = _domains.pop(name, None)
-    if not rec:
-        return _error(404, "ResourceNotFoundException", f"Domain not found: {name}")
-    _teardown_dataplane(rec)
-    _tags.pop(_arn(name), None)
-    _change_progress.pop(name, None)
+    try:
+        rec = delete_domain_record(name)
+    except OpenSearchServiceError as exc:
+        return _error(exc.status, exc.code, exc.message)
     out = dict(rec)
     out["Deleted"] = True
     return _json(200, {"DomainStatus": _public(out)})
@@ -563,49 +1130,44 @@ def _describe_domains(payload):
 def _update_domain_config(name, payload):
     rec = _domains.get(name)
     if not rec:
-        return _error(404, "ResourceNotFoundException", f"Domain not found: {name}")
+        return _error(409, "ResourceNotFoundException", f"Domain not found: {name}")
     updatable = {
         "ClusterConfig", "EBSOptions", "AccessPolicies", "SnapshotOptions",
         "VPCOptions", "CognitoOptions", "AdvancedOptions",
         "DomainEndpointOptions", "AdvancedSecurityOptions",
         "EncryptionAtRestOptions", "NodeToNodeEncryptionOptions",
         "AutoTuneOptions", "OffPeakWindowOptions", "SoftwareUpdateOptions",
+        *_OPTIONAL_DOMAIN_OPTIONS,
     }
     for k, v in payload.items():
         if k in updatable:
             if k == "VPCOptions":
                 _set_vpc_options(rec, v)
+            elif k == "AutoTuneOptions":
+                _set_auto_tune(rec, v)
             else:
-                rec[k] = v
+                rec[k] = copy.deepcopy(v)
     rec["_UpdatedTime"] = _now()
 
     # Real AWS marks the domain Processing while config rollout happens; we
     # complete immediately because the data plane (if any) doesn't actually
     # re-provision.
-    _change_progress[name] = {
-        "ChangeId": new_uuid(),
-        "StartTime": _now(),
-        "Status": "COMPLETED",
-        "PendingProperties": [],
-        "CompletedProperties": list(payload.keys()),
-        "TotalNumberOfStages": 0,
-        "ConfigChangeStatus": "Completed",
-    }
+    _record_change(name, rec, list(payload.keys()))
     return _json(200, {"DomainConfig": _domain_config(rec)})
 
 
 def _describe_domain_config(name):
     rec = _domains.get(name)
     if not rec:
-        return _error(404, "ResourceNotFoundException", f"Domain not found: {name}")
+        return _error(409, "ResourceNotFoundException", f"Domain not found: {name}")
     return _json(200, {"DomainConfig": _domain_config(rec)})
 
 
 def _describe_domain_change_progress(name, query_params):
     rec = _domains.get(name)
     if not rec:
-        return _error(404, "ResourceNotFoundException", f"Domain not found: {name}")
-    progress = _change_progress.get(name) or {
+        return _error(409, "ResourceNotFoundException", f"Domain not found: {name}")
+    progress = (rec.get("_Changes") or {}).get(_qp(query_params, "changeid")) or _change_progress.get(name) or {
         "ChangeId": "",
         "StartTime": rec.get("_CreatedTime", _now()),
         "Status": "COMPLETED",
@@ -617,8 +1179,25 @@ def _describe_domain_change_progress(name, query_params):
     return _json(200, {"ChangeProgressStatus": progress})
 
 
+def _page(items, limit, token):
+    try:
+        start = max(int(token), 0) if token else 0
+    except (TypeError, ValueError):
+        start = 0
+    try:
+        limit = int(limit) if limit else 0
+    except (TypeError, ValueError):
+        limit = 0
+    end = start + limit if limit > 0 else len(items)
+    return items[start:end], (str(end) if end < len(items) else None)
+
+
 def _list_versions(query_params):
-    return _json(200, {"Versions": list(_SUPPORTED_VERSIONS)})
+    versions, nxt = _page(list(_SUPPORTED_VERSIONS), _qp(query_params, "maxResults"), _qp(query_params, "nextToken"))
+    resp = {"Versions": versions}
+    if nxt:
+        resp["NextToken"] = nxt
+    return _json(200, resp)
 
 
 def _get_compatible_versions(query_params):
@@ -626,7 +1205,7 @@ def _get_compatible_versions(query_params):
     if domain:
         rec = _domains.get(domain)
         if not rec:
-            return _error(404, "ResourceNotFoundException", f"Domain not found: {domain}")
+            return _error(409, "ResourceNotFoundException", f"Domain not found: {domain}")
         source = rec["EngineVersion"]
         targets = [v for v in _SUPPORTED_VERSIONS
                    if _engine_type(v) == _engine_type(source) and v != source]
@@ -646,11 +1225,14 @@ def _add_tags(payload):
     tag_list = payload.get("TagList") or []
     if not arn:
         return _error(400, "ValidationException", "ARN is required")
+    arn, err = _resolve_taggable_opensearch_arn(arn)
+    if err:
+        return err
     existing = _tags.get(arn) or []
     by_key = {t["Key"]: t for t in existing}
     for t in tag_list:
         by_key[t["Key"]] = t
-    _tags[arn] = list(by_key.values())
+    _tags[arn] = copy.deepcopy(list(by_key.values()))
     return _json(200, {})
 
 
@@ -658,7 +1240,10 @@ def _list_tags(query_params):
     arn = _qp(query_params, "arn")
     if not arn:
         return _error(400, "ValidationException", "arn query parameter is required")
-    return _json(200, {"TagList": list(_tags.get(arn) or [])})
+    arn, err = _resolve_taggable_opensearch_arn(arn)
+    if err:
+        return err
+    return _json(200, {"TagList": copy.deepcopy(list(_tags.get(arn) or []))})
 
 
 def _remove_tags(payload):
@@ -666,9 +1251,159 @@ def _remove_tags(payload):
     keys = set(payload.get("TagKeys") or [])
     if not arn:
         return _error(400, "ValidationException", "ARN is required")
+    arn, err = _resolve_taggable_opensearch_arn(arn)
+    if err:
+        return err
     existing = _tags.get(arn) or []
     _tags[arn] = [t for t in existing if t["Key"] not in keys]
     return _json(200, {})
+
+
+# ---------------------------------------------------------------------------
+# Packages
+# ---------------------------------------------------------------------------
+# CRUD + domain association, keyed by the service-generated PackageID. Like the
+# domain change-progress model, status transitions complete synchronously:
+# a package is AVAILABLE the moment it is created/updated, and an association
+# is ACTIVE the moment it is made, so a client's poll succeeds on first call.
+
+def _new_package_id() -> str:
+    return f"F{new_uuid().replace('-', '')[:10].upper()}"
+
+
+def _public_package(rec: dict) -> dict:
+    """Strip internal _-prefixed fields. PackageSource is an input-only shape
+    (AWS does not echo it from DescribePackages), so it is stored privately."""
+    return {k: v for k, v in rec.items() if not k.startswith("_")}
+
+
+def _create_package(payload):
+    name = payload.get("PackageName")
+    ptype = payload.get("PackageType")
+    source = payload.get("PackageSource")
+    if not name:
+        return _error(400, "ValidationException", "PackageName is required")
+    if not ptype:
+        return _error(400, "ValidationException", "PackageType is required")
+    if source is None:
+        return _error(400, "ValidationException", "PackageSource is required")
+    now = _now()
+    pid = _new_package_id()
+    rec = {
+        "PackageID": pid,
+        "PackageName": name,
+        "PackageType": ptype,
+        "PackageDescription": payload.get("PackageDescription", ""),
+        "PackageStatus": "AVAILABLE",
+        "CreatedAt": now,
+        "LastUpdatedAt": now,
+        "AvailablePackageVersion": "1",
+        "_PackageSource": source,
+    }
+    _packages[pid] = rec
+    return _json(200, {"PackageDetails": _public_package(rec)})
+
+
+def _update_package(payload):
+    pid = payload.get("PackageID")
+    rec = _packages.get(pid)
+    if not rec:
+        return _error(409, "ResourceNotFoundException", f"Package not found: {pid}")
+    if "PackageSource" in payload:
+        rec["_PackageSource"] = payload["PackageSource"]
+    if "PackageDescription" in payload:
+        rec["PackageDescription"] = payload["PackageDescription"]
+    try:
+        rec["AvailablePackageVersion"] = str(int(rec.get("AvailablePackageVersion", "1")) + 1)
+    except (TypeError, ValueError):
+        rec["AvailablePackageVersion"] = "2"
+    rec["LastUpdatedAt"] = _now()
+    rec["PackageStatus"] = "AVAILABLE"
+    return _json(200, {"PackageDetails": _public_package(rec)})
+
+
+def _describe_packages(payload):
+    results = list(_packages.values())
+    for f in payload.get("Filters") or []:
+        fname = f.get("Name")
+        fvals = f.get("Value") or []
+        if not fvals:
+            continue
+        if fname in ("PackageID", "PackageName", "PackageStatus", "PackageType"):
+            results = [p for p in results if p.get(fname) in fvals]
+    results = sorted(results, key=lambda p: p["PackageID"])
+    start = int(payload["NextToken"]) if payload.get("NextToken") else 0
+    max_results = payload.get("MaxResults")
+    if max_results:
+        page = results[start:start + max_results]
+        resp = {"PackageDetailsList": [_public_package(p) for p in page]}
+        if start + max_results < len(results):
+            resp["NextToken"] = str(start + max_results)
+    else:
+        resp = {"PackageDetailsList": [_public_package(p) for p in results[start:]]}
+    return _json(200, resp)
+
+
+def _delete_package(pid):
+    rec = _packages.pop(pid, None)
+    if not rec:
+        return _error(409, "ResourceNotFoundException", f"Package not found: {pid}")
+    # Cascade: drop any domain associations this package still had.
+    for key in [k for k in _domain_packages.keys() if k.split(":", 1)[0] == pid]:
+        _domain_packages.pop(key, None)
+    out = dict(rec)
+    out["PackageStatus"] = "DELETED"
+    return _json(200, {"PackageDetails": _public_package(out)})
+
+
+def _associate_package(pid, domain_name):
+    rec = _packages.get(pid)
+    if not rec:
+        return _error(409, "ResourceNotFoundException", f"Package not found: {pid}")
+    if domain_name not in _domains:
+        return _error(409, "ResourceNotFoundException", f"Domain not found: {domain_name}")
+    detail = {
+        "PackageID": pid,
+        "PackageName": rec["PackageName"],
+        "PackageType": rec["PackageType"],
+        "DomainName": domain_name,
+        "DomainPackageStatus": "ACTIVE",
+        "PackageVersion": rec["AvailablePackageVersion"],
+        "LastUpdated": _now(),
+        "ReferencePath": f"packages/{rec['PackageName']}",
+    }
+    _domain_packages[f"{pid}:{domain_name}"] = detail
+    return _json(200, {"DomainPackageDetails": detail})
+
+
+def _dissociate_package(pid, domain_name):
+    detail = _domain_packages.pop(f"{pid}:{domain_name}", None)
+    if not detail:
+        return _error(409, "ResourceNotFoundException",
+                      f"Package {pid} is not associated with domain {domain_name}")
+    out = dict(detail)
+    out["DomainPackageStatus"] = "DISSOCIATING"
+    return _json(200, {"DomainPackageDetails": out})
+
+
+def _list_packages_for_domain(domain_name, query_params):
+    if domain_name not in _domains:
+        return _error(409, "ResourceNotFoundException", f"Domain not found: {domain_name}")
+    details = sorted(
+        (v for k, v in _domain_packages.items() if k.split(":", 1)[-1] == domain_name),
+        key=lambda d: d["PackageID"],
+    )
+    start = int(_qp(query_params, "nextToken")) if _qp(query_params, "nextToken") else 0
+    mr = _qp(query_params, "maxResults")
+    if mr:
+        limit = int(mr)
+        page = details[start:start + limit]
+        resp = {"DomainPackageDetailsList": page}
+        if start + limit < len(details):
+            resp["NextToken"] = str(start + limit)
+    else:
+        resp = {"DomainPackageDetailsList": details[start:]}
+    return _json(200, resp)
 
 
 # ---------------------------------------------------------------------------
@@ -680,7 +1415,9 @@ async def handle_request(method, path, headers, body_bytes, query_params):
     try:
         payload = json.loads(body_text) if body_text else {}
     except json.JSONDecodeError:
-        return _error(400, "InvalidPayloadException", "Request body is not valid JSON")
+        # Botocore opensearch model has no InvalidPayloadException — JSON
+        # parsing failures map to the generic ValidationException (400).
+        return _error(400, "ValidationException", "Request body is not valid JSON")
 
     p = path.rstrip("/")
 
@@ -704,13 +1441,33 @@ async def handle_request(method, path, headers, body_bytes, query_params):
     if method == "POST" and _DOMAIN_INFO_RE.match(path):
         return _describe_domains(payload)
 
+    # Packages — literal sub-paths before the generic packages/{PackageID}.
+    if method == "POST" and _PACKAGES_UPDATE_RE.match(path):
+        return _update_package(payload)
+    if method == "POST" and _PACKAGES_DESCRIBE_RE.match(path):
+        return _describe_packages(payload)
+    m = _PACKAGES_ASSOCIATE_RE.match(path)
+    if method == "POST" and m:
+        return _associate_package(m.group("pid"), m.group("domain"))
+    m = _PACKAGES_DISSOCIATE_RE.match(path)
+    if method == "POST" and m:
+        return _dissociate_package(m.group("pid"), m.group("domain"))
+    m = _PACKAGE_RE.match(path)
+    if method == "DELETE" and m:
+        return _delete_package(m.group("pid"))
+    if method == "POST" and _PACKAGES_RE.match(path):
+        return _create_package(payload)
+    m = _DOMAIN_PACKAGES_RE.match(path)
+    if method == "GET" and m:
+        return _list_packages_for_domain(m.group("name"), query_params)
+
     m = _DOMAIN_CONFIG_RE.match(path)
     if m:
         name = m.group("name")
         if method == "GET":
             return _describe_domain_config(name)
         if method == "POST":
-            return _update_domain_config(name, payload)
+            return await run_offloop(_update_domain_config, name, payload)
 
     m = _DOMAIN_PROGRESS_RE.match(path)
     if method == "GET" and m:
@@ -718,13 +1475,30 @@ async def handle_request(method, path, headers, body_bytes, query_params):
 
     m = _DOMAIN_RE.match(path)
     if method == "POST" and m and m.group("name") is None:
-        return _create_domain(payload)
+        # Spawns the OpenSearch (and Dashboards) container: seconds warm,
+        # minutes on a cold pull, and it holds the loop for every other
+        # service meanwhile. Shared pool — an OpenSearch node never calls
+        # back into MiniStack, so this cannot re-enter.
+        return await run_offloop(_create_domain, payload)
     if m and m.group("name"):
         name = m.group("name")
         if method == "GET":
             return _describe_domain(name)
         if method == "DELETE":
-            return _delete_domain(name)
+            return await run_offloop(_delete_domain, name)
 
     return _error(400, "InvalidAction",
                   f"OpenSearch operation not implemented: {method} {path}")
+
+
+def _live_container_ids():
+    ids = set()
+    for _key, rec in _domains.all_items():
+        for field in ("_ContainerId", "_DashboardsContainerId"):
+            cid = rec.get(field)
+            if cid:
+                ids.add(cid)
+    return ids
+
+
+container_reaper.register_live_ids("opensearch", _live_container_ids)

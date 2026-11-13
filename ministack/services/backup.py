@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 AWS Backup Service Emulator.
 REST/JSON protocol — /backup-vaults/*, /backup/plans/*, /backup-jobs/*, /tags/* paths.
@@ -10,6 +12,14 @@ Supports:
               ListBackupSelections
   Jobs:       StartBackupJob, StopBackupJob, DescribeBackupJob, ListBackupJobs
   Tags:       TagResource, UntagResource, ListTags
+
+Read-only surface (empty/default documents — no persisted state for these
+resource families yet, so lists come back empty and singleton lookups return
+ResourceNotFoundException, matching real AWS):
+  Copy/Restore/Report/Scan jobs, Frameworks, Report plans, Recovery points,
+  Protected resources, Legal holds, Restore-testing plans/selections,
+  Backup-plan templates, Tiering configurations, account/region/global
+  settings, supported resource types, vault access-policy / notifications.
 """
 
 import copy
@@ -17,8 +27,15 @@ import json
 import logging
 import time
 
-from ministack.core.persistence import load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    AccountScopedDict,
+    get_account_id,
+    get_region,
+    new_uuid,
+    to_output_shape,
+)
 
 logger = logging.getLogger("backup")
 
@@ -26,10 +43,10 @@ logger = logging.getLogger("backup")
 # State
 # ---------------------------------------------------------------------------
 
-_vaults     = AccountScopedDict()     # vault_name -> vault record
-_plans      = AccountScopedDict()     # plan_id -> plan record
-_selections = AccountScopedDict()     # selection_id -> selection record
-_jobs       = AccountScopedDict()     # job_id -> job record
+_vaults     = AccountRegionScopedDict()     # vault_name -> vault record
+_plans      = AccountRegionScopedDict()     # plan_id -> plan record
+_selections = AccountRegionScopedDict()     # selection_id -> selection record
+_jobs       = AccountRegionScopedDict()     # job_id -> job record
 
 
 def reset():
@@ -40,10 +57,10 @@ def reset():
 
 
 def get_state():
-    # Preserve AccountScopedDict wrappers; casting to a plain dict drops
-    # the per-account scoping and would persist only the current request's
-    # tenants. AccountScopedDict has a JSON encoder hook that round-trips
-    # the (account, key) tuple correctly.
+    # Preserve scoped wrappers; casting to a plain dict drops the per-account
+    # and per-region scoping and would persist only the current request's
+    # tenants. Scoped dicts have JSON encoder hooks that round-trip the
+    # tuple keys correctly.
     return {
         "vaults":     copy.deepcopy(_vaults),
         "plans":      copy.deepcopy(_plans),
@@ -52,23 +69,44 @@ def get_state():
     }
 
 
-def restore_state(data):
+def _restore_state(data):
     _vaults.update(data.get("vaults", {}))
     _plans.update(data.get("plans", {}))
-    _selections.update(data.get("selections", {}))
+    _restore_selections(data.get("selections", {}))
     _jobs.update(data.get("jobs", {}))
 
 
+def _restore_selections(restored):
+    if isinstance(restored, AccountRegionScopedDict):
+        _selections.update(restored)
+        return
+
+    if isinstance(restored, AccountScopedDict):
+        selection_items = restored._data.items()
+    elif isinstance(restored, dict):
+        account_id = get_account_id()
+        selection_items = [((account_id, selection_id), record) for selection_id, record in restored.items()]
+    else:
+        return
+
+    plan_regions = {
+        (account_id, plan_id): region
+        for (account_id, region, _plan_id), plan in _plans.all_items()
+        for plan_id in (plan.get("BackupPlanId", _plan_id),)
+    }
+    fallback_region = get_region()
+    for (account_id, selection_id), record in selection_items:
+        region = plan_regions.get(
+            (account_id, record.get("BackupPlanId")),
+            fallback_region,
+        )
+        _selections.set_scoped(account_id, region, selection_id, record)
+
+
 def load_persisted_state(data):
-    restore_state(data)
+    _restore_state(data)
 
 
-try:
-    _restored = load_state("backup")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted backup state; continuing fresh")
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +183,7 @@ def _paginate(items, query, key):
 
 def _create_vault(name, body):
     if name in _vaults:
-        return _err("AlreadyExistsException", f"Vault '{name}' already exists.", 409)
+        return _err("AlreadyExistsException", f"Vault '{name}' already exists.", 400)
     vault = {
         "BackupVaultName": name,
         "BackupVaultArn": _vault_arn(name),
@@ -168,20 +206,23 @@ def _create_vault(name, body):
 def _describe_vault(name):
     v = _vaults.get(name)
     if v is None:
-        return _err("ResourceNotFoundException", f"Vault '{name}' not found.", 404)
-    return _ok(copy.copy(v))
+        return _err("ResourceNotFoundException", f"Vault '{name}' not found.", 400)
+    return _ok(to_output_shape("backup", "DescribeBackupVaultOutput", v))
 
 
 def _delete_vault(name):
     if name not in _vaults:
-        return _err("ResourceNotFoundException", f"Vault '{name}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Vault '{name}' not found.", 400)
     del _vaults[name]
     logger.info("DeleteBackupVault: %s", name)
     return _no_content()
 
 
 def _list_vaults(query):
-    items = list(_vaults.values())
+    items = [
+        {k: v for k, v in to_output_shape("backup", "BackupVaultListMember", vault).items() if v not in ("", None)}
+        for vault in _vaults.values()
+    ]
     return _paginate(items, query, "BackupVaultList")
 
 
@@ -228,11 +269,10 @@ def _create_plan(body):
 def _get_plan(plan_id):
     p = _plans.get(plan_id)
     if p is None:
-        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 400)
     return _ok({
         "BackupPlanId": p["BackupPlanId"],
         "BackupPlanArn": p["BackupPlanArn"],
-        "BackupPlanName": p["BackupPlanName"],
         "CreationDate": p["CreationDate"],
         "LastExecutionDate": p["LastExecutionDate"],
         "VersionId": p["VersionId"],
@@ -244,7 +284,7 @@ def _get_plan(plan_id):
 def _update_plan(plan_id, body):
     p = _plans.get(plan_id)
     if p is None:
-        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 400)
     plan_data = body.get("BackupPlan", {})
     if not plan_data:
         return _err("InvalidParameterValueException", "BackupPlan is required.", 400)
@@ -275,7 +315,7 @@ def _update_plan(plan_id, body):
 def _delete_plan(plan_id):
     p = _plans.get(plan_id)
     if p is None:
-        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 400)
     del _plans[plan_id]
     logger.info("DeleteBackupPlan: %s", plan_id)
     return _ok({
@@ -304,8 +344,8 @@ def _list_plans(query):
 def _list_plan_versions(plan_id):
     p = _plans.get(plan_id)
     if p is None:
-        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 404)
-    return _ok({"BackupPlanVersionsList": p["Versions"]})
+        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 400)
+    return _ok({"BackupPlanVersionsList": [to_output_shape("backup", "BackupPlansListMember", v) for v in p["Versions"]]})
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +354,7 @@ def _list_plan_versions(plan_id):
 
 def _create_selection(plan_id, body):
     if plan_id not in _plans:
-        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 400)
     sel = body.get("BackupSelection", {})
     if not sel:
         return _err("InvalidParameterValueException", "BackupSelection is required.", 400)
@@ -342,10 +382,10 @@ def _create_selection(plan_id, body):
 
 def _get_selection(plan_id, selection_id):
     if plan_id not in _plans:
-        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 400)
     s = _selections.get(selection_id)
     if s is None or s["BackupPlanId"] != plan_id:
-        return _err("ResourceNotFoundException", f"Selection '{selection_id}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Selection '{selection_id}' not found.", 400)
     return _ok({
         "SelectionId": s["SelectionId"],
         "BackupPlanId": s["BackupPlanId"],
@@ -364,10 +404,10 @@ def _get_selection(plan_id, selection_id):
 
 def _delete_selection(plan_id, selection_id):
     if plan_id not in _plans:
-        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 400)
     s = _selections.get(selection_id)
     if s is None or s["BackupPlanId"] != plan_id:
-        return _err("ResourceNotFoundException", f"Selection '{selection_id}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Selection '{selection_id}' not found.", 400)
     del _selections[selection_id]
     logger.info("DeleteBackupSelection: %s", selection_id)
     return _no_content()
@@ -375,7 +415,7 @@ def _delete_selection(plan_id, selection_id):
 
 def _list_selections(plan_id):
     if plan_id not in _plans:
-        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Plan '{plan_id}' not found.", 400)
     items = [
         {
             "SelectionId": s["SelectionId"],
@@ -397,7 +437,7 @@ def _list_selections(plan_id):
 def _start_job(body):
     vault_name = body.get("BackupVaultName", "")
     if vault_name and vault_name not in _vaults:
-        return _err("ResourceNotFoundException", f"Vault '{vault_name}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Vault '{vault_name}' not found.", 400)
     job_id = new_uuid()
     now = _epoch()
     record = {
@@ -407,7 +447,8 @@ def _start_job(body):
         "BackupVaultArn": _vault_arn(vault_name) if vault_name else "",
         "ResourceArn": body.get("ResourceArn", ""),
         "IamRoleArn": body.get("IamRoleArn", ""),
-        "StartBy": now,
+        # StartWindowMinutes "is optional, and the default is 8 hours".
+        "StartBy": now + int(body.get("StartWindowMinutes") or 480) * 60,
         "CreationDate": now,
         "CompletionDate": now,
         "State": "COMPLETED",
@@ -419,6 +460,10 @@ def _start_job(body):
         "RecoveryPointTags": body.get("RecoveryPointTags", {}),
         "IdempotencyToken": body.get("IdempotencyToken", ""),
     }
+    if body.get("Lifecycle") is not None:
+        record["RecoveryPointLifecycle"] = body["Lifecycle"]
+    if body.get("BackupOptions") is not None:
+        record["BackupOptions"] = body["BackupOptions"]
     _jobs[job_id] = record
     # increment recovery point count on the vault
     if vault_name and vault_name in _vaults:
@@ -435,7 +480,7 @@ def _start_job(body):
 def _stop_job(job_id):
     j = _jobs.get(job_id)
     if j is None:
-        return _err("ResourceNotFoundException", f"Job '{job_id}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Job '{job_id}' not found.", 400)
     if j["State"] in ("COMPLETED", "FAILED", "ABORTED"):
         return _err(
             "InvalidRequestException",
@@ -448,11 +493,22 @@ def _stop_job(job_id):
     return _no_content()
 
 
+
+def _shape_view(record, shape):
+    """The record's members that the backup output shape has."""
+    import botocore.session
+
+    global _BACKUP_MODEL
+    if "_BACKUP_MODEL" not in globals():
+        _BACKUP_MODEL = botocore.session.get_session().get_service_model("backup")
+    members = _BACKUP_MODEL.shape_for(shape).members
+    return {k: v for k, v in record.items() if k in members}
+
 def _describe_job(job_id):
     j = _jobs.get(job_id)
     if j is None:
-        return _err("ResourceNotFoundException", f"Job '{job_id}' not found.", 404)
-    return _ok(copy.copy(j))
+        return _err("ResourceNotFoundException", f"Job '{job_id}' not found.", 400)
+    return _ok(_shape_view(j, "DescribeBackupJobOutput"))
 
 
 def _list_jobs(query):
@@ -466,7 +522,7 @@ def _list_jobs(query):
         items = [j for j in items if j["State"] == state_filter]
     if resource_filter:
         items = [j for j in items if j["ResourceArn"] == resource_filter]
-    return _paginate(items, query, "BackupJobs")
+    return _paginate([_shape_view(j, "BackupJob") for j in items], query, "BackupJobs")
 
 
 # ---------------------------------------------------------------------------
@@ -475,12 +531,22 @@ def _list_jobs(query):
 
 def _resolve_resource(arn):
     """Return the mutable tag dict for a supported backup ARN, or None."""
-    if ":backup-vault:" in arn:
-        name = arn.split(":")[-1]
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError as exc:
+        raise ValueError("ResourceArn must be a Backup ARN.") from exc
+
+    if spec.service != "backup":
+        raise ValueError("ResourceArn must be a Backup ARN.")
+    if spec.region != get_region() or spec.account_id != get_account_id():
+        return None
+
+    if spec.resource.startswith("backup-vault:"):
+        name = spec.resource.removeprefix("backup-vault:")
         v = _vaults.get(name)
         return v["BackupVaultTags"] if v is not None else None
-    if ":backup-plan:" in arn:
-        pid = arn.split(":")[-1]
+    if spec.resource.startswith("backup-plan:"):
+        pid = spec.resource.removeprefix("backup-plan:")
         p = _plans.get(pid)
         return p["Tags"] if p is not None else None
     return None
@@ -488,28 +554,311 @@ def _resolve_resource(arn):
 
 def _tag_resource(arn, body):
     tags = body.get("Tags", {})
-    tag_dict = _resolve_resource(arn)
+    try:
+        tag_dict = _resolve_resource(arn)
+    except ValueError as exc:
+        return _err("InvalidParameterValueException", str(exc), 400)
     if tag_dict is None:
-        return _err("ResourceNotFoundException", f"Resource '{arn}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Resource '{arn}' not found.", 400)
     tag_dict.update(tags)
     return _no_content()
 
 
 def _untag_resource(arn, body):
     keys = body.get("TagKeyList", [])
-    tag_dict = _resolve_resource(arn)
+    try:
+        tag_dict = _resolve_resource(arn)
+    except ValueError as exc:
+        return _err("InvalidParameterValueException", str(exc), 400)
     if tag_dict is None:
-        return _err("ResourceNotFoundException", f"Resource '{arn}' not found.", 404)
+        return _err("ResourceNotFoundException", f"Resource '{arn}' not found.", 400)
     for k in keys:
         tag_dict.pop(k, None)
     return _no_content()
 
 
-def _list_tags(arn):
-    tag_dict = _resolve_resource(arn)
+def _list_tags(arn, query=None):
+    try:
+        tag_dict = _resolve_resource(arn)
+    except ValueError as exc:
+        return _err("InvalidParameterValueException", str(exc), 400)
     if tag_dict is None:
-        return _err("ResourceNotFoundException", f"Resource '{arn}' not found.", 404)
-    return _ok({"Tags": dict(tag_dict)})
+        return _err("ResourceNotFoundException", f"Resource '{arn}' not found.", 400)
+    query = query or {}
+    items = list(tag_dict.items())
+    try:
+        start = max(int(query.get("nextToken") or 0), 0)
+    except (TypeError, ValueError):
+        start = 0
+    try:
+        limit = int(query.get("maxResults") or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    end = start + limit if limit > 0 else len(items)
+    out = {"Tags": dict(items[start:end])}
+    if end < len(items):
+        out["NextToken"] = str(end)
+    return _ok(out)
+
+
+# ---------------------------------------------------------------------------
+# Read-only surface (empty / default documents)
+#
+# MiniStack does not yet persist copy jobs, restore jobs, report jobs/plans,
+# frameworks, recovery points, protected resources, legal holds,
+# restore-testing plans/selections, backup-plan templates or tiering
+# configurations. Real AWS returns empty lists for the List* operations on
+# these families and ResourceNotFoundException for a Get*/Describe* of a
+# specific (necessarily absent) resource. AWS Backup returns HTTP 400 for
+# ResourceNotFoundException (not 404), so these handlers use _not_found().
+#
+# Shapes and JSON key casing are taken verbatim from the botocore
+# backup/2018-11-15 service-2.json (rest-json) output shapes.
+# ---------------------------------------------------------------------------
+
+# AWS resource types supported by AWS Backup (GetSupportedResourceTypes).
+_SUPPORTED_RESOURCE_TYPES = [
+    "Aurora", "CloudFormation", "DocumentDB", "DynamoDB", "EBS", "EC2",
+    "EFS", "EKS", "FSx", "Neptune", "RDS", "Redshift", "S3",
+    "SAP HANA on Amazon EC2", "Storage Gateway", "Timestream", "VirtualMachine",
+]
+
+
+def _not_found(msg):
+    # AWS Backup returns HTTP 400 for ResourceNotFoundException.
+    return _err("ResourceNotFoundException", msg, 400)
+
+
+def _empty_list(query, key):
+    """List* on a family MiniStack does not persist yet: AWS-correct empty page."""
+    return _paginate([], query, key)
+
+
+# --- Copy jobs -------------------------------------------------------------
+
+def _list_copy_jobs(query):
+    return _empty_list(query, "CopyJobs")
+
+
+def _describe_copy_job(copy_job_id):
+    return _not_found(f"Copy job '{copy_job_id}' not found.")
+
+
+# --- Restore jobs ----------------------------------------------------------
+
+def _list_restore_jobs(query):
+    return _empty_list(query, "RestoreJobs")
+
+
+def _describe_restore_job(restore_job_id):
+    return _not_found(f"Restore job '{restore_job_id}' not found.")
+
+
+def _get_restore_job_metadata(restore_job_id):
+    return _not_found(f"Restore job '{restore_job_id}' not found.")
+
+
+def _list_restore_jobs_by_resource(query):
+    return _empty_list(query, "RestoreJobs")
+
+
+# --- Report jobs / plans ---------------------------------------------------
+
+def _list_report_jobs(query):
+    return _empty_list(query, "ReportJobs")
+
+
+def _describe_report_job(report_job_id):
+    return _not_found(f"Report job '{report_job_id}' not found.")
+
+
+def _list_report_plans(query):
+    return _empty_list(query, "ReportPlans")
+
+
+def _describe_report_plan(report_plan_name):
+    return _not_found(f"Report plan '{report_plan_name}' not found.")
+
+
+# --- Frameworks ------------------------------------------------------------
+
+def _list_frameworks(query):
+    return _empty_list(query, "Frameworks")
+
+
+def _describe_framework(framework_name):
+    return _not_found(f"Framework '{framework_name}' not found.")
+
+
+# --- Recovery points -------------------------------------------------------
+
+def _list_recovery_points_by_vault(vault_name, query):
+    if vault_name not in _vaults:
+        return _not_found(f"Vault '{vault_name}' not found.")
+    return _empty_list(query, "RecoveryPoints")
+
+
+def _describe_recovery_point(vault_name, recovery_point_arn):
+    if vault_name not in _vaults:
+        return _not_found(f"Vault '{vault_name}' not found.")
+    return _not_found(f"Recovery point '{recovery_point_arn}' not found.")
+
+
+def _get_recovery_point_index_details(vault_name, recovery_point_arn):
+    if vault_name not in _vaults:
+        return _not_found(f"Vault '{vault_name}' not found.")
+    return _not_found(f"Recovery point '{recovery_point_arn}' not found.")
+
+
+def _get_recovery_point_restore_metadata(vault_name, recovery_point_arn):
+    if vault_name not in _vaults:
+        return _not_found(f"Vault '{vault_name}' not found.")
+    return _not_found(f"Recovery point '{recovery_point_arn}' not found.")
+
+
+def _list_recovery_points_by_resource(query):
+    return _empty_list(query, "RecoveryPoints")
+
+
+# --- Protected resources ---------------------------------------------------
+
+def _list_protected_resources(query):
+    return _empty_list(query, "Results")
+
+
+def _list_protected_resources_by_vault(vault_name, query):
+    if vault_name not in _vaults:
+        return _not_found(f"Vault '{vault_name}' not found.")
+    return _empty_list(query, "Results")
+
+
+def _describe_protected_resource(resource_arn):
+    return _not_found(f"Protected resource '{resource_arn}' not found.")
+
+
+# --- Legal holds -----------------------------------------------------------
+
+def _list_legal_holds(query):
+    return _empty_list(query, "LegalHolds")
+
+
+def _get_legal_hold(legal_hold_id):
+    return _not_found(f"Legal hold '{legal_hold_id}' not found.")
+
+
+def _list_recovery_points_by_legal_hold(legal_hold_id, query):
+    return _not_found(f"Legal hold '{legal_hold_id}' not found.")
+
+
+# --- Restore testing -------------------------------------------------------
+
+def _list_restore_testing_plans(query):
+    return _empty_list(query, "RestoreTestingPlans")
+
+
+def _get_restore_testing_plan(plan_name):
+    return _not_found(f"Restore testing plan '{plan_name}' not found.")
+
+
+def _list_restore_testing_selections(plan_name, query):
+    return _not_found(f"Restore testing plan '{plan_name}' not found.")
+
+
+def _get_restore_testing_selection(plan_name, selection_name):
+    return _not_found(f"Restore testing plan '{plan_name}' not found.")
+
+
+# --- Scan jobs -------------------------------------------------------------
+
+def _list_scan_jobs(query):
+    return _empty_list(query, "ScanJobs")
+
+
+def _describe_scan_job(scan_job_id):
+    return _not_found(f"Scan job '{scan_job_id}' not found.")
+
+
+# --- Audit summaries (aggregations) ----------------------------------------
+
+def _list_backup_job_summaries(query):
+    return _ok({"BackupJobSummaries": []})
+
+
+def _list_copy_job_summaries(query):
+    return _ok({"CopyJobSummaries": []})
+
+
+def _list_restore_job_summaries(query):
+    return _ok({"RestoreJobSummaries": []})
+
+
+def _list_scan_job_summaries(query):
+    return _ok({"ScanJobSummaries": []})
+
+
+# --- Backup plan templates -------------------------------------------------
+
+def _list_backup_plan_templates(query):
+    return _paginate([], query, "BackupPlanTemplatesList")
+
+
+# --- Indexed recovery points -----------------------------------------------
+
+def _list_indexed_recovery_points(query):
+    return _empty_list(query, "IndexedRecoveryPoints")
+
+
+# --- Tiering configurations ------------------------------------------------
+
+def _list_tiering_configurations(query):
+    return _empty_list(query, "TieringConfigurations")
+
+
+def _get_tiering_configuration(name):
+    return _not_found(f"Tiering configuration '{name}' not found.")
+
+
+# --- Logically air-gapped restore access vaults ----------------------------
+
+def _list_restore_access_backup_vaults(vault_name, query):
+    if vault_name not in _vaults:
+        return _not_found(f"Vault '{vault_name}' not found.")
+    return _empty_list(query, "RestoreAccessBackupVaults")
+
+
+# --- Vault access policy / notifications -----------------------------------
+
+def _get_vault_access_policy(vault_name):
+    # Real AWS returns ResourceNotFoundException when no policy is set (and when
+    # the vault itself is absent). MiniStack persists no vault access policies.
+    if vault_name not in _vaults:
+        return _not_found(f"Vault '{vault_name}' not found.")
+    return _not_found(f"No access policy is associated with vault '{vault_name}'.")
+
+
+def _get_vault_notifications(vault_name):
+    # Real AWS returns ResourceNotFoundException when no notification config is
+    # set. MiniStack persists no vault notification configurations.
+    if vault_name not in _vaults:
+        return _not_found(f"Vault '{vault_name}' not found.")
+    return _not_found(f"No notifications are associated with vault '{vault_name}'.")
+
+
+# --- Account / region / global settings (always-present defaults) ----------
+
+def _describe_region_settings():
+    return _ok({
+        "ResourceTypeOptInPreference": {},
+        "ResourceTypeManagementPreference": {},
+    })
+
+
+def _describe_global_settings():
+    return _ok({"GlobalSettings": {}})
+
+
+def _get_supported_resource_types():
+    return _ok({"ResourceTypes": list(_SUPPORTED_RESOURCE_TYPES)})
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +886,48 @@ async def handle_request(method, path, headers, body_bytes, query_params):
                 return _describe_vault(name)
             if method == "DELETE":
                 return _delete_vault(name)
+        # /backup-vaults/{vaultName}/<sub-resource>
+        if len(parts) >= 3:
+            name = parts[1]
+            sub = parts[2]
+            if method == "GET":
+                if sub == "access-policy" and len(parts) == 3:
+                    return _get_vault_access_policy(name)
+                if sub == "notification-configuration" and len(parts) == 3:
+                    return _get_vault_notifications(name)
+                if sub == "resources" and len(parts) == 3:
+                    return _list_protected_resources_by_vault(name, query)
+                if sub == "recovery-points":
+                    if len(parts) == 3:
+                        return _list_recovery_points_by_vault(name, query)
+                    # /backup-vaults/{name}/recovery-points/{rpArn}[/index|/restore-metadata]
+                    if parts[-1] == "index":
+                        rp = "/".join(parts[3:-1])
+                        return _get_recovery_point_index_details(name, rp)
+                    if parts[-1] == "restore-metadata":
+                        rp = "/".join(parts[3:-1])
+                        return _get_recovery_point_restore_metadata(name, rp)
+                    rp = "/".join(parts[3:])
+                    return _describe_recovery_point(name, rp)
+
+    # /logically-air-gapped-backup-vaults/{vaultName}/restore-access-backup-vaults
+    if (
+        len(parts) == 3
+        and parts[0] == "logically-air-gapped-backup-vaults"
+        and parts[2] == "restore-access-backup-vaults"
+        and method == "GET"
+    ):
+        return _list_restore_access_backup_vaults(parts[1], query)
+
+    # /backup/template/plans — ListBackupPlanTemplates
+    if (
+        len(parts) == 3
+        and parts[0] == "backup"
+        and parts[1] == "template"
+        and parts[2] == "plans"
+        and method == "GET"
+    ):
+        return _list_backup_plan_templates(query)
 
     # /backup/plans (and nested selections/versions)
     if len(parts) >= 2 and parts[0] == "backup" and parts[1] == "plans":
@@ -594,7 +985,7 @@ async def handle_request(method, path, headers, body_bytes, query_params):
     if parts and parts[0] == "tags":
         arn = "/".join(parts[1:])
         if method == "GET":
-            return _list_tags(arn)
+            return _list_tags(arn, query)
         if method == "POST":
             return _tag_resource(arn, body)
 
@@ -603,5 +994,114 @@ async def handle_request(method, path, headers, body_bytes, query_params):
         arn = "/".join(parts[1:])
         if method == "POST":
             return _untag_resource(arn, body)
+
+    # -------------------------------------------------------------------
+    # Read-only families with no persisted state (empty / not-found docs).
+    # -------------------------------------------------------------------
+
+    # /copy-jobs and /copy-jobs/{copyJobId}
+    if parts and parts[0] == "copy-jobs" and method == "GET":
+        if len(parts) == 1:
+            return _list_copy_jobs(query)
+        if len(parts) == 2:
+            return _describe_copy_job(parts[1])
+
+    # /restore-jobs, /restore-jobs/{id}, /restore-jobs/{id}/metadata
+    if parts and parts[0] == "restore-jobs" and method == "GET":
+        if len(parts) == 1:
+            return _list_restore_jobs(query)
+        if len(parts) == 2:
+            return _describe_restore_job(parts[1])
+        if len(parts) == 3 and parts[2] == "metadata":
+            return _get_restore_job_metadata(parts[1])
+
+    # /resources and /resources/{resourceArn}[/recovery-points|/restore-jobs]
+    if parts and parts[0] == "resources" and method == "GET":
+        if len(parts) == 1:
+            return _list_protected_resources(query)
+        if parts[-1] == "recovery-points":
+            return _list_recovery_points_by_resource(query)
+        if parts[-1] == "restore-jobs":
+            return _list_restore_jobs_by_resource(query)
+        return _describe_protected_resource("/".join(parts[1:]))
+
+    # /legal-holds, /legal-holds/{id}, /legal-holds/{id}/recovery-points
+    if parts and parts[0] == "legal-holds" and method == "GET":
+        if len(parts) == 1:
+            return _list_legal_holds(query)
+        if len(parts) == 2:
+            return _get_legal_hold(parts[1])
+        if len(parts) == 3 and parts[2] == "recovery-points":
+            return _list_recovery_points_by_legal_hold(parts[1], query)
+
+    # /restore-testing/plans[/{name}[/selections[/{sel}]]]
+    if len(parts) >= 2 and parts[0] == "restore-testing" and parts[1] == "plans" and method == "GET":
+        if len(parts) == 2:
+            return _list_restore_testing_plans(query)
+        if len(parts) == 3:
+            return _get_restore_testing_plan(parts[2])
+        if len(parts) == 4 and parts[3] == "selections":
+            return _list_restore_testing_selections(parts[2], query)
+        if len(parts) == 5 and parts[3] == "selections":
+            return _get_restore_testing_selection(parts[2], parts[4])
+
+    # /scan/jobs and /scan/jobs/{scanJobId}
+    if len(parts) >= 2 and parts[0] == "scan" and parts[1] == "jobs" and method == "GET":
+        if len(parts) == 2:
+            return _list_scan_jobs(query)
+        if len(parts) == 3:
+            return _describe_scan_job(parts[2])
+
+    # /tiering-configurations and /tiering-configurations/{name}
+    if parts and parts[0] == "tiering-configurations" and method == "GET":
+        if len(parts) == 1:
+            return _list_tiering_configurations(query)
+        if len(parts) == 2:
+            return _get_tiering_configuration(parts[1])
+
+    # /indexes/recovery-point — ListIndexedRecoveryPoints
+    if (
+        len(parts) == 2
+        and parts[0] == "indexes"
+        and parts[1] == "recovery-point"
+        and method == "GET"
+    ):
+        return _list_indexed_recovery_points(query)
+
+    # /audit/* — frameworks, report-jobs, report-plans and summaries
+    if len(parts) >= 2 and parts[0] == "audit" and method == "GET":
+        sub = parts[1]
+        if sub == "frameworks":
+            if len(parts) == 2:
+                return _list_frameworks(query)
+            if len(parts) == 3:
+                return _describe_framework(parts[2])
+        if sub == "report-jobs":
+            if len(parts) == 2:
+                return _list_report_jobs(query)
+            if len(parts) == 3:
+                return _describe_report_job(parts[2])
+        if sub == "report-plans":
+            if len(parts) == 2:
+                return _list_report_plans(query)
+            if len(parts) == 3:
+                return _describe_report_plan(parts[2])
+        if sub == "backup-job-summaries":
+            return _list_backup_job_summaries(query)
+        if sub == "copy-job-summaries":
+            return _list_copy_job_summaries(query)
+        if sub == "restore-job-summaries":
+            return _list_restore_job_summaries(query)
+        if sub == "scan-job-summaries":
+            return _list_scan_job_summaries(query)
+
+    # Singleton account / global settings and supported resource types.
+    if parts and method == "GET":
+        if parts == ["account-settings"]:
+            return _describe_region_settings()
+        if parts == ["global-settings"]:
+            return _describe_global_settings()
+        if parts == ["supported-resource-types"]:
+            return _get_supported_resource_types()
 
     return _err("ValidationException", f"No route for {method} {path}", 400)

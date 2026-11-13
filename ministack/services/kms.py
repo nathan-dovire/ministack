@@ -1,33 +1,44 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 KMS (Key Management Service) Emulator.
 JSON-based API via X-Amz-Target (prefix: TrentService).
 Supports: CreateKey, ListKeys, DescribeKey, Sign, Verify,
           Encrypt, Decrypt, GenerateDataKey,
-          GenerateDataKeyWithoutPlaintext.
+          GenerateDataKeyWithoutPlaintext, GenerateDataKeyPair,
+          GenerateDataKeyPairWithoutPlaintext, GenerateMac, VerifyMac,
+          GenerateRandom, CreateGrant, ListGrants, RevokeGrant, RetireGrant.
 """
 
 import base64
+import binascii
 import hashlib
+import hmac
 import json
 import logging
 import os
+import re
+import threading
 import time
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
     get_region,
     json_response,
     new_uuid,
+    request_scope,
 )
 
 logger = logging.getLogger("kms")
 
 try:
     from cryptography.exceptions import InvalidSignature
-    from cryptography.hazmat.primitives import hashes, serialization
-    from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa, utils
+    from cryptography.hazmat.primitives import hashes, keywrap, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec, ed25519, padding, rsa, utils
     HAS_CRYPTO = True
 except ImportError:
     InvalidSignature = Exception
@@ -40,17 +51,61 @@ except ImportError:
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-from ministack.core.persistence import PERSIST_STATE, load_state
 
-_keys = AccountScopedDict()
+_keys = AccountRegionScopedDict()
 # key_id -> {
 #     KeyId, Arn, KeyState, KeyUsage, KeySpec, Description,
 #     CreationDate, Enabled, Origin,
 #     _private_key (asymmetric private key object, RSA/ECC only),
 #     _public_key_der (bytes, RSA/ECC only),
 #     _symmetric_key (bytes, SYMMETRIC_DEFAULT only),
+#     _hmac_key (bytes, HMAC_* only),
 # }
-_aliases = AccountScopedDict()  # alias_name -> key_id (e.g. "alias/my-key" -> "uuid")
+_aliases = AccountRegionScopedDict()  # alias ARN -> key_id
+_alias_dates = AccountRegionScopedDict()  # alias ARN -> {CreationDate, LastUpdatedDate}
+_grants = AccountRegionScopedDict()
+# grant_id -> {
+#     GrantId, KeyId (key ARN), Name, CreationDate, GranteePrincipal,
+#     RetiringPrincipal, IssuingAccount, Operations, Constraints,
+#     _tokens (every GrantToken CreateGrant has returned for this grant),
+# }
+
+_HMAC_KEY_SPECS = {
+    "HMAC_224": ("HMAC_SHA_224", 28),
+    "HMAC_256": ("HMAC_SHA_256", 32),
+    "HMAC_384": ("HMAC_SHA_384", 48),
+    "HMAC_512": ("HMAC_SHA_512", 64),
+}
+
+_MAC_ALGORITHM_DIGESTS = {
+    "HMAC_SHA_224": "sha224",
+    "HMAC_SHA_256": "sha256",
+    "HMAC_SHA_384": "sha384",
+    "HMAC_SHA_512": "sha512",
+}
+
+MAC_KEY_USAGE = "GENERATE_VERIFY_MAC"
+
+MAC_MESSAGE_MAX_BYTES = 4096
+
+MAC_MAX_BYTES = 6144
+
+_MAX_MESSAGE_B64_CHARS = 4 * ((MAC_MESSAGE_MAX_BYTES + 2) // 3)
+
+
+def _alias_arn(alias_name):
+    return f"arn:aws:kms:{get_region()}:{get_account_id()}:{alias_name}"
+
+
+def _alias_arn_from_key_record(alias_name, rec, account_id=None):
+    if rec and rec.get("Arn"):
+        try:
+            spec = parse_arn(rec["Arn"])
+            if spec.service == "kms" and spec.region and spec.account_id:
+                return f"arn:{spec.partition}:kms:{spec.region}:{spec.account_id}:{alias_name}"
+        except ArnParseError:
+            pass
+    return f"arn:aws:kms:{get_region()}:{account_id or get_account_id()}:{alias_name}"
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -58,14 +113,27 @@ _aliases = AccountScopedDict()  # alias_name -> key_id (e.g. "alias/my-key" -> "
 def get_state():
     """Return JSON-serializable state. Symmetric keys are base64-encoded;
     RSA private keys are PEM-encoded if cryptography is available."""
-    from ministack.core.responses import AccountScopedDict
-    serializable_keys = AccountScopedDict()
+    serializable_keys = AccountRegionScopedDict()
     # Iterate _data directly to capture ALL accounts
     for scoped_key, rec in _keys._data.items():
         entry = {k: v for k, v in rec.items()
-                 if k not in ("_private_key", "_public_key_der", "_symmetric_key")}
+                 if k not in ("_private_key", "_public_key_der", "_symmetric_key",
+                              "_hmac_key", "_import_wrapping_key", "_import_token")}
+        if "_import_token" in rec:
+            entry["_import_token_b64"] = base64.b64encode(rec["_import_token"]).decode()
+        if "_import_wrapping_key" in rec and HAS_CRYPTO:
+            try:
+                entry["_import_wrapping_key_pem"] = base64.b64encode(
+                    rec["_import_wrapping_key"].private_bytes(
+                        serialization.Encoding.PEM,
+                        serialization.PrivateFormat.PKCS8,
+                        serialization.NoEncryption())).decode()
+            except Exception:
+                pass
         if "_symmetric_key" in rec:
             entry["_symmetric_key_b64"] = base64.b64encode(rec["_symmetric_key"]).decode()
+        if "_hmac_key" in rec:
+            entry["_hmac_key_b64"] = base64.b64encode(rec["_hmac_key"]).decode()
         if "_public_key_der" in rec:
             entry["_public_key_der_b64"] = base64.b64encode(rec["_public_key_der"]).decode()
         if "_private_key" in rec and HAS_CRYPTO:
@@ -79,16 +147,45 @@ def get_state():
             except Exception:
                 pass
         serializable_keys._data[scoped_key] = entry
-    return {"keys": serializable_keys, "aliases": _aliases}
+    return {
+        "keys": serializable_keys,
+        "aliases": _aliases,
+        "alias_dates": _alias_dates,
+        "grants": _grants,
+    }
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     if data:
-        from ministack.core.responses import AccountScopedDict
         keys_data = data.get("keys", {})
+
+        def _region_from_key_entry(entry):
+            try:
+                spec = parse_arn(entry.get("Arn", ""))
+            except (ArnParseError, AttributeError):
+                return get_region()
+            if spec.service != "kms":
+                return get_region()
+            return spec.region or get_region()
+
         def _restore_key_entry(entry):
             if "_symmetric_key_b64" in entry:
                 entry["_symmetric_key"] = base64.b64decode(entry.pop("_symmetric_key_b64"))
+            if "_import_token_b64" in entry:
+                entry["_import_token"] = base64.b64decode(entry.pop("_import_token_b64"))
+            if "_import_wrapping_key_pem" in entry and HAS_CRYPTO:
+                try:
+                    entry["_import_wrapping_key"] = serialization.load_pem_private_key(
+                        base64.b64decode(entry.pop("_import_wrapping_key_pem")),
+                        password=None)
+                except Exception:
+                    entry.pop("_import_wrapping_key_pem", None)
+            if "_hmac_key_b64" in entry:
+                entry["_hmac_key"] = base64.b64decode(entry.pop("_hmac_key_b64"))
             if "_public_key_der_b64" in entry:
                 entry["_public_key_der"] = base64.b64decode(entry.pop("_public_key_der_b64"))
             if "_private_key_pem" in entry and HAS_CRYPTO:
@@ -97,34 +194,94 @@ def restore_state(data):
                     entry["_private_key"] = serialization.load_pem_private_key(pem_bytes, password=None)
                 except Exception:
                     pass
-        if isinstance(keys_data, AccountScopedDict):
+
+        if isinstance(keys_data, AccountRegionScopedDict):
             for scoped_key, entry in keys_data._data.items():
                 _restore_key_entry(entry)
                 _keys._data[scoped_key] = entry
+        elif isinstance(keys_data, AccountScopedDict):
+            for (account_id, kid), entry in keys_data._data.items():
+                _restore_key_entry(entry)
+                _keys.set_scoped(account_id, _region_from_key_entry(entry), kid, entry)
         else:
             for kid, entry in keys_data.items():
                 _restore_key_entry(entry)
-                _keys[kid] = entry
-        _aliases.update(data.get("aliases", {}))
+                _keys.set_scoped(get_account_id(), _region_from_key_entry(entry), kid, entry)
+
+        def _key_record_for_alias_target(account_id, target_id):
+            for (stored_account, _region, key_id), rec in _keys._data.items():
+                if stored_account == account_id and key_id == target_id:
+                    return rec
+            return None
+
+        def _store_alias(account_id, alias_key, target_id):
+            storage_key = alias_key
+            if not str(alias_key).startswith("arn:"):
+                storage_key = _alias_arn_from_key_record(
+                    alias_key,
+                    _key_record_for_alias_target(account_id, target_id),
+                    account_id,
+                )
+            try:
+                spec = parse_arn(storage_key)
+                region = spec.region if spec.service == "kms" and spec.region else get_region()
+            except ArnParseError:
+                region = get_region()
+            _aliases.set_scoped(account_id, region, storage_key, target_id)
+
+        aliases_data = data.get("aliases", {})
+        if isinstance(aliases_data, AccountRegionScopedDict):
+            _aliases.update(aliases_data)
+        elif isinstance(aliases_data, AccountScopedDict):
+            for (account_id, alias_key), target_id in aliases_data._data.items():
+                _store_alias(account_id, alias_key, target_id)
+        else:
+            for alias_key, target_id in aliases_data.items():
+                _store_alias(get_account_id(), alias_key, target_id)
+        alias_dates = data.get("alias_dates")
+        if isinstance(alias_dates, AccountRegionScopedDict):
+            _alias_dates.update(alias_dates)
+        grants = data.get("grants")
+        if isinstance(grants, AccountRegionScopedDict):
+            _grants.update(grants)
 
 
-try:
-    _restored = load_state("kms")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 def _arn(key_id):
     return f"arn:aws:kms:{get_region()}:{get_account_id()}:key/{key_id}"
 
 
+def _key_not_found(key_ref):
+    """NotFoundException for a key id, key ARN, alias name or alias ARN, in AWS's words."""
+    key_ref = key_ref or ""
+    if key_ref.startswith("alias/") or ":alias/" in key_ref:
+        arn = key_ref if key_ref.startswith("arn:") else _alias_arn(key_ref)
+        return error_response_json("NotFoundException", f"Alias {arn} is not found.", 400)
+    arn = key_ref if key_ref.startswith("arn:") else _arn(key_ref)
+    return error_response_json("NotFoundException", f"Key '{arn}' does not exist", 400)
+
+
+def _default_key_policy():
+    """The key policy a key gets without one, in the layout GetKeyPolicy returns it on AWS."""
+    return ('{\n  "Version" : "2012-10-17",\n  "Id" : "key-default-1",\n  "Statement" : [ {\n'
+            '    "Sid" : "Enable IAM User Permissions",\n    "Effect" : "Allow",\n    "Principal" : {\n'
+            f'      "AWS" : "arn:aws:iam::{get_account_id()}:root"\n    }},\n    "Action" : "kms:*",\n'
+            '    "Resource" : "*"\n  } ]\n}')
+
+
+def _key_material_id(rec):
+    """Stable for a key's symmetric material; changes when the material does."""
+    return hmac.new(
+        rec["_symmetric_key"],
+        b"ministack:kms:key-material-id:" + rec["KeyId"].encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
 def _key_metadata(rec):
-    return {
+    metadata = {
+        "AWSAccountId": rec["Arn"].split(":")[4],
         "KeyId": rec["KeyId"],
         "Arn": rec["Arn"],
         "CreationDate": rec["CreationDate"],
@@ -133,30 +290,316 @@ def _key_metadata(rec):
         "KeyUsage": rec["KeyUsage"],
         "KeyState": rec["KeyState"],
         "Origin": rec["Origin"],
-        "KeyManager": "CUSTOMER",
+        "KeyManager": rec.get("KeyManager", "CUSTOMER"),
         "CustomerMasterKeySpec": rec["KeySpec"],
         "KeySpec": rec["KeySpec"],
-        "EncryptionAlgorithms": rec.get("EncryptionAlgorithms", []),
-        "SigningAlgorithms": rec.get("SigningAlgorithms", []),
     }
+    if _is_hmac_key(rec):
+        metadata["MacAlgorithms"] = rec.get("MacAlgorithms", [])
+    else:
+        metadata["EncryptionAlgorithms"] = rec.get("EncryptionAlgorithms", [])
+        metadata["SigningAlgorithms"] = rec.get("SigningAlgorithms", [])
+    # "This value is present only when the KMS key is scheduled for deletion,
+    # that is, when its KeyState is PendingDeletion."
+    if "DeletionDate" in rec:
+        metadata["DeletionDate"] = rec["DeletionDate"]
+    if "_symmetric_key" in rec and rec["Origin"] in ("AWS_KMS", "EXTERNAL"):
+        metadata["CurrentKeyMaterialId"] = _key_material_id(rec)
+    # Both are reported only for a key with imported material.
+    if "ExpirationModel" in rec:
+        metadata["ExpirationModel"] = rec["ExpirationModel"]
+    if "ValidTo" in rec:
+        metadata["ValidTo"] = rec["ValidTo"]
+    metadata["MultiRegion"] = rec.get("MultiRegion", False)
+    if rec.get("MultiRegion"):
+        account = get_account_id()
+        primary_region = rec.get("_mrk_primary_region", get_region())
+        regions = rec.get("_mrk_regions") or [primary_region]
+        def member_arn(region):
+            return f"arn:aws:kms:{region}:{account}:key/{rec['KeyId']}"
+        metadata["MultiRegionConfiguration"] = {
+            "MultiRegionKeyType": rec.get("_mrk_type", "PRIMARY"),
+            "PrimaryKey": {"Arn": member_arn(primary_region), "Region": primary_region},
+            "ReplicaKeys": [
+                {"Arn": member_arn(region), "Region": region}
+                for region in regions if region != primary_region
+            ],
+        }
+        if rec.get("KeyState") == "PendingReplicaDeletion" and rec.get("_pending_window_days"):
+            metadata["PendingDeletionWindowInDays"] = rec["_pending_window_days"]
+    return metadata
+
+
+_AWS_S3_ALIAS = "alias/aws/s3"
+# GetKeyPolicy of the aws/s3 key, byte for byte as AWS returns it (recorded on AWS, us-east-2).
+_AWS_S3_KEY_POLICY = (
+    '{\n  "Version" : "2012-10-17",\n  "Id" : "auto-s3-2",\n  "Statement" : [ {\n'
+    '    "Sid" : "Allow access through S3 for all principals in the account that are authorized to use S3",\n'
+    '    "Effect" : "Allow",\n    "Principal" : {\n      "AWS" : "*"\n    },\n'
+    '    "Action" : [ "kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*", "kms:DescribeKey" ],\n'
+    '    "Resource" : "*",\n    "Condition" : {\n      "StringEquals" : {\n'
+    '        "kms:ViaService" : "s3.<region>.amazonaws.com",\n        "kms:CallerAccount" : "<account>"\n'
+    '      }\n    }\n  }, {\n    "Sid" : "Allow direct access to key metadata to the account",\n'
+    '    "Effect" : "Allow",\n    "Principal" : {\n      "AWS" : "arn:aws:iam::<account>:root"\n    },\n'
+    '    "Action" : [ "kms:Describe*", "kms:Get*", "kms:List*" ],\n    "Resource" : "*"\n  } ]\n}'
+)
+_KEY_ID_RE = re.compile(r"(?:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|mrk-[0-9a-fA-F]{32})")
+
+
+# Serializes the first use of aws/s3, so two concurrent first writes do not create two keys. _create_key does not
+# come back here, so the lock is never taken twice.
+_aws_s3_key_lock = threading.Lock()
+
+
+def aws_managed_s3_key():
+    """The account's AWS managed key ``aws/s3`` in this Region, created on first use by S3 or DescribeKey (recorded
+    on AWS in sa-east-1, us-west-2 and eu-west-1)."""
+    alias_arn = _alias_arn(_AWS_S3_ALIAS)
+    with _aws_s3_key_lock:
+        rec = _keys.get(_aliases[alias_arn]) if alias_arn in _aliases else None
+        if rec is None:
+            rec = _create_aws_s3_key(alias_arn)
+    return rec
+
+
+def _create_aws_s3_key(alias_arn):
+    created = _create_key({
+        "Description": "Default key that protects my S3 objects when no other key is defined",
+        "Policy": _AWS_S3_KEY_POLICY.replace("<region>", get_region()).replace("<account>", get_account_id()),
+    })
+    key_id = json.loads(created[2])["KeyMetadata"]["KeyId"]
+    rec = _keys[key_id]
+    rec["KeyManager"] = "AWS"
+    _aliases[alias_arn] = key_id
+    _stamp_alias(alias_arn, created=True)
+    return rec
+
+
+def _s3_key_arn(key_ref):
+    """``(key ARN, None)`` or ``(None, (code, message, status))`` for the key an S3 write names.
+
+    Recorded on AWS, us-east-2: no key (or ``alias/aws/s3``) is the account's ``aws/s3`` key; a key ID,
+    alias, alias ARN or key ARN of this account resolves to the key ARN, another account's only when it
+    exists; anything else is refused with the KMS error S3 relays.
+    """
+    region, account = get_region(), get_account_id()
+    not_found = "KMS.NotFoundException"
+    if not key_ref or key_ref in (_AWS_S3_ALIAS, f"arn:aws:kms:{region}:{account}:{_AWS_S3_ALIAS}"):
+        return aws_managed_s3_key()["Arn"], None
+    if key_ref.startswith("arn:"):
+        try:
+            spec = parse_arn(key_ref)
+        except ArnParseError:
+            return None, (not_found, f"Invalid arn {key_ref}", 400)
+        if spec.service != "kms":
+            return None, (not_found, f"Invalid arn {spec.service}", 400)
+        if spec.region != region:
+            return None, (not_found, f"Invalid arn {spec.region}", 400)
+        if not spec.account_id or not spec.resource.startswith(("key/", "alias/")):
+            return None, (not_found, f"Invalid arn {key_ref}", 400)
+        if spec.account_id != account:
+            _, rec = _foreign_key(key_ref)
+            if rec:
+                return rec["Arn"], None
+            from ministack.core.iam_evaluator import caller_arn
+            return None, ("AccessDenied", f"User: {caller_arn()} is not authorized to perform: "
+                          "kms:GenerateDataKey on this resource because the resource does not exist in this "
+                          "Region, no resource-based policies allow access, or a resource-based policy "
+                          "explicitly denies access", 403)
+        if spec.resource.startswith("alias/"):
+            rec = _keys.get(_aliases.get(key_ref)) if key_ref in _aliases else None
+            if rec:
+                return rec["Arn"], None
+            return None, (not_found, f"Alias {key_ref} is not found.", 400)
+        key_id = spec.resource[len("key/"):]
+        if not _KEY_ID_RE.fullmatch(key_id):
+            return None, (not_found, f"Invalid keyId {key_id}", 400)
+        rec = _keys.get(key_id)
+        if rec and rec.get("Arn") == key_ref:
+            return rec["Arn"], None
+        return None, (not_found, f"Key '{key_ref}' does not exist", 400)
+    if key_ref.startswith("alias/"):
+        alias_arn = _alias_arn(key_ref)
+        rec = _keys.get(_aliases[alias_arn]) if alias_arn in _aliases else None
+        if rec:
+            return rec["Arn"], None
+        return None, (not_found, f"Alias {alias_arn} is not found.", 400)
+    if not _KEY_ID_RE.fullmatch(key_ref):
+        return None, (not_found, f"Invalid keyId '{key_ref}'", 400)
+    rec = _keys.get(key_ref)
+    if rec:
+        return rec["Arn"], None
+    return None, (not_found, f"Key '{_arn(key_ref)}' does not exist", 400)
+
+
+def resolve_key_for_s3(key_ref):
+    """``(key ARN, None)`` or ``(None, (code, message, status))`` for the key an S3 write names.
+
+    The reference rules of ``_s3_key_arn``; a key that is disabled, pending deletion or pending import is
+    refused with KMS's error, this account's or another's, ahead of any authorization (recorded on AWS,
+    us-east-2, by key ID and ARN).
+    """
+    arn, err = _s3_key_arn(key_ref)
+    if err or not arn:
+        return arn, err
+    rec = _keys.get(arn.rsplit("/", 1)[-1]) if arn.split(":")[4] == get_account_id() else _foreign_key(arn)[1]
+    state = (rec or {}).get("KeyState")
+    if state == "Disabled":
+        return None, ("KMS.DisabledException", f"{arn} is disabled.", 400)
+    if state in ("PendingDeletion", "PendingImport"):
+        words = "pending deletion" if state == "PendingDeletion" else "pending import"
+        return None, ("KMS.KMSInvalidStateException", f"{arn} is {words}.", 400)
+    return arn, None
+
+
+def _key_ref_from_arn(key_id_or_arn):
+    try:
+        spec = parse_arn(key_id_or_arn)
+    except ArnParseError:
+        return None
+    if (
+        spec.partition != "aws"
+        or spec.service != "kms"
+        or spec.region != get_region()
+        or spec.account_id != get_account_id()
+    ):
+        return None
+    if spec.resource.startswith("key/"):
+        key_id = spec.resource[len("key/"):]
+        return ("key", key_id) if key_id else None
+    if spec.resource.startswith("alias/"):
+        alias_name = spec.resource
+        return ("alias", key_id_or_arn) if alias_name != "alias/" else None
+    return None
+
+
+# Operations a principal in another account can call on a key it names by key ARN
+# (KMS developer guide, "Allowing users in other accounts to use a KMS key").
+_CROSS_ACCOUNT_ACTIONS = frozenset({
+    "Encrypt", "Decrypt", "GenerateDataKey", "GenerateDataKeyWithoutPlaintext", "GenerateDataKeyPair",
+    "GenerateDataKeyPairWithoutPlaintext", "GenerateMac", "VerifyMac", "Sign", "Verify",
+    "DescribeKey", "GetPublicKey", "CreateGrant", "GetKeyRotationStatus", "ListGrants", "RetireGrant", "RevokeGrant",
+})
+
+
+# Operations that refuse an alias as KeyId, whether or not it exists (recorded on AWS, us-east-1).
+_NO_ALIAS_ACTIONS = frozenset({
+    "GetKeyPolicy", "PutKeyPolicy", "ListKeyPolicies", "GetKeyRotationStatus", "EnableKeyRotation",
+    "DisableKeyRotation", "EnableKey", "DisableKey", "UpdateKeyDescription", "ScheduleKeyDeletion",
+    "CancelKeyDeletion", "TagResource", "UntagResource", "ListResourceTags", "CreateGrant", "ListGrants",
+    "RevokeGrant", "GetParametersForImport", "DeleteImportedKeyMaterial", "ReplicateKey",
+})
+
+
+def _foreign_key(key_arn):
+    """``(owner account, key record or None)`` for a key ARN or alias ARN of another account in this Region,
+    else ``(None, None)``."""
+    if not isinstance(key_arn, str) or not key_arn.startswith("arn:"):
+        return None, None
+    try:
+        spec = parse_arn(key_arn)
+    except ArnParseError:
+        return None, None
+    if (spec.partition != "aws" or spec.service != "kms" or spec.region != get_region()
+            or not spec.account_id or spec.account_id == get_account_id()):
+        return None, None
+    if spec.resource.startswith("alias/"):
+        key_id = _aliases.get_scoped(spec.account_id, spec.region, key_arn)
+        return spec.account_id, (_keys.get_scoped(spec.account_id, spec.region, key_id) if key_id else None)
+    if not spec.resource.startswith("key/"):
+        return None, None
+    rec = _keys.get_scoped(spec.account_id, spec.region, spec.resource[len("key/"):])
+    return spec.account_id, (rec if rec and rec.get("Arn") == key_arn else None)
+
+
+def _ciphertext_key(data):
+    """``(owner account, key record)`` of another account's key that a symmetric ciphertext names, else
+    ``(None, None)``."""
+    blob = data.get("CiphertextBlob", "")
+    try:
+        ciphertext = base64.b64decode(blob) if isinstance(blob, str) else (blob or b"")
+    except (binascii.Error, ValueError):
+        return None, None
+    if len(ciphertext) <= 68:
+        return None, None
+    key_id = ciphertext[:36].decode("utf-8", errors="ignore")
+    if key_id in _keys:
+        return None, None
+    return _ciphertext_owner_by_id(key_id)
+
+
+def _cross_account_denied(action, rec):
+    """AWS's refusal of a call on another account's key: the key is named when it exists (recorded with
+    two accounts in us-east-1, once new keys had settled)."""
+    from ministack.core.iam_evaluator import caller_arn
+    if rec is None:
+        return error_response_json(
+            "AccessDeniedException",
+            f"User: {caller_arn()} is not authorized to perform: kms:{action} on this resource because the resource "
+            "does not exist in this Region, no resource-based policies allow access, or a resource-based policy "
+            "explicitly denies access", 400)
+    return error_response_json(
+        "AccessDeniedException",
+        f"User: {caller_arn()} is not authorized to perform: kms:{action} on resource: {rec['Arn']} "
+        f"because no resource-based policy allows the kms:{action} action", 400)
+
+
+def ciphertext_key_arn(key_id):
+    """The ARN of the key a symmetric ciphertext names: the caller's own, else another account's in this Region."""
+    if key_id in _keys:
+        return _keys[key_id]["Arn"]
+    owner, rec = _ciphertext_owner_by_id(key_id)
+    return rec["Arn"] if rec else _arn(key_id)
+
+
+def _ciphertext_owner_by_id(key_id):
+    for (account, region, kid), rec in list(_keys._data.items()):
+        if kid == key_id and region == get_region() and account != get_account_id():
+            return account, rec
+    return None, None
+
+
+def key_arn_for_request(resource_arn):
+    """The key ARN an authorization check is about: an alias resolved to its key."""
+    owner, rec = _foreign_key(resource_arn)
+    if rec:
+        return rec["Arn"]
+    rec = _resolve_key(resource_arn)
+    if rec:
+        return rec["Arn"]
+    return resource_arn
+
+
+def key_policy_allows_caller(rec, action, caller=None):
+    """Whether *rec*'s key policy allows *caller* (the calling principal by default) *action* (``Encrypt``, ...)."""
+    from ministack.core.iam_evaluator import EvalContext, caller_arn, evaluate_resource_policy
+    caller = caller or caller_arn()
+    principal_type = ("Root" if caller.endswith(":root") else "AssumedRole" if ":assumed-role/" in caller
+                      else "User")
+    ctx = EvalContext(principal_arn=caller, principal_type=principal_type, principal_account=caller.split(":")[4],
+                      action=f"kms:{action}", resource_arn=rec["Arn"], region=get_region())
+    return evaluate_resource_policy(rec.get("Policy") or "", ctx).decision == "Allow"
 
 
 def _resolve_key(key_id_or_arn):
     if not key_id_or_arn:
         return None
+    if key_id_or_arn.startswith("arn:"):
+        key_ref = _key_ref_from_arn(key_id_or_arn)
+        if not key_ref:
+            return None
+        ref_type, key_ref_value = key_ref
+        if ref_type == "key":
+            rec = _keys.get(key_ref_value)
+            return rec if rec and rec.get("Arn") == key_id_or_arn else None
+        key_id_or_arn = key_ref_value
     # Direct key ID lookup
     if key_id_or_arn in _keys:
         return _keys[key_id_or_arn]
-    # ARN lookup
-    for rec in _keys.values():
-        if rec["Arn"] == key_id_or_arn:
-            return rec
-    # Alias lookup: "alias/my-key" or "arn:aws:kms:...:alias/my-key"
-    alias_name = key_id_or_arn
-    if ":alias/" in alias_name:
-        alias_name = "alias/" + alias_name.split(":alias/")[-1]
-    if alias_name in _aliases:
-        return _keys.get(_aliases[alias_name])
+    # Alias lookup: "alias/my-key"
+    alias_arn = key_id_or_arn if key_id_or_arn.startswith("arn:") else _alias_arn(key_id_or_arn)
+    if alias_arn in _aliases:
+        return _keys.get(_aliases[alias_arn])
     return None
 
 
@@ -168,10 +611,31 @@ def _check_key_state(rec):
             f"{rec['Arn']} is pending deletion.",
             400,
         )
+    if rec["KeyState"] == "PendingImport":
+        return error_response_json(
+            "KMSInvalidStateException",
+            f"{rec['Arn']} is pending import.",
+            400,
+        )
     if rec["KeyState"] == "Disabled":
         return error_response_json(
             "DisabledException",
             f"{rec['Arn']} is disabled.",
+            400,
+        )
+    return None
+
+
+def _is_hmac_key(rec):
+    return "_hmac_key" in rec or rec.get("KeySpec") in _HMAC_KEY_SPECS
+
+
+def _reject_hmac_key(rec, operation):
+    if _is_hmac_key(rec):
+        return error_response_json(
+            "InvalidKeyUsageException",
+            f"{rec['Arn']} key usage is {rec.get('KeyUsage', MAC_KEY_USAGE)} "
+            f"which is not valid for {operation}.",
             400,
         )
     return None
@@ -191,23 +655,61 @@ def _require_crypto(operation):
 # ---- Operations ----
 
 
+def _set_asymmetric_material(rec, private_key):
+    """Record an asymmetric private key and the public key AWS derives from it."""
+    rec["_private_key"] = private_key
+    rec["_public_key_der"] = private_key.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+
+def _asymmetric_key_spec(private_key):
+    """The KeySpec a loaded private key corresponds to, or None if unsupported."""
+    if isinstance(private_key, rsa.RSAPrivateKey):
+        return f"RSA_{private_key.key_size}"
+    if isinstance(private_key, ed25519.Ed25519PrivateKey):
+        return "ECC_NIST_EDWARDS25519"
+    if isinstance(private_key, ec.EllipticCurvePrivateKey):
+        return {
+            "secp256r1": "ECC_NIST_P256",
+            "secp384r1": "ECC_NIST_P384",
+            "secp521r1": "ECC_NIST_P521",
+            "secp256k1": "ECC_SECG_P256K1",
+        }.get(private_key.curve.name)
+    return None
+
+
 def _create_key(data):
-    key_id = new_uuid()
+    # A multi-Region key's id carries the mrk- prefix, and the id is what ties
+    # the primary and its replicas together across regions.
+    multi_region = bool(data.get("MultiRegion", False))
+    key_id = f"mrk-{new_uuid().replace('-', '')}" if multi_region else new_uuid()
     key_spec = data.get("KeySpec", data.get("CustomerMasterKeySpec", "SYMMETRIC_DEFAULT"))
     key_usage = data.get("KeyUsage", "ENCRYPT_DECRYPT")
+    if key_spec in _HMAC_KEY_SPECS and key_usage != MAC_KEY_USAGE:
+        return error_response_json(
+            "ValidationException",
+            f"KeyUsage {key_usage} is not compatible with KeySpec {key_spec}. "
+            f"HMAC KMS keys require KeyUsage {MAC_KEY_USAGE}.",
+            400,
+        )
+    if key_usage == MAC_KEY_USAGE and key_spec not in _HMAC_KEY_SPECS:
+        return error_response_json(
+            "ValidationException",
+            f"KeyUsage {MAC_KEY_USAGE} is not compatible with KeySpec {key_spec}. "
+            "It requires one of: "
+            f"[{', '.join(sorted(_HMAC_KEY_SPECS))}]",
+            400,
+        )
     description = data.get("Description", "")
     tags = data.get("Tags", [])
-    policy = data.get("Policy", json.dumps({
-        "Version": "2012-10-17",
-        "Id": "key-default-1",
-        "Statement": [{
-            "Sid": "Enable IAM User Permissions",
-            "Effect": "Allow",
-            "Principal": {"AWS": f"arn:aws:iam::{get_account_id()}:root"},
-            "Action": "kms:*",
-            "Resource": "*",
-        }],
-    }))
+    origin = data.get("Origin", "AWS_KMS")
+    if origin not in ("AWS_KMS", "EXTERNAL"):
+        return error_response_json(
+            "UnsupportedOperationException",
+            f"Origin {origin} is not supported.", 400)
+    policy = data.get("Policy", _default_key_policy())
 
     rec = {
         "KeyId": key_id,
@@ -218,28 +720,48 @@ def _create_key(data):
         "KeyUsage": key_usage,
         "Description": description,
         "CreationDate": int(time.time()),
-        "Origin": "AWS_KMS",
+        "Origin": origin,
         "Tags": tags,
         "Policy": policy,
+        "MultiRegion": multi_region,
     }
+    if multi_region:
+        # Topology lives on every member and is kept in sync by ReplicateKey
+        # and ScheduleKeyDeletion: the primary region plus every region that
+        # holds a member, from which each member's MultiRegionConfiguration is
+        # rebuilt on read.
+        rec["_mrk_type"] = "PRIMARY"
+        rec["_mrk_primary_region"] = get_region()
+        rec["_mrk_regions"] = [get_region()]
 
     if key_spec == "SYMMETRIC_DEFAULT":
-        rec["_symmetric_key"] = os.urandom(32)
+        # An EXTERNAL key has no material until ImportKeyMaterial supplies it,
+        # so it starts PendingImport rather than Enabled.
+        if origin != "EXTERNAL":
+            rec["_symmetric_key"] = os.urandom(32)
+        else:
+            rec["KeyState"] = "PendingImport"
+            rec["Enabled"] = False
         rec["EncryptionAlgorithms"] = ["SYMMETRIC_DEFAULT"]
         rec["SigningAlgorithms"] = []
-    elif key_spec in ("RSA_2048", "RSA_4096"):
+    elif key_spec in _HMAC_KEY_SPECS:
+        mac_algorithm, material_len = _HMAC_KEY_SPECS[key_spec]
+        if origin == "EXTERNAL":
+            rec["KeyState"] = "PendingImport"
+            rec["Enabled"] = False
+        else:
+            rec["_hmac_key"] = os.urandom(material_len)
+        rec["MacAlgorithms"] = [mac_algorithm]
+    elif key_spec in ("RSA_2048", "RSA_3072", "RSA_4096"):
         err = _require_crypto("CreateKey")
         if err:
             return err
-        bits = 2048 if key_spec == "RSA_2048" else 4096
-        private_key = rsa.generate_private_key(
-            public_exponent=65537, key_size=bits
-        )
-        rec["_private_key"] = private_key
-        rec["_public_key_der"] = private_key.public_key().public_bytes(
-            serialization.Encoding.DER,
-            serialization.PublicFormat.SubjectPublicKeyInfo,
-        )
+        if origin == "EXTERNAL":
+            rec["KeyState"] = "PendingImport"
+            rec["Enabled"] = False
+        else:
+            _set_asymmetric_material(rec, rsa.generate_private_key(
+                public_exponent=65537, key_size=int(key_spec.split("_")[1])))
         if key_usage == "SIGN_VERIFY":
             rec["SigningAlgorithms"] = [
                 "RSASSA_PKCS1_V1_5_SHA_256",
@@ -266,12 +788,11 @@ def _create_key(data):
             "ECC_NIST_P521": ec.SECP521R1(),
             "ECC_SECG_P256K1": ec.SECP256K1(),
         }
-        private_key = ec.generate_private_key(curve_map[key_spec])
-        rec["_private_key"] = private_key
-        rec["_public_key_der"] = private_key.public_key().public_bytes(
-            serialization.Encoding.DER,
-            serialization.PublicFormat.SubjectPublicKeyInfo,
-        )
+        if origin == "EXTERNAL":
+            rec["KeyState"] = "PendingImport"
+            rec["Enabled"] = False
+        else:
+            _set_asymmetric_material(rec, ec.generate_private_key(curve_map[key_spec]))
         signing_algo_map = {
             "ECC_NIST_P256": ["ECDSA_SHA_256"],
             "ECC_NIST_P384": ["ECDSA_SHA_384"],
@@ -279,6 +800,21 @@ def _create_key(data):
             "ECC_SECG_P256K1": ["ECDSA_SHA_256"],
         }
         rec["SigningAlgorithms"] = signing_algo_map[key_spec]
+        rec["EncryptionAlgorithms"] = []
+    elif key_spec == "ECC_NIST_EDWARDS25519":
+        err = _require_crypto("CreateKey")
+        if err:
+            return err
+        if origin == "EXTERNAL":
+            rec["KeyState"] = "PendingImport"
+            rec["Enabled"] = False
+        else:
+            _set_asymmetric_material(rec, ed25519.Ed25519PrivateKey.generate())
+        # Real AWS exposes both for ECC_NIST_EDWARDS25519 — verified against the
+        # KMS Developer Guide "Supported signing algorithms for ECC key specs"
+        # table. PH variant is listed in metadata even though Sign/Verify return
+        # UnsupportedOperationException below until Ed25519ph lands.
+        rec["SigningAlgorithms"] = ["ED25519_SHA_512", "ED25519_PH_SHA_512"]
         rec["EncryptionAlgorithms"] = []
     else:
         return error_response_json(
@@ -292,20 +828,34 @@ def _create_key(data):
     return json_response({"KeyMetadata": _key_metadata(rec)})
 
 
+def _marker_page(data, items, key_fn, default_limit, result_key):
+    start = 0
+    marker = data.get("Marker")
+    if marker:
+        ids = [key_fn(i) for i in items]
+        if marker not in ids:
+            return error_response_json("InvalidMarkerException", "Invalid marker.", 400)
+        start = ids.index(marker)
+    limit = data.get("Limit") or default_limit
+    resp = {result_key: items[start:start + limit], "Truncated": start + limit < len(items)}
+    if resp["Truncated"]:
+        resp["NextMarker"] = key_fn(items[start + limit])
+    return json_response(resp)
+
+
 def _list_keys(data):
-    limit = data.get("Limit", 1000)
     keys = [{"KeyId": r["KeyId"], "KeyArn": r["Arn"]} for r in _keys.values()]
-    return json_response({
-        "Keys": keys[:limit],
-        "Truncated": len(keys) > limit,
-    })
+    return _marker_page(data, keys, lambda k: k["KeyId"], 100, "Keys")
 
 
 def _describe_key(data):
     key_id = data.get("KeyId", "")
+    if key_id in (_AWS_S3_ALIAS, _alias_arn(_AWS_S3_ALIAS)):
+        # DescribeKey of alias/aws/s3 creates the AWS managed key (recorded on AWS, sa-east-1).
+        aws_managed_s3_key()
     rec = _resolve_key(key_id)
     if not rec:
-        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+        return _key_not_found(key_id)
     return json_response({"KeyMetadata": _key_metadata(rec)})
 
 
@@ -313,7 +863,15 @@ def _get_public_key(data):
     key_id = data.get("KeyId", "")
     rec = _resolve_key(key_id)
     if not rec:
-        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+        return _key_not_found(key_id)
+    err = _reject_hmac_key(rec, "GetPublicKey")
+    if err:
+        return err
+    # An EXTERNAL asymmetric key has no public key until its material is
+    # imported, so the absence below is a key state, not a symmetric key.
+    if rec["KeyState"] == "PendingImport":
+        return error_response_json(
+            "KMSInvalidStateException", f"{rec['Arn']} is pending import.", 400)
     if "_public_key_der" not in rec:
         return error_response_json(
             "UnsupportedOperationException",
@@ -331,15 +889,14 @@ def _get_public_key(data):
 
 
 def _sign(data):
-    err = _require_crypto("Sign")
-    if err:
-        return err
-
     key_id = data.get("KeyId", "")
     rec = _resolve_key(key_id)
     if not rec:
-        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
-    err = _check_key_state(rec)
+        return _key_not_found(key_id)
+    err = _check_key_state(rec) or _reject_hmac_key(rec, "Sign")
+    if err:
+        return err
+    err = _require_crypto("Sign")
     if err:
         return err
     if "_private_key" not in rec:
@@ -358,7 +915,48 @@ def _sign(data):
     else:
         message = message_b64
 
+    err = _algorithm_error(rec, algorithm, "SigningAlgorithms")
+    if err:
+        return err
+    if algorithm in ("ED25519_SHA_512", "ED25519_PH_SHA_512"):
+        if rec["KeySpec"] != "ECC_NIST_EDWARDS25519":
+            return error_response_json(
+                "UnsupportedOperationException",
+                f"Signing algorithm {algorithm} is not supported for this key",
+                400,
+            )
+        # AWS KMS: "ED25519_SHA_512 signing algorithm requires MessageType:RAW,
+        # while ED25519_PH_SHA_512 requires MessageType:DIGEST. These message
+        # types cannot be used interchangeably." (Developer Guide).
+        if algorithm == "ED25519_SHA_512" and message_type != "RAW":
+            return error_response_json(
+                "UnsupportedOperationException",
+                "ED25519_SHA_512 signing algorithm requires MessageType=RAW",
+                400,
+            )
+        if algorithm == "ED25519_PH_SHA_512":
+            # HashEdDSA (Ed25519ph) — RFC 8032 §5.1 / FIPS 186-5 §7.8. The
+            # cryptography library does not expose the dom2 prefix needed for a
+            # spec-correct implementation, so we surface the gap honestly
+            # instead of routing through pure Ed25519 (which would produce
+            # signatures incompatible with real AWS KMS).
+            return error_response_json(
+                "UnsupportedOperationException",
+                "ED25519_PH_SHA_512 (Ed25519ph) signing is not yet implemented in this emulator",
+                400,
+            )
+        signature = rec["_private_key"].sign(message)
+        logger.debug("Signed %d bytes with key %s (%s)", len(message), key_id, algorithm)
+        return json_response({
+            "KeyId": rec["Arn"],
+            "Signature": base64.b64encode(signature).decode(),
+            "SigningAlgorithm": algorithm,
+        })
+
     pad, hash_algo = _signing_params(algorithm)
+    err = _digest_length_error(algorithm, message_type, message, hash_algo)
+    if err:
+        return err
     if hash_algo is None:
         return error_response_json(
             "UnsupportedOperationException",
@@ -392,15 +990,14 @@ def _sign(data):
 
 
 def _verify(data):
-    err = _require_crypto("Verify")
-    if err:
-        return err
-
     key_id = data.get("KeyId", "")
     rec = _resolve_key(key_id)
     if not rec:
-        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
-    err = _check_key_state(rec)
+        return _key_not_found(key_id)
+    err = _check_key_state(rec) or _reject_hmac_key(rec, "Verify")
+    if err:
+        return err
+    err = _require_crypto("Verify")
     if err:
         return err
     if "_private_key" not in rec:
@@ -418,7 +1015,47 @@ def _verify(data):
     message = base64.b64decode(message_b64) if isinstance(message_b64, str) else message_b64
     signature = base64.b64decode(signature_b64) if isinstance(signature_b64, str) else signature_b64
 
-    pad, hash_algo = _signing_params(algorithm, for_verify=True)
+    err = _algorithm_error(rec, algorithm, "SigningAlgorithms")
+    if err:
+        return err
+    public_key = rec["_private_key"].public_key()
+    if algorithm in ("ED25519_SHA_512", "ED25519_PH_SHA_512"):
+        if rec["KeySpec"] != "ECC_NIST_EDWARDS25519":
+            return error_response_json(
+                "UnsupportedOperationException",
+                f"Signing algorithm {algorithm} is not supported for this key",
+                400,
+            )
+        if algorithm == "ED25519_SHA_512" and message_type != "RAW":
+            return error_response_json(
+                "UnsupportedOperationException",
+                "ED25519_SHA_512 signing algorithm requires MessageType=RAW",
+                400,
+            )
+        if algorithm == "ED25519_PH_SHA_512":
+            return error_response_json(
+                "UnsupportedOperationException",
+                "ED25519_PH_SHA_512 (Ed25519ph) verification is not yet implemented in this emulator",
+                400,
+            )
+        try:
+            public_key.verify(signature, message)
+        except InvalidSignature:
+            return error_response_json(
+                "KMSInvalidSignatureException",
+                "Signature verification failed",
+                400,
+            )
+        return json_response({
+            "KeyId": rec["Arn"],
+            "SignatureValid": True,
+            "SigningAlgorithm": algorithm,
+        })
+
+    pad, hash_algo = _signing_params(algorithm)
+    err = _digest_length_error(algorithm, message_type, message, hash_algo)
+    if err:
+        return err
     if hash_algo is None:
         return error_response_json(
             "UnsupportedOperationException",
@@ -426,7 +1063,6 @@ def _verify(data):
             400,
         )
 
-    public_key = rec["_private_key"].public_key()
     try:
         if pad is None:
             # ECDSA
@@ -440,7 +1076,6 @@ def _verify(data):
                 public_key.verify(signature, message, pad, utils.Prehashed(hash_algo))
             else:
                 public_key.verify(signature, message, pad, hash_algo)
-        valid = True
     except InvalidSignature:
         return error_response_json(
             "KMSInvalidSignatureException",
@@ -455,7 +1090,43 @@ def _verify(data):
     })
 
 
-def _signing_params(algorithm, for_verify=False):
+_SIGNING_ALGORITHM_ENUM = (
+    "RSASSA_PSS_SHA_256", "RSASSA_PSS_SHA_384", "RSASSA_PSS_SHA_512", "RSASSA_PKCS1_V1_5_SHA_256",
+    "RSASSA_PKCS1_V1_5_SHA_384", "RSASSA_PKCS1_V1_5_SHA_512", "ECDSA_SHA_256", "ECDSA_SHA_384", "ECDSA_SHA_512",
+    "ED25519_SHA_512", "ED25519_PH_SHA_512", "SM2DSA", "ML_DSA_SHAKE_256",
+)
+
+
+def _algorithm_error(rec, algorithm, field):
+    """InvalidKeyUsageException for an algorithm the key spec doesn't support."""
+    if algorithm in rec.get(field, []):
+        return None
+    if field == "SigningAlgorithms" and algorithm not in _SIGNING_ALGORITHM_ENUM:
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{algorithm}' at 'signingAlgorithm' failed to satisfy constraint: "
+            f"Member must satisfy enum value set: [{', '.join(_SIGNING_ALGORITHM_ENUM)}]",
+            400,
+        )
+    return error_response_json(
+        "InvalidKeyUsageException",
+        f"Algorithm {algorithm} is incompatible with key spec {rec.get('KeySpec', '')}.",
+        400,
+    )
+
+
+def _digest_length_error(algorithm, message_type, message, hash_algo):
+    if message_type == "DIGEST" and hash_algo is not None and len(message) != hash_algo.digest_size:
+        return error_response_json("ValidationException", f"Digest is invalid length for algorithm {algorithm}.", 400)
+    return None
+
+
+def _oaep_padding(algorithm):
+    digest = hashes.SHA1() if algorithm == "RSAES_OAEP_SHA_1" else hashes.SHA256()
+    return padding.OAEP(mgf=padding.MGF1(algorithm=digest), algorithm=digest, label=None)
+
+
+def _signing_params(algorithm):
     """Return (padding, hash_algorithm) for a signing algorithm.
 
     For RSA algorithms, padding is a padding object.
@@ -465,8 +1136,8 @@ def _signing_params(algorithm, for_verify=False):
     if not HAS_CRYPTO:
         return None, None
 
-    # PSS salt_length must be MAX_LENGTH for signing, AUTO for verification
-    pss_salt = padding.PSS.AUTO if for_verify else padding.PSS.MAX_LENGTH
+    # AWS KMS signs RSASSA_PSS with a salt as long as the digest (key spec reference).
+    pss_salt = padding.PSS.DIGEST_LENGTH
 
     algo_map = {
         "RSASSA_PKCS1_V1_5_SHA_256": (padding.PKCS1v15(), hashes.SHA256()),
@@ -501,12 +1172,174 @@ def _signing_params(algorithm, for_verify=False):
     return algo_map.get(algorithm, (None, None))
 
 
+def _blob_too_long_error(field_name, max_bytes):
+    return error_response_json(
+        "ValidationException",
+        f"1 validation error detected: Value at '{field_name}' failed to "
+        "satisfy constraint: Member must have length less than or equal to "
+        f"{max_bytes}",
+        400,
+    )
+
+
+def _decode_blob(value, field_name, max_bytes=None):
+    if max_bytes is not None and isinstance(value, str) and len(value) > 4 * ((max_bytes + 2) // 3):
+        return None, _blob_too_long_error(field_name, max_bytes)
+    if isinstance(value, (bytes, bytearray)):
+        decoded = bytes(value)
+    elif isinstance(value, str):
+        try:
+            decoded = base64.b64decode(value, validate=True)
+        except (binascii.Error, ValueError):
+            return None, error_response_json(
+                "SerializationException",
+                f"Invalid base64 encoding for '{field_name}'",
+                400,
+            )
+    else:
+        return None, error_response_json(
+            "SerializationException",
+            f"Expected a base64-encoded blob for '{field_name}'",
+            400,
+        )
+    if max_bytes is not None and len(decoded) > max_bytes:
+        return None, _blob_too_long_error(field_name, max_bytes)
+    return decoded, None
+
+
+def _message_too_long_error():
+    return error_response_json(
+        "ValidationException",
+        "1 validation error detected: Value at 'message' failed to satisfy "
+        "constraint: Member must have length less than or equal to "
+        f"{MAC_MESSAGE_MAX_BYTES}",
+        400,
+    )
+
+
+def _mac_params(data, operation):
+    algorithm = data.get("MacAlgorithm", "")
+    if algorithm not in _MAC_ALGORITHM_DIGESTS:
+        return None, None, None, error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{algorithm}' at 'macAlgorithm' "
+            "failed to satisfy constraint: Member must satisfy enum value set: "
+            f"[{', '.join(_MAC_ALGORITHM_DIGESTS)}]",
+            400,
+        )
+
+    raw_message = data.get("Message", "")
+    if isinstance(raw_message, str) and len(raw_message) > _MAX_MESSAGE_B64_CHARS:
+        return None, None, None, _message_too_long_error()
+
+    message, err = _decode_blob(raw_message, "message")
+    if err:
+        return None, None, None, err
+    if not message:
+        return None, None, None, error_response_json(
+            "ValidationException",
+            "1 validation error detected: Value at 'message' failed to satisfy "
+            "constraint: Member must have length greater than or equal to 1",
+            400,
+        )
+    if len(message) > MAC_MESSAGE_MAX_BYTES:
+        return None, None, None, _message_too_long_error()
+
+    key_id = data.get("KeyId", "")
+    rec = _resolve_key(key_id)
+    if not rec:
+        return None, None, None, _key_not_found(key_id)
+    err = _check_key_state(rec)
+    if err:
+        return None, None, None, err
+    if not _is_hmac_key(rec) or "_hmac_key" not in rec:
+        return None, None, None, error_response_json(
+            "InvalidKeyUsageException",
+            f"{rec['Arn']} key usage is {rec.get('KeyUsage', '')} which is not "
+            f"valid for {operation}. {operation} requires a key with key usage "
+            f"{MAC_KEY_USAGE}.",
+            400,
+        )
+    if algorithm not in rec.get("MacAlgorithms", []):
+        return None, None, None, error_response_json(
+            "InvalidKeyUsageException",
+            f"Algorithm {algorithm} is incompatible with key spec "
+            f"{rec.get('KeySpec', '')}.",
+            400,
+        )
+    return rec, algorithm, message, None
+
+
+def _compute_mac(rec, algorithm, message):
+    return hmac.new(
+        rec["_hmac_key"], message, _MAC_ALGORITHM_DIGESTS[algorithm]
+    ).digest()
+
+
+def _dry_run_error(operation):
+    return error_response_json(
+        "DryRunOperationException",
+        "The request was rejected because the DryRun parameter was specified.",
+        400,
+    )
+
+
+def _generate_mac(data):
+    rec, algorithm, message, err = _mac_params(data, "GenerateMac")
+    if err:
+        return err
+    if data.get("DryRun"):
+        return _dry_run_error("GenerateMac")
+
+    mac = _compute_mac(rec, algorithm, message)
+    logger.debug(
+        "Generated MAC over %d bytes with key %s (%s)",
+        len(message), rec["KeyId"], algorithm,
+    )
+    return json_response({
+        "KeyId": rec["Arn"],
+        "Mac": base64.b64encode(mac).decode(),
+        "MacAlgorithm": algorithm,
+    })
+
+
+def _verify_mac(data):
+    mac, err = _decode_blob(data.get("Mac", ""), "mac", MAC_MAX_BYTES)
+    if err:
+        return err
+    if not mac:
+        return error_response_json(
+            "ValidationException",
+            "1 validation error detected: Value at 'mac' failed to satisfy "
+            "constraint: Member must have length greater than or equal to 1",
+            400,
+        )
+
+    rec, algorithm, message, err = _mac_params(data, "VerifyMac")
+    if err:
+        return err
+    if not hmac.compare_digest(_compute_mac(rec, algorithm, message), mac):
+        return error_response_json(
+            "KMSInvalidMacException",
+            "The request was rejected because the HMAC verification failed.",
+            400,
+        )
+    if data.get("DryRun"):
+        return _dry_run_error("VerifyMac")
+
+    return json_response({
+        "KeyId": rec["Arn"],
+        "MacValid": True,
+        "MacAlgorithm": algorithm,
+    })
+
+
 def _encrypt(data):
     key_id = data.get("KeyId", "")
     rec = _resolve_key(key_id)
     if not rec:
-        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
-    err = _check_key_state(rec)
+        return _key_not_found(key_id)
+    err = _reject_hmac_key(rec, "Encrypt") or _check_key_state(rec)
     if err:
         return err
 
@@ -520,13 +1353,15 @@ def _encrypt(data):
         # ciphertext is: key_id_bytes(36) + context_hash(32) + xor_encrypted_data.
         # EncryptionContext is mixed into key derivation so decrypt
         # must supply the same context or get different plaintext.
-        key_bytes = _derive_with_context(rec["_symmetric_key"], enc_context)
+        nonce = os.urandom(16)
+        key_bytes = _derive_with_context(rec["_symmetric_key"], enc_context, nonce)
         pad_stream = _expand_key(key_bytes, len(plaintext))
         encrypted = bytes(a ^ b for a, b in zip(plaintext, pad_stream))
         ctx_hash = hashlib.sha256(
             json.dumps(enc_context, sort_keys=True).encode()
         ).digest()
-        ciphertext = rec["KeyId"].encode() + ctx_hash + encrypted
+        # Layout: key_id(36) + ctx_hash(32) + nonce(16) + xor_encrypted_data.
+        ciphertext = rec["KeyId"].encode() + ctx_hash + nonce + encrypted
     elif "_private_key" in rec and rec["KeyUsage"] == "ENCRYPT_DECRYPT":
         if enc_context:
             return error_response_json(
@@ -537,15 +1372,12 @@ def _encrypt(data):
         err = _require_crypto("Encrypt")
         if err:
             return err
+        algorithm = data.get("EncryptionAlgorithm", "SYMMETRIC_DEFAULT")
+        err = _algorithm_error(rec, algorithm, "EncryptionAlgorithms")
+        if err:
+            return err
         public_key = rec["_private_key"].public_key()
-        ciphertext = public_key.encrypt(
-            plaintext,
-            padding.OAEP(
-                mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                algorithm=hashes.SHA256(),
-                label=None,
-            ),
-        )
+        ciphertext = public_key.encrypt(plaintext, _oaep_padding(algorithm))
     else:
         return error_response_json(
             "UnsupportedOperationException",
@@ -571,30 +1403,30 @@ def _decrypt(data):
     key_id_from_data = data.get("KeyId", "")
     rec = None
 
+    embedded = (_resolve_key(ciphertext[:36].decode("utf-8", errors="ignore"))
+                if len(ciphertext) > 68 else None)
     if key_id_from_data:
         rec = _resolve_key(key_id_from_data)
+        if not rec and not embedded:
+            # AWS reads the ciphertext before it looks up the KeyId (recorded in us-east-1).
+            return error_response_json("InvalidCiphertextException", "", 400)
 
     # Try extracting key ID from ciphertext prefix (symmetric)
-    if not rec and len(ciphertext) > 68:
-        embedded_id = ciphertext[:36].decode("utf-8", errors="ignore")
-        rec = _resolve_key(embedded_id)
+    if not rec:
+        rec = embedded
 
     if not rec:
         # AWS rule: NotFoundException only when the caller named a specific
         # KeyId that doesn't exist. A short/garbage ciphertext with no
         # explicit KeyId can't be parsed → InvalidCiphertextException.
         if key_id_from_data:
-            return error_response_json(
-                "NotFoundException",
-                f"Key {key_id_from_data} not found",
-                400,
-            )
+            return _key_not_found(key_id_from_data)
         return error_response_json(
             "InvalidCiphertextException",
             "",
             400,
         )
-    err = _check_key_state(rec)
+    err = _check_key_state(rec) or _reject_hmac_key(rec, "Decrypt")
     if err:
         return err
 
@@ -609,8 +1441,10 @@ def _decrypt(data):
                 "EncryptionContext does not match",
                 400,
             )
-        encrypted_data = ciphertext[68:]
-        key_bytes = _derive_with_context(rec["_symmetric_key"], enc_context)
+        # Layout: key_id(36) + ctx_hash(32) + nonce(16) + xor_encrypted_data.
+        nonce = ciphertext[68:84]
+        encrypted_data = ciphertext[84:]
+        key_bytes = _derive_with_context(rec["_symmetric_key"], enc_context, nonce)
         pad_stream = _expand_key(key_bytes, len(encrypted_data))
         plaintext = bytes(a ^ b for a, b in zip(encrypted_data, pad_stream))
     elif "_private_key" in rec:
@@ -623,19 +1457,19 @@ def _decrypt(data):
         err = _require_crypto("Decrypt")
         if err:
             return err
+        algorithm = data.get("EncryptionAlgorithm", "SYMMETRIC_DEFAULT")
+        if algorithm not in rec.get("EncryptionAlgorithms", []):
+            # Observed on AWS: RSA Decrypt without a matching algorithm is an opaque invalid ciphertext.
+            return error_response_json("InvalidCiphertextException", "", 400)
         try:
-            plaintext = rec["_private_key"].decrypt(
-                ciphertext,
-                padding.OAEP(
-                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                    algorithm=hashes.SHA256(),
-                    label=None,
-                ),
-            )
-        except ValueError as e:
+            plaintext = rec["_private_key"].decrypt(ciphertext, _oaep_padding(algorithm))
+        except ValueError:
+            # AWS KMS doesn't surface the underlying crypto library's error
+            # text; the documented InvalidCiphertextException message format
+            # is empty / opaque.
             return error_response_json(
                 "InvalidCiphertextException",
-                str(e),
+                "",
                 400,
             )
     else:
@@ -645,30 +1479,31 @@ def _decrypt(data):
             400,
         )
 
-    return json_response({
+    response = {
         "KeyId": rec["Arn"],
         "Plaintext": base64.b64encode(plaintext).decode(),
         "EncryptionAlgorithm": data.get(
             "EncryptionAlgorithm", "SYMMETRIC_DEFAULT"
         ),
-    })
+    }
+    if "_symmetric_key" in rec and "Recipient" not in data:
+        response["KeyMaterialId"] = _key_material_id(rec)
+    return json_response(response)
 
 
-def _generate_data_key_common(data):
+def _generate_data_key_common(data, action="GenerateDataKey"):
     """Shared logic for GenerateDataKey and GenerateDataKeyWithoutPlaintext."""
     key_id = data.get("KeyId", "")
     rec = _resolve_key(key_id)
     if not rec:
-        return None, None, error_response_json(
-            "NotFoundException", f"Key {key_id} not found", 400
-        )
-    err = _check_key_state(rec)
+        return None, None, _key_not_found(key_id)
+    err = _check_key_state(rec) or _reject_hmac_key(rec, action)
     if err:
         return None, None, err
     if "_symmetric_key" not in rec:
         return None, None, error_response_json(
             "UnsupportedOperationException",
-            "GenerateDataKey requires a symmetric key",
+            f"{action} requires a symmetric key",
             400,
         )
 
@@ -684,13 +1519,15 @@ def _generate_data_key_common(data):
         data_key = os.urandom(32)
 
     enc_context = data.get("EncryptionContext", {})
-    cmk_bytes = _derive_with_context(rec["_symmetric_key"], enc_context)
+    nonce = os.urandom(16)
+    cmk_bytes = _derive_with_context(rec["_symmetric_key"], enc_context, nonce)
     pad_stream = _expand_key(cmk_bytes, len(data_key))
     encrypted = bytes(a ^ b for a, b in zip(data_key, pad_stream))
     ctx_hash = hashlib.sha256(
         json.dumps(enc_context, sort_keys=True).encode()
     ).digest()
-    ciphertext = rec["KeyId"].encode() + ctx_hash + encrypted
+    # Layout: key_id(36) + ctx_hash(32) + nonce(16) + xor_encrypted_data.
+    ciphertext = rec["KeyId"].encode() + ctx_hash + nonce + encrypted
 
     return rec, data_key, ciphertext
 
@@ -700,27 +1537,164 @@ def _generate_data_key(data):
     if rec is None:
         # result is an error response tuple
         return result
-    return json_response({
+
+    response = {
         "KeyId": rec["Arn"],
         "Plaintext": base64.b64encode(data_key).decode(),
         "CiphertextBlob": base64.b64encode(result).decode(),
-    })
+    }
+    if "Recipient" not in data:
+        response["KeyMaterialId"] = _key_material_id(rec)
+
+    return json_response(response)
+
+
+def _generate_data_key_pair_common(data, action):
+    """Shared logic for GenerateDataKeyPair and GenerateDataKeyPairWithoutPlaintext.
+
+    Generates a data key pair and wraps the private key under the CMK. `action`
+    is the caller's operation name, so errors name the operation the client
+    actually invoked rather than whichever variant this helper was written for.
+
+    Returns (payload, private_key_der, None) on success, or (None, None, error)
+    on failure. The two operations differ in exactly one thing: whether
+    PrivateKeyPlaintext gets added to the payload -- so the caller decides that
+    and nothing else.
+
+    KeyPairSpec follows the real AWS enum, minus SM2 (which _create_key does not
+    implement either). The asymmetric specs now match _create_key's exactly.
+    """
+    key_id = data.get("KeyId", "")
+    rec = _resolve_key(key_id)
+    if not rec:
+        return None, None, _key_not_found(key_id)
+    err = _check_key_state(rec) or _reject_hmac_key(rec, action)
+    if err:
+        return None, None, err
+    # The CMK must be symmetric: it wraps the generated private key. Real AWS
+    # rejects an asymmetric CMK here with InvalidKeyUsageException (the KeyUsage
+    # is incompatible with generating data keys), not UnsupportedOperationException.
+    if "_symmetric_key" not in rec:
+        return None, None, error_response_json(
+            "InvalidKeyUsageException",
+            f"{action} requires a symmetric key",
+            400,
+        )
+    err = _require_crypto(action)
+    if err:
+        return None, None, err
+
+    spec = data.get("KeyPairSpec", "")
+    if spec in ("RSA_2048", "RSA_3072", "RSA_4096"):
+        private_key = rsa.generate_private_key(
+            public_exponent=65537, key_size=int(spec.split("_")[1])
+        )
+    elif spec in ("ECC_NIST_P256", "ECC_NIST_P384", "ECC_NIST_P521", "ECC_SECG_P256K1"):
+        curve_map = {
+            "ECC_NIST_P256": ec.SECP256R1(),
+            "ECC_NIST_P384": ec.SECP384R1(),
+            "ECC_NIST_P521": ec.SECP521R1(),
+            "ECC_SECG_P256K1": ec.SECP256K1(),
+        }
+        private_key = ec.generate_private_key(curve_map[spec])
+    elif spec == "ECC_NIST_EDWARDS25519":
+        private_key = ed25519.Ed25519PrivateKey.generate()
+    else:
+        return None, None, error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{spec}' at 'keyPairSpec' "
+            "failed to satisfy constraint: Member must satisfy enum value set: "
+            "[RSA_2048, RSA_3072, RSA_4096, ECC_NIST_P256, ECC_NIST_P384, "
+            "ECC_NIST_P521, ECC_SECG_P256K1, ECC_NIST_EDWARDS25519]",
+            400,
+        )
+
+    private_der = private_key.private_bytes(
+        serialization.Encoding.DER,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    public_der = private_key.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+    enc_context = data.get("EncryptionContext", {})
+    # Ciphertext layout: key_id(36) + ctx_hash(32) + nonce(16) + xor_encrypted_data.
+    # The per-blob nonce is what stops the wrapped private key from leaking:
+    # without it the keystream repeats across every blob sharing this CMK and
+    # EncryptionContext. Must stay in step with _encrypt,
+    # _generate_data_key_common and _decrypt, which spell out this layout by hand.
+    nonce = os.urandom(16)
+    cmk_bytes = _derive_with_context(rec["_symmetric_key"], enc_context, nonce)
+    pad_stream = _expand_key(cmk_bytes, len(private_der))
+    encrypted = bytes(a ^ b for a, b in zip(private_der, pad_stream))
+    ctx_hash = hashlib.sha256(
+        json.dumps(enc_context, sort_keys=True).encode()
+    ).digest()
+    ciphertext = rec["KeyId"].encode() + ctx_hash + nonce + encrypted
+
+    logger.info("Generated data key pair %s under CMK %s", spec, rec["KeyId"])
+    payload = {
+        "KeyId": rec["Arn"],
+        "KeyPairSpec": spec,
+        "PrivateKeyCiphertextBlob": base64.b64encode(ciphertext).decode(),
+        "PublicKey": base64.b64encode(public_der).decode(),
+        "KeyMaterialId": _key_material_id(rec),
+    }
+    return payload, private_der, None
+
+
+def _generate_data_key_pair(data):
+    payload, private_der, err = _generate_data_key_pair_common(
+        data, "GenerateDataKeyPair"
+    )
+    if err:
+        return err
+    payload["PrivateKeyPlaintext"] = base64.b64encode(private_der).decode()
+    return json_response(payload)
+
+
+def _generate_data_key_pair_without_plaintext(data):
+    """Same as GenerateDataKeyPair, minus PrivateKeyPlaintext.
+
+    That omission is the whole point of this variant: the private key exists
+    only inside this process for the moment it takes to wrap it, so the caller
+    can persist the ciphertext + public key without ever holding the private
+    key material.
+    """
+    payload, _private_der, err = _generate_data_key_pair_common(
+        data, "GenerateDataKeyPairWithoutPlaintext"
+    )
+    if err:
+        return err
+    return json_response(payload)
 
 
 def _generate_data_key_without_plaintext(data):
-    rec, _data_key, result = _generate_data_key_common(data)
+    rec, _data_key, result = _generate_data_key_common(
+        data, "GenerateDataKeyWithoutPlaintext"
+    )
     if rec is None:
         return result
     return json_response({
         "KeyId": rec["Arn"],
         "CiphertextBlob": base64.b64encode(result).decode(),
+        "KeyMaterialId": _key_material_id(rec),
     })
 
 
-def _derive_with_context(key_bytes, enc_context):
-    """Mix EncryptionContext into key material so decrypt requires the same context."""
+def _derive_with_context(key_bytes, enc_context, nonce):
+    """Mix EncryptionContext and a per-blob nonce into key material.
+
+    The nonce makes the keystream unique per ciphertext even under the same CMK
+    and EncryptionContext, so wrapping a partly-predictable plaintext (e.g. a
+    key pair's DER, whose public half is recoverable from the returned
+    PublicKey) no longer leaks the keystream. decrypt reads the nonce back out
+    of the ciphertext layout.
+    """
     ctx_bytes = json.dumps(enc_context, sort_keys=True).encode()
-    return hashlib.sha256(key_bytes + ctx_bytes).digest()
+    return hashlib.sha256(key_bytes + ctx_bytes + nonce).digest()
 
 
 def _expand_key(key_bytes, length):
@@ -746,56 +1720,313 @@ def _create_alias(data):
     rec = _resolve_key(target_key_id)
     if not rec:
         return error_response_json("NotFoundException", f"Key {target_key_id} not found", 400)
-    if alias_name in _aliases:
+    alias_arn = _alias_arn(alias_name)
+    if alias_arn in _aliases:
         return error_response_json("AlreadyExistsException", f"Alias {alias_name} already exists", 400)
-    _aliases[alias_name] = rec["KeyId"]
+    _aliases[alias_arn] = rec["KeyId"]
+    _stamp_alias(alias_arn, created=True)
     logger.info("Created alias %s -> %s", alias_name, rec["KeyId"])
     return json_response({})
 
 
 def _delete_alias(data):
     alias_name = data.get("AliasName", "")
-    if alias_name not in _aliases:
+    alias_arn = _alias_arn(alias_name)
+    if alias_arn not in _aliases:
         return error_response_json("NotFoundException", f"Alias {alias_name} not found", 400)
-    del _aliases[alias_name]
+    del _aliases[alias_arn]
+    _alias_dates.pop(alias_arn, None)
     return json_response({})
 
 
 def _list_aliases(data):
     key_id = data.get("KeyId")
     items = []
-    for alias_name, target_id in _aliases.items():
+    for alias_arn, target_id in _aliases.items():
+        try:
+            spec = parse_arn(alias_arn)
+        except ArnParseError:
+            continue
+        if spec.service != "kms" or spec.region != get_region() or spec.account_id != get_account_id():
+            continue
         if key_id and target_id != key_id:
             rec = _resolve_key(key_id)
             if not rec or rec["KeyId"] != target_id:
                 continue
+        dates = _alias_dates.get(alias_arn) or _stamp_alias(alias_arn, created=True)
         items.append({
-            "AliasName": alias_name,
-            "AliasArn": f"arn:aws:kms:{get_region()}:{get_account_id()}:{alias_name}",
+            "AliasName": spec.resource,
+            "AliasArn": alias_arn,
             "TargetKeyId": target_id,
+            "CreationDate": dates["CreationDate"],
+            "LastUpdatedDate": dates["LastUpdatedDate"],
         })
-    return json_response({"Aliases": items, "Truncated": False})
+    s3_alias_arn = _alias_arn(_AWS_S3_ALIAS)
+    if not key_id and s3_alias_arn not in _aliases:
+        # alias/aws/s3 is listed before its key exists, without a target (recorded on AWS in sa-east-1, us-west-1,
+        # us-west-2 and eu-west-1).
+        items.append({"AliasName": _AWS_S3_ALIAS, "AliasArn": s3_alias_arn})
+    return _marker_page(data, items, lambda a: a["AliasArn"], 50, "Aliases")
 
 
 def _update_alias(data):
     alias_name = data.get("AliasName", "")
     target_key_id = data.get("TargetKeyId", "")
-    if alias_name not in _aliases:
+    alias_arn = _alias_arn(alias_name)
+    if alias_arn not in _aliases:
         return error_response_json("NotFoundException", f"Alias {alias_name} not found", 400)
     rec = _resolve_key(target_key_id)
     if not rec:
         return error_response_json("NotFoundException", f"Key {target_key_id} not found", 400)
-    _aliases[alias_name] = rec["KeyId"]
+    _aliases[alias_arn] = rec["KeyId"]
+    _stamp_alias(alias_arn, created=False)
+    return json_response({})
+
+
+def _stamp_alias(alias_arn, created):
+    """Record an alias's CreationDate (kept on update) and LastUpdatedDate."""
+    now = int(time.time())
+    previous = None if created else _alias_dates.get(alias_arn)
+    dates = {"CreationDate": (previous or {}).get("CreationDate", now), "LastUpdatedDate": now}
+    _alias_dates[alias_arn] = dates
+    return dates
+
+
+# ---- Grants ----
+#
+# Grants are stored and listed, but MiniStack does not evaluate them when
+# authorizing other calls.
+
+_GRANT_OPERATIONS = {
+    "Decrypt", "Encrypt", "GenerateDataKey", "GenerateDataKeyWithoutPlaintext",
+    "ReEncryptFrom", "ReEncryptTo", "Sign", "Verify", "GetPublicKey",
+    "CreateGrant", "RetireGrant", "DescribeKey", "GenerateDataKeyPair",
+    "GenerateDataKeyPairWithoutPlaintext", "GenerateMac", "VerifyMac",
+    "DeriveSharedSecret",
+}
+# From the Grants guide: grants for symmetric encryption keys cannot allow
+# Sign, Verify, GenerateMac or VerifyMac, and grants for asymmetric keys cannot
+# allow operations that generate data keys or data key pairs.
+_NOT_FOR_SYMMETRIC = {"Sign", "Verify", "GenerateMac", "VerifyMac"}
+_NOT_FOR_ASYMMETRIC = {
+    "GenerateDataKey", "GenerateDataKeyWithoutPlaintext",
+    "GenerateDataKeyPair", "GenerateDataKeyPairWithoutPlaintext",
+}
+# HMAC keys support only GenerateMac and VerifyMac as cryptographic
+# operations (HMAC keys guide); DescribeKey, CreateGrant and RetireGrant apply
+# to every key type (Grants guide).
+_HMAC_GRANT_OPERATIONS = {"GenerateMac", "VerifyMac", "DescribeKey", "CreateGrant", "RetireGrant"}
+_GRANTS_DEFAULT_LIMIT = 50
+_GRANTS_MAX_LIMIT = 100
+
+
+def _grant_key(key_id):
+    """Resolve a grant operation's KeyId. Grant operations take a key ID or key
+    ARN, not an alias."""
+    if not key_id or "alias/" in key_id:
+        return None
+    return _resolve_key(key_id)
+
+
+def _is_asymmetric(rec):
+    return rec.get("KeySpec", "SYMMETRIC_DEFAULT") != "SYMMETRIC_DEFAULT" and not _is_hmac_key(rec)
+
+
+def _grant_operation_error(rec, operations):
+    if not isinstance(operations, list) or not operations:
+        return "Operations must contain at least one grant operation."
+    unknown = sorted(set(operations) - _GRANT_OPERATIONS)
+    if unknown:
+        return f"{', '.join(unknown)} is not a valid grant operation."
+    if _is_hmac_key(rec):
+        blocked = sorted(set(operations) - _HMAC_GRANT_OPERATIONS)
+    elif rec.get("KeySpec", "SYMMETRIC_DEFAULT") == "SYMMETRIC_DEFAULT":
+        blocked = sorted(set(operations) & _NOT_FOR_SYMMETRIC)
+    elif _is_asymmetric(rec):
+        blocked = sorted(set(operations) & _NOT_FOR_ASYMMETRIC)
+    else:
+        blocked = []
+    if blocked:
+        return f"{', '.join(blocked)} is not supported on KMS key {rec['Arn']}."
+    return None
+
+
+def _grant_entry(grant):
+    return {k: v for k, v in grant.items() if not k.startswith("_") and v is not None}
+
+
+def _find_grant(rec, grant_id):
+    grant = _grants.get(grant_id) if grant_id else None
+    return grant if grant and grant["KeyId"] == rec["Arn"] else None
+
+
+def _create_grant(data):
+    key_id = data.get("KeyId", "")
+    rec = _grant_key(key_id)
+    if not rec:
+        return _key_not_found(key_id)
+    state_error = _check_key_state(rec)
+    if state_error:
+        return state_error
+    if rec["KeyState"] == "PendingReplicaDeletion":
+        # Key states table: CreateGrant fails in this state too.
+        return error_response_json(
+            "KMSInvalidStateException",
+            f"{rec['Arn']} is pending replica deletion.",
+            400,
+        )
+    grantee = data.get("GranteePrincipal")
+    service_grantee = data.get("GranteeServicePrincipal")
+    if bool(grantee) == bool(service_grantee):
+        return error_response_json(
+            "ValidationException",
+            "You must specify either GranteePrincipal or GranteeServicePrincipal, but not both.", 400)
+    if data.get("RetiringPrincipal") and data.get("RetiringServicePrincipal"):
+        return error_response_json(
+            "ValidationException",
+            "You can specify either RetiringPrincipal or RetiringServicePrincipal, but not both.", 400)
+    operations = data.get("Operations")
+    message = _grant_operation_error(rec, operations)
+    if message:
+        return error_response_json("ValidationException", message, 400)
+    if data.get("DryRun"):
+        return _dry_run_error("CreateGrant")
+
+    grant = {
+        "KeyId": rec["Arn"],
+        "Name": data.get("Name") or "",
+        "GranteePrincipal": grantee or None,
+        "GranteeServicePrincipal": service_grantee or None,
+        "RetiringPrincipal": data.get("RetiringPrincipal"),
+        "RetiringServicePrincipal": data.get("RetiringServicePrincipal"),
+        "IssuingAccount": f"arn:aws:iam::{get_account_id()}:root",
+        "Operations": list(operations),
+        "Constraints": data.get("Constraints") or None,
+    }
+    token = base64.urlsafe_b64encode(os.urandom(48)).decode().rstrip("=")
+
+    # A retry with the same Name and identical parameters returns the original
+    # GrantId, with a new token that works for the same grant.
+    if grant["Name"]:
+        for existing in _grants.values():
+            if all(existing.get(k) == v for k, v in grant.items()):
+                existing["_tokens"].append(token)
+                return json_response({"GrantId": existing["GrantId"], "GrantToken": token})
+
+    grant_id = hashlib.sha256(new_uuid().encode()).hexdigest()
+    grant.update({"GrantId": grant_id, "CreationDate": int(time.time()), "_tokens": [token]})
+    _grants[grant_id] = grant
+    logger.info("Created grant %s on %s for %s", grant_id, rec["KeyId"], grantee or service_grantee)
+    return json_response({"GrantId": grant_id, "GrantToken": token})
+
+
+def _list_grants(data):
+    key_id = data.get("KeyId", "")
+    rec = _grant_key(key_id)
+    if not rec:
+        return _key_not_found(key_id)
+    limit = data.get("Limit", _GRANTS_DEFAULT_LIMIT)
+    if not isinstance(limit, int) or not 1 <= limit <= _GRANTS_MAX_LIMIT:
+        return error_response_json(
+            "ValidationException",
+            f"Limit must be between 1 and {_GRANTS_MAX_LIMIT}.",
+            400,
+        )
+
+    grants = sorted(
+        (g for g in _grants.values() if g["KeyId"] == rec["Arn"]),
+        key=lambda g: (g["CreationDate"], g["GrantId"]),
+    )
+    if data.get("GrantId"):
+        grants = [g for g in grants if g["GrantId"] == data["GrantId"]]
+    if data.get("GranteePrincipal"):
+        grants = [g for g in grants if g.get("GranteePrincipal") == data["GranteePrincipal"]]
+    if data.get("GranteeServicePrincipal"):
+        grants = [g for g in grants if g.get("GranteeServicePrincipal") == data["GranteeServicePrincipal"]]
+
+    start = 0
+    marker = data.get("Marker")
+    if marker:
+        ids = [g["GrantId"] for g in grants]
+        if marker not in ids:
+            return error_response_json("InvalidMarkerException", "Invalid marker.", 400)
+        start = ids.index(marker)
+
+    page = grants[start:start + limit]
+    resp = {"Grants": [_grant_entry(g) for g in page], "Truncated": start + limit < len(grants)}
+    if resp["Truncated"]:
+        resp["NextMarker"] = grants[start + limit]["GrantId"]
+    return json_response(resp)
+
+
+def _revoke_grant(data):
+    key_id = data.get("KeyId", "")
+    rec = _grant_key(key_id)
+    if not rec:
+        return _key_not_found(key_id)
+    grant_id = data.get("GrantId", "")
+    grant = _find_grant(rec, grant_id)
+    if not grant:
+        return error_response_json("NotFoundException", f"Grant does not exist: {grant_id}", 400)
+    if data.get("DryRun"):
+        return _dry_run_error("RevokeGrant")
+    del _grants[grant_id]
+    logger.info("Revoked grant %s on %s", grant_id, rec["KeyId"])
+    return json_response({})
+
+
+def _retire_grant(data):
+    """Identify the grant by its token, or by KeyId and GrantId together."""
+    token = data.get("GrantToken")
+    if token:
+        grant = next((g for g in _grants.values() if token in g["_tokens"]), None)
+        if not grant:
+            return error_response_json("InvalidGrantTokenException", "Invalid grant token.", 400)
+    else:
+        key_id, grant_id = data.get("KeyId"), data.get("GrantId")
+        if not key_id or not grant_id:
+            return error_response_json(
+                "ValidationException",
+                "Specify a GrantToken, or both a KeyId and a GrantId.",
+                400,
+            )
+        # Recorded on AWS (us-east-1): KeyId must be a key ARN, and an unknown key or grant is refused
+        # without saying which.
+        if not key_id.startswith("arn:"):
+            return error_response_json("NotFoundException", f"Invalid arn {key_id}", 400)
+        if ":alias/" in key_id:
+            return error_response_json("InvalidArnException", "Key Aliases are not supported for this operation.", 400)
+        rec = _grant_key(key_id)
+        grant = _find_grant(rec, grant_id) if rec else None
+        if not grant:
+            return _cross_account_denied("RetireGrant", None)
+    if data.get("DryRun"):
+        return _dry_run_error("RetireGrant")
+    del _grants[grant["GrantId"]]
+    logger.info("Retired grant %s", grant["GrantId"])
     return json_response({})
 
 
 # ---- Key Rotation ----
 
 
+def _reject_rotation_for_hmac(rec, operation):
+    if _is_hmac_key(rec):
+        return error_response_json(
+            "UnsupportedOperationException",
+            f"{operation} is not supported for HMAC KMS keys ({rec['Arn']}).",
+            400,
+        )
+    return None
+
+
 def _enable_key_rotation(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+        return _key_not_found(data.get('KeyId', ''))
+    err = _reject_rotation_for_hmac(rec, "EnableKeyRotation")
+    if err:
+        return err
     rec["KeyRotationEnabled"] = True
     rec["RotationPeriodInDays"] = data.get("RotationPeriodInDays", 365)
     return json_response({})
@@ -804,7 +2035,10 @@ def _enable_key_rotation(data):
 def _disable_key_rotation(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+        return _key_not_found(data.get('KeyId', ''))
+    err = _reject_rotation_for_hmac(rec, "DisableKeyRotation")
+    if err:
+        return err
     rec["KeyRotationEnabled"] = False
     return json_response({})
 
@@ -812,20 +2046,32 @@ def _disable_key_rotation(data):
 def _get_key_rotation_status(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
-    return json_response({
-        "KeyRotationEnabled": rec.get("KeyRotationEnabled", False),
-        "RotationPeriodInDays": rec.get("RotationPeriodInDays", 365),
-    })
+        return _key_not_found(data.get('KeyId', ''))
+    out = {"KeyId": rec["Arn"], "KeyRotationEnabled": rec.get("KeyRotationEnabled", False)}
+    if out["KeyRotationEnabled"]:
+        # Without rotation AWS answers no period (recorded in us-east-1).
+        out["RotationPeriodInDays"] = rec.get("RotationPeriodInDays", 365)
+    return json_response(out)
 
 
 # ---- Key Policy ----
 
 
+def key_policy_for_arn(resource_arn: str) -> tuple[str, str] | None:
+    """The key policy and owner account, for the identity check."""
+    owner, rec = _foreign_key(resource_arn)
+    if owner:
+        return (rec.get("Policy") or "", owner) if rec else None
+    rec = _resolve_key(resource_arn)
+    if not rec:
+        return None
+    return rec.get("Policy") or "", get_account_id()
+
+
 def _get_key_policy(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+        return _key_not_found(data.get('KeyId', ''))
     policy = rec.get("Policy")
     return json_response({"Policy": policy, "PolicyName": "default"})
 
@@ -833,7 +2079,7 @@ def _get_key_policy(data):
 def _put_key_policy(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+        return _key_not_found(data.get('KeyId', ''))
     rec["Policy"] = data.get("Policy", "")
     return json_response({})
 
@@ -841,8 +2087,8 @@ def _put_key_policy(data):
 def _list_key_policies(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
-    return json_response({"PolicyNames": ["default"], "Truncated": False})
+        return _key_not_found(data.get('KeyId', ''))
+    return _marker_page(data, ["default"], lambda n: n, 100, "PolicyNames")
 
 
 # ---- Enable / Disable / Schedule Deletion ----
@@ -851,7 +2097,7 @@ def _list_key_policies(data):
 def _enable_key(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+        return _key_not_found(data.get('KeyId', ''))
     rec["Enabled"] = True
     rec["KeyState"] = "Enabled"
     return json_response({})
@@ -860,23 +2106,158 @@ def _enable_key(data):
 def _disable_key(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+        return _key_not_found(data.get('KeyId', ''))
     rec["Enabled"] = False
     rec["KeyState"] = "Disabled"
     return json_response({})
 
 
-def _schedule_key_deletion(data):
+def _update_key_description(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+        return _key_not_found(data.get('KeyId', ''))
+    # An explicit empty string clears the description, which is how AWS removes it.
+    rec["Description"] = data.get("Description", "")
+    return json_response({})
+
+
+_KEY_MATERIAL_FIELDS = (
+    "_symmetric_key", "_hmac_key", "_private_key", "_public_key_der",
+    "EncryptionAlgorithms", "SigningAlgorithms", "MacAlgorithms",
+)
+
+
+def _mrk_members(rec):
+    """Yield (region, member record) for every member of a multi-Region key."""
+    account = get_account_id()
+    for region in rec.get("_mrk_regions") or []:
+        with request_scope(account, region):
+            member = _keys.get(rec["KeyId"])
+        if member is not None:
+            yield region, member
+
+
+def _replicate_key(data):
+    """ReplicateKey — create a replica of a multi-Region primary key in
+    another region, sharing its id and key material, so a ciphertext produced
+    in one region decrypts in the other, as AWS's shared-material model
+    guarantees."""
+    rec = _resolve_key(data.get("KeyId", ""))
+    if not rec:
+        return _key_not_found(data.get('KeyId', ''))
+    if not rec.get("MultiRegion"):
+        return error_response_json(
+            "UnsupportedOperationException",
+            f"{rec['Arn']} is not a multi-Region key.", 400)
+    if rec.get("_mrk_type") != "PRIMARY":
+        return error_response_json(
+            "UnsupportedOperationException",
+            f"{rec['Arn']} is a multi-Region replica key. ReplicateKey must be "
+            "called on the multi-Region primary key.", 400)
+    if rec.get("KeyState") not in ("Enabled", "Disabled"):
+        return error_response_json(
+            "KMSInvalidStateException",
+            f"{rec['Arn']} is in the {rec.get('KeyState')} state; it cannot be "
+            "replicated.", 400)
+    replica_region = data.get("ReplicaRegion")
+    if not replica_region:
+        return error_response_json(
+            "ValidationException", "ReplicaRegion is required", 400)
+    if replica_region in (rec.get("_mrk_regions") or []):
+        return error_response_json(
+            "AlreadyExistsException",
+            f"Key {rec['KeyId']} already exists in region {replica_region}", 400)
+
+    account = get_account_id()
+    tags = data.get("Tags", [])
+    policy = data.get("Policy") or json.dumps({
+        "Version": "2012-10-17",
+        "Id": "key-default-1",
+        "Statement": [{
+            "Sid": "Enable IAM User Permissions",
+            "Effect": "Allow",
+            "Principal": {"AWS": f"arn:aws:iam::{account}:root"},
+            "Action": "kms:*",
+            "Resource": "*",
+        }],
+    })
+    replica = {
+        "KeyId": rec["KeyId"],
+        "Arn": f"arn:aws:kms:{replica_region}:{account}:key/{rec['KeyId']}",
+        "KeyState": "Enabled",
+        "Enabled": True,
+        "KeySpec": rec["KeySpec"],
+        "KeyUsage": rec["KeyUsage"],
+        # The replica has its own description, policy and tags; only the key
+        # material and id are shared. An omitted Description is empty, per the
+        # API reference.
+        "Description": data.get("Description", ""),
+        "CreationDate": int(time.time()),
+        "Origin": rec["Origin"],
+        "Tags": tags,
+        "Policy": policy,
+        "MultiRegion": True,
+        "_mrk_type": "REPLICA",
+        "_mrk_primary_region": rec["_mrk_primary_region"],
+    }
+    for field in _KEY_MATERIAL_FIELDS:
+        if field in rec:
+            replica[field] = rec[field]
+
+    regions = list(rec.get("_mrk_regions") or []) + [replica_region]
+    replica["_mrk_regions"] = regions
+    with request_scope(account, replica_region):
+        _keys[rec["KeyId"]] = replica
+    # Every member reports the full topology.
+    for _region, member in _mrk_members(rec):
+        member["_mrk_regions"] = regions
+
+    return json_response({
+        "ReplicaKeyMetadata": _key_metadata_in_region(replica, replica_region),
+        "ReplicaPolicy": policy,
+        "ReplicaTags": tags,
+    })
+
+
+def _key_metadata_in_region(rec, region):
+    """_key_metadata built as the target region would build it — the ARNs it
+    contains are region-qualified via the request context."""
+    with request_scope(get_account_id(), region):
+        return _key_metadata(rec)
+
+
+def _schedule_key_deletion(data):
     days = data.get("PendingWindowInDays", 30)
-    rec["KeyState"] = "PendingDeletion"
+    if isinstance(days, int) and not 7 <= days <= 30:
+        return error_response_json("ValidationException", "PendingWindowInDays must be between 7 and 30", 400)
+    rec = _resolve_key(data.get("KeyId", ""))
+    if not rec:
+        return _key_not_found(data.get('KeyId', ''))
+    state = "PendingDeletion"
+    if rec.get("MultiRegion"):
+        others = [r for r in (rec.get("_mrk_regions") or []) if r != get_region()]
+        if rec.get("_mrk_type") == "PRIMARY" and others:
+            # A primary with live replicas waits on them, as AWS does.
+            state = "PendingReplicaDeletion"
+            rec["_pending_window_days"] = days
+        elif rec.get("_mrk_type") == "REPLICA":
+            # The departing replica leaves the topology every member reports,
+            # and a primary that was only waiting on it moves on to
+            # PendingDeletion.
+            regions = [r for r in (rec.get("_mrk_regions") or []) if r != get_region()]
+            for _region, member in _mrk_members(rec):
+                member["_mrk_regions"] = regions
+                if (member.get("_mrk_type") == "PRIMARY"
+                        and member.get("KeyState") == "PendingReplicaDeletion"
+                        and len(regions) == 1):
+                    member["KeyState"] = "PendingDeletion"
+            rec["_mrk_regions"] = [get_region()]
+    rec["KeyState"] = state
     rec["Enabled"] = False
     rec["DeletionDate"] = int(time.time() + (days * 86400))
     return json_response({
         "KeyId": rec["Arn"],
-        "KeyState": "PendingDeletion",
+        "KeyState": state,
         "DeletionDate": rec["DeletionDate"],
     })
 
@@ -884,7 +2265,7 @@ def _schedule_key_deletion(data):
 def _cancel_key_deletion(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+        return _key_not_found(data.get('KeyId', ''))
     rec["KeyState"] = "Disabled"
     rec.pop("DeletionDate", None)
     return json_response({"KeyId": rec["Arn"]})
@@ -893,10 +2274,221 @@ def _cancel_key_deletion(data):
 # ---- Tags ----
 
 
+# ---------------------------------------------------------------------------
+# Imported key material (BYOK). AWS's own flow, not a config file: create the
+# key with Origin EXTERNAL, fetch a wrapping public key and an import token
+# with GetParametersForImport, wrap the material, and hand it to
+# ImportKeyMaterial. Enums and errors from botocore kms service-2.json.
+# ---------------------------------------------------------------------------
+
+_WRAPPING_ALGORITHMS = (
+    "RSAES_PKCS1_V1_5", "RSAES_OAEP_SHA_1", "RSAES_OAEP_SHA_256",
+    "RSA_AES_KEY_WRAP_SHA_1", "RSA_AES_KEY_WRAP_SHA_256",
+)
+_WRAPPING_KEY_SIZES = {"RSA_2048": 2048, "RSA_3072": 3072, "RSA_4096": 4096}
+_IMPORT_TOKEN_VALID_SECONDS = 24 * 3600
+
+
+def _unwrap_key_material(private_key, algorithm: str, wrapped: bytes) -> bytes:
+    """The key material inside `wrapped`, per the WrappingAlgorithm used."""
+    if algorithm == "RSAES_PKCS1_V1_5":
+        return private_key.decrypt(wrapped, padding.PKCS1v15())
+    if algorithm in ("RSAES_OAEP_SHA_1", "RSAES_OAEP_SHA_256"):
+        digest = hashes.SHA1() if algorithm.endswith("SHA_1") else hashes.SHA256()
+        return private_key.decrypt(wrapped, padding.OAEP(
+            mgf=padding.MGF1(algorithm=digest), algorithm=digest, label=None))
+    # RSA_AES_KEY_WRAP_*: an ephemeral AES key wrapped with RSA-OAEP, followed
+    # by the material wrapped under it with AES key wrap with padding (RFC 5649).
+    digest = hashes.SHA1() if algorithm.endswith("SHA_1") else hashes.SHA256()
+    rsa_len = private_key.key_size // 8
+    if len(wrapped) <= rsa_len:
+        raise ValueError("wrapped material is shorter than the RSA block")
+    ephemeral = private_key.decrypt(wrapped[:rsa_len], padding.OAEP(
+        mgf=padding.MGF1(algorithm=digest), algorithm=digest, label=None))
+    return keywrap.aes_key_unwrap_with_padding(ephemeral, wrapped[rsa_len:])
+
+
+def _get_parameters_for_import(data):
+    key_id = data.get("KeyId", "")
+    rec = _resolve_key(key_id)
+    if not rec:
+        return _key_not_found(key_id)
+    algorithm = data.get("WrappingAlgorithm", "")
+    key_spec = data.get("WrappingKeySpec", "")
+    if algorithm not in _WRAPPING_ALGORITHMS:
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{algorithm}' at "
+            "'wrappingAlgorithm' failed to satisfy constraint: Member must "
+            "satisfy enum value set: " + str(sorted(_WRAPPING_ALGORITHMS)), 400)
+    if key_spec not in _WRAPPING_KEY_SIZES:
+        return error_response_json(
+            "UnsupportedOperationException",
+            f"WrappingKeySpec {key_spec} is not supported.", 400)
+    if rec.get("Origin") != "EXTERNAL":
+        return error_response_json(
+            "UnsupportedOperationException",
+            f"{rec['Arn']} origin is not EXTERNAL.", 400)
+    if rec["KeyState"] == "PendingDeletion":
+        return error_response_json(
+            "KMSInvalidStateException", f"{rec['Arn']} is pending deletion.", 400)
+    err = _require_crypto("GetParametersForImport")
+    if err:
+        return err
+
+    wrapping_key = rsa.generate_private_key(
+        public_exponent=65537, key_size=_WRAPPING_KEY_SIZES[key_spec])
+    token = os.urandom(32)
+    rec["_import_wrapping_key"] = wrapping_key
+    rec["_import_token"] = token
+    rec["_import_algorithm"] = algorithm
+    rec["_import_token_expires"] = int(time.time()) + _IMPORT_TOKEN_VALID_SECONDS
+    return json_response({
+        "KeyId": rec["Arn"],
+        "ImportToken": base64.b64encode(token).decode(),
+        "PublicKey": base64.b64encode(wrapping_key.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo)).decode(),
+        "ParametersValidTo": rec["_import_token_expires"],
+    })
+
+
+def _store_imported_material(rec, material):
+    """Place unwrapped key material on the record, per the key's KeySpec.
+
+    Symmetric and HMAC material is raw bytes of the spec's length; asymmetric
+    material is the private key alone, DER-encoded PKCS#8, from which the
+    public key is derived.
+    """
+    key_spec = rec.get("KeySpec", "SYMMETRIC_DEFAULT")
+    if key_spec == "SYMMETRIC_DEFAULT":
+        if len(material) != 32:
+            return error_response_json(
+                "IncorrectKeyMaterialException",
+                "A SYMMETRIC_DEFAULT key takes 256 bits of key material.", 400)
+        rec["_symmetric_key"] = material
+        return None
+    if key_spec in _HMAC_KEY_SPECS:
+        material_len = _HMAC_KEY_SPECS[key_spec][1]
+        if len(material) != material_len:
+            return error_response_json(
+                "IncorrectKeyMaterialException",
+                f"A {key_spec} key takes {material_len * 8} bits of key material.",
+                400)
+        rec["_hmac_key"] = material
+        return None
+    try:
+        private_key = serialization.load_der_private_key(material, password=None)
+    except Exception:
+        return error_response_json(
+            "IncorrectKeyMaterialException",
+            f"A {key_spec} key takes a DER-encoded PKCS#8 private key.", 400)
+    if _asymmetric_key_spec(private_key) != key_spec:
+        return error_response_json(
+            "IncorrectKeyMaterialException",
+            f"The key material does not match KeySpec {key_spec}.", 400)
+    _set_asymmetric_material(rec, private_key)
+    return None
+
+
+def _import_key_material(data):
+    key_id = data.get("KeyId", "")
+    rec = _resolve_key(key_id)
+    if not rec:
+        return _key_not_found(key_id)
+    if rec.get("Origin") != "EXTERNAL":
+        return error_response_json(
+            "UnsupportedOperationException",
+            f"{rec['Arn']} origin is not EXTERNAL.", 400)
+    if rec["KeyState"] == "PendingDeletion":
+        return error_response_json(
+            "KMSInvalidStateException", f"{rec['Arn']} is pending deletion.", 400)
+    expiration = data.get("ExpirationModel", "KEY_MATERIAL_EXPIRES")
+    if expiration not in ("KEY_MATERIAL_EXPIRES", "KEY_MATERIAL_DOES_NOT_EXPIRE"):
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{expiration}' at "
+            "'expirationModel' failed to satisfy constraint: Member must "
+            "satisfy enum value set: [KEY_MATERIAL_DOES_NOT_EXPIRE, "
+            "KEY_MATERIAL_EXPIRES]", 400)
+    if expiration == "KEY_MATERIAL_EXPIRES" and data.get("ValidTo") is None:
+        return error_response_json(
+            "ValidationException",
+            "ValidTo is required when ExpirationModel is KEY_MATERIAL_EXPIRES.",
+            400)
+    try:
+        token = base64.b64decode(data.get("ImportToken", "") or "", validate=True)
+        wrapped = base64.b64decode(data.get("EncryptedKeyMaterial", "") or "",
+                                   validate=True)
+    except (binascii.Error, ValueError):
+        return error_response_json(
+            "ValidationException", "Invalid base64 in the request.", 400)
+    stored = rec.get("_import_token")
+    if not stored or token != stored:
+        return error_response_json(
+            "InvalidImportTokenException",
+            "The import token is invalid for this key.", 400)
+    if int(time.time()) > rec.get("_import_token_expires", 0):
+        return error_response_json(
+            "ExpiredImportTokenException", "The import token has expired.", 400)
+
+    try:
+        material = _unwrap_key_material(
+            rec["_import_wrapping_key"], rec["_import_algorithm"], wrapped)
+    except Exception:
+        return error_response_json(
+            "InvalidCiphertextException",
+            "The key material could not be unwrapped with the wrapping key.",
+            400)
+    err = _store_imported_material(rec, material)
+    if err:
+        return err
+    rec["KeyState"] = "Enabled"
+    rec["Enabled"] = True
+    rec["ExpirationModel"] = expiration
+    if expiration == "KEY_MATERIAL_EXPIRES":
+        rec["ValidTo"] = data["ValidTo"]
+    else:
+        rec.pop("ValidTo", None)
+    # The token is single-use: a second import needs fresh parameters.
+    for field in ("_import_wrapping_key", "_import_token", "_import_algorithm",
+                  "_import_token_expires"):
+        rec.pop(field, None)
+    logger.info("ImportKeyMaterial: %s", rec["KeyId"])
+    response = {"KeyId": rec["Arn"]}
+    if "_symmetric_key" in rec:
+        response["KeyMaterialId"] = _key_material_id(rec)
+    return json_response(response)
+
+
+def _delete_imported_key_material(data):
+    key_id = data.get("KeyId", "")
+    rec = _resolve_key(key_id)
+    if not rec:
+        return _key_not_found(key_id)
+    if rec.get("Origin") != "EXTERNAL":
+        return error_response_json(
+            "UnsupportedOperationException",
+            f"{rec['Arn']} origin is not EXTERNAL.", 400)
+    if rec["KeyState"] == "PendingDeletion":
+        return error_response_json(
+            "KMSInvalidStateException", f"{rec['Arn']} is pending deletion.", 400)
+    response = {"KeyId": rec["Arn"]}
+    if "_symmetric_key" in rec:
+        response["KeyMaterialId"] = _key_material_id(rec)
+    for field in ("_symmetric_key", "_hmac_key", "_private_key", "_public_key_der"):
+        rec.pop(field, None)
+    rec.pop("ValidTo", None)
+    rec["KeyState"] = "PendingImport"
+    rec["Enabled"] = False
+    logger.info("DeleteImportedKeyMaterial: %s", rec["KeyId"])
+    return json_response(response)
+
+
 def _tag_resource(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+        return _key_not_found(data.get('KeyId', ''))
     tags = rec.setdefault("Tags", [])
     for tag in data.get("Tags", []):
         existing = next((t for t in tags if t["TagKey"] == tag["TagKey"]), None)
@@ -910,7 +2502,7 @@ def _tag_resource(data):
 def _untag_resource(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
+        return _key_not_found(data.get('KeyId', ''))
     remove_keys = set(data.get("TagKeys", []))
     rec["Tags"] = [t for t in rec.get("Tags", []) if t["TagKey"] not in remove_keys]
     return json_response({})
@@ -919,8 +2511,56 @@ def _untag_resource(data):
 def _list_resource_tags(data):
     rec = _resolve_key(data.get("KeyId", ""))
     if not rec:
-        return error_response_json("NotFoundException", f"Key {data.get('KeyId', '')} not found", 400)
-    return json_response({"Tags": rec.get("Tags", []), "Truncated": False})
+        return _key_not_found(data.get('KeyId', ''))
+    return _marker_page(data, list(rec.get("Tags", [])), lambda t: t["TagKey"], 50, "Tags")
+
+
+def _generate_random(data):
+    """``GenerateRandom`` — a keyless operation; only the byte count matters.
+
+    ``NumberOfBytes`` is optional in the model but the service refuses its
+    absence with "NumberOfBytes is required.", so an omitted count is a
+    ``ValidationException`` rather than a silent default. ``CustomKeyStoreId``
+    answers ``CustomKeyStoreNotFoundException`` — MiniStack has no custom key
+    stores. The Nitro-enclave ``Recipient`` parameter answers
+    ``UnsupportedOperationException``: a caller sending it expects
+    ``CiphertextForRecipient`` and a null ``Plaintext``, and MiniStack cannot
+    encrypt to an enclave's attestation key — answering ``Plaintext`` anyway
+    would be a shape the real service never produces for that request.
+    """
+    number_of_bytes = data.get("NumberOfBytes")
+    if number_of_bytes is None:
+        return error_response_json("ValidationException", "NumberOfBytes is required.", 400)
+    if type(number_of_bytes) is not int or number_of_bytes < 1:
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{number_of_bytes}' at "
+            "'numberOfBytes' failed to satisfy constraint: Member must have "
+            "value greater than or equal to 1",
+            400,
+        )
+    if number_of_bytes > 1024:
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{number_of_bytes}' at "
+            "'numberOfBytes' failed to satisfy constraint: Member must have "
+            "value less than or equal to 1024",
+            400,
+        )
+    if data.get("CustomKeyStoreId"):
+        return error_response_json(
+            "CustomKeyStoreNotFoundException",
+            f"Custom key store {data['CustomKeyStoreId']} does not exist",
+            400,
+        )
+    if data.get("Recipient"):
+        return error_response_json(
+            "UnsupportedOperationException",
+            "The Recipient parameter is not supported by MiniStack: plaintext "
+            "cannot be encrypted to a Nitro enclave attestation key.",
+            400,
+        )
+    return json_response({"Plaintext": base64.b64encode(os.urandom(number_of_bytes)).decode()})
 
 
 # ---- Request handler ----
@@ -936,6 +2576,7 @@ async def handle_request(method, path, headers, body, query_params):
 
     handlers = {
         "CreateKey": _create_key,
+        "ReplicateKey": _replicate_key,
         "ListKeys": _list_keys,
         "DescribeKey": _describe_key,
         "GetPublicKey": _get_public_key,
@@ -943,11 +2584,20 @@ async def handle_request(method, path, headers, body, query_params):
         "Verify": _verify,
         "Encrypt": _encrypt,
         "Decrypt": _decrypt,
+        "GenerateMac": _generate_mac,
+        "VerifyMac": _verify_mac,
         "GenerateDataKey": _generate_data_key,
         "GenerateDataKeyWithoutPlaintext": _generate_data_key_without_plaintext,
+        "GenerateDataKeyPair": _generate_data_key_pair,
+        "GenerateDataKeyPairWithoutPlaintext": _generate_data_key_pair_without_plaintext,
+        "GenerateRandom": _generate_random,
         "CreateAlias": _create_alias,
         "DeleteAlias": _delete_alias,
         "ListAliases": _list_aliases,
+        "CreateGrant": _create_grant,
+        "ListGrants": _list_grants,
+        "RevokeGrant": _revoke_grant,
+        "RetireGrant": _retire_grant,
         "UpdateAlias": _update_alias,
         "EnableKeyRotation": _enable_key_rotation,
         "DisableKeyRotation": _disable_key_rotation,
@@ -957,8 +2607,12 @@ async def handle_request(method, path, headers, body, query_params):
         "ListKeyPolicies": _list_key_policies,
         "EnableKey": _enable_key,
         "DisableKey": _disable_key,
+        "UpdateKeyDescription": _update_key_description,
         "ScheduleKeyDeletion": _schedule_key_deletion,
         "CancelKeyDeletion": _cancel_key_deletion,
+        "GetParametersForImport": _get_parameters_for_import,
+        "ImportKeyMaterial": _import_key_material,
+        "DeleteImportedKeyMaterial": _delete_imported_key_material,
         "TagResource": _tag_resource,
         "UntagResource": _untag_resource,
         "ListResourceTags": _list_resource_tags,
@@ -970,9 +2624,32 @@ async def handle_request(method, path, headers, body, query_params):
         return error_response_json(
             "InvalidAction", f"Unknown action: {action}", 400
         )
+    key_ref = data.get("KeyId")
+    if (action in _NO_ALIAS_ACTIONS and isinstance(key_ref, str)
+            and (key_ref.startswith("alias/") or ":alias/" in key_ref)):
+        return error_response_json("InvalidArnException", "Key Aliases are not supported for this operation.", 400)
+    if (isinstance(key_ref, str) and key_ref.startswith("arn:aws:kms:") and key_ref.split(":")[3] != get_region()
+            and key_ref.split(":")[4] != get_account_id()):
+        return error_response_json("NotFoundException", f"Invalid arn {key_ref.split(':')[3]}", 400)
+    owner, rec = _foreign_key(key_ref)
+    if owner is None and action == "Decrypt" and not key_ref:
+        owner, rec = _ciphertext_key(data)
+    if owner:
+        # Another account's key: its key policy decides, in both auth modes, as on AWS.
+        if rec is None or not key_policy_allows_caller(rec, action):
+            return _cross_account_denied(action, rec)
+        if action not in _CROSS_ACCOUNT_ACTIONS:
+            return error_response_json("AccessDeniedException", "This operation cannot be called cross account", 400)
+        if key_ref:
+            # RetireGrant only takes a key ARN; the others resolve the bare id in the owner's account.
+            data = {**data, "KeyId": rec["Arn"] if action == "RetireGrant" else rec["KeyId"]}
+        with request_scope(owner, get_region()):
+            return handler(data)
     return handler(data)
 
 
 def reset():
     _keys.clear()
     _aliases.clear()
+    _alias_dates.clear()
+    _grants.clear()

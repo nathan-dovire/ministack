@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 ECR (Elastic Container Registry) Emulator.
 JSON-based API via X-Amz-Target (prefix: AmazonEC2ContainerRegistry_V20150921).
@@ -9,33 +11,38 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
 
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
     get_region,
     json_response,
     new_uuid,
+    request_scope,
+    set_request_account_id,
+    set_request_region,
 )
 
 logger = logging.getLogger("ecr")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-_repositories = AccountScopedDict()
-_images = AccountScopedDict()
-_lifecycle_policies = AccountScopedDict()
-_repo_policies = AccountScopedDict()
+_repositories = AccountRegionScopedDict()
+_images = AccountRegionScopedDict()
+_lifecycle_policies = AccountRegionScopedDict()
+_repo_policies = AccountRegionScopedDict()
 # Docker Registry HTTP API V2 backing storage.
 # _layer_blobs[repo] = {digest: bytes}     — finalised layer + config bytes addressable by digest.
 # _manifest_blobs[repo] = {digest: bytes}  — raw manifest bytes addressable by digest (for HEAD/GET by digest).
 # _uploads[repo] = {upload_uuid: bytearray} — in-flight chunked uploads (cleared on PUT).
-_layer_blobs = AccountScopedDict()
-_manifest_blobs = AccountScopedDict()
-_uploads = AccountScopedDict()
+_layer_blobs = AccountRegionScopedDict()
+_manifest_blobs = AccountRegionScopedDict()
+_uploads = AccountRegionScopedDict()
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -54,25 +61,67 @@ def get_state():
     }
 
 
-def restore_state(data):
-    if data:
-        _repositories.update(data.get("repositories", {}))
-        _images.update(data.get("images", {}))
-        _lifecycle_policies.update(data.get("lifecycle_policies", {}))
-        _repo_policies.update(data.get("repo_policies", {}))
-        _layer_blobs.update(data.get("layer_blobs", {}))
-        _manifest_blobs.update(data.get("manifest_blobs", {}))
+def load_persisted_state(data):
+    return _restore_state(data)
 
 
-try:
-    _restored = load_state("ecr")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
+def _restore_state(data):
+    if not data:
+        return
+
+    restored_repositories = data.get("repositories", {})
+    legacy_repo_regions = {}
+    if isinstance(restored_repositories, AccountScopedDict):
+        legacy_repo_regions = {
+            (account_id, name): _repositories._region_for_legacy_value(
+                name, repository
+            )
+            for (account_id, name), repository in restored_repositories._data.items()
+        }
+    elif isinstance(restored_repositories, dict):
+        account_id = get_account_id()
+        legacy_repo_regions = {
+            (account_id, name): _repositories._region_for_legacy_value(
+                name, repository
+            )
+            for name, repository in restored_repositories.items()
+        }
+
+    _repositories.update(restored_repositories)
+    for store, key in (
+        (_images, "images"),
+        (_lifecycle_policies, "lifecycle_policies"),
+        (_repo_policies, "repo_policies"),
+        (_layer_blobs, "layer_blobs"),
+        (_manifest_blobs, "manifest_blobs"),
+    ):
+        _restore_repository_child_store(
+            store, data.get(key, {}), legacy_repo_regions
+        )
+
+
+def _restore_repository_child_store(store, restored, legacy_repo_regions):
+    """Adopt legacy name-keyed child state into its repository's region."""
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return
+
+    if isinstance(restored, AccountScopedDict):
+        entries = restored._data.items()
+    elif isinstance(restored, dict):
+        account_id = get_account_id()
+        entries = (
+            ((account_id, name), value) for name, value in restored.items()
+        )
+    else:
+        store.update(restored)
+        return
+
+    for (account_id, name), value in entries:
+        region = legacy_repo_regions.get((account_id, name), get_region())
+        store.set_scoped(account_id, region, name, value)
+
+
 
 
 def _repo_arn(name):
@@ -156,14 +205,27 @@ def _create_repository(data):
         "encryptionConfiguration": data.get("encryptionConfiguration", {"encryptionType": "AES256"}),
         "tags": data.get("tags", []),
     }
+    if data.get("imageTagMutabilityExclusionFilters"):
+        repo["imageTagMutabilityExclusionFilters"] = data["imageTagMutabilityExclusionFilters"]
     _repositories[name] = repo
     _images[name] = []
     return json_response({"repository": _repo_shape(repo)})
 
 
+def _paged(data, key, items):
+    try:
+        start = max(int(data.get("nextToken") or 0), 0)
+    except (TypeError, ValueError):
+        start = 0
+    end = start + (data.get("maxResults") or 100)
+    body = {key: items[start:end]}
+    if end < len(items):
+        body["nextToken"] = str(end)
+    return json_response(body)
+
+
 def _describe_repositories(data):
     names = data.get("repositoryNames", [])
-    max_results = data.get("maxResults", 1000)
 
     if names:
         repos = []
@@ -172,10 +234,8 @@ def _describe_repositories(data):
                 return error_response_json("RepositoryNotFoundException",
                                            f"The repository with name '{n}' does not exist", 400)
             repos.append(_repositories[n])
-    else:
-        repos = list(_repositories.values())
-
-    return json_response({"repositories": [_repo_shape(r) for r in repos[:max_results]]})
+        return json_response({"repositories": [_repo_shape(r) for r in repos]})
+    return _paged(data, "repositories", [_repo_shape(r) for r in _repositories.values()])
 
 
 def _delete_repository(data):
@@ -327,7 +387,7 @@ def _list_images(data):
             continue
         result.append(img["imageId"])
 
-    return json_response({"imageIds": result})
+    return _paged(data, "imageIds", result)
 
 
 def _describe_images(data):
@@ -363,7 +423,9 @@ def _describe_images(data):
                 "application/vnd.docker.distribution.manifest.v2+json"),
         })
 
-    return json_response({"imageDetails": details})
+    if image_ids:
+        return json_response({"imageDetails": details})
+    return _paged(data, "imageDetails", details)
 
 
 def _get_authorization_token(data):
@@ -375,6 +437,14 @@ def _get_authorization_token(data):
             "proxyEndpoint": f"https://{get_account_id()}.dkr.ecr.{get_region()}.amazonaws.com",
         }]
     })
+
+
+def repository_policy_for_arn(resource_arn: str) -> tuple[str, str] | None:
+    """The repository policy and owner account, for the identity check."""
+    name = resource_arn.partition(":repository/")[2]
+    if name not in _repositories:
+        return None
+    return _repo_policies.get(name) or "", get_account_id()
 
 
 def _get_repository_policy(data):
@@ -507,11 +577,19 @@ def _put_image_tag_mutability(data):
                                    f"The repository with name '{name}' does not exist", 400)
     mutability = data.get("imageTagMutability", "MUTABLE")
     _repositories[name]["imageTagMutability"] = mutability
-    return json_response({
+    filters = data.get("imageTagMutabilityExclusionFilters")
+    if filters:
+        _repositories[name]["imageTagMutabilityExclusionFilters"] = filters
+    else:
+        _repositories[name].pop("imageTagMutabilityExclusionFilters", None)
+    resp = {
         "registryId": _registry_id(),
         "repositoryName": name,
         "imageTagMutability": mutability,
-    })
+    }
+    if filters:
+        resp["imageTagMutabilityExclusionFilters"] = filters
+    return json_response(resp)
 
 
 def _put_image_scanning_configuration(data):
@@ -603,10 +681,32 @@ def _find_image(repo_name, image_id):
 
 
 def _find_repo_by_arn(arn):
-    for repo in _repositories.values():
-        if repo["repositoryArn"] == arn:
-            return repo
-    return None
+    name = _repo_name_from_arn(arn)
+    if not name:
+        return None
+    repo = _repositories.get(name)
+    if not repo or repo.get("repositoryArn") != arn:
+        return None
+    return repo
+
+
+def _repo_name_from_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None
+    if (
+        spec.partition != "aws"
+        or spec.service != "ecr"
+        or spec.account_id != get_account_id()
+        or spec.region != get_region()
+    ):
+        return None
+    prefix = "repository/"
+    if not spec.resource.startswith(prefix):
+        return None
+    name = spec.resource[len(prefix):]
+    return name or None
 
 
 def _repo_shape(repo):
@@ -617,6 +717,8 @@ def _repo_shape(repo):
         "repositoryUri": repo["repositoryUri"],
         "createdAt": repo["createdAt"],
         "imageTagMutability": repo.get("imageTagMutability", "MUTABLE"),
+        **({"imageTagMutabilityExclusionFilters": repo["imageTagMutabilityExclusionFilters"]}
+           if repo.get("imageTagMutabilityExclusionFilters") else {}),
         "imageScanningConfiguration": repo.get("imageScanningConfiguration", {"scanOnPush": False}),
         "encryptionConfiguration": repo.get("encryptionConfiguration", {"encryptionType": "AES256"}),
     }
@@ -644,6 +746,9 @@ def reset():
 _REGISTRY_API_VERSION_HEADER = ("Docker-Distribution-API-Version", "registry/2.0")
 _DEFAULT_MANIFEST_MEDIA_TYPE = "application/vnd.docker.distribution.manifest.v2+json"
 _UPLOAD_PART_SIZE = 10 * 1024 * 1024  # advisory chunk size; clients ignore for chunked uploads
+_ECR_REGISTRY_HOST_RE = re.compile(
+    r"^(\d{12})\.dkr\.ecr\.([a-z0-9-]+)\."
+)
 
 
 def _registry_error(status, code, message, detail=None):
@@ -748,6 +853,42 @@ def _query_first(query_params, key):
     if isinstance(val, list):
         return val[0] if val else None
     return val
+
+
+def _registry_scope_hint(value):
+    if not isinstance(value, str):
+        return None
+    match = _ECR_REGISTRY_HOST_RE.match(value.lower())
+    return match.groups() if match else None
+
+
+def _select_registry_request_scope(name, headers, query_params):
+    """Pin an unsigned Registry V2 request to its repository's tenant scope."""
+    scope_hint = _registry_scope_hint(headers.get("host"))
+    if scope_hint is None:
+        scope_hint = _registry_scope_hint(_query_first(query_params, "ns"))
+    if scope_hint is not None:
+        account_id, region = scope_hint
+        set_request_account_id(account_id)
+        set_request_region(region)
+        return
+
+    if not name:
+        return
+
+    # Preserve the ambient request scope when it already resolves the repo.
+    if name in _repositories:
+        return
+
+    account_id = get_account_id()
+    matches = [
+        region
+        for (stored_account, region, stored_name), _repository
+        in _repositories.all_items()
+        if stored_account == account_id and stored_name == name
+    ]
+    if len(matches) == 1:
+        set_request_region(matches[0])
 
 
 def _v2_ping():
@@ -1029,6 +1170,143 @@ def _resolve_manifest(name, ref):
     return None, None, None
 
 
+# ── Images ECS runs from this registry ──────────────────────
+
+_INDEX_MEDIA_TYPES = frozenset((
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.oci.image.index.v1+json",
+))
+
+
+def _held_image(image):
+    """(account, region, repository, reference) when ``image`` names a repository this MiniStack holds, else None."""
+    host, _, rest = (image or "").partition("/")
+    match = _ECR_REGISTRY_HOST_RE.match(host.lower() + ".")
+    if not match or not rest:
+        return None
+    if "@" in rest:
+        repo, ref = rest.split("@", 1)
+    elif ":" in rest.rsplit("/", 1)[-1]:
+        repo, ref = rest.rsplit(":", 1)
+    else:
+        repo, ref = rest, "latest"
+    account, region = match.groups()
+    if _repositories.get_scoped(account, region, repo) is None:
+        return None
+    return account, region, repo, ref
+
+
+_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+
+
+def held_image_readable(image, principal_arn):
+    """Under AUTH=true, a repository in another account is readable only when its policy allows the
+    caller to pull (ecr:BatchGetImage and ecr:GetDownloadUrlForLayer, the ECR guide's pull example); its own
+    account always can."""
+    from ministack.app import AUTH
+    held = _held_image(image)
+    if held is None or not AUTH or held[0] == get_account_id():
+        return True
+    from ministack.core.iam_evaluator import EvalContext, resource_policy_allows
+    account, region, repo, _ref = held
+    policy = _repo_policies.get_scoped(account, region, repo)
+    return all(resource_policy_allows(policy, EvalContext(
+        principal_arn=principal_arn, principal_account=principal_arn.split(":")[4],
+        principal_type="AssumedRole" if ":role/" in principal_arn else "Root", action=action,
+        resource_arn=f"arn:aws:ecr:{region}:{account}:repository/{repo}", region=region), same_account=False)
+        for action in ("ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"))
+
+
+def held_image_digest(image):
+    """The manifest digest of an image this MiniStack holds, or None (not held, or no such tag)."""
+    held = _held_image(image)
+    if held is None:
+        return None
+    account, region, repo, ref = held
+    with request_scope(account, region):
+        return _resolve_manifest(repo, ref)[0]
+
+
+def held_image_archive(image, architecture):
+    """A ``docker load`` archive of an image this MiniStack holds, for ``architecture`` (amd64, arm64, ...).
+
+    Returns ``(archive bytes, config digest)``, or None when the image is not held here or cannot be
+    assembled (missing blobs, or a layer compression Docker's loaders may not take)."""
+    import gzip
+    import io
+    import tarfile
+
+    held = _held_image(image)
+    if held is None:
+        return None
+    account, region, repo, ref = held
+    with request_scope(account, region):
+        digest, blob, media_type = _resolve_manifest(repo, ref)
+        blobs = _layer_blobs.get(repo, {})
+        manifests = _manifest_blobs.get(repo, {})
+    if blob is None:
+        return None
+    try:
+        manifest = json.loads(blob)
+        if manifest.get("mediaType", media_type) in _INDEX_MEDIA_TYPES or "manifests" in manifest:
+            chosen = next((m for m in manifest.get("manifests", [])
+                           if (m.get("platform") or {}).get("architecture") == architecture
+                           and (m.get("platform") or {}).get("os", "linux") == "linux"), None)
+            if chosen is None or chosen.get("digest") not in manifests:
+                return None
+            manifest = json.loads(manifests[chosen["digest"]])
+        config_digest = manifest["config"]["digest"]
+        if not _DIGEST_RE.fullmatch(config_digest):
+            return None
+        config = blobs[config_digest]
+        layers = []
+        for layer in manifest.get("layers", []):
+            data = blobs[layer["digest"]]
+            if "zstd" in layer.get("mediaType", ""):
+                return None
+            layers.append(gzip.decompress(data) if data[:2] == b"\x1f\x8b" else data)
+    except (KeyError, TypeError, ValueError, OSError):
+        return None
+
+    def add(tar, name, data):
+        info = tarfile.TarInfo(name)
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+
+    tag = None if "@" in image.rsplit("/", 1)[-1] else image if ":" in image.rsplit("/", 1)[-1] else f"{image}:latest"
+    config_name = f"{config_digest.split(':', 1)[1]}.json"
+    layer_names = [f"{hashlib.sha256(data).hexdigest()}/layer.tar" for data in layers]
+    out = io.BytesIO()
+    with tarfile.open(fileobj=out, mode="w") as tar:
+        add(tar, config_name, config)
+        for name, data in zip(layer_names, layers):
+            add(tar, name, data)
+        add(tar, "manifest.json", json.dumps([{"Config": config_name, "RepoTags": [tag] if tag else [],
+                                                "Layers": layer_names}]).encode())
+    return out.getvalue(), config_digest
+
+
+_DOCKER_ARCHITECTURES = {"x86_64": "amd64", "aarch64": "arm64"}
+
+
+def load_held_image(docker_client, image, architecture=None):
+    """Load an image this MiniStack holds into ``docker_client`` for ``architecture`` (the daemon's when None).
+
+    Returns the reference to run it by, or None when it is not held here or has no image for that platform."""
+    if not architecture:
+        reported = (docker_client.info() or {}).get("Architecture", "")
+        architecture = _DOCKER_ARCHITECTURES.get(reported, reported)
+    built = held_image_archive(image, architecture)
+    if built is None:
+        return None
+    archive, config_digest = built
+    loaded = docker_client.images.load(archive)
+    if "@" not in image.rsplit("/", 1)[-1]:
+        return image
+    # An untagged load is named by its ID: the config digest on the classic store, the manifest digest on containerd's.
+    return loaded[0].id if loaded else config_digest
+
+
 def _v2_put_manifest(name, ref, headers, body):
     err = _ensure_repo_exists(name)
     if err is not None:
@@ -1219,6 +1497,8 @@ async def handle_registry_request(method, path, headers, body, query_params):
     verb, name, ref = parsed
     method = method.upper()
     headers = {k.lower(): v for k, v in (headers or {}).items()}
+
+    _select_registry_request_scope(name, headers, query_params)
 
     if verb == "ping":
         if method not in ("GET", "HEAD"):

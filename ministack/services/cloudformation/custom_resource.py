@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 CloudFormation Custom Resource — ResponseURL intercept and Lambda invocation.
 """
@@ -5,10 +7,13 @@ import logging
 import os
 import threading
 
+from ministack.core.tls import use_ssl_enabled
+
 logger = logging.getLogger("cloudformation")
 
 _HOST = os.environ.get("MINISTACK_HOST", "localhost")
-_PORT = os.environ.get("GATEWAY_PORT", "4566")
+# The gateway port as the app resolves it: GATEWAY_PORT > EDGE_PORT > 4566.
+_PORT = os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
 
 _lock = threading.Lock()
 # token → {"event": threading.Event, "result": dict | None}
@@ -38,17 +43,33 @@ def reset():
         _pending.clear()
 
 
+def _gateway_url() -> str:
+    """The gateway's base URL, in the scheme it serves."""
+    scheme = "https" if use_ssl_enabled() else "http"
+    return f"{scheme}://{_HOST}:{_PORT}"
+
+
 def _response_url(token: str) -> str:
-    return f"http://{_HOST}:{_PORT}/_ministack/cfn-response/{token}"
+    return f"{_gateway_url()}/_ministack/cfn-response/{token}"
 
 
-def _func_name_from_arn(service_token: str) -> str:
-    """Extract function name from a Lambda ARN, or return as-is."""
-    if service_token.startswith("arn:"):
-        parts = service_token.split(":")
-        # arn:aws:lambda:region:account:function:<name>[:<qualifier>]
-        return parts[6] if len(parts) >= 7 else parts[-1]
-    return service_token
+def _normalise_resource_properties(value):
+    """Match CloudFormation's custom-resource property wire representation.
+
+    CloudFormation preserves maps and lists in ``ResourceProperties`` but
+    serialises primitive property values as strings.  CDK's bundled custom
+    resource handlers rely on this behaviour (for example, the S3 bucket
+    notifications handler calls ``.lower()`` on boolean template properties).
+    """
+    if isinstance(value, dict):
+        return {key: _normalise_resource_properties(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_normalise_resource_properties(item) for item in value]
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return value
 
 
 def invoke_custom_resource(
@@ -73,18 +94,29 @@ def invoke_custom_resource(
     Raises RuntimeError if the Lambda responds with Status=FAILED.
     """
     import ministack.services.lambda_svc as _lambda_svc
-    from ministack.core.responses import new_uuid
+    from ministack.core.arn import ArnParseError, parse_arn
+    from ministack.core.responses import get_region, new_uuid
 
     service_token = props.get("ServiceToken", "")
-    func_name = _func_name_from_arn(service_token)
+    if isinstance(service_token, str) and service_token.startswith("arn:"):
+        try:
+            token_arn = parse_arn(service_token)
+        except ArnParseError:
+            token_arn = None
+        if token_arn and token_arn.service == "lambda" and token_arn.region != get_region():
+            raise ValueError(
+                f"Custom resource ServiceToken {service_token!r} must be in "
+                f"the stack region {get_region()}."
+            )
 
-    if func_name not in _lambda_svc._functions:
+    func_record, func_config, func_name = _lambda_svc._get_func_record_for_ref(service_token)
+
+    if func_record is None or func_config is None:
         raise ValueError(
             f"Custom resource ServiceToken {service_token!r} not found. "
             "Ensure the Lambda function is provisioned before the custom resource."
         )
 
-    func_record = _lambda_svc._functions[func_name]
     try:
         service_timeout = int(props.get("ServiceTimeout", 3600))
     except (ValueError, TypeError):
@@ -100,17 +132,18 @@ def invoke_custom_resource(
         "ResponseURL": _response_url(token),
         "ResourceType": resource_type,
         "LogicalResourceId": logical_id,
-        "ResourceProperties": dict(props),
+        "ResourceProperties": _normalise_resource_properties(props),
     }
     if physical_id is not None:
         cfn_event["PhysicalResourceId"] = physical_id
     if old_props is not None:
-        cfn_event["OldResourceProperties"] = dict(old_props)
+        cfn_event["OldResourceProperties"] = _normalise_resource_properties(old_props)
 
     event_obj = register_token(token)
 
     try:
-        _lambda_svc._execute_function(func_record, cfn_event)
+        exec_record = _lambda_svc._execution_record_for_config(func_record, func_config)
+        _lambda_svc._execute_function_with_config_scope(exec_record, cfn_event)
     except Exception as exc:
         logger.warning("Custom resource Lambda raised synchronously: %s", exc)
 

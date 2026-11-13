@@ -1,0 +1,2067 @@
+"""
+Bedrock + Bedrock Runtime integration tests.
+
+Verifies wire-shape parity for the Converse family + control-plane listings,
+mock + (where reachable) proxy paths. Token counts are heuristic so we assert
+on presence and ordering, not absolute values.
+"""
+
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
+
+import botocore.exceptions
+import pytest
+from conftest import ENDPOINT, make_client
+
+# ---------------------------------------------------------------------------
+# Control plane
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_list_foundation_models_returns_catalog():
+    client = make_client("bedrock")
+    resp = client.list_foundation_models()
+    summaries = resp["modelSummaries"]
+    assert len(summaries) > 10
+    ids = {s["modelId"] for s in summaries}
+    assert "anthropic.claude-3-5-sonnet-20241022-v2:0" in ids
+    assert "amazon.nova-pro-v1:0" in ids
+    assert "meta.llama3-1-70b-instruct-v1:0" in ids
+    for s in summaries:
+        assert s["modelArn"].startswith("arn:aws:bedrock:us-east-1::foundation-model/")
+        assert s["modelLifecycle"]["status"] == "ACTIVE"
+        assert s["inferenceTypesSupported"] == ["ON_DEMAND"]
+
+
+def test_bedrock_list_foundation_models_filters_by_provider():
+    client = make_client("bedrock")
+    resp = client.list_foundation_models(byProvider="Anthropic")
+    for s in resp["modelSummaries"]:
+        assert s["providerName"] == "Anthropic"
+
+
+def test_bedrock_get_foundation_model_by_id():
+    client = make_client("bedrock")
+    resp = client.get_foundation_model(
+        modelIdentifier="anthropic.claude-3-5-sonnet-20241022-v2:0"
+    )
+    details = resp["modelDetails"]
+    assert details["modelId"] == "anthropic.claude-3-5-sonnet-20241022-v2:0"
+    assert details["providerName"] == "Anthropic"
+    assert details["responseStreamingSupported"] is True
+
+
+def test_bedrock_get_foundation_model_unknown_id_returns_404():
+    import botocore.exceptions
+
+    client = make_client("bedrock")
+    try:
+        client.get_foundation_model(modelIdentifier="does-not-exist")
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ResourceNotFoundException"
+    else:
+        raise AssertionError("expected ResourceNotFoundException")
+
+
+# ---------------------------------------------------------------------------
+# Converse (non-streaming)
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_converse_returns_shape_required_fields():
+    client = make_client("bedrock-runtime")
+    resp = client.converse(
+        modelId="anthropic.claude-3-5-sonnet-20241022-v2:0",
+        messages=[{"role": "user", "content": [{"text": "hello"}]}],
+    )
+    # Required by botocore ConverseResponse: output, stopReason, usage, metrics
+    assert "output" in resp
+    assert "message" in resp["output"]
+    assert resp["output"]["message"]["role"] == "assistant"
+    assert isinstance(resp["output"]["message"]["content"], list)
+    assert "text" in resp["output"]["message"]["content"][0]
+    assert resp["stopReason"] in (
+        "end_turn", "tool_use", "max_tokens", "stop_sequence",
+        "guardrail_intervened", "content_filtered",
+    )
+    assert "usage" in resp
+    for k in ("inputTokens", "outputTokens", "totalTokens"):
+        assert isinstance(resp["usage"][k], int)
+    assert resp["usage"]["totalTokens"] == (
+        resp["usage"]["inputTokens"] + resp["usage"]["outputTokens"]
+    )
+    assert isinstance(resp["metrics"]["latencyMs"], int)
+    assert resp["metrics"]["latencyMs"] >= 1
+
+
+def test_bedrock_converse_with_system_prompt_and_inference_config():
+    client = make_client("bedrock-runtime")
+    resp = client.converse(
+        modelId="amazon.nova-pro-v1:0",
+        system=[{"text": "You are a terse assistant."}],
+        messages=[{"role": "user", "content": [{"text": "what is 2+2?"}]}],
+        inferenceConfig={"maxTokens": 64, "temperature": 0.0},
+    )
+    assert resp["output"]["message"]["role"] == "assistant"
+    text = resp["output"]["message"]["content"][0]["text"]
+    assert "nova" in text.lower() or "ministack" in text.lower()
+
+
+def test_bedrock_converse_distinct_prompts_produce_distinct_replies():
+    client = make_client("bedrock-runtime")
+    model = "anthropic.claude-3-haiku-20240307-v1:0"
+    a = client.converse(modelId=model, messages=[
+        {"role": "user", "content": [{"text": "alpha"}]}])
+    b = client.converse(modelId=model, messages=[
+        {"role": "user", "content": [{"text": "beta"}]}])
+    assert (a["output"]["message"]["content"][0]["text"]
+            != b["output"]["message"]["content"][0]["text"])
+
+
+def test_bedrock_converse_via_inference_profile_id():
+    client = make_client("bedrock-runtime")
+    resp = client.converse(
+        modelId="us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+        messages=[{"role": "user", "content": [{"text": "hi"}]}],
+    )
+    assert resp["output"]["message"]["role"] == "assistant"
+
+
+def test_bedrock_converse_rejects_invalid_role():
+    import botocore.exceptions
+
+    client = make_client("bedrock-runtime")
+    try:
+        client.converse(
+            modelId="anthropic.claude-3-haiku-20240307-v1:0",
+            messages=[{"role": "system", "content": [{"text": "x"}]}],
+        )
+    except botocore.exceptions.ParamValidationError:
+        # botocore client-side validation catches this before the wire — fine.
+        return
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ValidationException"
+    else:
+        raise AssertionError("expected ValidationException or ParamValidationError")
+
+
+# ---------------------------------------------------------------------------
+# ConverseStream (eventstream)
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_converse_stream_emits_full_event_sequence():
+    client = make_client("bedrock-runtime")
+    resp = client.converse_stream(
+        modelId="anthropic.claude-3-5-haiku-20241022-v1:0",
+        messages=[{"role": "user", "content": [{"text": "stream please"}]}],
+    )
+    events = []
+    for evt in resp["stream"]:
+        events.append(evt)
+    # AWS sequence: messageStart -> contentBlockDelta+ -> contentBlockStop ->
+    # messageStop -> metadata. boto3's EventStream parser surfaces each event
+    # as a single-key dict keyed by event name.
+    names = [list(e.keys())[0] for e in events]
+    assert names[0] == "messageStart"
+    assert "contentBlockDelta" in names
+    assert "contentBlockStop" in names
+    assert "messageStop" in names
+    assert names[-1] == "metadata"
+
+    # Reassemble text from deltas
+    text = "".join(
+        e["contentBlockDelta"]["delta"]["text"]
+        for e in events if "contentBlockDelta" in e
+    )
+    assert len(text) > 0
+
+    # Metadata carries usage + metrics
+    meta = [e for e in events if "metadata" in e][0]["metadata"]
+    assert meta["usage"]["totalTokens"] == (
+        meta["usage"]["inputTokens"] + meta["usage"]["outputTokens"]
+    )
+    assert meta["metrics"]["latencyMs"] >= 1
+
+
+def test_bedrock_converse_stream_message_start_role_assistant():
+    client = make_client("bedrock-runtime")
+    resp = client.converse_stream(
+        modelId="amazon.nova-lite-v1:0",
+        messages=[{"role": "user", "content": [{"text": "x"}]}],
+    )
+    first = next(iter(resp["stream"]))
+    assert "messageStart" in first
+    assert first["messageStart"]["role"] == "assistant"
+
+
+# ---------------------------------------------------------------------------
+# Control-plane: filter combinations + ARN lookup + region-awareness
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_list_foundation_models_filters_by_output_modality_embedding():
+    client = make_client("bedrock")
+    resp = client.list_foundation_models(byOutputModality="EMBEDDING")
+    ids = [s["modelId"] for s in resp["modelSummaries"]]
+    assert "amazon.titan-embed-text-v2:0" in ids
+    assert "anthropic.claude-3-5-sonnet-20241022-v2:0" not in ids
+
+
+def test_bedrock_get_foundation_model_by_arn():
+    client = make_client("bedrock")
+    arn = "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-haiku-20240307-v1:0"
+    resp = client.get_foundation_model(modelIdentifier=arn)
+    assert resp["modelDetails"]["modelId"] == "anthropic.claude-3-haiku-20240307-v1:0"
+
+
+def test_bedrock_get_foundation_model_arn_parser_does_not_tail_match_invalid_arns():
+    import botocore.exceptions
+
+    client = make_client("bedrock")
+    valid_tail = "foundation-model/anthropic.claude-3-haiku-20240307-v1:0"
+    bad_refs = [
+        f"arn:aws:lambda:us-east-1::{valid_tail}",
+        f"arn:aws:bedrock:us-west-2::{valid_tail}",
+        f"arn:aws:bedrock:us-east-1:000000000000:{valid_tail}",
+        "arn:aws:bedrock:us-east-1::custom-model/anthropic.claude-3-haiku-20240307-v1:0",
+        "arn:aws:bedrock:us-east-1",
+    ]
+    for model_identifier in bad_refs:
+        try:
+            client.get_foundation_model(modelIdentifier=model_identifier)
+        except botocore.exceptions.ClientError as exc:
+            assert exc.response["Error"]["Code"] == "ResourceNotFoundException"
+        else:
+            raise AssertionError(f"expected ResourceNotFoundException for {model_identifier}")
+
+
+def test_bedrock_model_arn_reflects_request_region():
+    import boto3
+    from botocore.config import Config
+    from conftest import ENDPOINT
+
+    client = boto3.client(
+        "bedrock", endpoint_url=ENDPOINT,
+        aws_access_key_id="test", aws_secret_access_key="test",
+        region_name="eu-west-1",
+        config=Config(region_name="eu-west-1", retries={"mode": "standard"}),
+    )
+    resp = client.list_foundation_models()
+    for s in resp["modelSummaries"]:
+        assert ":bedrock:eu-west-1:" in s["modelArn"]
+
+
+def test_bedrock_list_inference_profiles_returns_us_eu_apac_prefixes():
+    client = make_client("bedrock")
+    resp = client.list_inference_profiles()
+    ids = {p["inferenceProfileId"] for p in resp["inferenceProfileSummaries"]}
+    assert "us.anthropic.claude-3-5-sonnet-20241022-v2:0" in ids
+    assert "eu.anthropic.claude-3-5-sonnet-20241022-v2:0" in ids
+    assert "apac.anthropic.claude-3-5-sonnet-20241022-v2:0" in ids
+    for p in resp["inferenceProfileSummaries"]:
+        assert p["status"] == "ACTIVE"
+        assert p["type"] == "SYSTEM_DEFINED"
+        assert len(p["models"]) == 1
+
+
+def test_bedrock_get_inference_profile_returns_model_arn():
+    client = make_client("bedrock")
+    resp = client.get_inference_profile(
+        inferenceProfileIdentifier="us.amazon.nova-pro-v1:0"
+    )
+    assert resp["inferenceProfileId"] == "us.amazon.nova-pro-v1:0"
+    assert resp["models"][0]["modelArn"].endswith("amazon.nova-pro-v1:0")
+
+
+def test_bedrock_get_inference_profile_unknown_returns_404():
+    import botocore.exceptions
+
+    client = make_client("bedrock")
+    try:
+        client.get_inference_profile(inferenceProfileIdentifier="us.does-not-exist")
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ResourceNotFoundException"
+    else:
+        raise AssertionError("expected ResourceNotFoundException")
+
+
+# ---------------------------------------------------------------------------
+# Converse: multi-turn, multi-block, all model families
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_converse_multi_turn_conversation():
+    client = make_client("bedrock-runtime")
+    resp = client.converse(
+        modelId="anthropic.claude-3-haiku-20240307-v1:0",
+        messages=[
+            {"role": "user", "content": [{"text": "first"}]},
+            {"role": "assistant", "content": [{"text": "ack"}]},
+            {"role": "user", "content": [{"text": "second"}]},
+        ],
+    )
+    assert resp["output"]["message"]["role"] == "assistant"
+    # input token count grew with multi-turn vs single turn
+    assert resp["usage"]["inputTokens"] >= 1
+
+
+def test_bedrock_converse_multiple_content_blocks_in_message():
+    client = make_client("bedrock-runtime")
+    resp = client.converse(
+        modelId="anthropic.claude-3-5-sonnet-20241022-v2:0",
+        messages=[{
+            "role": "user",
+            "content": [
+                {"text": "block one"},
+                {"text": "block two"},
+            ],
+        }],
+    )
+    assert resp["output"]["message"]["role"] == "assistant"
+
+
+def test_bedrock_converse_token_count_headers_present_in_http_response():
+    import urllib.request
+
+    from conftest import ENDPOINT
+
+    body = json.dumps({
+        "messages": [{"role": "user", "content": [{"text": "header check"}]}],
+    }).encode()
+    req = urllib.request.Request(
+        f"{ENDPOINT}/model/amazon.nova-micro-v1%3A0/converse",
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": ("AWS4-HMAC-SHA256 "
+                              "Credential=test/20260605/us-east-1/bedrock/aws4_request, "
+                              "SignedHeaders=host;x-amz-date, Signature=x"),
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req) as resp:
+        assert resp.status == 200
+        assert int(resp.headers["x-amzn-bedrock-input-token-count"]) >= 1
+        assert int(resp.headers["x-amzn-bedrock-output-token-count"]) >= 1
+
+
+def test_bedrock_converse_family_anthropic():
+    _converse_family("anthropic.claude-3-5-sonnet-20241022-v2:0")
+
+
+def test_bedrock_converse_family_nova():
+    _converse_family("amazon.nova-pro-v1:0")
+
+
+def test_bedrock_converse_family_titan():
+    _converse_family("amazon.titan-text-express-v1")
+
+
+def test_bedrock_converse_family_llama():
+    _converse_family("meta.llama3-1-70b-instruct-v1:0")
+
+
+def test_bedrock_converse_family_mistral():
+    _converse_family("mistral.mistral-large-2407-v1:0")
+
+
+def test_bedrock_converse_family_cohere():
+    _converse_family("cohere.command-r-plus-v1:0")
+
+
+def test_bedrock_converse_family_ai21():
+    _converse_family("ai21.jamba-1-5-large-v1:0")
+
+
+def _converse_family(model_id: str):
+    client = make_client("bedrock-runtime")
+    resp = client.converse(
+        modelId=model_id,
+        messages=[{"role": "user", "content": [{"text": "hi"}]}],
+    )
+    text = resp["output"]["message"]["content"][0]["text"]
+    assert isinstance(text, str) and len(text) > 0
+    assert resp["stopReason"] == "end_turn"
+    assert resp["usage"]["totalTokens"] > 0
+
+
+# ---------------------------------------------------------------------------
+# Converse: optional shape fields (toolConfig, guardrailConfig, requestMetadata)
+# Wire-shape tolerance: accept them without 400 even though we don't act on them
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_converse_accepts_tool_config():
+    client = make_client("bedrock-runtime")
+    resp = client.converse(
+        modelId="anthropic.claude-3-5-sonnet-20241022-v2:0",
+        messages=[{"role": "user", "content": [{"text": "x"}]}],
+        toolConfig={
+            "tools": [{
+                "toolSpec": {
+                    "name": "noop",
+                    "description": "no-op",
+                    "inputSchema": {"json": {"type": "object"}},
+                },
+            }],
+        },
+    )
+    assert resp["output"]["message"]["role"] == "assistant"
+
+
+def test_bedrock_converse_accepts_request_metadata():
+    client = make_client("bedrock-runtime")
+    resp = client.converse(
+        modelId="amazon.nova-lite-v1:0",
+        messages=[{"role": "user", "content": [{"text": "x"}]}],
+        requestMetadata={"trace": "abc", "experiment": "v2"},
+    )
+    assert resp["usage"]["totalTokens"] >= 1
+
+
+def test_bedrock_converse_inference_config_stop_sequences_accepted():
+    client = make_client("bedrock-runtime")
+    resp = client.converse(
+        modelId="meta.llama3-1-8b-instruct-v1:0",
+        messages=[{"role": "user", "content": [{"text": "x"}]}],
+        inferenceConfig={
+            "maxTokens": 32,
+            "temperature": 0.5,
+            "topP": 0.9,
+            "stopSequences": ["END"],
+        },
+    )
+    assert resp["output"]["message"]["role"] == "assistant"
+
+
+# ---------------------------------------------------------------------------
+# Converse validation paths (wire-level, bypassing botocore client validation)
+# ---------------------------------------------------------------------------
+
+
+def _raw_converse(body: dict) -> tuple:
+    """Return (status, body_dict) from a raw POST to /model/.../converse."""
+    import urllib.error
+    import urllib.request
+
+    from conftest import ENDPOINT
+
+    req = urllib.request.Request(
+        f"{ENDPOINT}/model/anthropic.claude-3-haiku-20240307-v1%3A0/converse",
+        data=json.dumps(body).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": ("AWS4-HMAC-SHA256 "
+                              "Credential=test/20260605/us-east-1/bedrock/aws4_request, "
+                              "SignedHeaders=host;x-amz-date, Signature=x"),
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read())
+
+
+def test_bedrock_converse_validation_messages_not_list():
+    status, body = _raw_converse({"messages": "not a list"})
+    assert status == 400
+    assert body["__type"] == "ValidationException"
+
+
+def test_bedrock_converse_validation_invalid_role():
+    status, body = _raw_converse({"messages": [
+        {"role": "system", "content": [{"text": "x"}]},
+    ]})
+    assert status == 400
+    assert body["__type"] == "ValidationException"
+
+
+def test_bedrock_converse_validation_empty_content():
+    status, body = _raw_converse({"messages": [
+        {"role": "user", "content": []},
+    ]})
+    assert status == 400
+    assert body["__type"] == "ValidationException"
+
+
+def test_bedrock_converse_validation_malformed_body():
+    import urllib.error
+    import urllib.request
+
+    from conftest import ENDPOINT
+
+    req = urllib.request.Request(
+        f"{ENDPOINT}/model/anthropic.claude-3-haiku-20240307-v1%3A0/converse",
+        data=b"{not json",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": ("AWS4-HMAC-SHA256 "
+                              "Credential=test/20260605/us-east-1/bedrock/aws4_request, "
+                              "SignedHeaders=host;x-amz-date, Signature=x"),
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            assert False, "should have raised"
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+        body = json.loads(e.read())
+        assert body["__type"] == "ValidationException"
+
+
+# ---------------------------------------------------------------------------
+# ConverseStream: text reconstruction + delta order
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_converse_stream_deltas_reconstruct_full_text():
+    client = make_client("bedrock-runtime")
+    resp = client.converse_stream(
+        modelId="anthropic.claude-3-5-sonnet-20241022-v2:0",
+        messages=[{"role": "user", "content": [{"text": "reconstruct me"}]}],
+    )
+    deltas = []
+    saw_stop = False
+    for evt in resp["stream"]:
+        if "contentBlockDelta" in evt:
+            deltas.append(evt["contentBlockDelta"]["delta"]["text"])
+        if "messageStop" in evt:
+            saw_stop = True
+            assert evt["messageStop"]["stopReason"] == "end_turn"
+    assert saw_stop
+    assert "".join(deltas)  # non-empty
+    # All deltas refer to contentBlockIndex 0 (single text block)
+    # (validated by virtue of reaching here without KeyError)
+
+
+def test_bedrock_converse_stream_via_inference_profile_id():
+    client = make_client("bedrock-runtime")
+    resp = client.converse_stream(
+        modelId="eu.anthropic.claude-3-haiku-20240307-v1:0",
+        messages=[{"role": "user", "content": [{"text": "x"}]}],
+    )
+    names = [list(e.keys())[0] for e in resp["stream"]]
+    assert names[0] == "messageStart"
+    assert names[-1] == "metadata"
+
+
+def test_bedrock_runtime_accepts_foundation_model_arn_model_id():
+    client = make_client("bedrock-runtime")
+    arn = "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-haiku-20240307-v1:0"
+    resp = client.converse(
+        modelId=arn,
+        messages=[{"role": "user", "content": [{"text": "hello via arn"}]}],
+    )
+    assert resp["output"]["message"]["role"] == "assistant"
+
+
+def test_bedrock_runtime_accepts_custom_model_arn_with_path_segments():
+    client = make_client("bedrock-runtime")
+    arn = "arn:aws:bedrock:us-east-1:000000000000:custom-model/my-model/123456789012"
+    resp = client.converse(
+        modelId=arn,
+        messages=[{"role": "user", "content": [{"text": "hello via custom arn"}]}],
+    )
+    assert resp["output"]["message"]["role"] == "assistant"
+
+
+def test_bedrock_runtime_accepts_additional_model_arn_shapes():
+    client = make_client("bedrock-runtime")
+    arns = [
+        "arn:aws:bedrock:us-east-1:000000000000:custom-model-deployment/my-deployment",
+        "arn:aws:bedrock:us-east-1:000000000000:prompt-router/my-router",
+        "arn:aws:sagemaker:us-east-1:000000000000:endpoint/my-bedrock-endpoint",
+    ]
+    for arn in arns:
+        resp = client.converse(
+            modelId=arn,
+            messages=[{"role": "user", "content": [{"text": "hello via arn"}]}],
+        )
+        assert resp["output"]["message"]["role"] == "assistant"
+
+
+def test_bedrock_runtime_model_id_arn_parser_does_not_tail_match_invalid_arns():
+    model_id = "arn:aws:lambda:us-east-1::foundation-model/anthropic.claude-3-haiku-20240307-v1:0"
+    encoded_model_id = urllib.parse.quote(model_id, safe="")
+    req = urllib.request.Request(
+        f"{ENDPOINT}/model/{encoded_model_id}/converse",
+        data=json.dumps({
+            "messages": [{"role": "user", "content": [{"text": "x"}]}],
+        }).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": ("AWS4-HMAC-SHA256 "
+                              "Credential=test/20260605/us-east-1/bedrock/aws4_request, "
+                              "SignedHeaders=host;x-amz-date, Signature=x"),
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req):
+            raise AssertionError("expected ValidationException")
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 400
+        body = json.loads(exc.read())
+        assert body["__type"] == "ValidationException"
+
+
+# ---------------------------------------------------------------------------
+# InvokeModel — family-specific request/response shape
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_invoke_model_anthropic_messages_shape():
+    client = make_client("bedrock-runtime")
+    resp = client.invoke_model(
+        modelId="anthropic.claude-3-5-sonnet-20241022-v2:0",
+        body=json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hello"}],
+        }),
+    )
+    body = json.loads(resp["body"].read())
+    assert body["type"] == "message"
+    assert body["role"] == "assistant"
+    assert body["model"] == "anthropic.claude-3-5-sonnet-20241022-v2:0"
+    assert body["content"][0]["type"] == "text"
+    assert "text" in body["content"][0]
+    assert body["stop_reason"] == "end_turn"
+    assert body["usage"]["input_tokens"] >= 1
+    assert body["usage"]["output_tokens"] >= 1
+
+
+def test_bedrock_invoke_model_titan_text_shape():
+    client = make_client("bedrock-runtime")
+    resp = client.invoke_model(
+        modelId="amazon.titan-text-express-v1",
+        body=json.dumps({
+            "inputText": "tell me a story",
+            "textGenerationConfig": {"maxTokenCount": 100, "temperature": 0.5},
+        }),
+    )
+    body = json.loads(resp["body"].read())
+    assert "inputTextTokenCount" in body
+    assert "results" in body
+    assert body["results"][0]["completionReason"] == "FINISH"
+    assert "outputText" in body["results"][0]
+
+
+def test_bedrock_invoke_model_llama_shape():
+    client = make_client("bedrock-runtime")
+    resp = client.invoke_model(
+        modelId="meta.llama3-1-70b-instruct-v1:0",
+        body=json.dumps({"prompt": "[INST] hi [/INST]", "max_gen_len": 100}),
+    )
+    body = json.loads(resp["body"].read())
+    assert "generation" in body
+    assert body["stop_reason"] == "stop"
+    assert "prompt_token_count" in body
+    assert "generation_token_count" in body
+
+
+def test_bedrock_invoke_model_mistral_shape():
+    client = make_client("bedrock-runtime")
+    resp = client.invoke_model(
+        modelId="mistral.mistral-large-2407-v1:0",
+        body=json.dumps({"prompt": "<s>[INST] hi [/INST]", "max_tokens": 100}),
+    )
+    body = json.loads(resp["body"].read())
+    assert "outputs" in body
+    assert body["outputs"][0]["stop_reason"] == "stop"
+
+
+def test_bedrock_invoke_model_cohere_shape():
+    client = make_client("bedrock-runtime")
+    resp = client.invoke_model(
+        modelId="cohere.command-r-plus-v1:0",
+        body=json.dumps({"prompt": "x", "max_tokens": 100}),
+    )
+    body = json.loads(resp["body"].read())
+    assert "generations" in body
+    assert body["generations"][0]["finish_reason"] == "COMPLETE"
+
+
+def test_bedrock_invoke_model_returns_token_count_headers():
+    import urllib.request
+
+    from conftest import ENDPOINT
+
+    req = urllib.request.Request(
+        f"{ENDPOINT}/model/anthropic.claude-3-haiku-20240307-v1%3A0/invoke",
+        data=json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 50,
+            "messages": [{"role": "user", "content": "x"}],
+        }).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": ("AWS4-HMAC-SHA256 "
+                              "Credential=test/20260605/us-east-1/bedrock/aws4_request, "
+                              "SignedHeaders=host;x-amz-date, Signature=x"),
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req) as resp:
+        assert resp.status == 200
+        assert int(resp.headers["x-amzn-bedrock-input-token-count"]) >= 1
+        assert int(resp.headers["x-amzn-bedrock-output-token-count"]) >= 1
+
+
+def test_bedrock_invoke_model_rejects_empty_body():
+    import botocore.exceptions
+
+    client = make_client("bedrock-runtime")
+    try:
+        client.invoke_model(
+            modelId="anthropic.claude-3-haiku-20240307-v1:0",
+            body=b"",
+        )
+    except botocore.exceptions.ParamValidationError:
+        return
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ValidationException"
+    else:
+        raise AssertionError("expected ValidationException or ParamValidationError")
+
+
+# ---------------------------------------------------------------------------
+# InvokeModelWithResponseStream — eventstream chunk envelope (bytes-encoded)
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_invoke_model_with_response_stream_anthropic_envelope():
+
+    client = make_client("bedrock-runtime")
+    resp = client.invoke_model_with_response_stream(
+        modelId="anthropic.claude-3-5-sonnet-20241022-v2:0",
+        body=json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "stream"}],
+        }),
+    )
+    inner_events = []
+    for evt in resp["body"]:
+        chunk = evt["chunk"]
+        # Each chunk["bytes"] is base64-encoded JSON of the family-specific
+        # event (per AWS InvokeModelWithResponseStream wire format)
+        inner = json.loads(chunk["bytes"])
+        inner_events.append(inner)
+    types = [e["type"] for e in inner_events]
+    assert types[0] == "message_start"
+    assert "content_block_start" in types
+    assert "content_block_delta" in types
+    assert "content_block_stop" in types
+    assert "message_delta" in types
+    assert types[-1] == "message_stop"
+
+
+def test_bedrock_invoke_model_with_response_stream_titan_envelope():
+    client = make_client("bedrock-runtime")
+    resp = client.invoke_model_with_response_stream(
+        modelId="amazon.titan-text-express-v1",
+        body=json.dumps({"inputText": "x"}),
+    )
+    inners = [json.loads(evt["chunk"]["bytes"]) for evt in resp["body"]]
+    assert all("outputText" in i for i in inners)
+    assert inners[-1]["completionReason"] == "FINISH"
+
+
+# ---------------------------------------------------------------------------
+# ApplyGuardrail
+# ---------------------------------------------------------------------------
+
+
+def _make_guardrail(name, **policies):
+    return _bedrock().create_guardrail(
+        name=name,
+        blockedInputMessaging="Input blocked by guardrail.",
+        blockedOutputsMessaging="Output blocked by guardrail.",
+        **policies,
+    )["guardrailId"]
+
+
+def test_bedrock_apply_guardrail_returns_required_fields():
+    gid = _make_guardrail("gr-apply-shape")
+    client = make_client("bedrock-runtime")
+    resp = client.apply_guardrail(
+        guardrailIdentifier=gid,
+        guardrailVersion="DRAFT",
+        source="INPUT",
+        content=[{"text": {"text": "hello world"}}],
+    )
+    # Required by botocore ApplyGuardrailResponse
+    for k in ("usage", "action", "outputs", "assessments"):
+        assert k in resp
+    assert resp["action"] == "NONE"
+    assert resp["outputs"][0]["text"] == "hello world"
+    assert isinstance(resp["usage"]["topicPolicyUnits"], int)
+    assert resp["guardrailCoverage"]["textCharacters"]["total"] == len("hello world")
+
+
+def test_bedrock_apply_guardrail_unknown_id_is_not_found():
+    client = make_client("bedrock-runtime")
+    try:
+        client.apply_guardrail(
+            guardrailIdentifier="gr-does-not-exist",
+            guardrailVersion="DRAFT",
+            source="INPUT",
+            content=[{"text": {"text": "hello"}}],
+        )
+        raise AssertionError("expected ResourceNotFoundException")
+    except botocore.exceptions.ClientError as e:
+        assert e.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_bedrock_apply_guardrail_blocks_configured_word():
+    gid = _make_guardrail(
+        "gr-word-block",
+        wordPolicyConfig={"wordsConfig": [{"text": "pineapple"}]},
+    )
+    client = make_client("bedrock-runtime")
+    resp = client.apply_guardrail(
+        guardrailIdentifier=gid, guardrailVersion="DRAFT", source="INPUT",
+        content=[{"text": {"text": "I love Pineapple on pizza"}}],
+    )
+    assert resp["action"] == "GUARDRAIL_INTERVENED"
+    assert resp["outputs"] == [{"text": "Input blocked by guardrail."}]
+    words = resp["assessments"][0]["wordPolicy"]["customWords"]
+    assert words[0]["match"] == "pineapple"
+    assert words[0]["action"] == "BLOCKED"
+    assert resp["usage"]["wordPolicyUnits"] >= 1
+    # A clean input passes the same guardrail
+    clean = client.apply_guardrail(
+        guardrailIdentifier=gid, guardrailVersion="DRAFT", source="INPUT",
+        content=[{"text": {"text": "I love mango on pizza"}}],
+    )
+    assert clean["action"] == "NONE"
+    assert clean["outputs"][0]["text"] == "I love mango on pizza"
+
+
+def test_bedrock_apply_guardrail_anonymizes_pii_and_regex():
+    gid = _make_guardrail(
+        "gr-pii-anon",
+        sensitiveInformationPolicyConfig={
+            "piiEntitiesConfig": [{"type": "EMAIL", "action": "ANONYMIZE"}],
+            "regexesConfig": [{"name": "ticket", "pattern": r"TICKET-\d+",
+                               "action": "ANONYMIZE"}],
+        },
+    )
+    client = make_client("bedrock-runtime")
+    resp = client.apply_guardrail(
+        guardrailIdentifier=gid, guardrailVersion="DRAFT", source="OUTPUT",
+        content=[{"text": {"text": "Contact bob@example.com about TICKET-42"}}],
+    )
+    assert resp["action"] == "GUARDRAIL_INTERVENED"
+    assert resp["outputs"][0]["text"] == "Contact {EMAIL} about {ticket}"
+    sip = resp["assessments"][0]["sensitiveInformationPolicy"]
+    assert sip["piiEntities"][0]["type"] == "EMAIL"
+    assert sip["piiEntities"][0]["action"] == "ANONYMIZED"
+    assert sip["regexes"][0]["name"] == "ticket"
+    assert sip["regexes"][0]["action"] == "ANONYMIZED"
+
+
+def test_bedrock_apply_guardrail_blocking_pii_blocks():
+    gid = _make_guardrail(
+        "gr-pii-block",
+        sensitiveInformationPolicyConfig={
+            "piiEntitiesConfig": [{"type": "US_SOCIAL_SECURITY_NUMBER",
+                                   "action": "BLOCK"}],
+        },
+    )
+    client = make_client("bedrock-runtime")
+    resp = client.apply_guardrail(
+        guardrailIdentifier=gid, guardrailVersion="DRAFT", source="INPUT",
+        content=[{"text": {"text": "my ssn is 123-45-6789"}}],
+    )
+    assert resp["action"] == "GUARDRAIL_INTERVENED"
+    assert resp["outputs"] == [{"text": "Input blocked by guardrail."}]
+
+
+def test_bedrock_converse_honours_guardrail_config():
+    gid = _make_guardrail(
+        "gr-converse",
+        wordPolicyConfig={"wordsConfig": [{"text": "forbidden"}]},
+    )
+    client = make_client("bedrock-runtime")
+    blocked = client.converse(
+        modelId="anthropic.claude-3-5-sonnet-20241022-v2:0",
+        messages=[{"role": "user", "content": [{"text": "say the forbidden word"}]}],
+        guardrailConfig={"guardrailIdentifier": gid, "guardrailVersion": "DRAFT",
+                         "trace": "enabled"},
+    )
+    assert blocked["stopReason"] == "guardrail_intervened"
+    assert blocked["output"]["message"]["content"][0]["text"] == \
+        "Input blocked by guardrail."
+    assessment = blocked["trace"]["guardrail"]["inputAssessment"][gid]
+    assert assessment["wordPolicy"]["customWords"][0]["match"] == "forbidden"
+
+    clean = client.converse(
+        modelId="anthropic.claude-3-5-sonnet-20241022-v2:0",
+        messages=[{"role": "user", "content": [{"text": "hello there"}]}],
+        guardrailConfig={"guardrailIdentifier": gid, "guardrailVersion": "DRAFT"},
+    )
+    assert clean["stopReason"] == "end_turn"
+
+
+def test_bedrock_converse_unknown_guardrail_is_not_found():
+    client = make_client("bedrock-runtime")
+    try:
+        client.converse(
+            modelId="anthropic.claude-3-5-sonnet-20241022-v2:0",
+            messages=[{"role": "user", "content": [{"text": "hello"}]}],
+            guardrailConfig={"guardrailIdentifier": "gr-nope",
+                             "guardrailVersion": "DRAFT"},
+        )
+        raise AssertionError("expected ResourceNotFoundException")
+    except botocore.exceptions.ClientError as e:
+        assert e.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+def test_bedrock_apply_guardrail_rejects_invalid_source():
+    import botocore.exceptions
+
+    client = make_client("bedrock-runtime")
+    try:
+        client.apply_guardrail(
+            guardrailIdentifier="gr",
+            guardrailVersion="DRAFT",
+            source="MIDDLE",
+            content=[{"text": {"text": "x"}}],
+        )
+    except botocore.exceptions.ParamValidationError:
+        return
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ValidationException"
+    else:
+        raise AssertionError("expected ValidationException")
+
+
+# ---------------------------------------------------------------------------
+# Async invoke (state-only — mocks complete instantly)
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_start_async_invoke_then_get():
+    client = make_client("bedrock-runtime")
+    start = client.start_async_invoke(
+        modelId="amazon.nova-pro-v1:0",
+        modelInput={"messages": [{"role": "user", "content": [{"text": "x"}]}]},
+        outputDataConfig={"s3OutputDataConfig": {"s3Uri": "s3://bucket/prefix/"}},
+    )
+    arn = start["invocationArn"]
+    assert arn.startswith("arn:aws:bedrock:us-east-1:")
+    get_resp = client.get_async_invoke(invocationArn=arn)
+    assert get_resp["invocationArn"] == arn
+    assert get_resp["status"] == "Completed"
+    assert "modelArn" in get_resp
+    assert "submitTime" in get_resp
+
+
+def test_bedrock_start_async_invoke_accepts_foundation_model_arn_model_id():
+    client = make_client("bedrock-runtime")
+    arn = "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-pro-v1:0"
+    start = client.start_async_invoke(
+        modelId=arn,
+        modelInput={"messages": [{"role": "user", "content": [{"text": "x"}]}]},
+        outputDataConfig={"s3OutputDataConfig": {"s3Uri": "s3://bucket/prefix/"}},
+    )
+    get_resp = client.get_async_invoke(invocationArn=start["invocationArn"])
+    assert get_resp["modelArn"] == arn
+
+
+def test_bedrock_start_async_invoke_rejects_invalid_model_id_arn():
+    import botocore.exceptions
+
+    client = make_client("bedrock-runtime")
+    try:
+        client.start_async_invoke(
+            modelId="arn:aws:sqs:us-east-1::foundation-model/amazon.nova-pro-v1:0",
+            modelInput={"messages": [{"role": "user", "content": [{"text": "x"}]}]},
+            outputDataConfig={"s3OutputDataConfig": {"s3Uri": "s3://bucket/prefix/"}},
+        )
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ValidationException"
+    else:
+        raise AssertionError("expected ValidationException")
+
+
+def test_bedrock_list_async_invokes_includes_started_ones():
+    client = make_client("bedrock-runtime")
+    client.start_async_invoke(
+        modelId="amazon.nova-lite-v1:0",
+        modelInput={"messages": [{"role": "user", "content": [{"text": "x"}]}]},
+        outputDataConfig={"s3OutputDataConfig": {"s3Uri": "s3://b/p/"}},
+    )
+    resp = client.list_async_invokes()
+    assert "asyncInvokeSummaries" in resp
+    assert len(resp["asyncInvokeSummaries"]) >= 1
+
+
+def test_bedrock_get_async_invoke_unknown_returns_404():
+    import botocore.exceptions
+
+    client = make_client("bedrock-runtime")
+    arn = "arn:aws:bedrock:us-east-1:000000000000:async-invoke/missing"
+    try:
+        client.get_async_invoke(invocationArn=arn)
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ResourceNotFoundException"
+    else:
+        raise AssertionError("expected ResourceNotFoundException")
+
+
+# ===========================================================================
+# OpenAI-compatible Chat Completions (bedrock-runtime, /v1/chat/completions)
+# OpenAI-shape (not AWS-shape), so driven with raw HTTP mirroring openai-python.
+# Validates wire-shape parity: required response fields, SSE stream framing,
+# error envelope, role/content validation.
+# ===========================================================================
+
+
+def _post_chat(body: dict) -> tuple:
+    req = urllib.request.Request(
+        f"{ENDPOINT}/v1/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status, dict(resp.headers), resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers), e.read()
+
+
+def _post_chat_json(body: dict) -> tuple:
+    status, headers, raw = _post_chat(body)
+    return status, headers, json.loads(raw)
+
+
+def _post_chat_stream_lines(body: dict) -> list:
+    status, headers, raw = _post_chat({**body, "stream": True})
+    assert status == 200
+    assert headers.get("Content-Type") == "text/event-stream"
+    lines = []
+    for chunk in raw.decode().split("\n\n"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        assert chunk.startswith("data: "), f"non-SSE chunk: {chunk!r}"
+        payload = chunk[len("data: "):]
+        if payload == "[DONE]":
+            lines.append("[DONE]")
+        else:
+            lines.append(json.loads(payload))
+    return lines
+
+
+def test_bedrock_openai_chat_completion_required_response_fields():
+    status, _, body = _post_chat_json({
+        "model": "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        "messages": [{"role": "user", "content": "hello"}],
+    })
+    assert status == 200
+    for k in ("id", "object", "created", "model", "choices", "usage"):
+        assert k in body, f"missing {k}"
+    assert body["object"] == "chat.completion"
+    assert body["id"].startswith("chatcmpl-")
+    assert isinstance(body["created"], int)
+    assert body["model"] == "anthropic.claude-3-5-sonnet-20241022-v2:0"
+    choice = body["choices"][0]
+    assert choice["index"] == 0
+    assert choice["message"]["role"] == "assistant"
+    assert isinstance(choice["message"]["content"], str)
+    assert choice["finish_reason"] in ("stop", "length", "tool_calls",
+                                        "content_filter", "function_call")
+    for k in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        assert isinstance(body["usage"][k], int)
+    assert body["usage"]["total_tokens"] == (
+        body["usage"]["prompt_tokens"] + body["usage"]["completion_tokens"]
+    )
+
+
+def test_bedrock_openai_chat_completion_accepts_list_content_parts():
+    """OpenAI accepts content as either str or [{'type':'text','text':'...'}]."""
+    status, _, body = _post_chat_json({
+        "model": "amazon.nova-pro-v1:0",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "part one"},
+                {"type": "text", "text": "part two"},
+            ],
+        }],
+    })
+    assert status == 200
+    assert body["choices"][0]["message"]["role"] == "assistant"
+
+
+def test_bedrock_openai_chat_completion_multi_turn():
+    status, _, body = _post_chat_json({
+        "model": "meta.llama3-1-70b-instruct-v1:0",
+        "messages": [
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "alpha?"},
+            {"role": "assistant", "content": "beta"},
+            {"role": "user", "content": "gamma?"},
+        ],
+    })
+    assert status == 200
+    assert body["usage"]["prompt_tokens"] >= 1
+
+
+def test_bedrock_openai_distinct_prompts_produce_distinct_replies():
+    _, _, a = _post_chat_json({
+        "model": "anthropic.claude-3-haiku-20240307-v1:0",
+        "messages": [{"role": "user", "content": "alpha"}],
+    })
+    _, _, b = _post_chat_json({
+        "model": "anthropic.claude-3-haiku-20240307-v1:0",
+        "messages": [{"role": "user", "content": "beta"}],
+    })
+    assert a["choices"][0]["message"]["content"] != b["choices"][0]["message"]["content"]
+
+
+def test_bedrock_openai_chat_completion_stream_emits_role_then_content_then_done():
+    events = _post_chat_stream_lines({
+        "model": "amazon.nova-lite-v1:0",
+        "messages": [{"role": "user", "content": "stream"}],
+    })
+    assert events[0]["choices"][0]["delta"]["role"] == "assistant"
+    assert events[-1] == "[DONE]"
+    assert events[-2]["choices"][0]["finish_reason"] == "stop"
+    content = ""
+    for e in events[1:-2]:
+        if "content" in e["choices"][0]["delta"]:
+            content += e["choices"][0]["delta"]["content"]
+    assert content
+
+
+def test_bedrock_openai_chat_completion_stream_all_chunks_are_completion_chunk_object():
+    events = _post_chat_stream_lines({
+        "model": "mistral.mistral-large-2407-v1:0",
+        "messages": [{"role": "user", "content": "x"}],
+    })
+    for e in events[:-1]:
+        assert e["object"] == "chat.completion.chunk"
+        assert e["id"].startswith("chatcmpl-")
+
+
+def test_bedrock_openai_chat_completion_stream_finish_reason_only_on_last_data_chunk():
+    events = _post_chat_stream_lines({
+        "model": "cohere.command-r-plus-v1:0",
+        "messages": [{"role": "user", "content": "x"}],
+    })
+    with_finish = [
+        i for i, e in enumerate(events)
+        if isinstance(e, dict) and e["choices"][0]["finish_reason"] is not None
+    ]
+    assert with_finish == [len(events) - 2]
+
+
+def _expect_openai_error(body: dict, expected_status: int = 400):
+    status, _, parsed = _post_chat_json(body)
+    assert status == expected_status, parsed
+    assert "error" in parsed
+    assert "message" in parsed["error"]
+    assert "type" in parsed["error"]
+
+
+def test_bedrock_openai_chat_completion_missing_model_field():
+    _expect_openai_error({"messages": [{"role": "user", "content": "x"}]})
+
+
+def test_bedrock_openai_chat_completion_empty_messages():
+    _expect_openai_error({"model": "x", "messages": []})
+
+
+def test_bedrock_openai_chat_completion_invalid_role():
+    _expect_openai_error({
+        "model": "x",
+        "messages": [{"role": "bogus", "content": "y"}],
+    })
+
+
+def test_bedrock_openai_chat_completion_message_missing_content():
+    _expect_openai_error({
+        "model": "x",
+        "messages": [{"role": "user"}],
+    })
+
+
+def test_bedrock_openai_chat_completion_malformed_json_body():
+    req = urllib.request.Request(
+        f"{ENDPOINT}/v1/chat/completions",
+        data=b"{nope",
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req):
+            assert False, "expected error"
+    except urllib.error.HTTPError as e:
+        assert e.code == 400
+        body = json.loads(e.read())
+        assert body["error"]["type"] == "invalid_request_error"
+
+
+def test_bedrock_openai_chat_completion_method_not_allowed_for_get():
+    req = urllib.request.Request(
+        f"{ENDPOINT}/v1/chat/completions",
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req):
+            assert False, "expected error"
+    except urllib.error.HTTPError as e:
+        assert e.code == 405
+
+
+def test_bedrock_openai_chat_completion_system_fingerprint_present():
+    _, _, body = _post_chat_json({
+        "model": "anthropic.claude-3-haiku-20240307-v1:0",
+        "messages": [{"role": "user", "content": "x"}],
+    })
+    assert body["system_fingerprint"] == "ministack"
+
+
+def test_bedrock_openai_chat_completion_accepts_system_developer_tool_roles():
+    """OpenAI added 'developer' and accepts 'tool' role messages."""
+    for role in ("system", "developer", "tool"):
+        status, _, body = _post_chat_json({
+            "model": "x",
+            "messages": [
+                {"role": role, "content": f"x-{role}"},
+                {"role": "user", "content": "go"},
+            ],
+        })
+        assert status == 200, f"role {role} rejected: {body}"
+
+
+# ---------------------------------------------------------------------------
+# Bedrock control-plane (guardrails, custom/imported models, provisioned
+# throughput, jobs, marketplace). Folded from test_bedrock_control_plane.py.
+# ---------------------------------------------------------------------------
+
+
+def _bedrock():
+    return make_client("bedrock")
+
+
+# ---------------------------------------------------------------------------
+# Guardrails — full CRUD + version
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_create_guardrail_returns_id_and_arn():
+    resp = _bedrock().create_guardrail(
+        name="gr-test-1",
+        description="test",
+        blockedInputMessaging="blocked",
+        blockedOutputsMessaging="blocked",
+    )
+    assert resp["guardrailId"].startswith("gr-")
+    assert ":guardrail/" in resp["guardrailArn"]
+    assert resp["version"] == "DRAFT"
+
+
+def test_bedrock_get_guardrail_round_trips():
+    create = _bedrock().create_guardrail(
+        name="gr-get",
+        blockedInputMessaging="x", blockedOutputsMessaging="y",
+    )
+    resp = _bedrock().get_guardrail(guardrailIdentifier=create["guardrailId"])
+    assert resp["name"] == "gr-get"
+    assert resp["status"] == "READY"
+    assert resp["version"] == "DRAFT"
+
+
+def test_bedrock_list_guardrails_includes_created():
+    _bedrock().create_guardrail(name="gr-list-1",
+                                  blockedInputMessaging="a", blockedOutputsMessaging="b")
+    _bedrock().create_guardrail(name="gr-list-2",
+                                  blockedInputMessaging="a", blockedOutputsMessaging="b")
+    resp = _bedrock().list_guardrails()
+    names = {g["name"] for g in resp["guardrails"]}
+    assert {"gr-list-1", "gr-list-2"}.issubset(names)
+
+
+def test_bedrock_update_guardrail():
+    create = _bedrock().create_guardrail(name="gr-upd",
+                                            blockedInputMessaging="x",
+                                            blockedOutputsMessaging="y")
+    _bedrock().update_guardrail(
+        guardrailIdentifier=create["guardrailId"],
+        name="gr-upd-renamed",
+        blockedInputMessaging="x2",
+        blockedOutputsMessaging="y2",
+    )
+    g = _bedrock().get_guardrail(guardrailIdentifier=create["guardrailId"])
+    assert g["name"] == "gr-upd-renamed"
+
+
+def test_bedrock_create_guardrail_version_then_get():
+    create = _bedrock().create_guardrail(name="gr-ver",
+                                            blockedInputMessaging="x",
+                                            blockedOutputsMessaging="y")
+    ver = _bedrock().create_guardrail_version(
+        guardrailIdentifier=create["guardrailId"], description="v1",
+    )
+    assert ver["version"] == "1"
+    fetched = _bedrock().get_guardrail(
+        guardrailIdentifier=create["guardrailId"], guardrailVersion="1",
+    )
+    assert fetched["version"] == "1"
+
+
+def test_bedrock_delete_guardrail():
+    create = _bedrock().create_guardrail(name="gr-del",
+                                            blockedInputMessaging="x",
+                                            blockedOutputsMessaging="y")
+    _bedrock().delete_guardrail(guardrailIdentifier=create["guardrailId"])
+    try:
+        _bedrock().get_guardrail(guardrailIdentifier=create["guardrailId"])
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ResourceNotFoundException"
+    else:
+        raise AssertionError("expected NotFound after delete")
+
+
+def test_bedrock_create_guardrail_duplicate_name_conflict():
+    _bedrock().create_guardrail(name="gr-dup",
+                                  blockedInputMessaging="x", blockedOutputsMessaging="y")
+    try:
+        _bedrock().create_guardrail(name="gr-dup",
+                                      blockedInputMessaging="x", blockedOutputsMessaging="y")
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ConflictException"
+        assert exc.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    else:
+        raise AssertionError("expected ConflictException")
+
+
+# ---------------------------------------------------------------------------
+# Custom models
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_create_custom_model_returns_arn():
+    resp = _bedrock().create_custom_model(
+        modelName="cm-test-1",
+        modelSourceConfig={
+            "s3DataSource": {"s3Uri": "s3://x/y/"},
+        },
+    )
+    assert ":custom-model/cm-test-1" in resp["modelArn"]
+
+
+def test_bedrock_get_custom_model_round_trip():
+    _bedrock().create_custom_model(
+        modelName="cm-get",
+        modelSourceConfig={"s3DataSource": {"s3Uri": "s3://x/y/"}},
+    )
+    resp = _bedrock().get_custom_model(modelIdentifier="cm-get")
+    assert resp["modelName"] == "cm-get"
+
+
+def test_bedrock_list_custom_models():
+    _bedrock().create_custom_model(modelName="cm-l1",
+                                      modelSourceConfig={"s3DataSource": {"s3Uri": "s3://x/y/"}})
+    _bedrock().create_custom_model(modelName="cm-l2",
+                                      modelSourceConfig={"s3DataSource": {"s3Uri": "s3://x/y/"}})
+    resp = _bedrock().list_custom_models()
+    names = {m["modelName"] for m in resp["modelSummaries"]}
+    assert {"cm-l1", "cm-l2"}.issubset(names)
+
+
+def test_bedrock_delete_custom_model():
+    _bedrock().create_custom_model(modelName="cm-del",
+                                      modelSourceConfig={"s3DataSource": {"s3Uri": "s3://x/y/"}})
+    _bedrock().delete_custom_model(modelIdentifier="cm-del")
+    try:
+        _bedrock().get_custom_model(modelIdentifier="cm-del")
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+# ---------------------------------------------------------------------------
+# Provisioned throughput
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_create_provisioned_throughput():
+    resp = _bedrock().create_provisioned_model_throughput(
+        provisionedModelName="pt-test",
+        modelId="anthropic.claude-3-haiku-20240307-v1:0",
+        modelUnits=1,
+    )
+    assert ":provisioned-model/" in resp["provisionedModelArn"]
+
+
+def test_bedrock_get_list_update_delete_provisioned():
+    create = _bedrock().create_provisioned_model_throughput(
+        provisionedModelName="pt-rt",
+        modelId="amazon.nova-pro-v1:0", modelUnits=2,
+    )
+    pid = create["provisionedModelArn"].rsplit("/", 1)[-1]
+    g = _bedrock().get_provisioned_model_throughput(provisionedModelId=pid)
+    assert g["provisionedModelName"] == "pt-rt"
+    assert g["modelUnits"] == 2
+    lst = _bedrock().list_provisioned_model_throughputs()
+    assert any(p["provisionedModelArn"] == create["provisionedModelArn"]
+                for p in lst["provisionedModelSummaries"])
+    _bedrock().update_provisioned_model_throughput(
+        provisionedModelId=pid, desiredProvisionedModelName="pt-renamed",
+    )
+    _bedrock().delete_provisioned_model_throughput(provisionedModelId=pid)
+    try:
+        _bedrock().get_provisioned_model_throughput(provisionedModelId=pid)
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+# ---------------------------------------------------------------------------
+# Model customization jobs
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_create_get_list_stop_customization_job():
+    create = _bedrock().create_model_customization_job(
+        jobName="cj-test",
+        customModelName="cm-from-job",
+        roleArn="arn:aws:iam::000000000000:role/r",
+        baseModelIdentifier="anthropic.claude-3-haiku-20240307-v1:0",
+        trainingDataConfig={"s3Uri": "s3://x/train/"},
+        outputDataConfig={"s3Uri": "s3://x/out/"},
+        hyperParameters={"epochCount": "1"},
+    )
+    assert ":model-customization-job/" in create["jobArn"]
+    g = _bedrock().get_model_customization_job(jobIdentifier=create["jobArn"])
+    assert g["jobName"] == "cj-test"
+    lst = _bedrock().list_model_customization_jobs()
+    assert any(j["jobArn"] == create["jobArn"] for j in lst["modelCustomizationJobSummaries"])
+    _bedrock().stop_model_customization_job(jobIdentifier=create["jobArn"])
+    g2 = _bedrock().get_model_customization_job(jobIdentifier=create["jobArn"])
+    assert g2["status"] == "Stopped"
+
+
+# ---------------------------------------------------------------------------
+# Model import jobs + imported models
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_create_model_import_job_creates_imported_model():
+    create = _bedrock().create_model_import_job(
+        jobName="ij-test",
+        importedModelName="imported-1",
+        roleArn="arn:aws:iam::000000000000:role/r",
+        modelDataSource={"s3DataSource": {"s3Uri": "s3://x/y/"}},
+    )
+    assert ":model-import-job/" in create["jobArn"]
+    g = _bedrock().get_model_import_job(jobIdentifier=create["jobArn"])
+    assert g["importedModelName"] == "imported-1"
+    # Imported model side-effect
+    im = _bedrock().get_imported_model(modelIdentifier="imported-1")
+    assert im["modelName"] == "imported-1"
+
+
+def test_bedrock_list_imported_models():
+    _bedrock().create_model_import_job(
+        jobName="ij-l1", importedModelName="im-l-1",
+        roleArn="arn:aws:iam::000000000000:role/r",
+        modelDataSource={"s3DataSource": {"s3Uri": "s3://x/"}},
+    )
+    resp = _bedrock().list_imported_models()
+    names = {m["modelName"] for m in resp["modelSummaries"]}
+    assert "im-l-1" in names
+
+
+def test_bedrock_delete_imported_model():
+    _bedrock().create_model_import_job(
+        jobName="ij-d", importedModelName="im-del",
+        roleArn="arn:aws:iam::000000000000:role/r",
+        modelDataSource={"s3DataSource": {"s3Uri": "s3://x/"}},
+    )
+    _bedrock().delete_imported_model(modelIdentifier="im-del")
+    try:
+        _bedrock().get_imported_model(modelIdentifier="im-del")
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+# ---------------------------------------------------------------------------
+# Model copy jobs
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_create_get_list_copy_job():
+    src = "arn:aws:bedrock:us-east-1:000000000000:custom-model/src"
+    create = _bedrock().create_model_copy_job(
+        sourceModelArn=src,
+        targetModelName="copied-1",
+    )
+    assert ":model-copy-job/" in create["jobArn"]
+    g = _bedrock().get_model_copy_job(jobArn=create["jobArn"])
+    assert g["targetModelArn"].endswith(":custom-model/copied-1")
+    lst = _bedrock().list_model_copy_jobs()
+    assert any(j["jobArn"] == create["jobArn"] for j in lst["modelCopyJobSummaries"])
+
+
+# ---------------------------------------------------------------------------
+# Model invocation jobs (batch inference)
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_create_get_list_stop_invocation_job():
+    create = _bedrock().create_model_invocation_job(
+        jobName="bj-test",
+        modelId="anthropic.claude-3-haiku-20240307-v1:0",
+        roleArn="arn:aws:iam::000000000000:role/r",
+        inputDataConfig={"s3InputDataConfig": {"s3Uri": "s3://x/in/"}},
+        outputDataConfig={"s3OutputDataConfig": {"s3Uri": "s3://x/out/"}},
+    )
+    assert ":model-invocation-job/" in create["jobArn"]
+    g = _bedrock().get_model_invocation_job(jobIdentifier=create["jobArn"])
+    assert g["jobName"] == "bj-test"
+    lst = _bedrock().list_model_invocation_jobs()
+    assert any(j["jobArn"] == create["jobArn"] for j in lst["invocationJobSummaries"])
+    _bedrock().stop_model_invocation_job(jobIdentifier=create["jobArn"])
+
+
+# ---------------------------------------------------------------------------
+# Evaluation jobs
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_create_get_list_stop_evaluation_job():
+    create = _bedrock().create_evaluation_job(
+        jobName="ej-test",
+        roleArn="arn:aws:iam::000000000000:role/r",
+        evaluationConfig={
+            "automated": {
+                "datasetMetricConfigs": [{
+                    "taskType": "Generation",
+                    "dataset": {"name": "Builtin.BoolQ"},
+                    "metricNames": ["Builtin.Accuracy"],
+                }],
+            },
+        },
+        inferenceConfig={
+            "models": [{"bedrockModel": {"modelIdentifier": "anthropic.claude-3-haiku-20240307-v1:0",
+                                            "inferenceParams": "{}"}}],
+        },
+        outputDataConfig={"s3Uri": "s3://x/eval-out/"},
+    )
+    assert ":evaluation-job/" in create["jobArn"]
+    g = _bedrock().get_evaluation_job(jobIdentifier=create["jobArn"])
+    assert g["jobName"] == "ej-test"
+    lst = _bedrock().list_evaluation_jobs()
+    assert any(j["jobArn"] == create["jobArn"] for j in lst["jobSummaries"])
+    _bedrock().stop_evaluation_job(jobIdentifier=create["jobArn"])
+
+
+def test_bedrock_batch_delete_evaluation_job():
+    create = _bedrock().create_evaluation_job(
+        jobName="ej-bd",
+        roleArn="arn:aws:iam::000000000000:role/r",
+        evaluationConfig={"automated": {"datasetMetricConfigs": [{
+            "taskType": "Generation", "dataset": {"name": "x"}, "metricNames": ["m"]
+        }]}},
+        inferenceConfig={"models": [{"bedrockModel": {"modelIdentifier": "x",
+                                                         "inferenceParams": "{}"}}]},
+        outputDataConfig={"s3Uri": "s3://x/"},
+    )
+    resp = _bedrock().batch_delete_evaluation_job(jobIdentifiers=[create["jobArn"]])
+    assert resp["evaluationJobs"][0]["jobIdentifier"] == create["jobArn"]
+    assert resp["evaluationJobs"][0]["jobStatus"] == "Deleting"
+
+
+# ---------------------------------------------------------------------------
+# Marketplace endpoints
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_marketplace_endpoint_lifecycle():
+    create = _bedrock().create_marketplace_model_endpoint(
+        endpointName="mp-1",
+        modelSourceIdentifier="arn:aws:sagemaker:us-east-1:000000000000:model-package/x",
+        endpointConfig={
+            "sageMaker": {
+                "initialInstanceCount": 1,
+                "instanceType": "ml.m5.large",
+                "executionRole": "arn:aws:iam::000000000000:role/r",
+            },
+        },
+    )
+    arn = create["marketplaceModelEndpoint"]["endpointArn"]
+    g = _bedrock().get_marketplace_model_endpoint(endpointArn=arn)
+    assert g["marketplaceModelEndpoint"]["endpointArn"] == arn
+    assert g["marketplaceModelEndpoint"]["endpointStatus"] == "InService"
+    _bedrock().deregister_marketplace_model_endpoint(endpointArn=arn)
+    _bedrock().delete_marketplace_model_endpoint(endpointArn=arn)
+
+
+# ---------------------------------------------------------------------------
+# Prompt routers
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_prompt_router_lifecycle():
+    create = _bedrock().create_prompt_router(
+        promptRouterName="pr-test",
+        models=[{"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-haiku-20240307-v1:0"}],
+        fallbackModel={"modelArn": "arn:aws:bedrock:us-east-1::foundation-model/amazon.nova-pro-v1:0"},
+        routingCriteria={"responseQualityDifference": 0.1},
+    )
+    arn = create["promptRouterArn"]
+    g = _bedrock().get_prompt_router(promptRouterArn=arn)
+    assert g["promptRouterName"] == "pr-test"
+    lst = _bedrock().list_prompt_routers()
+    assert any(p["promptRouterArn"] == arn for p in lst["promptRouterSummaries"])
+    _bedrock().delete_prompt_router(promptRouterArn=arn)
+
+
+# ---------------------------------------------------------------------------
+# Model invocation logging config
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_put_get_delete_logging_config():
+    _bedrock().put_model_invocation_logging_configuration(
+        loggingConfig={
+            "cloudWatchConfig": {
+                "logGroupName": "/aws/bedrock/invocations",
+                "roleArn": "arn:aws:iam::000000000000:role/r",
+            },
+            "textDataDeliveryEnabled": True,
+        },
+    )
+    g = _bedrock().get_model_invocation_logging_configuration()
+    assert g["loggingConfig"]["textDataDeliveryEnabled"] is True
+    _bedrock().delete_model_invocation_logging_configuration()
+    g2 = _bedrock().get_model_invocation_logging_configuration()
+    assert g2.get("loggingConfig") in (None, {})
+
+
+# ---------------------------------------------------------------------------
+# Application inference profiles
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_application_inference_profile_lifecycle():
+    create = _bedrock().create_inference_profile(
+        inferenceProfileName="aip-test",
+        modelSource={
+            "copyFrom": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-haiku-20240307-v1:0"
+        },
+    )
+    arn = create["inferenceProfileArn"]
+    g = _bedrock().get_inference_profile(inferenceProfileIdentifier=arn.rsplit("/", 1)[-1])
+    assert g["inferenceProfileName"] == "aip-test"
+    _bedrock().delete_inference_profile(inferenceProfileIdentifier=arn.rsplit("/", 1)[-1])
+
+
+# ---------------------------------------------------------------------------
+# Use case for model access
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_put_get_use_case_for_model_access():
+    _bedrock().put_use_case_for_model_access(formData=b"hello world form data")
+    resp = _bedrock().get_use_case_for_model_access()
+    assert b"hello world" in resp["formData"]
+
+
+# ---------------------------------------------------------------------------
+# Foundation model agreement
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_create_foundation_model_agreement():
+    resp = _bedrock().create_foundation_model_agreement(
+        offerToken="offer-tok-1",
+        modelId="anthropic.claude-3-haiku-20240307-v1:0",
+    )
+    assert resp["modelId"] == "anthropic.claude-3-haiku-20240307-v1:0"
+
+
+def test_bedrock_get_foundation_model_availability():
+    resp = _bedrock().get_foundation_model_availability(
+        modelId="anthropic.claude-3-haiku-20240307-v1:0",
+    )
+    assert resp["modelId"] == "anthropic.claude-3-haiku-20240307-v1:0"
+    assert resp["entitlementAvailability"] == "AVAILABLE"
+
+
+def test_bedrock_list_foundation_model_agreement_offers():
+    resp = _bedrock().list_foundation_model_agreement_offers(
+        modelId="anthropic.claude-3-haiku-20240307-v1:0",
+    )
+    assert "offers" in resp
+
+
+def test_bedrock_agreement_offer_token_creates_an_agreement():
+    model_id = "anthropic.claude-3-haiku-20240307-v1:0"
+    offers = _bedrock().list_foundation_model_agreement_offers(modelId=model_id)["offers"]
+    assert len(offers) == 1
+    assert set(offers[0]["termDetails"]) == {"usageBasedPricingTerm", "legalTerm", "supportTerm"}
+    resp = _bedrock().create_foundation_model_agreement(
+        offerToken=offers[0]["offerToken"], modelId=model_id,
+    )
+    assert resp["ResponseMetadata"]["HTTPStatusCode"] == 202
+    assert resp["modelId"] == model_id
+
+
+def test_bedrock_agreement_lifecycle_drives_availability():
+    """The Terraform/OpenTofu agreement resource waits on agreementAvailability
+    reaching AVAILABLE after create and NOT_AVAILABLE after delete."""
+    model_id = "anthropic.claude-3-haiku-20240307-v1:0"
+    client = _bedrock()
+    token = client.list_foundation_model_agreement_offers(modelId=model_id)["offers"][0]["offerToken"]
+    client.create_foundation_model_agreement(offerToken=token, modelId=model_id)
+    status = client.get_foundation_model_availability(modelId=model_id)["agreementAvailability"]["status"]
+    assert status == "AVAILABLE"
+    client.delete_foundation_model_agreement(modelId=model_id)
+    status = client.get_foundation_model_availability(modelId=model_id)["agreementAvailability"]["status"]
+    assert status == "NOT_AVAILABLE"
+    amazon = client.get_foundation_model_availability(modelId="amazon.titan-text-express-v1")
+    assert amazon["agreementAvailability"]["status"] == "AVAILABLE"
+
+
+def test_bedrock_amazon_models_have_no_agreement_offers():
+    resp = _bedrock().list_foundation_model_agreement_offers(modelId="amazon.titan-text-express-v1")
+    assert resp["offers"] == []
+
+
+def test_bedrock_create_foundation_model_agreement_unknown_model():
+    with pytest.raises(botocore.exceptions.ClientError) as exc:
+        _bedrock().create_foundation_model_agreement(offerToken="t", modelId="nope.model-v1:0")
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+# ---------------------------------------------------------------------------
+# Tagging
+# ---------------------------------------------------------------------------
+
+
+def test_bedrock_tag_list_untag_resource():
+    gr = _bedrock().create_guardrail(
+        name="gr-tag", blockedInputMessaging="x", blockedOutputsMessaging="y",
+        tags=[{"key": "env", "value": "prod"}],
+    )
+    arn = gr["guardrailArn"]
+    _bedrock().tag_resource(resourceARN=arn, tags=[{"key": "team", "value": "ml"}])
+    resp = _bedrock().list_tags_for_resource(resourceARN=arn)
+    keys = {t["key"]: t["value"] for t in resp["tags"]}
+    assert keys["env"] == "prod"
+    assert keys["team"] == "ml"
+    _bedrock().untag_resource(resourceARN=arn, tagKeys=["env"])
+    resp2 = _bedrock().list_tags_for_resource(resourceARN=arn)
+    keys2 = {t["key"] for t in resp2["tags"]}
+    assert "env" not in keys2
+    assert "team" in keys2
+
+
+def test_bedrock_tag_resource_rejects_malformed_arn():
+    try:
+        _bedrock().tag_resource(
+            resourceARN="not-an-arn-but-long-enough",
+            tags=[{"key": "team", "value": "ml"}],
+        )
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ValidationException"
+    else:
+        raise AssertionError("expected ValidationException")
+
+
+def test_bedrock_tag_resource_rejects_wrong_scope_arn():
+    gr = _bedrock().create_guardrail(
+        name="gr-tag-scope", blockedInputMessaging="x", blockedOutputsMessaging="y",
+    )
+    wrong_region = gr["guardrailArn"].replace(":us-east-1:", ":us-west-2:")
+    try:
+        _bedrock().tag_resource(
+            resourceARN=wrong_region,
+            tags=[{"key": "team", "value": "ml"}],
+        )
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ResourceNotFoundException"
+    else:
+        raise AssertionError("expected ResourceNotFoundException")
+
+
+def test_bedrock_tag_resource_rejects_noncanonical_partition_arn():
+    gr = _bedrock().create_guardrail(
+        name="gr-tag-partition", blockedInputMessaging="x", blockedOutputsMessaging="y",
+    )
+    wrong_partition = gr["guardrailArn"].replace("arn:aws:", "arn:aws-cn:", 1)
+    try:
+        _bedrock().tag_resource(
+            resourceARN=wrong_partition,
+            tags=[{"key": "team", "value": "ml"}],
+        )
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ResourceNotFoundException"
+    else:
+        raise AssertionError("expected ResourceNotFoundException")
+
+
+def test_bedrock_tag_resource_rejects_wrong_service_arn():
+    gr = _bedrock().create_guardrail(
+        name="gr-tag-service", blockedInputMessaging="x", blockedOutputsMessaging="y",
+    )
+    wrong_service = gr["guardrailArn"].replace(":bedrock:", ":lambda:")
+    try:
+        _bedrock().tag_resource(
+            resourceARN=wrong_service,
+            tags=[{"key": "team", "value": "ml"}],
+        )
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ValidationException"
+    else:
+        raise AssertionError("expected ValidationException")
+
+
+def test_bedrock_tag_resource_accepts_application_inference_profile_arn():
+    create = _bedrock().create_inference_profile(
+        inferenceProfileName="aip-tag",
+        modelSource={
+            "copyFrom": "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-haiku-20240307-v1:0"
+        },
+    )
+    arn = create["inferenceProfileArn"]
+    assert ":application-inference-profile/" in arn
+
+    _bedrock().tag_resource(
+        resourceARN=arn,
+        tags=[{"key": "team", "value": "ml"}],
+    )
+    resp = _bedrock().list_tags_for_resource(resourceARN=arn)
+    assert {"key": "team", "value": "ml"} in resp["tags"]
+
+
+def test_bedrock_list_tags_rejects_unknown_resource_arn():
+    arn = "arn:aws:bedrock:us-east-1:000000000000:guardrail/gr-missing"
+    try:
+        _bedrock().list_tags_for_resource(resourceARN=arn)
+    except botocore.exceptions.ClientError as exc:
+        assert exc.response["Error"]["Code"] == "ResourceNotFoundException"
+    else:
+        raise AssertionError("expected ResourceNotFoundException")
+
+
+# ---------------------------------------------------------------------------
+# Converse toolConfig <-> OpenAI tools. The mapping is pure, so it is exercised
+# directly rather than through a live model endpoint.
+# ---------------------------------------------------------------------------
+
+_TOOL_SPEC = {
+    "tools": [{"toolSpec": {
+        "name": "get_weather",
+        "description": "Get weather",
+        "inputSchema": {"json": {"type": "object",
+                                 "properties": {"city": {"type": "string"}},
+                                 "required": ["city"]}},
+    }}],
+}
+
+
+def test_bedrock_converse_tool_config_maps_to_openai_tools():
+    from ministack.services import bedrock_runtime as br
+
+    tools, choice = br._openai_tools(_TOOL_SPEC)
+    assert tools == [{"type": "function", "function": {
+        "name": "get_weather",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
+                       "required": ["city"]},
+        "description": "Get weather",
+    }}]
+    assert choice is None
+
+
+@pytest.mark.parametrize(("tool_choice", "expected"), [
+    ({"auto": {}}, "auto"),
+    ({"any": {}}, "required"),
+    ({"tool": {"name": "get_weather"}},
+     {"type": "function", "function": {"name": "get_weather"}}),
+])
+def test_bedrock_converse_tool_choice_maps(tool_choice, expected):
+    from ministack.services import bedrock_runtime as br
+
+    _tools, choice = br._openai_tools({**_TOOL_SPEC, "toolChoice": tool_choice})
+    assert choice == expected
+
+
+def test_bedrock_converse_tool_use_and_result_survive_the_round_trip():
+    """A tool-calling loop keeps its history: the assistant's toolUse becomes an
+    OpenAI tool_call and the user's toolResult becomes a role "tool" message."""
+    from ministack.services import bedrock_runtime as br
+
+    messages = [
+        {"role": "user", "content": [{"text": "weather in Paris?"}]},
+        {"role": "assistant", "content": [{"toolUse": {
+            "toolUseId": "call_abc", "name": "get_weather", "input": {"city": "Paris"}}}]},
+        {"role": "user", "content": [{"toolResult": {
+            "toolUseId": "call_abc", "content": [{"json": {"tempC": 18}}],
+            "status": "success"}}]},
+    ]
+    assert br._openai_messages(messages, []) == [
+        {"role": "user", "content": "weather in Paris?"},
+        {"role": "assistant", "content": None, "tool_calls": [{
+            "id": "call_abc", "type": "function",
+            "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'}}]},
+        {"role": "tool", "tool_call_id": "call_abc", "content": '{"tempC": 18}'},
+    ]
+
+
+def test_bedrock_converse_tool_call_becomes_a_tool_use_block():
+    from ministack.services import bedrock_runtime as br
+
+    blocks, stop_reason = br._converse_blocks_from_message({
+        "role": "assistant", "content": "",
+        "tool_calls": [{"id": "call_abc", "type": "function",
+                        "function": {"name": "get_weather",
+                                     "arguments": '{"city": "Paris"}'}}],
+    })
+    assert stop_reason == "tool_use"
+    assert blocks == [{"toolUse": {"toolUseId": "call_abc", "name": "get_weather",
+                                  "input": {"city": "Paris"}}}]
+
+
+def test_bedrock_converse_plain_reply_still_ends_the_turn():
+    from ministack.services import bedrock_runtime as br
+
+    blocks, stop_reason = br._converse_blocks_from_message(
+        {"role": "assistant", "content": "hello"})
+    assert (blocks, stop_reason) == ([{"text": "hello"}], "end_turn")
+
+
+def test_bedrock_converse_unparseable_tool_arguments_are_malformed_tool_use():
+    """malformed_tool_use is a documented Converse stopReason; a model that
+    emits invalid JSON arguments is not a proxy failure."""
+    from ministack.services import bedrock_runtime as br
+
+    _blocks, stop_reason = br._converse_blocks_from_message({
+        "role": "assistant", "content": "",
+        "tool_calls": [{"id": "c", "type": "function",
+                        "function": {"name": "t", "arguments": "{not json"}}],
+    })
+    assert stop_reason == "malformed_tool_use"
+
+
+def test_bedrock_converse_without_tool_config_sends_no_tools():
+    from ministack.services import bedrock_runtime as br
+
+    assert br._openai_tools(None) == ([], None)
+    assert br._openai_tools({}) == ([], None)
+
+
+def test_bedrock_converse_stream_emits_the_tool_use_event_sequence():
+    """A tool call streams as its own content block: contentBlockStart carries
+    toolUseId and name, the input arrives as a JSON string in a toolUse delta,
+    and the turn stops with tool_use."""
+    from botocore.eventstream import EventStreamBuffer
+
+    from ministack.services import bedrock_runtime as br
+
+    raw = br._build_converse_stream(
+        "m", [{"role": "user", "content": [{"text": "hi"}]}], [], 0, "",
+        stop_reason="tool_use",
+        tool_uses=[{"toolUseId": "call_abc", "name": "get_weather",
+                    "input": {"city": "Paris"}}],
+    )
+    buffer = EventStreamBuffer()
+    buffer.add_data(raw)
+    events = []
+    for event in buffer:
+        headers = event.headers
+        events.append((headers.get(":event-type"), json.loads(event.payload)))
+
+    kinds = [name for name, _ in events]
+    assert kinds == ["messageStart", "contentBlockDelta", "contentBlockStop",
+                     "contentBlockStart", "contentBlockDelta", "contentBlockStop",
+                     "messageStop", "metadata"], kinds
+    start = dict(events)["contentBlockStart"]
+    assert start == {"contentBlockIndex": 1,
+                     "start": {"toolUse": {"toolUseId": "call_abc",
+                                           "name": "get_weather"}}}
+    tool_delta = [p for name, p in events
+                  if name == "contentBlockDelta" and "toolUse" in p["delta"]][0]
+    assert tool_delta["contentBlockIndex"] == 1
+    assert json.loads(tool_delta["delta"]["toolUse"]["input"]) == {"city": "Paris"}
+    assert dict(events)["messageStop"] == {"stopReason": "tool_use"}
+
+
+def test_bedrock_converse_tool_call_reports_the_proxy_token_usage(monkeypatch):
+    """A tool-call turn has no text to estimate from; the proxy's own usage is
+    the model's token count, tool schema and tool call included."""
+    import io
+
+    from botocore.eventstream import EventStreamBuffer
+
+    from ministack.services import bedrock_runtime as br
+
+    reply = {"choices": [{"message": {"role": "assistant", "content": "", "tool_calls": [
+        {"id": "call_abc", "type": "function",
+         "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'}}]}}],
+        "usage": {"prompt_tokens": 158, "completion_tokens": 20, "total_tokens": 178}}
+    monkeypatch.setattr(br, "_PROXY_URL", "http://proxy.invalid")
+    monkeypatch.setattr(br.urllib.request, "urlopen",
+                        lambda *a, **k: io.BytesIO(json.dumps(reply).encode()))
+
+    message, counts = br._proxy_openai_chat_message(
+        "m", [{"role": "user", "content": [{"text": "weather?"}]}], [], None)
+    assert message["tool_calls"][0]["id"] == "call_abc"
+    assert counts == (158, 20)
+
+    raw = br._build_converse_stream(
+        "m", [{"role": "user", "content": [{"text": "weather?"}]}], [], 0, "",
+        stop_reason="tool_use", input_tokens=158, output_tokens=20)
+    buffer = EventStreamBuffer()
+    buffer.add_data(raw)
+    metadata = [json.loads(e.payload) for e in buffer if e.headers.get(":event-type") == "metadata"][0]
+    assert metadata["usage"] == {"inputTokens": 158, "outputTokens": 20, "totalTokens": 178}
+
+
+def test_bedrock_converse_stream_without_tools_is_unchanged():
+    from botocore.eventstream import EventStreamBuffer
+
+    from ministack.services import bedrock_runtime as br
+
+    raw = br._build_converse_stream(
+        "m", [{"role": "user", "content": [{"text": "hi"}]}], [], 0, "hello")
+    buffer = EventStreamBuffer()
+    buffer.add_data(raw)
+    kinds = [e.headers.get(":event-type") for e in buffer]
+    assert "contentBlockStart" not in kinds
+    assert kinds[0] == "messageStart" and kinds[-1] == "metadata"
+
+
+def test_bedrock_get_guardrail_returns_output_policy_shapes():
+    create = _bedrock().create_guardrail(
+        name="gr-shapes", blockedInputMessaging="x", blockedOutputsMessaging="y",
+        topicPolicyConfig={"topicsConfig": [{"name": "t", "definition": "d", "type": "DENY"}]},
+        contentPolicyConfig={"filtersConfig": [{"type": "HATE", "inputStrength": "HIGH", "outputStrength": "HIGH"}]},
+        wordPolicyConfig={"wordsConfig": [{"text": "w"}], "managedWordListsConfig": [{"type": "PROFANITY"}]},
+        sensitiveInformationPolicyConfig={
+            "piiEntitiesConfig": [{"type": "EMAIL", "action": "BLOCK"}],
+            "regexesConfig": [{"name": "r", "pattern": "a+", "action": "ANONYMIZE"}],
+        },
+        contextualGroundingPolicyConfig={"filtersConfig": [{"type": "GROUNDING", "threshold": 0.5}]},
+    )
+    g = _bedrock().get_guardrail(guardrailIdentifier=create["guardrailId"])
+    assert g["topicPolicy"]["topics"][0]["name"] == "t"
+    assert g["contentPolicy"]["filters"][0]["type"] == "HATE"
+    assert g["wordPolicy"]["words"] == [{"text": "w"}]
+    assert g["wordPolicy"]["managedWordLists"] == [{"type": "PROFANITY"}]
+    assert g["sensitiveInformationPolicy"]["piiEntities"][0]["type"] == "EMAIL"
+    assert g["sensitiveInformationPolicy"]["regexes"][0]["pattern"] == "a+"
+    assert g["contextualGroundingPolicy"]["filters"][0]["threshold"] == 0.5

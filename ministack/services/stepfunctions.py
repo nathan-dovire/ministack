@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 Step Functions Service Emulator with ASL execution engine.
 JSON-based API via X-Amz-Target (AWSStepFunctions).
@@ -25,6 +27,7 @@ SUCCEEDED / FAILED / TIMED_OUT / ABORTED.
 
 import ast
 import asyncio
+import base64
 import contextvars
 import copy
 import json
@@ -35,21 +38,46 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from concurrent.futures import wait as futures_wait
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from ministack.core.persistence import PERSIST_STATE, load_state
+try:
+    import jsonata
+except ImportError:  # the wheel is optional at runtime: JSONata states refuse
+    jsonata = None   # cleanly instead of the whole service failing to load
+
+from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import run_reentrant
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
+    _service_model,
     error_response_json,
     get_account_id,
     get_region,
-    json_response,
     new_uuid,
     now_iso,
 )
+from ministack.core.responses import (
+    json_response as _core_json_response,
+)
 
 logger = logging.getLogger("states")
+
+
+def _drop_none(value):
+    """AWS omits unset members; it never sends null."""
+    if isinstance(value, dict):
+        return {k: _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
+def json_response(data, status=200, **kwargs):
+    return _core_json_response(_drop_none(data), status, **kwargs)
+
 
 # Scale factor for Wait state durations and retry intervals.
 # 0 = skip all waits, 0.01 = 1% of normal, 1 = normal (default).
@@ -119,24 +147,31 @@ def _get_mock_response(sm_name: str, test_case: str, state_name: str, attempt: i
                 continue
     return None
 
-_state_machines = AccountScopedDict()
-_executions = AccountScopedDict()
-_task_tokens = AccountScopedDict()
-_tags = AccountScopedDict()
-_activities = AccountScopedDict()
-_activity_tasks = AccountScopedDict()
+_state_machines = AccountRegionScopedDict()
+_executions = AccountRegionScopedDict()
+# Continuation tokens are ephemeral, like AWS's 24-hour history tokens. Each
+# token fixes the history length so new events cannot shift reverse-order pages.
+_HISTORY_TOKEN_TTL_SECONDS = 24 * 60 * 60
+_history_page_tokens = {}
+_history_page_tokens_lock = threading.Lock()
+_events_lock = threading.Lock()
+_task_tokens = AccountRegionScopedDict()
+_tags = AccountRegionScopedDict()
+_activities = AccountRegionScopedDict()
+_activity_tasks = AccountRegionScopedDict()
+_map_runs = AccountRegionScopedDict()
 
 # version_arn -> {stateMachineVersionArn, stateMachineRevisionId,
 #                 description, creationDate, definition, roleArn, type,
 #                 loggingConfiguration}
 # Version ARN shape: arn:aws:states:<region>:<acct>:stateMachine:<name>:<N>
-_state_machine_versions = AccountScopedDict()
+_state_machine_versions = AccountRegionScopedDict()
 
 # alias_arn -> {stateMachineAliasArn, name, description,
 #               routingConfiguration: [{stateMachineVersionArn, weight}],
 #               creationDate, updateDate}
 # Alias ARN shape: arn:aws:states:<region>:<acct>:stateMachine:<name>:<aliasName>
-_state_machine_aliases = AccountScopedDict()
+_state_machine_aliases = AccountRegionScopedDict()
 
 # ── Persistence ────────────────────────────────────────────
 
@@ -148,21 +183,27 @@ def get_state():
         "activities": copy.deepcopy(_activities),
         "state_machine_versions": copy.deepcopy(_state_machine_versions),
         "state_machine_aliases": copy.deepcopy(_state_machine_aliases),
+        "map_runs": copy.deepcopy(_map_runs),
     }
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     if not data:
         return
     _state_machines.update(data.get("state_machines", {}))
     _executions.update(data.get("executions", {}))
+    _map_runs.update(data.get("map_runs", {}))
     _tags.update(data.get("tags", {}))
     _activities.update(data.get("activities", {}))
     _state_machine_versions.update(data.get("state_machine_versions", {}))
     _state_machine_aliases.update(data.get("state_machine_aliases", {}))
     # Executions that were RUNNING when the process died cannot resume —
     # mark them FAILED, following the ECS precedent (tasks → STOPPED).
-    for exc in _executions.values():
+    for exc in _executions.all_values():
         if exc.get("status") == "RUNNING":
             exc["status"] = "FAILED"
             exc["stopDate"] = now_iso()
@@ -170,15 +211,6 @@ def restore_state(data):
             exc["cause"] = "Execution was running when service restarted"
 
 
-try:
-    _restored = load_state("stepfunctions")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 _TIMESTAMP_RESPONSE_FIELDS = {
@@ -234,6 +266,12 @@ def _finalize_response(response):
 # Entry point
 # ---------------------------------------------------------------------------
 
+# Actions that run a state machine to completion inside the request. They
+# re-enter MiniStack (Lambda invokes, aws-sdk integrations), so they run on a
+# dedicated thread rather than holding the event loop those nested calls need.
+_OFF_LOOP_ACTIONS = {"StartSyncExecution", "TestState"}
+
+
 async def handle_request(method, path, headers, body, query_params):
     target = headers.get("x-amz-target", "")
     action = target.split(".")[-1] if "." in target else ""
@@ -277,13 +315,27 @@ async def handle_request(method, path, headers, body, query_params):
         "DeleteStateMachineAlias": _delete_state_machine_alias,
         "DescribeStateMachineAlias": _describe_state_machine_alias,
         "ListStateMachineAliases": _list_state_machine_aliases,
+        "ListMapRuns": _list_map_runs,
+        "DescribeMapRun": _describe_map_run,
+        "UpdateMapRun": _update_map_run,
     }
 
     handler = handlers.get(action)
     if not handler:
         return error_response_json("InvalidAction", f"Unknown action: {action}", 400)
+    if action in ("StartExecution", "StartSyncExecution") and headers.get("x-amzn-trace-id"):
+        data["traceHeader"] = headers["x-amzn-trace-id"]
     if action == "GetActivityTask":
         return _finalize_response(await _get_activity_task(data))
+    if action in _OFF_LOOP_ACTIONS:
+        # These run a state machine to completion inline. Every task state calls
+        # back into MiniStack — Lambda invokes, aws-sdk service integrations —
+        # so this must not hold the event loop: the nested calls need it, and a
+        # service handler that awaits (Docker work runs off-loop now) cannot be
+        # driven from the loop thread at all. Dedicated thread, not the shared
+        # pool, because the work re-enters the server.
+        return _finalize_response(
+            await run_reentrant(handler, data, thread_name="ministack-sfn-sync-exec"))
     return _finalize_response(handler(data))
 
 
@@ -291,30 +343,265 @@ async def handle_request(method, path, headers, body, query_params):
 # State machine CRUD
 # ---------------------------------------------------------------------------
 
+def _validate_definition_jsonata(definition_str) -> str | None:
+    """The first malformed ``{% ... %}`` expression's refusal, or None.
+
+    AWS rejects a definition carrying an unparsable JSONata expression at
+    CreateStateMachine/UpdateStateMachine time with InvalidDefinition and an
+    INVALID_JSONATA_EXPRESSION message naming the field's path — a typo never
+    reaches an execution. Parse only: evaluation errors stay runtime."""
+    if jsonata is None or not isinstance(definition_str, str):
+        return None
+    try:
+        definition = json.loads(definition_str)
+    except (TypeError, ValueError):
+        return None  # JSON validity is judged by the existing checks
+
+    def walk(node, path):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                found = walk(v, f"{path}/{k}")
+                if found:
+                    return found
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                found = walk(v, f"{path}/{i}")
+                if found:
+                    return found
+        elif (isinstance(node, str) and node.startswith("{%")
+                and node.endswith("%}")):
+            try:
+                jsonata.Jsonata.jsonata(node[2:-2].strip())
+            except Exception as exc:
+                return f"INVALID_JSONATA_EXPRESSION: {exc}\n  at {path or '/'}"
+        return None
+
+    return walk(definition, "")
+
+
+_ENCRYPTION_TYPES = ("AWS_OWNED_KEY", "CUSTOMER_MANAGED_KMS_KEY")
+# What AWS stores when a CUSTOMER_MANAGED_KMS_KEY configuration has no reuse period.
+_DEFAULT_KMS_DATA_KEY_REUSE_PERIOD = 300
+
+
+def _default_encryption():
+    """The encryptionConfiguration a machine reports when no customer
+    managed key was set. A fresh dict each call, so no two records share one."""
+    return {"type": "AWS_OWNED_KEY"}
+
+
+# How AWS's JSON deserializer names a value of the wrong JSON type.
+def _json_token(value):
+    if isinstance(value, bool):
+        return "TRUE_VALUE" if value else "FALSE_VALUE"
+    if isinstance(value, (int, float)):
+        return "NUMBER_VALUE"
+    return "STRING_VALUE"
+
+
+def _wrong_json_type(value, expected):
+    """AWS's SerializationException message for a member of the wrong JSON
+    type, or None. expected is "Integer", "String" or "structure"."""
+    if isinstance(value, list):
+        return "Start of list found where not expected"
+    if isinstance(value, dict):
+        return None if expected == "structure" else "Start of structure or map found where not expected."
+    if expected == "structure":
+        return "Expected null"
+    if expected == "Integer":
+        if isinstance(value, (bool, str)):
+            return f"{_json_token(value)} can not be converted to an Integer"
+        return None
+    if isinstance(value, str):
+        return None
+    return f"{_json_token(value)} can not be converted to a String"
+
+
+def _encryption_serialization_error(cfg):
+    """The SerializationException AWS answers when encryptionConfiguration or
+    one of its members has the wrong JSON type. AWS reports one member,
+    checking them in the order reuse period, kmsKeyId, type whatever order
+    the request lists them in. A JSON null is not an error: AWS treats it as
+    an absent field. This exception's message member is "Message" on the
+    wire."""
+    if cfg is None:
+        return None
+    message = _wrong_json_type(cfg, "structure")
+    if message is None:
+        for member, expected in (("kmsDataKeyReusePeriodSeconds", "Integer"),
+                                 ("kmsKeyId", "String"), ("type", "String")):
+            if cfg.get(member) is not None:
+                message = _wrong_json_type(cfg[member], expected)
+                if message:
+                    break
+    if message is None:
+        return None
+    return error_response_json("SerializationException", message, 400, message_key="Message")
+
+
+def _with_integer_period(cfg):
+    """The configuration with a JSON number period read as an integer: AWS
+    accepts 300.5 and stores 300."""
+    period = cfg.get("kmsDataKeyReusePeriodSeconds")
+    if isinstance(period, float):
+        return {**cfg, "kmsDataKeyReusePeriodSeconds": int(period)}
+    return cfg
+
+
+def _encryption_validation_error(cfg):
+    """The ValidationException for an encryptionConfiguration that breaks the
+    member constraints, or None. AWS reports every broken constraint in one
+    message, in the order reuse period, kmsKeyId, type."""
+    problems = []
+    period = cfg.get("kmsDataKeyReusePeriodSeconds")
+    if isinstance(period, int) and not isinstance(period, bool):
+        if period < 60:
+            problems.append(
+                f"Value '{period}' at 'encryptionConfiguration.kmsDataKeyReusePeriodSeconds' "
+                "failed to satisfy constraint: Member must have value greater than or equal to 60")
+        elif period > 900:
+            problems.append(
+                f"Value '{period}' at 'encryptionConfiguration.kmsDataKeyReusePeriodSeconds' "
+                "failed to satisfy constraint: Member must have value less than or equal to 900")
+    key_id = cfg.get("kmsKeyId")
+    if isinstance(key_id, str):
+        if not key_id:
+            problems.append(
+                "Value '' at 'encryptionConfiguration.kmsKeyId' failed to satisfy "
+                "constraint: Member must have length greater than or equal to 1")
+        elif len(key_id) > 2048:
+            problems.append(
+                f"Value '{key_id}' at 'encryptionConfiguration.kmsKeyId' failed to satisfy "
+                "constraint: Member must have length less than or equal to 2048")
+    enc_type = cfg.get("type")
+    if enc_type is None:
+        problems.append(
+            "Value null at 'encryptionConfiguration.type' failed to satisfy "
+            "constraint: Member must not be null")
+    elif enc_type not in _ENCRYPTION_TYPES:
+        problems.append(
+            f"Value '{enc_type}' at 'encryptionConfiguration.type' failed to satisfy "
+            f"constraint: Member must satisfy enum value set: [{', '.join(_ENCRYPTION_TYPES)}]")
+    if not problems:
+        return None
+    count = (f"{len(problems)} validation error detected" if len(problems) == 1
+             else f"{len(problems)} validation errors detected")
+    return error_response_json("ValidationException", f"{count}: " + "; ".join(problems), 400)
+
+
+def _encryption_configuration_error(cfg):
+    """The InvalidEncryptionConfiguration for a well-formed configuration
+    whose members do not fit its type, or None. The key is not looked up in
+    KMS."""
+    if cfg["type"] == "CUSTOMER_MANAGED_KMS_KEY":
+        if cfg.get("kmsKeyId") is None:
+            return error_response_json(
+                "InvalidEncryptionConfiguration",
+                "Invalid Encryption Configuration: Must set a valid kmsKeyId.", 400)
+        return None
+    if cfg.get("kmsKeyId") is not None:
+        return error_response_json(
+            "InvalidEncryptionConfiguration",
+            "Invalid Encryption Configuration: Custom kmsKeyId is not allowed when "
+            "selecting AWS_OWNED_KEY.", 400)
+    if cfg.get("kmsDataKeyReusePeriodSeconds") is not None:
+        return error_response_json(
+            "InvalidEncryptionConfiguration",
+            "Invalid Encryption Configuration: Custom kmsDataKeyReusePeriodSeconds is not "
+            "allowed when selecting AWS_OWNED_KEY.", 400)
+    return None
+
+
+def _stored_encryption(cfg):
+    """The configuration a machine stores and describes for an accepted
+    request value: AWS_OWNED_KEY when absent, and a customer managed key with
+    the 300 second default when no reuse period was sent."""
+    if cfg is None or cfg["type"] == "AWS_OWNED_KEY":
+        return _default_encryption()
+    period = cfg.get("kmsDataKeyReusePeriodSeconds")
+    return {
+        "type": "CUSTOMER_MANAGED_KMS_KEY",
+        "kmsKeyId": cfg["kmsKeyId"],
+        "kmsDataKeyReusePeriodSeconds": (
+            _DEFAULT_KMS_DATA_KEY_REUSE_PERIOD if period is None else period),
+    }
+
+
 def _create_state_machine(data):
     name = data.get("name")
     if not name:
         return error_response_json("ValidationException", "name is required", 400)
+    # AWS checks the encryptionConfiguration's JSON types and member
+    # constraints before the definition, and whether its members fit its
+    # type after the definition and before the existing-machine check.
+    encryption = data.get("encryptionConfiguration")
+    invalid = _encryption_serialization_error(encryption)
+    if invalid is None and encryption is not None:
+        encryption = _with_integer_period(encryption)
+        invalid = _encryption_validation_error(encryption)
+    if invalid:
+        return invalid
+    invalid = _validate_definition_jsonata(data.get("definition"))
+    if invalid:
+        return error_response_json("InvalidDefinition", invalid, 400)
+    if encryption is not None:
+        invalid = _encryption_configuration_error(encryption)
+        if invalid:
+            return invalid
+    encryption = _stored_encryption(encryption)
 
     arn = f"arn:aws:states:{get_region()}:{get_account_id()}:stateMachine:{name}"
     if arn in _state_machines:
+        # Creating the same machine twice is idempotent on AWS and makes SDK retry safe
+        # It checks the sfn itself: definition, type, logging, encryption and whether the call publishes
+        existing = _state_machines[arn]
+        publishes = bool(data.get("publish"))
+        if (data.get("definition", "{}") == existing["definition"]
+                and data.get("type", "STANDARD") == existing["type"]
+                and data.get("loggingConfiguration",
+                             {"level": "OFF", "includeExecutionData": False})
+                == existing["loggingConfiguration"]
+                and encryption == existing.get("encryptionConfiguration", _default_encryption())
+                and publishes == bool(existing.get("createVersionArn"))
+                # AWS's idempotency check also covers versionDescription: a
+                # publishing re-create carrying a different description is a
+                # different machine, not a retry.
+                and (not publishes
+                     or data.get("versionDescription", "")
+                     == _state_machine_versions.get(
+                         existing.get("createVersionArn") or "", {}
+                     ).get("description", ""))):
+            response = {"stateMachineArn": arn, "creationDate": existing["creationDate"]}
+            if publishes:
+                response["stateMachineVersionArn"] = existing["createVersionArn"]
+            return json_response(response)
         return error_response_json(
             "StateMachineAlreadyExists",
             f"State machine {name} already exists", 400)
+
+    role_arn = data.get("roleArn",
+                        f"arn:aws:iam::{get_account_id()}:role/StepFunctionsRole")
+    from ministack.core.iam_evaluator import validate_role_arn
+    role_err = validate_role_arn(role_arn)
+    if role_err:
+        return error_response_json("ValidationException", role_err, 400)
 
     ts = now_iso()
     _state_machines[arn] = {
         "stateMachineArn": arn,
         "name": name,
         "definition": data.get("definition", "{}"),
-        "roleArn": data.get("roleArn",
-                            f"arn:aws:iam::{get_account_id()}:role/StepFunctionsRole"),
+        "roleArn": role_arn,
         "type": data.get("type", "STANDARD"),
         "creationDate": ts,
         "status": "ACTIVE",
         "loggingConfiguration": data.get(
             "loggingConfiguration",
             {"level": "OFF", "includeExecutionData": False}),
+        # Machines without a customer managed key report AWS_OWNED_KEY.
+        "encryptionConfiguration": encryption,
+        **({"tracingConfiguration": data["tracingConfiguration"]}
+           if data.get("tracingConfiguration") else {}),
         # AWS rotates revisionId on every Create/Update. Callers use it
         # as an optimistic-concurrency precondition when publishing a
         # version (see _publish_state_machine_version).
@@ -338,6 +625,7 @@ def _create_state_machine(data):
         _state_machines[arn]["lastVersionNumber"] += 1
         next_number = _state_machines[arn]["lastVersionNumber"]
         version_arn = f"{arn}:{next_number}"
+        _state_machines[arn]["createVersionArn"] = version_arn
         _state_machine_versions[version_arn] = {
             "stateMachineVersionArn": version_arn,
             "stateMachineArn": arn,
@@ -349,6 +637,10 @@ def _create_state_machine(data):
             "type": _state_machines[arn]["type"],
             "loggingConfiguration": copy.deepcopy(
                 _state_machines[arn]["loggingConfiguration"]),
+            "encryptionConfiguration": copy.deepcopy(
+                _state_machines[arn]["encryptionConfiguration"]),
+            **({"tracingConfiguration": copy.deepcopy(_state_machines[arn]["tracingConfiguration"])}
+               if _state_machines[arn].get("tracingConfiguration") else {}),
         }
         response["stateMachineVersionArn"] = version_arn
     return json_response(response)
@@ -369,11 +661,19 @@ def _delete_state_machine(data):
     return json_response({})
 
 
+# Bookkeeping the machine record carries that is NOT part of AWS's
+# DescribeStateMachine response shape and must never reach a caller.
+_SM_INTERNAL_KEYS = frozenset({"createVersionArn", "lastVersionNumber"})
+
+
 def _describe_state_machine(data):
     arn = data.get("stateMachineArn")
     sm = _state_machines.get(arn)
     if sm:
-        return json_response(sm)
+        body = {k: v for k, v in sm.items() if k not in _SM_INTERNAL_KEYS}
+        # Machines persisted before encryptionConfiguration was stored.
+        body.setdefault("encryptionConfiguration", _default_encryption())
+        return json_response(body)
     # AWS's DescribeStateMachine also accepts a qualified version ARN
     # (arn:...:stateMachine:<name>:<N>) and returns the snapshot
     # captured at publish time, with stateMachineArn echoing the
@@ -392,6 +692,10 @@ def _describe_state_machine(data):
             "description": version.get("description", ""),
             "loggingConfiguration": version.get("loggingConfiguration")
                 or base_sm.get("loggingConfiguration", {"level": "OFF"}),
+            "encryptionConfiguration": version.get("encryptionConfiguration")
+                or _default_encryption(),
+            **({"tracingConfiguration": version["tracingConfiguration"]}
+               if version.get("tracingConfiguration") else {}),
             "revisionId": version.get("stateMachineRevisionId", ""),
         })
     # DescribeStateMachine on an alias ARN: AWS accepts it and returns
@@ -420,18 +724,44 @@ def _describe_state_machine(data):
 
 
 def _update_state_machine(data):
+    # AWS checks the encryptionConfiguration's JSON types and member
+    # constraints before it looks the machine up, and whether its members fit
+    # its type before the definition. Everything is checked before anything
+    # is written, so a refused call changes nothing.
+    encryption = data.get("encryptionConfiguration")
+    invalid = _encryption_serialization_error(encryption)
+    if invalid is None and encryption is not None:
+        encryption = _with_integer_period(encryption)
+        invalid = _encryption_validation_error(encryption)
+    if invalid:
+        return invalid
     arn = data.get("stateMachineArn")
     sm = _state_machines.get(arn)
     if not sm:
         return error_response_json(
             "StateMachineDoesNotExist",
             f"State machine {arn} not found", 400)
+    if encryption is not None:
+        invalid = _encryption_configuration_error(encryption)
+        if invalid:
+            return invalid
+        if "definition" not in data:
+            return error_response_json(
+                "MissingRequiredParameter",
+                "The definition must be specified when updating the EncryptionConfiguration", 400)
     if "definition" in data:
+        invalid = _validate_definition_jsonata(data["definition"])
+        if invalid:
+            return error_response_json("InvalidDefinition", invalid, 400)
         sm["definition"] = data["definition"]
     if "roleArn" in data:
         sm["roleArn"] = data["roleArn"]
     if "loggingConfiguration" in data:
         sm["loggingConfiguration"] = data["loggingConfiguration"]
+    if data.get("tracingConfiguration"):
+        sm["tracingConfiguration"] = data["tracingConfiguration"]
+    if encryption is not None:
+        sm["encryptionConfiguration"] = _stored_encryption(encryption)
     # Rotate revisionId so subsequent PublishStateMachineVersion calls
     # with a stale caller-supplied revisionId raise ConflictException
     # (matches AWS optimistic-concurrency semantics).
@@ -455,6 +785,10 @@ def _update_state_machine(data):
             "roleArn": sm["roleArn"],
             "type": sm["type"],
             "loggingConfiguration": copy.deepcopy(sm["loggingConfiguration"]),
+            "encryptionConfiguration": copy.deepcopy(
+                sm.get("encryptionConfiguration") or _default_encryption()),
+            **({"tracingConfiguration": copy.deepcopy(sm["tracingConfiguration"])}
+               if sm.get("tracingConfiguration") else {}),
         }
         response["stateMachineVersionArn"] = version_arn
         response["revisionId"] = sm["revisionId"]
@@ -467,24 +801,41 @@ def _list_state_machines(data):
          "type": sm["type"], "creationDate": sm["creationDate"]}
         for sm in _state_machines.values()
     ]
-    max_results = int(data.get("maxResults", 1000))
-    next_token = data.get("nextToken")
+    return _offset_page(data, "stateMachines", all_machines)
+
+
+def _offset_page(data, key, items):
     start = 0
-    if next_token:
+    if data.get("nextToken"):
         try:
-            start = int(next_token)
-        except ValueError:
-            start = 0
-    page = all_machines[start:start + max_results]
-    resp = {"stateMachines": page}
-    if start + max_results < len(all_machines):
-        resp["nextToken"] = str(start + max_results)
+            start = int(data["nextToken"])
+        except (TypeError, ValueError):
+            start = -1
+        if start < 0:
+            return error_response_json("InvalidToken", "Invalid Token: 'Invalid token'", 400)
+    end = start + (data.get("maxResults") or 100)
+    resp = {key: items[start:end]}
+    if end < len(items):
+        resp["nextToken"] = str(end)
     return json_response(resp)
 
 
 # ---------------------------------------------------------------------------
 # Execution lifecycle
 # ---------------------------------------------------------------------------
+
+def _execution_version_arn(arn):
+    """The version ARN an execution of ``arn`` runs: the version itself, or
+    for an alias the version _resolve_state_machine_arn picks. None for a
+    base state machine."""
+    if arn in _state_machine_versions:
+        return arn
+    alias = _state_machine_aliases.get(arn)
+    routing = (alias or {}).get("routingConfiguration") or []
+    if routing:
+        return max(routing, key=lambda r: r.get("weight", 0)).get("stateMachineVersionArn")
+    return None
+
 
 def _resolve_state_machine_arn(arn):
     """Resolve a state-machine, version, or alias ARN to the base state-machine
@@ -534,6 +885,7 @@ def _start_execution(data):
         return error_response_json(
             "StateMachineDoesNotExist",
             f"State machine {sm_arn} not found", 400)
+    requested_arn = sm_arn
     sm_arn = base_arn
 
     sm = _state_machines[sm_arn]
@@ -563,6 +915,13 @@ def _start_execution(data):
         "outputDetails": {"included": True},
         "testCase": test_case,
         "mockAttempts": {},
+        **({"traceHeader": data["traceHeader"]} if data.get("traceHeader") else {}),
+        # DescribeStateMachineForExecution reports the encryption configuration
+        # the execution started with: the version's when a version or an alias
+        # was named.
+        "encryptionConfiguration": copy.deepcopy(
+            (_state_machine_versions.get(_execution_version_arn(requested_arn)) or sm)
+            .get("encryptionConfiguration") or _default_encryption()),
         "events": [
             {"id": 1, "type": "ExecutionStarted", "timestamp": start_date,
              "executionStartedEventDetails": {
@@ -570,12 +929,14 @@ def _start_execution(data):
         ],
     }
 
-    # Propagate the request's contextvars (notably the account ID set by
+    # Propagate the request's contextvars (notably the account ID and region set by
     # set_request_account_id) into the background execution thread. Python's
     # threading.Thread does NOT automatically copy contextvars, so without
-    # this snapshot the worker runs under the default account and silently
-    # fails to find the execution stored in AccountScopedDict under the
-    # caller's account. See issue #639.
+    # this snapshot the worker runs under the default scope and silently
+    # fails to find the execution stored under the caller's account and
+    # region. See issue #639.
+    _emit_execution_status_event(_executions[exec_arn])
+
     ctx_snapshot = contextvars.copy_context()
     threading.Thread(
         target=ctx_snapshot.run,
@@ -594,6 +955,11 @@ def _stop_execution(data):
         return error_response_json(
             "ExecutionDoesNotExist",
             f"Execution {exec_arn} not found", 400)
+    # A client may retry after the abort was applied but its response was lost.
+    # Return the original result without rewriting the cause or emitting a
+    # second ExecutionAborted event.
+    if execution["status"] == "ABORTED":
+        return json_response({"stopDate": execution["stopDate"]})
     if execution["status"] != "RUNNING":
         return error_response_json(
             "ValidationException", "Execution is not running", 400)
@@ -601,12 +967,15 @@ def _stop_execution(data):
     stop_date = now_iso()
     execution["status"] = "ABORTED"
     execution["stopDate"] = stop_date
+    execution["error"] = data.get("error")
+    execution["cause"] = data.get("cause")
     _add_event(execution, "ExecutionAborted", {
         "executionAbortedEventDetails": {
             "error": data.get("error", ""),
             "cause": data.get("cause", ""),
         },
     })
+    _emit_execution_status_event(execution)
     return json_response({"stopDate": stop_date})
 
 
@@ -633,38 +1002,105 @@ def _describe_execution(data):
         result["error"] = execution["error"]
     if execution.get("cause"):
         result["cause"] = execution["cause"]
+    if execution.get("mapRunArn"):
+        result["mapRunArn"] = execution["mapRunArn"]
+    if execution.get("traceHeader"):
+        result["traceHeader"] = execution["traceHeader"]
     return json_response(result)
 
 
+def _map_run_view(run):
+    return {k: v for k, v in run.items() if not k.startswith("_")}
+
+
+def _list_map_runs(data):
+    exec_arn = data.get("executionArn")
+    if exec_arn not in _executions:
+        return error_response_json("ExecutionDoesNotExist", f"Execution Does Not Exist: '{exec_arn}'", 400)
+    runs = [{"executionArn": r["executionArn"], "mapRunArn": r["mapRunArn"], "stateMachineArn": r["_stateMachineArn"],
+             "startDate": r["startDate"], **({"stopDate": r["stopDate"]} if r.get("stopDate") else {})}
+            for r in _map_runs.values() if r["executionArn"] == exec_arn]
+    return _offset_page(data, "mapRuns", runs)
+
+
+def _describe_map_run(data):
+    run = _map_runs.get(data.get("mapRunArn"))
+    if run is None:
+        return error_response_json("ResourceNotFound", f"Map Run Does Not Exist: '{data.get('mapRunArn')}'", 400)
+    return json_response(_map_run_view(run))
+
+
+def _update_map_run(data):
+    run = _map_runs.get(data.get("mapRunArn"))
+    if run is None:
+        return error_response_json("ResourceNotFound", f"Map Run Does Not Exist: '{data.get('mapRunArn')}'", 400)
+    for field in ("maxConcurrency", "toleratedFailurePercentage", "toleratedFailureCount"):
+        if field in data:
+            run[field] = data[field]
+    return json_response({})
+
+
+def _execution_sort_key(execution):
+    """AWS lists the most recent execution first: a running one by its
+    startDate, the rest by stopDate. The ARN breaks ties, so the order is
+    total and a token can resume it."""
+    return (execution["stopDate"] or execution["startDate"], execution["executionArn"])
+
+
+def _encode_execution_token(execution):
+    """Tokens carry the sort position of the last execution returned, not an
+    index, as AWS's do: with an offset, an execution started between pages
+    would repeat one."""
+    raw = json.dumps(list(_execution_sort_key(execution))).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _decode_execution_token(token):
+    try:
+        moment, arn = json.loads(base64.urlsafe_b64decode(token.encode("ascii")))
+        return (str(moment), str(arn))
+    except Exception:
+        return None
+
+
 def _list_executions(data):
+    cursor = None
+    if data.get("nextToken"):
+        cursor = _decode_execution_token(data["nextToken"])
+        if cursor is None:
+            return error_response_json("InvalidToken", "Invalid Token: 'Invalid token'", 400)
     sm_arn = data.get("stateMachineArn")
+    map_run_arn = data.get("mapRunArn")
+    if map_run_arn and map_run_arn not in _map_runs:
+        return error_response_json("ResourceNotFound", f"Map Run Does Not Exist: '{map_run_arn}'", 400)
     status_filter = data.get("statusFilter")
     all_execs = []
     for ex in _executions.values():
         if sm_arn and ex["stateMachineArn"] != sm_arn:
             continue
+        if map_run_arn and ex.get("mapRunArn") != map_run_arn:
+            continue
         if status_filter and ex["status"] != status_filter:
             continue
-        all_execs.append({
+        item = {
             "executionArn": ex["executionArn"],
             "stateMachineArn": ex["stateMachineArn"],
             "name": ex["name"],
             "status": ex["status"],
             "startDate": ex["startDate"],
             "stopDate": ex.get("stopDate"),
-        })
-    max_results = int(data.get("maxResults", 1000))
-    next_token = data.get("nextToken")
-    start = 0
-    if next_token:
-        try:
-            start = int(next_token)
-        except ValueError:
-            start = 0
-    page = all_execs[start:start + max_results]
+        }
+        if ex.get("mapRunArn"):
+            item["mapRunArn"] = ex["mapRunArn"]
+        all_execs.append(item)
+    all_execs.sort(key=_execution_sort_key, reverse=True)
+    if cursor is not None:
+        all_execs = [e for e in all_execs if _execution_sort_key(e) < cursor]
+    max_results = int(data.get("maxResults") or 1000)
+    page = all_execs[:max_results]
     resp = {"executions": page}
-    if start + max_results < len(all_execs):
-        resp["nextToken"] = str(start + max_results)
+    if len(all_execs) > max_results:
+        resp["nextToken"] = _encode_execution_token(page[-1])
     return json_response(resp)
 
 
@@ -675,11 +1111,67 @@ def _get_execution_history(data):
         return error_response_json(
             "ExecutionDoesNotExist",
             f"Execution {exec_arn} not found", 400)
+    max_results = data.get("maxResults", 100)
+    if max_results == 0 and not isinstance(max_results, bool):
+        max_results = 100
+    if not isinstance(max_results, int) or isinstance(max_results, bool) or not 0 < max_results <= 1000:
+        return error_response_json("ValidationException", "maxResults must be between 0 and 1000", 400)
+
+    reverse_order = data.get("reverseOrder", False)
+    include_data = data.get("includeExecutionData", True)
     events = list(execution["events"])
-    if data.get("reverseOrder", False):
-        events = list(reversed(events))
-    max_results = data.get("maxResults", 1000)
-    return json_response({"events": events[:max_results]})
+    token = data.get("nextToken")
+    if token is None:
+        start, snapshot_size = 0, len(events)
+    else:
+        with _history_page_tokens_lock:
+            page_state = _history_page_tokens.get(token) if isinstance(token, str) else None
+        if (page_state is None or page_state["expires"] <= time.time()
+                or page_state["executionArn"] != exec_arn
+                or page_state["maxResults"] != max_results
+                or page_state["reverseOrder"] != reverse_order
+                or page_state["includeExecutionData"] != include_data
+                or page_state["snapshotSize"] > len(events)):
+            return error_response_json("InvalidToken", "Invalid pagination token", 400)
+        start, snapshot_size = page_state["start"], page_state["snapshotSize"]
+
+    events = events[:snapshot_size]
+    if reverse_order:
+        events.reverse()
+
+    page = events[start:start + max_results]
+    if include_data is False:
+        page = [copy.deepcopy(event) for event in page]
+        for event in page:
+            for key, details in event.items():
+                if key.endswith("EventDetails") and isinstance(details, dict):
+                    for payload in ("input", "output"):
+                        if payload in details:
+                            del details[payload]
+
+    response = {"events": page}
+    if start + max_results < snapshot_size:
+        now = time.time()
+        with _history_page_tokens_lock:
+            # Dict insertion order is creation order, so expired tokens are
+            # removed from the front without scanning live continuations.
+            while _history_page_tokens:
+                oldest = next(iter(_history_page_tokens))
+                if _history_page_tokens[oldest]["expires"] > now:
+                    break
+                del _history_page_tokens[oldest]
+            next_token = new_uuid()
+            _history_page_tokens[next_token] = {
+                "executionArn": exec_arn,
+                "maxResults": max_results,
+                "reverseOrder": reverse_order,
+                "includeExecutionData": include_data,
+                "start": start + max_results,
+                "snapshotSize": snapshot_size,
+                "expires": now + _HISTORY_TOKEN_TTL_SECONDS,
+            }
+        response["nextToken"] = next_token
+    return json_response(response)
 
 
 def _start_sync_execution(data):
@@ -715,12 +1207,16 @@ def _start_sync_execution(data):
         "outputDetails": {"included": True},
         "testCase": test_case,
         "mockAttempts": {},
+        **({"traceHeader": data["traceHeader"]} if data.get("traceHeader") else {}),
         "events": [
             {"id": 1, "type": "ExecutionStarted", "timestamp": start_date,
              "executionStartedEventDetails": {
                  "input": input_str, "roleArn": sm["roleArn"]}},
         ],
     }
+    # StartSyncExecution is the express-flavored path: express workflows emit
+    # no EventBridge status events on AWS, so the emitter skips this record.
+    _executions[exec_arn]["sync"] = True
 
     _run_execution(exec_arn)
 
@@ -737,6 +1233,8 @@ def _start_sync_execution(data):
         "output": execution.get("output") or "{}",
         "outputDetails": {"included": True},
     }
+    if execution.get("traceHeader"):
+        resp["traceHeader"] = execution["traceHeader"]
     # Include error/cause for failed executions (matches AWS SFN behaviour)
     if execution["status"] == "FAILED":
         failed_events = [
@@ -771,6 +1269,9 @@ def _describe_state_machine_for_execution(data):
         "definition": sm["definition"],
         "roleArn": sm["roleArn"],
         "updateDate": sm.get("creationDate", now_iso()),
+        "encryptionConfiguration": copy.deepcopy(
+            execution.get("encryptionConfiguration")
+            or sm.get("encryptionConfiguration") or _default_encryption()),
     })
 
 
@@ -823,6 +1324,14 @@ def _create_activity(data):
     if not name:
         return error_response_json("ValidationException", "name is required", 400)
 
+    encryption = data.get("encryptionConfiguration")
+    invalid = _encryption_serialization_error(encryption)
+    if invalid is None and encryption is not None:
+        encryption = _with_integer_period(encryption)
+        invalid = _encryption_validation_error(encryption) or _encryption_configuration_error(encryption)
+    if invalid:
+        return invalid
+
     arn = f"arn:aws:states:{get_region()}:{get_account_id()}:activity:{name}"
     if arn in _activities:
         return error_response_json(
@@ -830,6 +1339,8 @@ def _create_activity(data):
 
     ts = now_iso()
     _activities[arn] = {"activityArn": arn, "name": name, "creationDate": ts}
+    if encryption is not None:
+        _activities[arn]["encryptionConfiguration"] = _stored_encryption(encryption)
     _activity_tasks[arn] = []
 
     tags = data.get("tags", [])
@@ -864,7 +1375,7 @@ def _list_activities(data):
         {"activityArn": a["activityArn"], "name": a["name"], "creationDate": a["creationDate"]}
         for a in _activities.values()
     ]
-    return json_response({"activities": acts})
+    return _offset_page(data, "activities", acts)
 
 
 async def _get_activity_task(data):
@@ -891,7 +1402,13 @@ async def _get_activity_task(data):
 def _tag_resource(data):
     arn = data.get("resourceArn")
     new_tags = data.get("tags", [])
-    existing = _tags.setdefault(arn, [])
+    account_id, region, error = _tag_resource_scope_from_arn(arn)
+    if error:
+        return error
+    existing = _tags.get_scoped(account_id, region, arn)
+    if existing is None:
+        existing = []
+        _tags.set_scoped(account_id, region, arn, existing)
     existing_map = {t["key"]: i for i, t in enumerate(existing)}
     for tag in new_tags:
         idx = existing_map.get(tag["key"])
@@ -906,14 +1423,57 @@ def _tag_resource(data):
 def _untag_resource(data):
     arn = data.get("resourceArn")
     keys_to_remove = set(data.get("tagKeys", []))
-    existing = _tags.get(arn, [])
-    _tags[arn] = [t for t in existing if t["key"] not in keys_to_remove]
+    account_id, region, error = _tag_resource_scope_from_arn(arn)
+    if error:
+        return error
+    existing = _tags.get_scoped(account_id, region, arn, [])
+    _tags.set_scoped(
+        account_id,
+        region,
+        arn,
+        [t for t in existing if t["key"] not in keys_to_remove],
+    )
     return json_response({})
 
 
 def _list_tags_for_resource(data):
     arn = data.get("resourceArn")
-    return json_response({"tags": _tags.get(arn, [])})
+    account_id, region, error = _tag_resource_scope_from_arn(arn)
+    if error:
+        return error
+    return json_response({"tags": _tags.get_scoped(account_id, region, arn, [])})
+
+
+def _tag_resource_scope_from_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None, None, _invalid_tag_resource_arn(arn)
+    if spec.service != "states" or not _is_stepfunctions_taggable_resource(spec.resource):
+        return None, None, _invalid_tag_resource_arn(arn)
+    if spec.account_id != get_account_id():
+        return None, None, error_response_json(
+            "AccessDeniedException",
+            "User is not authorized to access this resource.",
+            400,
+        )
+    if spec.region != get_region():
+        return None, None, error_response_json(
+            "InvalidArn",
+            f"Invalid ARN: {arn} is expected to be within the request region {get_region()}.",
+            400,
+        )
+    return spec.account_id, spec.region, None
+
+
+def _is_stepfunctions_taggable_resource(resource):
+    return isinstance(resource, str) and (
+        resource.startswith("stateMachine:") or resource.startswith("activity:")
+    )
+
+
+def _invalid_tag_resource_arn(arn):
+    return error_response_json("InvalidArn", f"Invalid resource ARN: {arn}", 400)
 
 
 # ---------------------------------------------------------------------------
@@ -921,14 +1481,16 @@ def _list_tags_for_resource(data):
 # ---------------------------------------------------------------------------
 
 def _add_event(execution, event_type, details=None):
-    event = {
-        "id": len(execution["events"]) + 1,
-        "type": event_type,
-        "timestamp": now_iso(),
-    }
-    if details:
-        event.update(details)
-    execution["events"].append(event)
+    # Map items and Parallel branches add events from several threads
+    with _events_lock:
+        event = {
+            "id": len(execution["events"]) + 1,
+            "type": event_type,
+            "timestamp": now_iso(),
+        }
+        if details:
+            event.update(details)
+        execution["events"].append(event)
     return event
 
 
@@ -1026,23 +1588,20 @@ def _test_state(data):
                 result["nextState"] = next_state
 
         elif state_type == "Succeed":
-            output = _apply_input_path(state_def, input_data)
-            output = _apply_output_path(state_def, output)
+            output = _apply_input_path(state_def, input_data, ctx)
+            output = _apply_output_path(state_def, output, ctx)
             result = {"status": "SUCCEEDED", "output": json.dumps(output)}
 
         elif state_type == "Fail":
-            result = {
-                "status": "FAILED",
-                "error": state_def.get("Error", "States.Fail"),
-                "cause": state_def.get("Cause", ""),
-            }
+            error, cause = _fail_state_error(state_def, input_data, ctx)
+            result = {"status": "FAILED", "error": error, "cause": cause}
 
         elif state_type == "Task":
-            effective = _apply_input_path(state_def, input_data)
+            effective = _apply_input_path(state_def, input_data, ctx)
             effective = _apply_parameters(state_def, effective, ctx)
 
             if inspection_level in ("DEBUG", "TRACE"):
-                inspection_data["afterInputPath"] = json.dumps(_apply_input_path(state_def, input_data))
+                inspection_data["afterInputPath"] = json.dumps(_apply_input_path(state_def, input_data, ctx))
                 inspection_data["afterParameters"] = json.dumps(effective)
 
             # Mock support
@@ -1097,7 +1656,7 @@ def _test_state(data):
                         mock_result = mock["result"]
                     task_result = _apply_result_selector(state_def, mock_result)
                     output = _apply_result_path(state_def, input_data, task_result)
-                    output = _apply_output_path(state_def, output)
+                    output = _apply_output_path(state_def, output, ctx)
                     result = {"status": "SUCCEEDED", "output": json.dumps(output)}
                     next_state = _next_or_end(state_def)
                     if next_state:
@@ -1118,7 +1677,7 @@ def _test_state(data):
                     if inspection_level in ("DEBUG", "TRACE"):
                         inspection_data["afterResultPath"] = json.dumps(output)
 
-                    output = _apply_output_path(state_def, output)
+                    output = _apply_output_path(state_def, output, ctx)
                     result = {"status": "SUCCEEDED", "output": json.dumps(output)}
                     next_state = _next_or_end(state_def)
                     if next_state:
@@ -1170,6 +1729,84 @@ class _ExecutionError(Exception):
         super().__init__(f"{error}: {cause}")
 
 
+def _iso_to_epoch_ms(iso):
+    """AWS's ISO record stamp -> the epoch-millisecond integer the status
+    event carries (the documented payloads show 13-digit values)."""
+    if not iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return int(dt.timestamp() * 1000)
+
+
+# The status event excludes an input/output whose escaped form exceeds 248 KiB
+# (an EventBridge quota Step Functions documents for these events); the
+# inputDetails/outputDetails "included" flag reports the exclusion.
+_STATUS_EVENT_PAYLOAD_CAP = 248 * 1024
+
+
+def _emit_execution_status_event(execution) -> None:
+    """Publish "Step Functions Execution Status Change" to the default bus.
+
+    Standard-workflow executions emit this automatically on AWS at every
+    status change (source aws.states): it is how consumers track a run
+    without polling DescribeExecution. Delivery is best-effort there, so a
+    publish failure is logged and never fails the execution. Sync-started
+    executions (the express-flavored path) emit nothing, as on AWS.
+    """
+    if execution.get("sync"):
+        return
+    status = execution["status"]
+    failed = status == "FAILED"
+    redrivable = failed  # TIMED_OUT is never set locally; FAILED is the one
+    detail = {
+        "executionArn": execution["executionArn"],
+        "stateMachineArn": execution["stateMachineArn"],
+        "name": execution["name"],
+        "status": status,
+        "startDate": _iso_to_epoch_ms(execution.get("startDate")),
+        "stopDate": _iso_to_epoch_ms(execution.get("stopDate")),
+        "input": execution.get("input"),
+        "inputDetails": {"included": True},
+        # The documented payloads carry the output only on SUCCEEDED; a failed
+        # record's local output (the Error/Cause document) stays off the event.
+        "output": execution.get("output") if status == "SUCCEEDED" else None,
+        "outputDetails": {"included": True} if status == "SUCCEEDED" else None,
+        "stateMachineVersionArn": None,
+        "stateMachineAliasArn": None,
+        "redriveCount": 0,
+        "redriveDate": None,
+        "redriveStatus": "REDRIVABLE" if redrivable else "NOT_REDRIVABLE",
+        "redriveStatusReason": (
+            f"Execution is {status} and is redrivable" if redrivable
+            else f"Execution is {status} and cannot be redriven"
+        ),
+        "error": execution.get("error") if failed else None,
+        "cause": execution.get("cause") if failed else None,
+    }
+    if detail["input"] is not None and len(detail["input"]) > _STATUS_EVENT_PAYLOAD_CAP:
+        detail["input"] = None
+        detail["inputDetails"] = {"included": False}
+    if detail["output"] is not None and len(detail["output"]) > _STATUS_EVENT_PAYLOAD_CAP:
+        detail["output"] = None
+        detail["outputDetails"] = {"included": False}
+    try:
+        from ministack.services import eventbridge
+        eventbridge._put_events({
+            "Entries": [{
+                "Source": "aws.states",
+                "DetailType": "Step Functions Execution Status Change",
+                "Detail": json.dumps(detail),
+                "Resources": [execution["executionArn"]],
+            }]
+        }, allow_aws_source=True)
+    except Exception:
+        logger.warning("Failed to publish execution status event for %s",
+                       execution["executionArn"], exc_info=True)
+
+
 def _run_execution(exec_arn):
     """Background thread: walk the ASL definition to completion."""
     execution = _executions.get(exec_arn)
@@ -1215,10 +1852,7 @@ def _run_execution(exec_arn):
             "Id": execution["stateMachineArn"],
             "Name": sm["name"],
         },
-        # JSONata workflow variables — bound via state `Assign` fields and
-        # referenced as `$name` in subsequent JSONata expressions. Scope is
-        # the whole execution (per AWS); Map/Parallel sub-branches share
-        # this dict with the parent, matching AWS semantics.
+        # Workflow variables set by `Assign`; Map items and Parallel branches get a copy
         "variables": {},
     }
 
@@ -1230,19 +1864,21 @@ def _run_execution(exec_arn):
                     "States.Runtime",
                     f"State '{current_name}' not found in definition")
 
-            ctx["State"] = {"Name": current_name, "EnteredTime": now_iso()}
+            ctx["State"] = {"Name": current_name, "EnteredTime": now_iso(), "RetryCount": 0}
             state_type = state_def.get("Type")
 
-            _add_event(execution, f"{state_type}StateEntered", {
+            entered = _add_event(execution, f"{state_type}StateEntered", {
                 "stateEnteredEventDetails": {
                     "name": current_name,
                     "input": json.dumps(current_input),
                 },
             })
+            if state_type == "Map":
+                _check_inline_map_fields(state_def, current_name, entered["id"])
 
             if state_type == "Succeed":
-                current_input = _apply_input_path(state_def, current_input)
-                current_input = _apply_output_path(state_def, current_input)
+                current_input = _apply_input_path(state_def, current_input, ctx)
+                current_input = _apply_output_path(state_def, current_input, ctx)
                 _add_event(execution, "SucceedStateExited", {
                     "stateExitedEventDetails": {
                         "name": current_name,
@@ -1253,9 +1889,7 @@ def _run_execution(exec_arn):
                 continue
 
             if state_type == "Fail":
-                raise _ExecutionError(
-                    state_def.get("Error", "States.Fail"),
-                    state_def.get("Cause", ""))
+                raise _ExecutionError(*_fail_state_error(state_def, current_input, ctx))
 
             handler_fn = {
                 "Pass": _execute_pass,
@@ -1273,9 +1907,16 @@ def _run_execution(exec_arn):
             if state_type in ("Task", "Parallel", "Map"):
                 current_input, next_name = handler_fn(
                     state_def, current_input, execution, ctx)
+            elif state_type == "Wait":
+                current_input, next_name = handler_fn(
+                    state_def, current_input, ctx, execution=execution)
             else:
                 current_input, next_name = handler_fn(
                     state_def, current_input, ctx)
+
+            # AWS writes no event after ExecutionAborted, so a stopped run skips the exit event.
+            if execution["status"] != "RUNNING":
+                break
 
             _add_event(execution, f"{state_type}StateExited", {
                 "stateExitedEventDetails": {
@@ -1293,6 +1934,7 @@ def _run_execution(exec_arn):
             _add_event(execution, "ExecutionSucceeded", {
                 "executionSucceededEventDetails": {"output": output_json},
             })
+            _emit_execution_status_event(execution)
 
     except _ExecutionError as err:
         _fail_execution(execution, err.error, err.cause)
@@ -1302,6 +1944,8 @@ def _run_execution(exec_arn):
 
 
 def _fail_execution(execution, error, cause):
+    if execution["status"] != "RUNNING":  # stopped meanwhile: AWS writes nothing after ExecutionAborted
+        return
     execution["status"] = "FAILED"
     execution["error"] = error
     execution["cause"] = cause
@@ -1310,6 +1954,7 @@ def _fail_execution(execution, error, cause):
     _add_event(execution, "ExecutionFailed", {
         "executionFailedEventDetails": {"error": error, "cause": cause},
     })
+    _emit_execution_status_event(execution)
 
 
 # ---------------------------------------------------------------------------
@@ -1327,13 +1972,14 @@ def _execute_pass(state_def, raw_input, ctx=None):
         _apply_state_assign(state_def, raw_input, ctx, result=output)
         return output, _next_or_end(state_def)
 
-    effective = _apply_input_path(state_def, raw_input)
-    effective = _apply_parameters(state_def, effective)
+    effective = _apply_input_path(state_def, raw_input, ctx)
+    effective = _apply_parameters(state_def, effective, ctx)
 
-    result = state_def.get("Result", effective)
-    result = _apply_result_selector(state_def, result)
+    assignment_result = state_def.get("Result", effective)
+    result = _apply_result_selector(state_def, assignment_result)
     output = _apply_result_path(state_def, raw_input, result)
-    output = _apply_output_path(state_def, output)
+    output = _apply_output_path(state_def, output, ctx)
+    _apply_state_assign(state_def, effective, ctx, result=assignment_result)
     return output, _next_or_end(state_def)
 
 
@@ -1347,6 +1993,7 @@ def _execute_task(state_def, raw_input, execution, ctx):
     query_language = _state_query_language(state_def, ctx)
 
     # SFN mock config — return canned response if configured (AWS SFN Local format)
+    _mock_throw = None
     if _sfn_mock_config and execution:
         test_case = execution.get("testCase", "")
         sm_name = ctx.get("StateMachine", {}).get("Name", "")
@@ -1357,31 +2004,31 @@ def _execute_task(state_def, raw_input, execution, ctx):
         if mock is not None:
             attempts[state_name] = attempt + 1
             if "Throw" in mock:
-                raise _ExecutionError(
+                # Feed the mocked error into the same Retry/Catch machinery a real
+                # task failure uses (#903). Raising here bypassed Catch entirely.
+                _mock_throw = _ExecutionError(
                     mock["Throw"].get("Error", "MockError"),
                     mock["Throw"].get("Cause", "Mocked failure"))
-            mock_result = mock.get("Return", {})
-            if query_language == "JSONata":
-                output = _apply_jsonata_output(
-                    state_def,
-                    raw_input,
-                    ctx,
-                    result=mock_result,
-                    default=mock_result,
-                )
             else:
-                result = _apply_result_selector(state_def, mock_result)
-                output = _apply_result_path(state_def, raw_input, result)
-                output = _apply_output_path(state_def, output)
-            return output, _next_or_end(state_def)
+                mock_result = mock.get("Return", {})
+                if query_language == "JSONata":
+                    output = _apply_jsonata_output(
+                        state_def,
+                        raw_input,
+                        ctx,
+                        result=mock_result,
+                        default=mock_result,
+                    )
+                    _apply_state_assign(state_def, raw_input, ctx, result=mock_result)
+                else:
+                    result = _apply_result_selector(state_def, mock_result)
+                    output = _apply_result_path(state_def, raw_input, result)
+                    output = _apply_output_path(state_def, output, ctx)
+                    _apply_state_assign(state_def, raw_input, ctx, result=mock_result)
+                return output, _next_or_end(state_def)
 
     if is_callback:
         ctx["Task"] = {"Token": new_uuid()}
-
-    effective = None
-    if query_language != "JSONata":
-        effective = _apply_input_path(state_def, raw_input)
-        effective = _apply_parameters(state_def, effective, ctx)
 
     retriers = state_def.get("Retry", [])
     catchers = state_def.get("Catch", [])
@@ -1389,6 +2036,10 @@ def _execute_task(state_def, raw_input, execution, ctx):
     last_error: _ExecutionError | None = None
 
     while True:
+        # Each attempt sees its own $$.State.RetryCount.
+        ctx["State"]["RetryCount"] = sum(retry_counts.values())
+        if query_language != "JSONata":
+            effective = _apply_parameters(state_def, _apply_input_path(state_def, raw_input, ctx), ctx)
         try:
             if query_language == "JSONata":
                 effective = _apply_jsonata_arguments(state_def, raw_input, ctx)
@@ -1400,9 +2051,16 @@ def _execute_task(state_def, raw_input, execution, ctx):
                 },
             })
 
+            if _mock_throw is not None:
+                raise _mock_throw
+
             if is_callback:
                 task_result = _invoke_with_callback(
                     resource, effective, ctx["Task"]["Token"], state_def)
+            # Skip activities: their timeout starts when a worker gets the task, not here
+            elif "TimeoutSeconds" in state_def and ":activity:" not in resource:
+                task_result = _invoke_resource_with_timeout(
+                    resource, effective, state_def["TimeoutSeconds"])
             else:
                 task_result = _invoke_resource(resource, effective)
 
@@ -1427,7 +2085,8 @@ def _execute_task(state_def, raw_input, execution, ctx):
             else:
                 result = _apply_result_selector(state_def, task_result)
                 output = _apply_result_path(state_def, raw_input, result)
-                output = _apply_output_path(state_def, output)
+                output = _apply_output_path(state_def, output, ctx)
+                _apply_state_assign(state_def, raw_input, ctx, result=task_result)
             return output, _next_or_end(state_def)
 
         except _ExecutionError as err:
@@ -1455,21 +2114,7 @@ def _execute_task(state_def, raw_input, execution, ctx):
         catcher = _find_matching_catcher(catchers, last_error.error)
         if catcher:
             error_output = {"Error": last_error.error, "Cause": last_error.cause}
-            if query_language == "JSONata" and "Output" in catcher:
-                output = _apply_jsonata_output(
-                    catcher,
-                    raw_input,
-                    ctx,
-                    error_output=error_output,
-                    default=error_output,
-                )
-            else:
-                output = _apply_result_path_raw(
-                    catcher.get("ResultPath", "$"), raw_input, error_output)
-            if query_language == "JSONata":
-                # Catch handlers can also carry `Assign`. `$states.errorOutput`
-                # is available here; `$states.result` is not (per AWS).
-                _apply_state_assign(catcher, raw_input, ctx, error_output=error_output)
+            output = _apply_catcher(catcher, raw_input, ctx, query_language, error_output)
             return output, catcher["Next"]
         raise last_error
 
@@ -1479,16 +2124,15 @@ def _execute_task(state_def, raw_input, execution, ctx):
 def _invoke_resource(resource, input_data):
     """Dispatch to Lambda or return a mock/passthrough."""
     if "states:::lambda:invoke" in resource:
-        func_name = input_data.get("FunctionName", "")
+        func_ref = input_data.get("FunctionName", "")
         payload = input_data.get("Payload", input_data)
-        if ":function:" in func_name:
-            func_name = func_name.split(":function:")[-1].split(":")[0]
-        result = _call_lambda(func_name, payload)
+        func_ref = _resolve_lambda_function_ref(func_ref, optimized=True)
+        result = _call_lambda(func_ref, payload)
         return {"StatusCode": 200, "Payload": result}
 
-    func_name = _extract_lambda_name(resource)
-    if func_name:
-        return _call_lambda(func_name, input_data)
+    func_ref = _extract_lambda_ref(resource)
+    if func_ref:
+        return _call_lambda(func_ref, input_data)
 
     # Activity resource — enqueue task and wait for worker to call GetActivityTask + SendTask*
     if ":activity:" in resource:
@@ -1509,7 +2153,36 @@ def _invoke_resource(resource, input_data):
     if "aws-sdk:" in resource:
         return _invoke_aws_sdk_integration(resource, input_data)
 
+    # An optimized service integration (arn:aws:states:::<service>:<action>)
+    # that reaches here is one MiniStack does not implement. Real AWS supports
+    # every documented optimized integration, so echoing the input back as a
+    # SUCCEEDED result hides a genuine gap (a state machine "passes" locally
+    # while its side effect never happens). Fail loudly instead, mirroring the
+    # aws-sdk dispatcher's "not yet implemented" failure.
+    if resource.startswith("arn:aws:states:::"):
+        raise _ExecutionError(
+            "States.Runtime",
+            f"{resource} is not yet implemented in MiniStack. Use the generic "
+            "arn:aws:states:::aws-sdk:<service>:<action> form, or open an issue "
+            "for this optimized integration.",
+        )
+
     return input_data
+
+
+def _invoke_resource_with_timeout(resource, input_data, timeout):
+    """Run the task, and raise States.Timeout when it runs longer than TimeoutSeconds.
+
+    This function does not stop the task thread. The task continues to run, but the state ignores its result.
+    """
+    pool = ThreadPoolExecutor(max_workers=1)
+    # Workers do not inherit contextvars, so copy them to keep the account and region scope (#639).
+    future = pool.submit(contextvars.copy_context().run, _invoke_resource, resource, input_data)
+    pool.shutdown(wait=False)
+    try:
+        return future.result(timeout=timeout)
+    except FutureTimeoutError:
+        raise _ExecutionError("States.Timeout", f"Task timed out after {timeout} seconds") from None
 
 
 def _invoke_activity(resource, input_data):
@@ -1551,17 +2224,59 @@ def _invoke_with_callback(resource, input_data, token, state_def):
         "event": evt, "result": None, "error": None, "heartbeat": None}
 
     clean_resource = resource.replace(".waitForTaskToken", "")
-    func_name = _extract_lambda_name(clean_resource)
-    if not func_name and "states:::lambda:invoke" in clean_resource:
-        func_name = input_data.get("FunctionName", "")
-        if ":function:" in func_name:
-            func_name = func_name.split(":function:")[-1].split(":")[0]
+    func_ref = _extract_lambda_ref(clean_resource)
+    if not func_ref and "states:::lambda:invoke" in clean_resource:
+        func_ref = input_data.get("FunctionName", "")
+        func_ref = _resolve_lambda_function_ref(func_ref, optimized=True)
 
-    if func_name:
+    if func_ref:
+        # For lambda:invoke[.waitForTaskToken] the resolved Parameters wrap the
+        # Lambda event under "Payload" (alongside "FunctionName"). Deliver only
+        # the Payload, mirroring the synchronous lambda:invoke path
+        # (_invoke_resource). Otherwise the handler receives the integration
+        # envelope ({"FunctionName": ..., "Payload": {...}}) instead of its
+        # input and fails to find the task token / its arguments.
+        lambda_payload = input_data.get("Payload", input_data) \
+            if isinstance(input_data, dict) else input_data
         try:
-            _call_lambda(func_name, input_data)
+            _call_lambda(func_ref, lambda_payload)
         except _ExecutionError:
             pass
+    else:
+        # Non-Lambda service integrations (sqs:sendMessage, sns:publish, …) must
+        # actually perform the call — delivering the payload that carries the
+        # task token — before we block for the callback. Without this the task is
+        # scheduled but nothing is ever sent and the execution hangs forever
+        # (#959). A failed integration fails the task (propagates) rather than
+        # hanging.
+        try:
+            for prefix, handler in _SERVICE_DISPATCH.items():
+                if clean_resource.startswith(prefix):
+                    handler(clean_resource, input_data)
+                    break
+            else:
+                if "aws-sdk:" in clean_resource:
+                    _invoke_aws_sdk_integration(clean_resource, input_data)
+                elif clean_resource.startswith(
+                        "arn:aws:states:::states:startExecution"):
+                    # The child execution carries the task token in its input,
+                    # so it has to be started before we block on the callback.
+                    _invoke_nested_start_execution(clean_resource, input_data)
+                elif clean_resource.startswith("arn:aws:states:::"):
+                    # An optimized integration MiniStack does not implement.
+                    # Falling through here sends nothing and then blocks on the
+                    # callback until TimeoutSeconds (default 99999), so the
+                    # execution hangs instead of reporting the gap. Fail loudly,
+                    # matching the synchronous dispatcher in _invoke_resource.
+                    raise _ExecutionError(
+                        "States.Runtime",
+                        f"{resource} is not yet implemented in MiniStack. Use "
+                        "the generic arn:aws:states:::aws-sdk:<service>:<action> "
+                        "form, or open an issue for this optimized integration.",
+                    )
+        except _ExecutionError:
+            _task_tokens.pop(token, None)
+            raise
 
     timeout = state_def.get("TimeoutSeconds", 99999)
     if not evt.wait(timeout=timeout):
@@ -1581,33 +2296,44 @@ def _invoke_with_callback(resource, input_data, token, state_def):
         return result_raw
 
 
-def _call_lambda(func_name, event):
+def _call_lambda(func_ref, event):
     """Invoke a Lambda via the co-located lambda_svc module (synchronous)."""
     try:
         from ministack.services import lambda_svc
     except ImportError:
-        logger.warning("lambda_svc unavailable; returning passthrough for %s", func_name)
+        logger.warning("lambda_svc unavailable; returning passthrough for %s", func_ref)
         return event
 
-    func = lambda_svc._functions.get(func_name)
-    if not func:
+    func, config, func_name = lambda_svc._get_func_record_for_ref(func_ref)
+    if not func or not config:
         raise _ExecutionError(
             "Lambda.ResourceNotFoundException",
             f"Function not found: {func_name}")
 
-    result = lambda_svc._execute_function(func, event)
+    exec_record = lambda_svc._execution_record_for_config(func, config)
+    result = lambda_svc._execute_function_with_config_scope(exec_record, event)
 
+    if result.get("service_error"):
+        # Lambda itself failed (Invoke answered 500 ServiceException); Step Functions names it Lambda.<ErrorName>.
+        body = result.get("body") or {}
+        raise _ExecutionError("Lambda.ServiceException", body.get("message", "") if isinstance(body, dict) else str(body))
     if result.get("error"):
         body = result.get("body", {})
         if isinstance(body, dict):
+            # AWS reports a failed Lambda task with Error set to the function's
+            # errorType and Cause set to a JSON-encoded string of the error
+            # payload ({"errorType": ..., "errorMessage": ..., "trace": [...]}),
+            # NOT the bare errorMessage. Consumers (Catch handlers, downstream
+            # tasks) routinely json.loads(Cause) to read errorType/errorMessage,
+            # so emit the JSON form to match.
             raise _ExecutionError(
                 body.get("errorType", "Lambda.Unknown"),
-                body.get("errorMessage", str(body)))
+                json.dumps(body))
         raise _ExecutionError("Lambda.Unknown", str(body))
 
     body = result.get("body")
     if body is None:
-        return {}
+        return None
     if isinstance(body, (dict, list)):
         return body
     try:
@@ -1640,15 +2366,19 @@ def _execute_choice(state_def, raw_input, ctx=None):
         raise _ExecutionError("States.NoChoiceMatched",
                               "No choice rule matched and no Default")
 
-    effective = _apply_input_path(state_def, raw_input)
+    effective = _apply_input_path(state_def, raw_input, ctx)
 
     for choice in state_def.get("Choices", []):
-        if _evaluate_rule(choice, effective):
-            return _apply_output_path(state_def, effective), choice["Next"]
+        if _evaluate_rule(choice, effective, ctx):
+            output = _apply_output_path(state_def, effective, ctx)
+            _apply_state_assign(choice, effective, ctx)
+            return output, choice["Next"]
 
     default = state_def.get("Default")
     if default:
-        return _apply_output_path(state_def, effective), default
+        output = _apply_output_path(state_def, effective, ctx)
+        _apply_state_assign(state_def, effective, ctx)
+        return output, default
 
     raise _ExecutionError("States.NoChoiceMatched",
                           "No choice rule matched and no Default")
@@ -1668,18 +2398,32 @@ def _evaluate_jsonata_choice_rule(rule, raw_input, ctx):
     return _truthy(condition)
 
 
-def _evaluate_rule(rule, data):
+def _resolve_path_or_ctx(path, data, ctx):
+    if path.startswith("$$."):
+        return _resolve_ctx_path(path, ctx or {})
+    if path.startswith("$") and len(path) > 1 and path[1] not in ".[":
+        match = re.match(r"^\$([^.[\s]+)(.*)$", path)
+        if match:
+            name, suffix = match.groups()
+            variables = (ctx or {}).get("variables", {})
+            if name not in variables:
+                raise _ExecutionError("States.Runtime", f"Undefined workflow variable: {name}")
+            return _resolve_path("$" + suffix, variables[name])
+    return _resolve_path(path, data)
+
+
+def _evaluate_rule(rule, data, ctx=None):
     if "And" in rule:
-        return all(_evaluate_rule(r, data) for r in rule["And"])
+        return all(_evaluate_rule(r, data, ctx) for r in rule["And"])
     if "Or" in rule:
-        return any(_evaluate_rule(r, data) for r in rule["Or"])
+        return any(_evaluate_rule(r, data, ctx) for r in rule["Or"])
     if "Not" in rule:
-        return not _evaluate_rule(rule["Not"], data)
+        return not _evaluate_rule(rule["Not"], data, ctx)
 
     variable = rule.get("Variable")
     if not variable:
         return False
-    value = _resolve_path(variable, data)
+    value = _resolve_path_or_ctx(variable, data, ctx)
 
     # --- type checks ---
     if "IsPresent" in rule:
@@ -1699,7 +2443,7 @@ def _evaluate_rule(rule, data):
     if "StringEquals" in rule:
         return value == rule["StringEquals"]
     if "StringEqualsPath" in rule:
-        return value == _resolve_path(rule["StringEqualsPath"], data)
+        return value == _resolve_path_or_ctx(rule["StringEqualsPath"], data, ctx)
     if "StringLessThan" in rule:
         return isinstance(value, str) and value < rule["StringLessThan"]
     if "StringGreaterThan" in rule:
@@ -1716,7 +2460,7 @@ def _evaluate_rule(rule, data):
     if "NumericEquals" in rule:
         return _is_num(value) and value == rule["NumericEquals"]
     if "NumericEqualsPath" in rule:
-        return _is_num(value) and value == _resolve_path(rule["NumericEqualsPath"], data)
+        return _is_num(value) and value == _resolve_path_or_ctx(rule["NumericEqualsPath"], data, ctx)
     if "NumericLessThan" in rule:
         return _is_num(value) and value < rule["NumericLessThan"]
     if "NumericGreaterThan" in rule:
@@ -1725,12 +2469,24 @@ def _evaluate_rule(rule, data):
         return _is_num(value) and value <= rule["NumericLessThanEquals"]
     if "NumericGreaterThanEquals" in rule:
         return _is_num(value) and value >= rule["NumericGreaterThanEquals"]
+    if "NumericLessThanPath" in rule:
+        rhs = _resolve_path_or_ctx(rule["NumericLessThanPath"], data, ctx)
+        return _is_num(value) and _is_num(rhs) and value < rhs
+    if "NumericGreaterThanPath" in rule:
+        rhs = _resolve_path_or_ctx(rule["NumericGreaterThanPath"], data, ctx)
+        return _is_num(value) and _is_num(rhs) and value > rhs
+    if "NumericLessThanEqualsPath" in rule:
+        rhs = _resolve_path_or_ctx(rule["NumericLessThanEqualsPath"], data, ctx)
+        return _is_num(value) and _is_num(rhs) and value <= rhs
+    if "NumericGreaterThanEqualsPath" in rule:
+        rhs = _resolve_path_or_ctx(rule["NumericGreaterThanEqualsPath"], data, ctx)
+        return _is_num(value) and _is_num(rhs) and value >= rhs
 
     # --- boolean ---
     if "BooleanEquals" in rule:
         return value is rule["BooleanEquals"] or value == rule["BooleanEquals"]
     if "BooleanEqualsPath" in rule:
-        return value == _resolve_path(rule["BooleanEqualsPath"], data)
+        return value == _resolve_path_or_ctx(rule["BooleanEqualsPath"], data, ctx)
 
     # --- timestamp ---
     for op, cmp_fn in [("TimestampEquals", lambda a, b: a == b),
@@ -1749,48 +2505,150 @@ def _evaluate_rule(rule, data):
 # Wait state
 # ---------------------------------------------------------------------------
 
-def _execute_wait(state_def, raw_input, ctx=None):
-    effective = _apply_input_path(state_def, raw_input)
+def _execute_wait(state_def, raw_input, ctx=None, execution=None):
+    if _state_query_language(state_def, ctx) == "JSONata":
+        # JSONata Wait: Seconds and Timestamp may be expressions, and Output
+        # and Assign replace the JSONPath chain, as for Pass.
+        if "Seconds" in state_def:
+            _scaled_sleep(_jsonata_wait_seconds(state_def, raw_input, ctx), execution)
+        elif "Timestamp" in state_def:
+            _sleep_until(_jsonata_wait_timestamp(state_def, raw_input, ctx), execution)
+        output = _apply_jsonata_output(state_def, raw_input, ctx, default=raw_input)
+        _apply_state_assign(state_def, raw_input, ctx)
+        return output, _next_or_end(state_def)
+
+    effective = _apply_input_path(state_def, raw_input, ctx)
 
     if "Seconds" in state_def:
-        _scaled_sleep(state_def["Seconds"])
+        _scaled_sleep(state_def["Seconds"], execution)
     elif "Timestamp" in state_def:
-        _sleep_until(state_def["Timestamp"])
+        _sleep_until(state_def["Timestamp"], execution)
     elif "SecondsPath" in state_def:
         secs = _resolve_path(state_def["SecondsPath"], effective)
         if isinstance(secs, (int, float)) and secs > 0:
-            _scaled_sleep(secs)
+            _scaled_sleep(secs, execution)
     elif "TimestampPath" in state_def:
         ts_str = _resolve_path(state_def["TimestampPath"], effective)
         if isinstance(ts_str, str):
-            _sleep_until(ts_str)
+            _sleep_until(ts_str, execution)
 
-    output = _apply_output_path(state_def, effective)
+    output = _apply_output_path(state_def, effective, ctx)
+    _apply_state_assign(state_def, effective, ctx)
     return output, _next_or_end(state_def)
 
 
-def _scaled_sleep(seconds):
+def _jsonata_wait_seconds(state_def, raw_input, ctx):
+    seconds = _jsonata_state_field(state_def, "Seconds", "number", raw_input, ctx)
+    if not float(seconds).is_integer():
+        raise _ExecutionError(
+            "States.QueryEvaluationError",
+            f"The Seconds field cannot be parsed as an integer: {json.dumps(seconds)}")
+    if seconds < 0:
+        raise _ExecutionError(
+            "States.QueryEvaluationError",
+            f"Seconds cannot be negative but was: {json.dumps(seconds)}")
+    return seconds
+
+
+def _jsonata_wait_timestamp(state_def, raw_input, ctx):
+    timestamp = _jsonata_state_field(state_def, "Timestamp", "string", raw_input, ctx)
+    if _parse_ts(timestamp) is None:
+        raise _ExecutionError(
+            "States.QueryEvaluationError",
+            "The Timestamp field cannot be parsed as an ISO-8601 extended offset "
+            f"date-time format string: {timestamp}")
+    return timestamp
+
+
+def _scaled_sleep(seconds, execution=None):
     scaled = seconds * _SFN_WAIT_SCALE
-    if scaled > 0:
+    if scaled <= 0:
+        return
+    if execution is None:
         time.sleep(scaled)
+        return
+    # A stopped execution ends its Wait at once, as on AWS.
+    deadline = time.monotonic() + scaled
+    while execution["status"] == "RUNNING" and time.monotonic() < deadline:
+        time.sleep(max(0, min(0.1, deadline - time.monotonic())))
 
 
-def _sleep_until(iso_ts):
+def _sleep_until(iso_ts, execution=None):
     try:
         target = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
         delta = (target - datetime.now(timezone.utc)).total_seconds()
         if delta > 0:
-            _scaled_sleep(delta)
+            _scaled_sleep(delta, execution)
     except (ValueError, TypeError):
         pass
+
+
+# ---------------------------------------------------------------------------
+# Fail state
+# ---------------------------------------------------------------------------
+
+def _fail_state_error(state_def, raw_input, ctx=None):
+    """The error and cause a Fail state ends with. JSONata states may give
+    either as an expression; JSONPath states may select either from the
+    input with ErrorPath or CausePath. Both must be strings."""
+    return (_fail_state_field(state_def, "Error", "States.Fail", raw_input, ctx),
+            _fail_state_field(state_def, "Cause", "", raw_input, ctx))
+
+
+def _fail_state_field(state_def, field, default, raw_input, ctx):
+    if field in state_def and _state_query_language(state_def, ctx) == "JSONata":
+        return _jsonata_state_field(state_def, field, "string", raw_input, ctx)
+    path = state_def.get(f"{field}Path")
+    if path is None:
+        return state_def.get(field, default)
+    value = (_evaluate_intrinsic(path, raw_input, ctx) if path.startswith("States.")
+             else _resolve_path_or_ctx(path, raw_input, ctx))
+    if not isinstance(value, str):
+        raise _ExecutionError(
+            "States.Runtime",
+            f"The value referenced by {field}Path must be a string, "
+            f"but the value was: {json.dumps(value)}")
+    return value
 
 
 # ---------------------------------------------------------------------------
 # Parallel state
 # ---------------------------------------------------------------------------
 
+def _with_retry_and_catch(state_def, raw_input, ctx, attempt):
+    """Run a Parallel or Map attempt under the state's Retry and Catch fields."""
+    state = ctx["State"]
+    retry_counts: dict = {}
+    while True:
+        # Branches share ctx and leave their own State in it; each attempt starts from this state's, counted.
+        ctx["State"] = {**state, "RetryCount": sum(retry_counts.values())}
+        try:
+            return attempt()
+        except _ExecutionError as err:
+            retrier, retrier_idx = _find_matching_retrier(
+                state_def.get("Retry", []), err.error, retry_counts)
+            if retrier is not None:
+                count = retry_counts.get(retrier_idx, 0)
+                interval = retrier.get("IntervalSeconds", 1)
+                _scaled_sleep(min(interval * (retrier.get("BackoffRate", 2.0) ** count), 60))
+                retry_counts[retrier_idx] = count + 1
+                continue
+            catcher = _find_matching_catcher(state_def.get("Catch", []), err.error)
+            if catcher is None:
+                raise
+            error_output = {"Error": err.error, "Cause": err.cause}
+            output = _apply_catcher(catcher, raw_input, ctx, _state_query_language(state_def, ctx), error_output)
+            return output, catcher["Next"]
+
+
 def _execute_parallel(state_def, raw_input, execution, ctx):
-    effective = _apply_input_path(state_def, raw_input)
+    return _with_retry_and_catch(
+        state_def, raw_input, ctx,
+        lambda: _run_parallel_branches(state_def, raw_input, execution, ctx))
+
+
+def _run_parallel_branches(state_def, raw_input, execution, ctx):
+    effective = _apply_input_path(state_def, raw_input, ctx)
     effective = _apply_parameters(state_def, effective, ctx)
 
     branches = state_def.get("Branches", [])
@@ -1802,12 +2660,12 @@ def _execute_parallel(state_def, raw_input, execution, ctx):
             results[idx] = _run_sub_machine(
                 branch.get("States", {}),
                 branch.get("StartAt"),
-                effective, execution, ctx)
+                effective, execution, copy.deepcopy(ctx))
         except Exception as exc:
             errors[idx] = exc
 
     # Each branch runs in its own thread; propagate the parent's contextvars
-    # so AccountScopedDict lookups (account ID, region) keep resolving to the
+    # so scoped store lookups (account ID, region) keep resolving to the
     # current execution's tenant. Take a fresh copy_context() per branch —
     # a single Context cannot be entered by two threads concurrently. See
     # issue #639.
@@ -1831,7 +2689,8 @@ def _execute_parallel(state_def, raw_input, execution, ctx):
 
     result = _apply_result_selector(state_def, results)
     output = _apply_result_path(state_def, raw_input, result)
-    output = _apply_output_path(state_def, output)
+    output = _apply_output_path(state_def, output, ctx)
+    _apply_state_assign(state_def, raw_input, ctx, result=results)
     return output, _next_or_end(state_def)
 
 
@@ -1839,12 +2698,40 @@ def _execute_parallel(state_def, raw_input, execution, ctx):
 # Map state
 # ---------------------------------------------------------------------------
 
-def _execute_map(state_def, raw_input, execution, ctx):
-    effective = _apply_input_path(state_def, raw_input)
-    effective = _apply_parameters(state_def, effective, ctx)
+def _check_inline_map_fields(state_def, state_name, entered_event_id):
+    """Fail an Inline Map that has a field that only a Distributed Map supports.
 
-    items_path = state_def.get("ItemsPath", "$")
-    items = _resolve_path(items_path, effective)
+    AWS fails the execution when it enters such a Map, and a Catch or Retry on the Map does not handle the error.
+    So the state loops call this right after they write MapStateEntered, with that event's id for the cause text,
+    and not through the Map's _with_retry_and_catch.
+    """
+    processor = state_def.get("Iterator") or state_def.get("ItemProcessor", {})
+    if (processor.get("ProcessorConfig") or {}).get("Mode") == "DISTRIBUTED":
+        return
+    if any(field in state_def for field in ("ItemReader", "ItemBatcher", "ResultWriter")):
+        raise _ExecutionError(
+            "States.Runtime",
+            f"An error occurred while executing the state '{state_name}' (entered at the event id "
+            f"#{entered_event_id}). The ItemReader, ItemBatcher and ResultWriter fields are not supported for "
+            "INLINE maps")
+
+
+def _execute_map(state_def, raw_input, execution, ctx):
+    return _with_retry_and_catch(
+        state_def, raw_input, ctx,
+        lambda: _run_map_items(state_def, raw_input, execution, ctx))
+
+
+def _run_map_items(state_def, raw_input, execution, ctx):
+    # No _apply_parameters here: on a Map, Parameters is the deprecated ItemSelector spelling and
+    # is applied per item below -- and ItemsPath must resolve against the untransformed input
+    effective = _apply_input_path(state_def, raw_input, ctx)
+    is_jsonata = _state_query_language(state_def, ctx) == "JSONata"
+
+    if is_jsonata and "Items" in state_def:
+        items = _jsonata_state_field(state_def, "Items", "array", raw_input, ctx)
+    else:
+        items = _resolve_path_or_ctx(state_def.get("ItemsPath", "$"), effective, ctx)
     if not isinstance(items, list):
         items = [items]
 
@@ -1852,6 +2739,10 @@ def _execute_map(state_def, raw_input, execution, ctx):
     iter_states = iterator.get("States", {})
     iter_start = iterator.get("StartAt")
     max_conc = state_def.get("MaxConcurrency", 0)
+    if is_jsonata and "MaxConcurrency" in state_def:
+        max_conc = _jsonata_state_field(state_def, "MaxConcurrency", "number", raw_input, ctx)
+    if (iterator.get("ProcessorConfig") or {}).get("Mode") == "DISTRIBUTED":
+        return _run_distributed_map(state_def, raw_input, effective, items, int(max_conc), iterator, execution, ctx)
 
     results = [None] * len(items)
     errors = [None] * len(items)
@@ -1861,10 +2752,15 @@ def _execute_map(state_def, raw_input, execution, ctx):
             item_ctx = copy.deepcopy(ctx)
             item_ctx["Map"] = {"Item": {"Index": idx, "Value": item}}
             item_params = state_def.get("ItemSelector") or state_def.get("Parameters")
-            # ItemSelector $ paths resolve against the Map state's effective input,
-            # not the individual item. $$.Map.Item.Value provides the item.
-            item_input = (_resolve_params_obj(item_params, effective, item_ctx)
-                          if item_params else item)
+            if not item_params:
+                item_input = item
+            elif is_jsonata:
+                # $states.context.Map.Item.Value provides the item.
+                item_input = _apply_jsonata_template(item_params, raw_input, item_ctx)
+            else:
+                # ItemSelector $ paths resolve against the Map state's effective input,
+                # not the individual item. $$.Map.Item.Value provides the item.
+                item_input = _resolve_params_obj(item_params, effective, item_ctx)
             results[idx] = _run_sub_machine(
                 iter_states, iter_start, item_input, execution, item_ctx)
         except Exception as exc:
@@ -1873,7 +2769,7 @@ def _execute_map(state_def, raw_input, execution, ctx):
     workers = max_conc if max_conc > 0 else (len(items) or 1)
     # ThreadPoolExecutor workers do not inherit the submitting thread's
     # contextvars, so wrap each submitted callable with copy_context().run
-    # to keep AccountScopedDict lookups bound to the current tenant. Take
+    # to keep scoped store lookups bound to the current tenant. Take
     # a fresh copy_context() per item — a single Context cannot be entered
     # by two threads concurrently. See issue #639.
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -1888,10 +2784,242 @@ def _execute_map(state_def, raw_input, execution, ctx):
             raise err if isinstance(err, _ExecutionError) else _ExecutionError(
                 "States.MapFailed", str(err))
 
+    if is_jsonata:
+        output = _apply_jsonata_output(state_def, raw_input, ctx, result=results, default=results)
+        _apply_state_assign(state_def, raw_input, ctx, result=results)
+        return output, _next_or_end(state_def)
+
     result = _apply_result_selector(state_def, results)
     output = _apply_result_path(state_def, raw_input, result)
-    output = _apply_output_path(state_def, output)
+    output = _apply_output_path(state_def, output, ctx)
+    _apply_state_assign(state_def, raw_input, ctx, result=results)
     return output, _next_or_end(state_def)
+
+
+_CSV_DELIMITERS = {"COMMA": ",", "PIPE": "|", "SEMICOLON": ";", "SPACE": " ", "TAB": "\t"}
+
+
+def _s3_object_text(bucket, key):
+    from ministack.services import s3
+
+    status, _headers, body = s3._get_object(bucket, key, {}, {})
+    if status != 200:
+        raise _ExecutionError("States.ItemReaderFailed", f"The specified key does not exist. (Bucket: {bucket}, Key: {key})")
+    return body.decode("utf-8") if isinstance(body, (bytes, bytearray)) else str(body)
+
+
+def _parse_reader_items(text, config):
+    """Items of a JSON, JSONL or CSV dataset, as the Distributed Map reads them."""
+    import csv
+    import io
+
+    input_type = config.get("InputType", "JSON")
+    if input_type == "JSONL":
+        return [json.loads(line) for line in text.splitlines() if line.strip()]
+    if input_type == "CSV":
+        rows = list(csv.reader(io.StringIO(text), delimiter=_CSV_DELIMITERS.get(config.get("CSVDelimiter", "COMMA"), ",")))
+        if config.get("CSVHeaderLocation") == "GIVEN":
+            headers = list(config.get("CSVHeaders") or [])
+        else:
+            headers, rows = (rows[0], rows[1:]) if rows else ([], [])
+        # Missing fields are empty strings and extra fields are dropped.
+        return [{h: (row[i] if i < len(row) else "") for i, h in enumerate(headers)} for row in rows if row]
+    data = json.loads(text)
+    pointer = config.get("ItemsPointer")
+    if pointer:
+        for part in pointer.strip("/").split("/"):
+            data = data[int(part)] if isinstance(data, list) else data[part]
+    return data
+
+
+def _read_map_items(reader, effective, ctx):
+    from ministack.services import s3
+
+    params = _resolve_params_obj(reader.get("Parameters") or reader.get("Arguments") or {}, effective, ctx)
+    config = reader.get("ReaderConfig") or {}
+    resource = reader.get("Resource", "")
+    if resource.endswith("s3:listObjectsV2"):
+        bucket = s3._buckets.get(params.get("Bucket"))
+        if bucket is None:
+            raise _ExecutionError("States.ItemReaderFailed", f"The specified bucket does not exist. (Bucket: {params.get('Bucket')})")
+        prefix = params.get("Prefix", "")
+        items = []
+        for key in sorted(k for k in bucket["objects"] if k.startswith(prefix)):
+            obj = bucket["objects"][key]
+            if config.get("Transformation") == "LOAD_AND_FLATTEN":
+                items.extend(_parse_reader_items(_s3_object_text(params["Bucket"], key), config))
+                continue
+            items.append({"Etag": obj.get("etag", ""), "Key": key, "LastModified": _epoch_seconds(obj.get("last_modified")),
+                          "Size": obj.get("size", 0), "StorageClass": obj.get("storage_class") or "STANDARD"})
+    else:
+        items = _parse_reader_items(_s3_object_text(params.get("Bucket"), params.get("Key")), config)
+    max_items = config.get("MaxItems")
+    if config.get("MaxItemsPath"):
+        max_items = _resolve_path_or_ctx(config["MaxItemsPath"], effective, ctx)
+    return items[:int(max_items)] if max_items else items
+
+
+def _epoch_seconds(stamp):
+    from datetime import datetime
+
+    if isinstance(stamp, (int, float)):
+        return int(stamp)
+    try:
+        return int(datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        return 0
+
+
+def _run_distributed_map(state_def, raw_input, effective, items, max_conc, iterator, execution, ctx):
+    """Each item runs as a child workflow execution of a Map Run, which ListMapRuns, DescribeMapRun and
+    ListExecutions(mapRunArn) report."""
+    if state_def.get("ItemReader"):
+        items = _read_map_items(state_def["ItemReader"], effective, ctx)
+    if not isinstance(items, list):
+        items = [items]
+    is_jsonata = _state_query_language(state_def, ctx) == "JSONata"
+
+    parent_sm = execution["stateMachineArn"].split(":")
+    sm_name, region, account = parent_sm[6], parent_sm[3], parent_sm[4]
+    label = state_def.get("Label") or new_uuid()
+    child_sm_arn = f"arn:aws:states:{region}:{account}:stateMachine:{sm_name}/{label}"
+    map_run_arn = f"arn:aws:states:{region}:{account}:mapRun:{sm_name}/{label}:{new_uuid()}"
+    batcher = state_def.get("ItemBatcher")
+    item_selector = state_def.get("ItemSelector") or state_def.get("Parameters")
+    if batcher:
+        units = _item_batches(batcher, item_selector, items, raw_input, effective, ctx, is_jsonata)
+    else:
+        units = [(item, 1) for item in items]
+    tolerated_pct = float(state_def.get("ToleratedFailurePercentage") or 0)
+    tolerated_count = int(state_def.get("ToleratedFailureCount") or 0)
+    zero = {k: 0 for k in ("pending", "running", "succeeded", "failed", "timedOut", "aborted", "total", "resultsWritten",
+                          "failuresNotRedrivable", "pendingRedrive")}
+    run = {
+        "mapRunArn": map_run_arn, "executionArn": execution["executionArn"], "status": "RUNNING",
+        "startDate": now_iso(), "maxConcurrency": max_conc, "toleratedFailurePercentage": tolerated_pct,
+        "toleratedFailureCount": tolerated_count, "itemCounts": dict(zero, total=len(items), pending=len(items)),
+        "executionCounts": dict(zero, total=len(units), pending=len(units)), "redriveCount": 0,
+        "_stateMachineArn": child_sm_arn,
+    }
+    _map_runs[map_run_arn] = run
+    results = [None] * len(units)
+    failures = [None] * len(units)
+    lock = threading.Lock()
+
+    def run_child(idx, item, n_items):
+        if batcher:
+            # The item is a batch. A batched child's context has no Map key, as on AWS.
+            child_input, item_ctx = item, copy.deepcopy(ctx)
+        else:
+            child_input, item_ctx = _select_map_item(item_selector, idx, item, raw_input, effective, ctx, is_jsonata)
+        name = new_uuid()
+        child = {
+            "executionArn": f"arn:aws:states:{region}:{account}:execution:{sm_name}/{label}:{name}",
+            "stateMachineArn": child_sm_arn, "name": name, "status": "RUNNING", "startDate": now_iso(),
+            "stopDate": None, "input": json.dumps(child_input), "inputDetails": {"included": True}, "output": None,
+            "outputDetails": {"included": True}, "mapRunArn": map_run_arn, "events": [],
+            "testCase": execution.get("testCase"), "mockAttempts": {},
+        }
+        _executions[child["executionArn"]] = child
+        with lock:
+            for counts, n in ((run["itemCounts"], n_items), (run["executionCounts"], 1)):
+                counts["pending"] -= n
+                counts["running"] += n
+        try:
+            results[idx] = _run_sub_machine(iterator.get("States", {}), iterator.get("StartAt"),
+                                            child_input, child, item_ctx)
+            child.update(status="SUCCEEDED", output=json.dumps(results[idx]))
+            outcome = "succeeded"
+        except Exception as exc:
+            err = exc if isinstance(exc, _ExecutionError) else _ExecutionError("States.TaskFailed", str(exc))
+            failures[idx] = err
+            child.update(status="FAILED", error=err.error, cause=err.cause)
+            outcome = "failed"
+        child["stopDate"] = now_iso()
+        with lock:
+            for counts, n in ((run["itemCounts"], n_items), (run["executionCounts"], 1)):
+                counts["running"] -= n
+                counts[outcome] += n
+
+    workers = max_conc if max_conc > 0 else (min(len(units), 64) or 1)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures_wait([pool.submit(contextvars.copy_context().run, run_child, i, unit, n)
+                      for i, (unit, n) in enumerate(units)])
+
+    # A failed batch counts all of its items as failed, as on AWS.
+    failed = sum(units[i][1] for i, f in enumerate(failures) if f is not None)
+    limits = []
+    if "ToleratedFailureCount" in state_def:
+        limits.append(failed > tolerated_count)
+    if "ToleratedFailurePercentage" in state_def:
+        limits.append(failed * 100 > tolerated_pct * len(items))
+    # With no threshold set, any failed item fails the Map Run.
+    exceeded = bool(failed) and (any(limits) if limits else True)
+    run["status"] = "FAILED" if exceeded else "SUCCEEDED"
+    run["stopDate"] = now_iso()
+    if exceeded:
+        raise _ExecutionError("States.ExceedToleratedFailureThreshold",
+                              "The specified tolerated failure threshold was exceeded")
+    if is_jsonata:
+        output = _apply_jsonata_output(state_def, raw_input, ctx, result=results, default=results)
+        _apply_state_assign(state_def, raw_input, ctx, result=results)
+        return output, _next_or_end(state_def)
+    result = _apply_result_selector(state_def, results)
+    output = _apply_result_path(state_def, raw_input, result)
+    output = _apply_output_path(state_def, output, ctx)
+    _apply_state_assign(state_def, raw_input, ctx, result=results)
+    return output, _next_or_end(state_def)
+
+
+def _select_map_item(item_selector, idx, item, raw_input, effective, ctx, is_jsonata):
+    """The child input for one Map item, and the context with $$.Map.Item that the ItemSelector reads."""
+    item_ctx = copy.deepcopy(ctx)
+    item_ctx["Map"] = {"Item": {"Index": idx, "Value": item}}
+    if not item_selector:
+        return item, item_ctx
+    if is_jsonata:
+        return _apply_jsonata_template(item_selector, raw_input, item_ctx), item_ctx
+    return _resolve_params_obj(item_selector, effective, item_ctx), item_ctx
+
+
+def _item_batches(batcher, item_selector, items, raw_input, effective, ctx, is_jsonata):
+    """The ItemBatcher batches in item order, each as (child input, number of items). A batch ends at
+    MaxItemsPerBatch items, or before the compact UTF-8 JSON of the child input passes MaxInputBytesPerBatch."""
+    selected = [_select_map_item(item_selector, i, item, raw_input, effective, ctx, is_jsonata)[0]
+                for i, item in enumerate(items)]
+    max_items = _item_batcher_limit(batcher, "MaxItemsPerBatch", raw_input, effective, ctx, is_jsonata)
+    # Without a byte limit a batch still stops at 256 KiB (AWS ItemBatcher doc).
+    max_bytes = _item_batcher_limit(batcher, "MaxInputBytesPerBatch", raw_input, effective, ctx, is_jsonata) or 262144
+    envelope = {}
+    if "BatchInput" in batcher:
+        envelope["BatchInput"] = (_apply_jsonata_template(batcher["BatchInput"], raw_input, ctx) if is_jsonata
+                                  else _resolve_params_obj(batcher["BatchInput"], effective, ctx))
+    base = _json_bytes({**envelope, "Items": []})
+    batches, current, size = [], [], base
+    for item in selected:
+        item_size = _json_bytes(item)
+        new_size = size + item_size + (1 if current else 0)
+        if current and ((max_items and len(current) == max_items) or (max_bytes and new_size > max_bytes)):
+            batches.append(current)
+            current, new_size = [], base + item_size
+        current.append(item)
+        size = new_size
+    if current:
+        batches.append(current)
+    return [({**envelope, "Items": batch}, len(batch)) for batch in batches]
+
+
+def _item_batcher_limit(batcher, field, raw_input, effective, ctx, is_jsonata):
+    """An ItemBatcher limit from a JSONata expression, a <field>Path, or a value. None when it is not set."""
+    if is_jsonata and field in batcher:
+        return _jsonata_state_field(batcher, field, "number", raw_input, ctx)
+    if f"{field}Path" in batcher:
+        return _resolve_path_or_ctx(batcher[f"{field}Path"], effective, ctx)
+    return batcher.get(field)
+
+
+def _json_bytes(value):
+    return len(json.dumps(value, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -1902,22 +3030,37 @@ def _run_sub_machine(states, start_at, input_data, execution, ctx):
     current_name = start_at
     current_input = copy.deepcopy(input_data)
 
-    while current_name:
+    # A stopped execution starts no more states in a Map or Parallel branch, as on AWS.
+    while current_name and execution["status"] == "RUNNING":
         state_def = states.get(current_name)
         if not state_def:
             raise _ExecutionError(
                 "States.Runtime", f"State '{current_name}' not found")
 
         state_type = state_def.get("Type")
-        ctx["State"] = {"Name": current_name, "EnteredTime": now_iso()}
+        ctx["State"] = {"Name": current_name, "EnteredTime": now_iso(), "RetryCount": 0}
+
+        entered = _add_event(execution, f"{state_type}StateEntered", {
+            "stateEnteredEventDetails": {
+                "name": current_name,
+                "input": json.dumps(current_input),
+            },
+        })
+        if state_type == "Map":
+            _check_inline_map_fields(state_def, current_name, entered["id"])
 
         if state_type == "Succeed":
-            return _apply_output_path(state_def,
-                                      _apply_input_path(state_def, current_input))
+            current_input = _apply_input_path(state_def, current_input, ctx)
+            current_input = _apply_output_path(state_def, current_input, ctx)
+            _add_event(execution, "SucceedStateExited", {
+                "stateExitedEventDetails": {
+                    "name": current_name,
+                    "output": json.dumps(current_input),
+                },
+            })
+            return current_input
         if state_type == "Fail":
-            raise _ExecutionError(
-                state_def.get("Error", "States.Fail"),
-                state_def.get("Cause", ""))
+            raise _ExecutionError(*_fail_state_error(state_def, current_input, ctx))
 
         handler_fn = {
             "Pass": _execute_pass,
@@ -1933,11 +3076,25 @@ def _run_sub_machine(states, start_at, input_data, execution, ctx):
                 "States.Runtime", f"Unknown state type: {state_type}")
 
         if state_type in ("Task", "Parallel", "Map"):
-            current_input, current_name = handler_fn(
+            current_input, next_name = handler_fn(
                 state_def, current_input, execution, ctx)
+        elif state_type == "Wait":
+            current_input, next_name = handler_fn(
+                state_def, current_input, ctx, execution=execution)
         else:
-            current_input, current_name = handler_fn(
+            current_input, next_name = handler_fn(
                 state_def, current_input, ctx)
+
+        if execution["status"] != "RUNNING":
+            break
+
+        _add_event(execution, f"{state_type}StateExited", {
+            "stateExitedEventDetails": {
+                "name": current_name,
+                "output": json.dumps(current_input),
+            },
+        })
+        current_name = next_name
 
     return current_input
 
@@ -1946,18 +3103,18 @@ def _run_sub_machine(states, start_at, input_data, execution, ctx):
 # Path / Parameter processing
 # ===================================================================
 
-def _apply_input_path(state_def, data):
+def _apply_input_path(state_def, data, ctx=None):
     ip = state_def.get("InputPath", "$")
     if ip is None:
         return {}
-    return _resolve_path(ip, data)
+    return _resolve_path_or_ctx(ip, data, ctx)
 
 
-def _apply_output_path(state_def, data):
+def _apply_output_path(state_def, data, ctx=None):
     op = state_def.get("OutputPath", "$")
     if op is None:
         return {}
-    return _resolve_path(op, data)
+    return _resolve_path_or_ctx(op, data, ctx)
 
 
 def _apply_parameters(state_def, data, ctx=None):
@@ -2023,7 +3180,7 @@ def _apply_jsonata_output(state_def, raw_input, ctx=None, result=None, error_out
 
 
 def _apply_state_assign(state_def, raw_input, ctx, result=None, error_output=None):
-    """Evaluate a state's `Assign` field (JSONata only) and merge results
+    """Evaluate a state's JSONPath or JSONata `Assign` field and merge results
     into ``ctx['variables']`` so later JSONata expressions can reference them
     as ``$name``. Variables are execution-scoped per AWS.
 
@@ -2032,17 +3189,23 @@ def _apply_state_assign(state_def, raw_input, ctx, result=None, error_output=Non
     """
     if ctx is None:
         return
-    if _state_query_language(state_def, ctx) != "JSONata":
-        return
     assign = state_def.get("Assign")
     if not isinstance(assign, dict):
         return
     variables = ctx.setdefault("variables", {})
-    for name, template in assign.items():
-        variables[name] = _apply_jsonata_template(
-            template, raw_input, ctx,
-            result=result, error_output=error_output,
-        )
+    if _state_query_language(state_def, ctx) == "JSONata":
+        assigned = {
+            name: _apply_jsonata_template(template, raw_input, ctx,
+                                          result=result, error_output=error_output)
+            for name, template in assign.items()
+        }
+    else:
+        data = result if state_def.get("Type") in ("Task", "Pass", "Map", "Parallel") else raw_input
+        if error_output is not None:
+            data = error_output
+        assigned = _resolve_params_obj(assign, data, ctx)
+    # All expressions see state-entry values, including assignments to peers.
+    variables.update(copy.deepcopy(assigned))
 
 
 def _apply_jsonata_template(value, raw_input, ctx=None, result=None, error_output=None):
@@ -2064,478 +3227,316 @@ def _apply_jsonata_template(value, raw_input, ctx=None, result=None, error_outpu
     return value
 
 
+def _jsonata_state_field(state_def, field, expected, raw_input, ctx):
+    """A state field that may be a JSONata expression, evaluated and held to
+    the JSON type AWS requires of it."""
+    value = _apply_jsonata_template(state_def[field], raw_input, ctx)
+    if _json_type(value) != expected:
+        raise _ExecutionError(
+            "States.QueryEvaluationError",
+            f"The JSONata expression specified for the field '{field}' returned an "
+            f"unexpected result type. Expected '{expected}', but was "
+            f"'{_json_type(value)}' for value: {json.dumps(value)}")
+    return value
+
+
+def _json_type(value):
+    """The JSON type name AWS reports for a JSONata result."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if _is_num(value):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    return "array" if isinstance(value, list) else "object"
+
+
 def _evaluate_jsonata(expression, raw_input, ctx=None, result=None, error_output=None):
+    """Evaluate a Step Functions JSONata expression (the text inside `{% %}`).
+
+    Parsing and evaluation are delegated to the `jsonata` package, a port of
+    the reference jsonata-js engine. AWS documents Step Functions as
+    implementing the JSONata 2.0.6 specification, with `$eval` the sole
+    omission (`$parse` replaces it). On top of the base engine we bind the
+    reserved `$states` variable and the workflow-scoped `$name` variables, and
+    register the six functions Step Functions adds over base JSONata.
+
+    Every evaluation failure surfaces as `States.QueryEvaluationError`, the one
+    error code AWS raises for any JSONata failure (type error, undefined
+    result, timeout, stack overflow). The 1-second timeout mirrors the limit
+    AWS documents for expression evaluation.
+    """
+    ctx = ctx or {}
     states = {
         "input": raw_input,
-        # workflow-scoped variables — looked up by bare `$name` references
-        # in expressions. See `_eval_jsonata_primary`.
-        "_variables": (ctx or {}).get("variables", {}),
         "result": result,
         "errorOutput": error_output,
-        "context": ctx or {},
+        "context": ctx,
     }
+    # Bare `$name` references resolve to workflow-scoped variables; `$states`
+    # is the reserved variable. The document is left unset (None) so bare paths
+    # do not resolve against the state input, which AWS reaches only via
+    # `$states.input`.
+    if jsonata is None:
+        raise _ExecutionError(
+            "States.QueryEvaluationError",
+            "JSONata support requires the jsonata-python package, which is "
+            "not installed in this build")
+    # jsonata-python reads a None binding as undefined, so a null variable uses its NULL_VALUE sentinel.
+    bindings = {
+        name: jsonata.utils.Utils.NULL_VALUE if value is None else value
+        for name, value in ctx.get("variables", {}).items()
+    }
+    bindings["states"] = states
     try:
-        return _eval_jsonata_expr(expression.strip(), states)
+        expr = jsonata.Jsonata.jsonata(expression, timeout=1000)
+        _register_sfn_jsonata_functions(expr)
+        value = expr.evaluate(None, bindings)
     except _ExecutionError:
         raise
     except Exception as exc:
-        raise _ExecutionError("States.QueryEvaluationError", str(exc))
+        # AWS's cause leads with the JSONata error code (T2010, D3030, ...).
+        # The engine keeps it in JException.error and leaves it out of the
+        # message, so it is prefixed here; a plain Python exception has none.
+        code = getattr(exc, "error", None)
+        message = f"{code}: {exc}" if isinstance(code, str) and code else str(exc)
+        raise _ExecutionError("States.QueryEvaluationError", message)
+    if value is None and not _jsonata_result_defined(expression, bindings):
+        # AWS raises on an expression that yields JSONata `undefined` (a missing
+        # field or unbound variable): "JSON cannot represent an undefined value
+        # expression." An explicit `null` is representable and passes through.
+        # The engine returns None for both, so `$exists` tells them apart.
+        raise _ExecutionError(
+            "States.QueryEvaluationError",
+            f"JSONata expression did not return a result: {expression}")
+    return value
 
 
-def _eval_jsonata_expr(expr, states):
-    """Tiny JSONata evaluator. Precedence layered low → high:
-       ternary `?:`, `or`, `and`, comparison (`= != < <= > >=`), `in`,
-       additive (`+ - &`), multiplicative (`* / %`), unary `-`, primary.
-
-    Anything outside this surface raises `States.QueryEvaluationError` so callers
-    fail fast and explicitly rather than silently producing wrong data.
-    """
-    expr = expr.strip()
-    if not expr:
-        raise ValueError("Empty JSONata expression")
-
-    # 1. Ternary (right-associative — peel outermost `?`)
-    q_pos = _find_top_level_token(expr, "?")
-    if q_pos >= 0:
-        c_pos = _find_matching_ternary_colon(expr, q_pos)
-        if c_pos < 0:
-            raise ValueError(f"Invalid JSONata conditional: {expr}")
-        condition = _eval_jsonata_expr(expr[:q_pos], states)
-        if _truthy(condition):
-            return _eval_jsonata_expr(expr[q_pos + 1:c_pos], states)
-        return _eval_jsonata_expr(expr[c_pos + 1:], states)
-
-    # 2. `or` (short-circuit, left-assoc → rightmost split)
-    pos, _ = _find_top_level_any_op(expr, ("or",), keyword=True)
-    if pos >= 0:
-        left = _eval_jsonata_expr(expr[:pos], states)
-        if _truthy(left):
-            return True
-        return _truthy(_eval_jsonata_expr(expr[pos + 2:], states))
-
-    # 3. `and` (short-circuit)
-    pos, _ = _find_top_level_any_op(expr, ("and",), keyword=True)
-    if pos >= 0:
-        left = _eval_jsonata_expr(expr[:pos], states)
-        if not _truthy(left):
-            return False
-        return _truthy(_eval_jsonata_expr(expr[pos + 3:], states))
-
-    # 4. Comparison
-    pos, op = _find_top_level_any_op(
-        expr, ("!=", "<=", ">=", "=", "<", ">"), keyword=False)
-    if pos >= 0:
-        left = _eval_jsonata_expr(expr[:pos], states)
-        right = _eval_jsonata_expr(expr[pos + len(op):], states)
-        return _apply_binary_op(op, left, right)
-    pos, _ = _find_top_level_any_op(expr, ("in",), keyword=True)
-    if pos >= 0:
-        left = _eval_jsonata_expr(expr[:pos], states)
-        right = _eval_jsonata_expr(expr[pos + 2:], states)
-        if right is None:
-            return False
-        try:
-            return left in right
-        except TypeError as exc:
-            raise ValueError(f"`in` failed: {exc}")
-
-    # 5. Additive
-    pos, op = _find_top_level_any_op(expr, ("+", "-", "&"), keyword=False)
-    if pos >= 0:
-        left = _eval_jsonata_expr(expr[:pos], states)
-        right = _eval_jsonata_expr(expr[pos + 1:], states)
-        return _apply_binary_op(op, left, right)
-
-    # 6. Multiplicative
-    pos, op = _find_top_level_any_op(expr, ("*", "/", "%"), keyword=False)
-    if pos >= 0:
-        left = _eval_jsonata_expr(expr[:pos], states)
-        right = _eval_jsonata_expr(expr[pos + 1:], states)
-        return _apply_binary_op(op, left, right)
-
-    # 7. Unary minus
-    if expr.startswith("-"):
-        inner = _eval_jsonata_expr(expr[1:].lstrip(), states)
-        if isinstance(inner, bool) or not isinstance(inner, (int, float)):
-            raise ValueError(f"Cannot negate non-numeric: {inner!r}")
-        return -inner
-
-    # 8. Primary
-    return _eval_jsonata_primary(expr, states)
-
-
-def _eval_jsonata_primary(expr, states):
-    # Paren grouping
-    if expr.startswith("(") and expr.endswith(")") and _is_balanced_outer(expr, "(", ")"):
-        return _eval_jsonata_expr(expr[1:-1], states)
-
-    # Built-in functions (AWS-supported JSONata subset)
-    for name, fn in (
-        ("$merge", _jsonata_merge),
-        ("$count", _jsonata_count),
-        ("$length", _jsonata_length),
-        ("$not", _jsonata_not),
-        ("$string", _jsonata_string),
-        ("$number", _jsonata_number),
-    ):
-        prefix = name + "("
-        if expr.startswith(prefix) and expr.endswith(")") \
-                and _is_balanced_outer(expr[len(name):], "(", ")"):
-            arg_expr = expr[len(prefix):-1].strip()
-            arg = _eval_jsonata_expr(arg_expr, states) if arg_expr else None
-            return fn(arg)
-
-    # Array literal
-    if expr.startswith("[") and expr.endswith("]") and _is_balanced_outer(expr, "[", "]"):
-        body = expr[1:-1].strip()
-        if not body:
-            return []
-        return [_eval_jsonata_expr(part, states) for part in _split_top_level(body, ",")]
-
-    # Object literal
-    if expr.startswith("{") and expr.endswith("}") and _is_balanced_outer(expr, "{", "}"):
-        body = expr[1:-1].strip()
-        if not body:
-            return {}
-        result = {}
-        for part in _split_top_level(body, ","):
-            key_expr, value_expr = _split_object_member(part)
-            key_expr = key_expr.strip()
-            if key_expr.startswith(("'", '"')):
-                key = ast.literal_eval(key_expr)
-            else:
-                key = key_expr
-            result[key] = _eval_jsonata_expr(value_expr, states)
-        return result
-
-    if expr.startswith("$states."):
-        return _resolve_jsonata_states_path(expr, states)
-
-    # Bare workflow variable reference: `$name` or `$name.dotted.path`.
-    # `$states.…` is already handled above; `$func(…)` was handled by the
-    # built-in function block above (variable refs have no `(`); so anything
-    # else starting with `$<alpha>` is a variable lookup. Issue #645.
-    if (len(expr) > 1
-            and expr[0] == "$"
-            and "(" not in expr
-            and re.fullmatch(r"\$[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*", expr)):
-        head, _dot, rest = expr[1:].partition(".")
-        variables = states.get("_variables", {})
-        if head not in variables:
-            raise ValueError(f"Undefined variable: ${head}")
-        value = variables[head]
-        if rest:
-            value = _resolve_dotted_path(rest, value)
-        return value
-
-    if expr in ("true", "false", "null"):
-        return {"true": True, "false": False, "null": None}[expr]
-
+def _jsonata_result_defined(expression, bindings):
+    """True if `expression` yields a value (including an explicit `null`), False
+    if it yields JSONata `undefined`. Distinguishes the two so an explicit null
+    passes through while an undefined result raises, matching AWS."""
     try:
-        return ast.literal_eval(expr)
-    except (SyntaxError, ValueError):
-        pass
+        probe = jsonata.Jsonata.jsonata(f"$exists(({expression}))", timeout=1000)
+        _register_sfn_jsonata_functions(probe)
+        return bool(probe.evaluate(None, bindings))
+    except Exception:
+        # If the probe cannot evaluate, treat the None result as undefined —
+        # AWS errors on non-results rather than emitting null.
+        return False
 
-    raise ValueError(f"Unsupported JSONata expression: {expr}")
+
+# The six functions Step Functions adds on top of base JSONata, documented
+# under "JSONata functions provided by Step Functions". They mirror the
+# States.* intrinsics available to JSONPath states. Per AWS, functions that
+# take integer parameters round any non-integer argument down.
+def _register_sfn_jsonata_functions(expr):
+    # Two base-engine functions are shadowed because jsonata-python returns a
+    # value where AWS (and jsonata-js) fail the evaluation; the shadows refuse
+    # exactly there and delegate everywhere else.
+    expr.register_lambda("toMillis", _sfn_jsonata_to_millis)
+    expr.register_lambda("replace", _sfn_jsonata_replace)
+    expr.register_lambda("partition", _sfn_jsonata_partition)
+    expr.register_lambda("range", _sfn_jsonata_range)
+    expr.register_lambda("hash", _sfn_jsonata_hash)
+    expr.register_lambda("random", _sfn_jsonata_random)
+    expr.register_lambda("uuid", _sfn_jsonata_uuid)
+    expr.register_lambda("parse", _sfn_jsonata_parse)
+
+
+def _sfn_jsonata_to_millis(timestamp=None, picture=None):
+    """`$toMillis` requiring a real ISO 8601 timestamp, as AWS does (D3110).
+
+    jsonata-python's parser also accepts a space-separated form; AWS refuses
+    it, so the space form and anything else the parser cannot read answer the
+    documented D3110 message."""
+    from jsonata import functions as _jsonata_functions
+    refusal = ValueError(
+        "D3110: The argument of the toMillis function must be an ISO 8601 "
+        f'formatted timestamp. Given "{timestamp}"')
+    if picture is None and isinstance(timestamp, str) and "T" not in timestamp:
+        raise refusal
+    try:
+        return _jsonata_functions.Functions.datetime_to_millis(timestamp, picture)
+    except ValueError:
+        raise refusal
+
+
+def _sfn_jsonata_replace(string=None, pattern=None, replacement=None, limit=None):
+    """`$replace` refusing a regex that can match nothing, as AWS does (D1004)."""
+    from jsonata import functions as _jsonata_functions
+    if hasattr(pattern, "search"):
+        m = pattern.search("")
+        if m is not None and m.group() == "":
+            raise ValueError("D1004: Regular expression matches zero length string")
+    return _jsonata_functions.Functions.replace(string, pattern, replacement, limit)
+
+
+def _sfn_jsonata_partition(array, size):
+    """`$partition(array, size)` -> array chunked into sub-arrays of `size`."""
+    size = math.floor(size)
+    if size <= 0:
+        raise ValueError("$partition chunk size must be a positive integer")
+    return [array[i:i + size] for i in range(0, len(array), size)]
+
+
+def _sfn_jsonata_range(start, end, step):
+    """`$range(start, end, step)` -> values from `start`, stepped by `step`,
+    up to and including `end`. `step` may be negative."""
+    start, end, step = math.floor(start), math.floor(end), math.floor(step)
+    if step == 0:
+        raise ValueError("$range delta must not be zero")
+    values = []
+    value = start
+    if step > 0:
+        while value <= end:
+            values.append(value)
+            value += step
+    else:
+        while value >= end:
+            values.append(value)
+            value += step
+    return values
+
+
+def _sfn_jsonata_hash(source, algorithm):
+    """`$hash(source, algorithm)` -> hex digest. Algorithm is one of
+    MD5, SHA-1, SHA-256, SHA-384, SHA-512."""
+    import hashlib
+    digest = _HASH_INTRINSIC_ALGORITHMS.get(algorithm)
+    if digest is None or not isinstance(source, str):
+        raise ValueError(
+            "$hash algorithm must be one of MD5, SHA-1, SHA-256, SHA-384, SHA-512")
+    return hashlib.new(digest, source.encode("utf-8")).hexdigest()
+
+
+def _sfn_jsonata_random(seed=None):
+    """`$random([seed])` -> float n where 0 <= n < 1. A given seed is
+    deterministic."""
+    import random
+    if seed is None:
+        return random.random()
+    return random.Random(math.floor(seed)).random()
+
+
+def _sfn_jsonata_uuid():
+    """`$uuid()` -> a v4 UUID string."""
+    return new_uuid()
+
+
+def _sfn_jsonata_parse(text):
+    """`$parse(string)` -> the JSON value the string deserializes to."""
+    return json.loads(text)
 
 
 def _truthy(value):
-    """JSONata truthiness: null/false/0/empty string/empty array/empty object are falsy."""
+    """JSONata truthiness: null/false/0/empty string/empty array/empty object are falsy.
+    For arrays, an array containing only falsy values is itself falsy (JSONata spec)."""
     if value is None or value is False:
         return False
     if isinstance(value, bool):
         return value
     if isinstance(value, (int, float)) and value == 0:
         return False
-    if isinstance(value, (str, list, dict)) and len(value) == 0:
+    if isinstance(value, str) and len(value) == 0:
         return False
+    if isinstance(value, dict) and len(value) == 0:
+        return False
+    if isinstance(value, list):
+        if len(value) == 0:
+            return False
+        return any(_truthy(v) for v in value)
     return True
 
 
-def _apply_binary_op(op, left, right):
-    try:
-        if op == "=":
-            return left == right
-        if op == "!=":
-            return left != right
-        if op == "<":
-            return left < right
-        if op == "<=":
-            return left <= right
-        if op == ">":
-            return left > right
-        if op == ">=":
-            return left >= right
-        if op == "+":
-            return left + right
-        if op == "-":
-            return left - right
-        if op == "&":
-            return _jsonata_string(left) + _jsonata_string(right)
-        if op == "*":
-            return left * right
-        if op == "/":
-            if right == 0:
-                raise ValueError("Division by zero")
-            return left / right
-        if op == "%":
-            if right == 0:
-                raise ValueError("Modulo by zero")
-            return left % right
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Operator '{op}' failed: {exc}")
-    raise ValueError(f"Unknown operator: {op}")
+def _parse_jsonpath_tokens(path):
+    """Parse the JSONPath subset used by ASL paths."""
+    tokens = []
+    pos = 1 # Skip the initial "$".
 
+    while pos < len(path):
+        if path[pos] == ".":
+            pos += 1
 
-def _jsonata_merge(args):
-    if not isinstance(args, list):
-        raise ValueError("$merge expects an array")
-    merged = {}
-    for item in args:
-        if isinstance(item, dict):
-            merged.update(item)
-    return merged
-
-
-def _jsonata_count(arg):
-    if arg is None:
-        return 0
-    if isinstance(arg, list):
-        return len(arg)
-    return 1
-
-
-def _jsonata_length(arg):
-    if not isinstance(arg, str):
-        raise ValueError("$length expects a string")
-    return len(arg)
-
-
-def _jsonata_not(arg):
-    return not _truthy(arg)
-
-
-def _jsonata_string(arg):
-    if arg is None:
-        return ""
-    if isinstance(arg, bool):
-        return "true" if arg else "false"
-    if isinstance(arg, (dict, list)):
-        return json.dumps(arg)
-    return str(arg)
-
-
-def _jsonata_number(arg):
-    if isinstance(arg, bool):
-        raise ValueError("$number cannot coerce boolean")
-    if isinstance(arg, (int, float)):
-        return arg
-    if isinstance(arg, str):
-        try:
-            return int(arg)
-        except ValueError:
-            return float(arg)
-    raise ValueError(f"$number cannot coerce {type(arg).__name__}")
-
-
-def _find_top_level_any_op(text, ops, keyword=False):
-    """Return (position, op) of the rightmost top-level occurrence of any op in ops.
-
-    `ops` is tried longest-first at each candidate position so e.g. `<=` wins
-    over `<`. For left-associative operators this returns the rightmost match,
-    which the caller splits on — yielding standard left-assoc evaluation when
-    the resulting left-hand side is recursed into.
-    """
-    ops_sorted = sorted(ops, key=len, reverse=True)
-    found = []
-    for idx, _ in _iter_top_level_chars(text):
-        for op in ops_sorted:
-            if not text.startswith(op, idx):
-                continue
-            if not _op_disambiguation_ok(text, idx, op, keyword):
-                continue
-            found.append((idx, op))
-            break
-    if not found:
-        return -1, None
-    return found[-1]
-
-
-def _op_disambiguation_ok(text, idx, op, keyword):
-    """Reject overlapping/ambiguous matches: `=` inside `!=`/`<=`/`>=`/`==`,
-    `<` / `>` inside `<=` / `>=`, leading-`-` as unary minus, and keyword ops
-    that aren't whitespace-bounded (so `or` in `$states.input.order` is skipped).
-    """
-    if keyword:
-        prev_ch = text[idx - 1] if idx > 0 else " "
-        next_idx = idx + len(op)
-        next_ch = text[next_idx] if next_idx < len(text) else " "
-        if not prev_ch.isspace():
-            return False
-        if not next_ch.isspace():
-            return False
-        return True
-    if op == "=":
-        prev_ch = text[idx - 1] if idx > 0 else ""
-        next_ch = text[idx + 1] if idx + 1 < len(text) else ""
-        if prev_ch in ("!", "<", ">", "="):
-            return False
-        if next_ch == "=":
-            return False
-    elif op in ("<", ">"):
-        next_ch = text[idx + 1] if idx + 1 < len(text) else ""
-        if next_ch == "=":
-            return False
-    elif op == "-":
-        # Treat `-` as unary when it's at the start or follows another operator /
-        # opening bracket. Only count it as binary subtract when the preceding
-        # non-space char is an operand terminator.
-        prev_idx = idx - 1
-        while prev_idx >= 0 and text[prev_idx] == " ":
-            prev_idx -= 1
-        if prev_idx < 0:
-            return False
-        prev_ch = text[prev_idx]
-        if not (prev_ch.isalnum() or prev_ch in "_)]}\"'"):
-            return False
-    elif op == "+":
-        prev_idx = idx - 1
-        while prev_idx >= 0 and text[prev_idx] == " ":
-            prev_idx -= 1
-        if prev_idx < 0:
-            return False
-        prev_ch = text[prev_idx]
-        if not (prev_ch.isalnum() or prev_ch in "_)]}\"'"):
-            return False
-    return True
-
-
-def _is_balanced_outer(expr, open_ch, close_ch):
-    """True when the outer pair of brackets in `expr` matches each other —
-    i.e. `(a)(b)` returns False, `(a + (b))` returns True. Quote-aware so
-    brackets inside string literals don't count.
-    """
-    depth = 0
-    in_quote = None
-    escape = False
-    for i, ch in enumerate(expr):
-        if in_quote:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == in_quote:
-                in_quote = None
-            continue
-        if ch in ("'", '"'):
-            in_quote = ch
-            continue
-        if ch == open_ch:
-            depth += 1
-        elif ch == close_ch:
-            depth -= 1
-            if depth == 0 and i < len(expr) - 1:
-                return False
-    return depth == 0
-
-
-def _resolve_jsonata_states_path(expr, states):
-    suffix = expr[len("$states."):]
-    root, _, rest = suffix.partition(".")
-    if root not in states:
-        raise ValueError(f"Unsupported $states field: {root}")
-    current = states[root]
-    if not rest:
-        return current
-    return _resolve_dotted_path(rest, current)
-
-
-def _resolve_dotted_path(path, data):
-    current = data
-    for raw_part in path.split("."):
-        part = raw_part
-        while part:
-            match = re.match(r"([A-Za-z_][A-Za-z0-9_]*)(?:\[(\d+)])?(.*)", part)
-            if not match:
-                raise ValueError(f"Unsupported JSONata path segment: {raw_part}")
-            field, idx, part = match.groups()
-            if isinstance(current, dict) and field in current:
-                current = current[field]
-            else:
+            # Ending on "." is invalid.
+            if pos >= len(path):
                 return None
-            if idx is not None:
-                if isinstance(current, list) and int(idx) < len(current):
-                    current = current[int(idx)]
-                else:
-                    return None
-    return current
 
+            # ".*"
+            if path[pos] == "*":
+                tokens.append(("wildcard", None))
+                pos += 1
+                continue
 
-def _split_object_member(member):
-    for idx, ch in _iter_top_level_chars(member):
-        if ch == ":":
-            return member[:idx], member[idx + 1:]
-    raise ValueError(f"Invalid JSONata object member: {member}")
+            # Bracket notation after "." - next pass will find the bracket.
+            if path[pos] == "[":
+                continue
 
-
-def _split_top_level(text, separator):
-    parts = []
-    start = 0
-    for idx, ch in _iter_top_level_chars(text):
-        if ch == separator:
-            parts.append(text[start:idx].strip())
-            start = idx + 1
-    parts.append(text[start:].strip())
-    return parts
-
-
-def _find_top_level_token(text, token):
-    for idx, ch in _iter_top_level_chars(text):
-        if text.startswith(token, idx):
-            if token == "=":
-                prev_ch = text[idx - 1] if idx > 0 else ""
-                next_ch = text[idx + 1] if idx + 1 < len(text) else ""
-                if prev_ch in ("!", "<", ">", "=") or next_ch == "=":
-                    continue
-            return idx
-    return -1
-
-
-def _find_matching_ternary_colon(text, question_pos):
-    nested = 0
-    for idx, ch in _iter_top_level_chars(text[question_pos + 1:]):
-        real_idx = question_pos + 1 + idx
-        if ch == "?":
-            nested += 1
-        elif ch == ":":
-            if nested == 0:
-                return real_idx
-            nested -= 1
-    return -1
-
-
-def _iter_top_level_chars(text):
-    depth = 0
-    quote = None
-    escape = False
-    for idx, ch in enumerate(text):
-        if quote:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == quote:
-                quote = None
+            # ".field"
+            start = pos
+            while pos < len(path) and path[pos] not in ".[":
+                pos += 1
+            if start == pos:
+                return None
+            tokens.append(("field", path[start:pos]))
             continue
-        if ch in ("'", '"'):
-            quote = ch
-            continue
-        if ch in "([{":
-            depth += 1
-        elif ch in ")]}":
-            depth -= 1
-        elif depth == 0:
-            yield idx, ch
+
+        # No ".", so must have opening bracket.
+        if path[pos] != "[":
+            return None
+        pos += 1
+
+        # Ending on "[" is invalid.
+        if pos >= len(path):
+            return None
+
+        # "[*]"
+        if path[pos] == "*":
+            tokens.append(("wildcard", None))
+            pos += 1
+
+        # Array index, eg "[0]"
+        elif path[pos].isdigit():
+            start = pos
+            while pos < len(path) and path[pos].isdigit():
+                pos += 1
+            tokens.append(("index", int(path[start:pos])))
+
+        # Quoted field name, eg "['field']"
+        elif path[pos] in ("'", '"'):
+            start = pos
+            quote = path[pos]
+            pos += 1
+            escaped = False
+            while pos < len(path):
+                if escaped:
+                    escaped = False
+                elif path[pos] == "\\":
+                    escaped = True
+                elif path[pos] == quote:
+                    break
+                pos += 1
+            if pos >= len(path):
+                return None
+            try:
+                field = ast.literal_eval(path[start:pos + 1])
+            except (SyntaxError, ValueError):
+                return None
+            if not isinstance(field, str):
+                return None
+            tokens.append(("field", field))
+            pos += 1
+        else:
+            return None
+
+        # Ensure there's a closing bracket.
+        if pos >= len(path) or path[pos] != "]":
+            return None
+        pos += 1
+
+    return tokens
 
 
 def _resolve_path(path, data):
@@ -2544,27 +3545,32 @@ def _resolve_path(path, data):
     if not path.startswith("$"):
         return data
 
-    parts = path[2:].split(".") if path.startswith("$.") else []
-    cur = data
-    for part in parts:
-        if not part:
-            continue
-        m = re.match(r"(\w+)\[(\d+)]", part)
-        if m:
-            field, idx = m.group(1), int(m.group(2))
-            if isinstance(cur, dict) and field in cur:
-                cur = cur[field]
-                if isinstance(cur, list) and idx < len(cur):
-                    cur = cur[idx]
-                else:
-                    return None
-            else:
-                return None
-        elif isinstance(cur, dict) and part in cur:
-            cur = cur[part]
-        else:
-            return None
-    return cur
+    tokens = _parse_jsonpath_tokens(path)
+    if tokens is None:
+        return None
+
+    projected = any(kind == "wildcard" for kind, _ in tokens)
+    values = [data]
+    for kind, value in tokens:
+        resolved = []
+        for current in values:
+            if kind == "field":
+                if isinstance(current, dict) and value in current:
+                    resolved.append(current[value])
+            elif kind == "index":
+                if isinstance(current, list) and value < len(current):
+                    resolved.append(current[value])
+                elif isinstance(current, list):
+                    resolved.append(None)
+            elif isinstance(current, list):
+                resolved.extend(current)
+            elif isinstance(current, dict):
+                resolved.extend(current.values())
+        values = resolved
+
+    if projected:
+        return values
+    return values[0] if values else None
 
 
 def _parse_intrinsic_args(s, pos):
@@ -2662,10 +3668,26 @@ def _eval_intrinsic_arg(arg, data, ctx):
         path = arg[1]
         if path.startswith("$$."):
             return _resolve_ctx_path(path, ctx or {})
-        return _resolve_path(path, data)
+        return _resolve_path_or_ctx(path, data, ctx)
     elif kind == "call":
         return _exec_intrinsic(arg, data, ctx)
     return None
+
+
+# Real AWS caps the base64 intrinsics and States.Hash at 10,000 characters of input
+_BASE64_INTRINSIC_MAX = 10_000
+
+# The five States.Hash publishes, mapped to what hashlib calls them.
+_HASH_INTRINSIC_ALGORITHMS = {
+    "MD5": "md5", "SHA-1": "sha1", "SHA-256": "sha256", "SHA-384": "sha384", "SHA-512": "sha512",
+}
+
+
+def _base64_intrinsic_arg(name, value):
+    """Validate single string argument of States.Base64Encode / States.Base64Decode."""
+    if not isinstance(value, str) or len(value) > _BASE64_INTRINSIC_MAX:
+        raise ValueError(f"Invalid arguments in {name}")
+    return value
 
 
 def _exec_intrinsic(node, data, ctx):
@@ -2682,6 +3704,15 @@ def _exec_intrinsic(node, data, ctx):
         merged.update(args[0])
         merged.update(args[1])
         return merged
+    elif name == "States.Base64Encode":
+        import base64
+        text = _base64_intrinsic_arg(name, args[0])
+        return base64.b64encode(text.encode("utf-8")).decode("ascii")
+    elif name == "States.Base64Decode":
+        import base64
+        raw = _base64_intrinsic_arg(name, args[0])
+        # AWS decodes leniently, so pad rather than reject input that arrives without it.
+        return base64.b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8", errors="replace")
     elif name == "States.Format":
         # AWS States.Format: \' → ', \{ → {, \} → }, \\ → \ in
         # template segments only.  Interpolated values are verbatim.
@@ -2704,6 +3735,28 @@ def _exec_intrinsic(node, data, ctx):
                 out.append(ch)
                 i += 1
         return "".join(out)
+    elif name == "States.Hash":
+        import hashlib
+        text, algorithm = args[0], args[1]
+        digest = _HASH_INTRINSIC_ALGORITHMS.get(algorithm)
+        if digest is None or not isinstance(text, str) or len(text) > _BASE64_INTRINSIC_MAX:
+            raise ValueError(f"Invalid arguments in {name}")
+        return hashlib.new(digest, text.encode("utf-8")).hexdigest()
+    elif name == "States.StringSplit":
+        # Every character of the second argument is a delimiter in its own right, and a run of them
+        # yields no empty members, so splitting an ARN on ":" indexes the same either way.
+        text, delimiters = args[0], args[1]
+        parts, current = [], []
+        for ch in text:
+            if ch in delimiters:
+                if current:
+                    parts.append("".join(current))
+                    current = []
+            else:
+                current.append(ch)
+        if current:
+            parts.append("".join(current))
+        return parts
     elif name == "States.ArrayGetItem":
         return args[0][int(args[1])]
     elif name == "States.Array":
@@ -2754,7 +3807,7 @@ def _resolve_params_obj(template, data, ctx=None):
                 elif value.startswith("$$."):
                     result[real_key] = _resolve_ctx_path(value, ctx or {})
                 else:
-                    result[real_key] = _resolve_path(value, data)
+                    result[real_key] = _resolve_path_or_ctx(value, data, ctx)
             else:
                 result[real_key] = value
         elif isinstance(value, dict):
@@ -2772,37 +3825,52 @@ def _resolve_params_obj(template, data, ctx=None):
 def _resolve_ctx_path(path, ctx):
     if not path.startswith("$$."):
         return None
-    parts = path[3:].split(".")
-    cur = ctx
-    for p in parts:
-        if isinstance(cur, dict) and p in cur:
-            cur = cur[p]
-        else:
-            return None
-    return cur
+    return _resolve_path(path[1:], ctx)
 
 
 # ===================================================================
 # Retry / Catch helpers
 # ===================================================================
 
+def _error_matches(error_equals, error):
+    """Return True when a retrier's or catcher's ErrorEquals list matches this error name.
+
+    States.TaskFailed matches every error name except States.Timeout, as the
+    AWS Step Functions error handling guide describes.
+    """
+    if "States.ALL" in error_equals or error in error_equals:
+        return True
+    return "States.TaskFailed" in error_equals and error != "States.Timeout"
+
+
 def _find_matching_retrier(retriers, error, retry_counts):
+    """The first retrier matching the error decides; once it has used its MaxAttempts there is no retry."""
     for idx, retrier in enumerate(retriers):
-        equals = retrier.get("ErrorEquals", [])
-        max_attempts = retrier.get("MaxAttempts", 3)
-        if retry_counts.get(idx, 0) >= max_attempts:
-            continue
-        if "States.ALL" in equals or "States.TaskFailed" in equals or error in equals:
+        if _error_matches(retrier.get("ErrorEquals", []), error):
+            if retry_counts.get(idx, 0) >= retrier.get("MaxAttempts", 3):
+                return None, -1
             return retrier, idx
     return None, -1
 
 
 def _find_matching_catcher(catchers, error):
     for catcher in catchers:
-        equals = catcher.get("ErrorEquals", [])
-        if "States.ALL" in equals or "States.TaskFailed" in equals or error in equals:
+        if _error_matches(catcher.get("ErrorEquals", []), error):
             return catcher
     return None
+
+
+def _apply_catcher(catcher, raw_input, ctx, query_language, error_output):
+    """Build a caught error's output and apply the catcher's Assign."""
+    if query_language == "JSONata" and "Output" in catcher:
+        output = _apply_jsonata_output(catcher, raw_input, ctx, error_output=error_output, default=error_output)
+    else:
+        output = _apply_result_path_raw(catcher.get("ResultPath", "$"), raw_input, error_output)
+    if query_language == "JSONata":
+        # Catch handlers can also carry `Assign`. `$states.errorOutput`
+        # is available here; `$states.result` is not (per AWS).
+        _apply_state_assign(catcher, raw_input, ctx, error_output=error_output)
+    return output
 
 
 # ===================================================================
@@ -2810,11 +3878,106 @@ def _find_matching_catcher(catchers, error):
 # ===================================================================
 
 def _extract_lambda_name(resource):
+    func_ref = _extract_lambda_ref(resource)
+    if not func_ref:
+        return None
+    if isinstance(func_ref, str) and func_ref.startswith("arn:"):
+        try:
+            spec = parse_arn(func_ref)
+        except ArnParseError:
+            return None
+        parts = spec.resource.split(":", 2)
+        if len(parts) >= 2 and parts[0] == "function":
+            return parts[1]
+    if isinstance(func_ref, str) and ":" in func_ref:
+        return func_ref.split(":", 1)[0]
+    return func_ref
+
+
+def _extract_lambda_ref(resource):
     if not resource:
         return None
     if ":function:" in resource:
-        return resource.split(":function:")[-1].split(":")[0]
+        return _resolve_lambda_function_ref(resource, optimized=False)
     return None
+
+
+def _resolve_lambda_function_name(value, optimized):
+    func_ref = _resolve_lambda_function_ref(value, optimized)
+    if not isinstance(func_ref, str):
+        return func_ref
+    if func_ref.startswith("arn:"):
+        try:
+            spec = parse_arn(func_ref)
+        except ArnParseError:
+            return func_ref
+        parts = spec.resource.split(":", 2)
+        if len(parts) >= 2 and parts[0] == "function":
+            return parts[1]
+    if ":" in func_ref:
+        return func_ref.split(":", 1)[0]
+    return func_ref
+
+
+def _lambda_ref_error(value, optimized, message):
+    if optimized:
+        raise _ExecutionError(
+            "Lambda.ResourceNotFoundException",
+            f"Function not found: {value}. {message}",
+        )
+    raise _ExecutionError(
+        "States.Runtime",
+        f"Invalid Lambda resource '{value}': {message}",
+    )
+
+
+def _resolve_lambda_function_ref(value, optimized):
+    if not value:
+        return value
+    if not isinstance(value, str):
+        return value
+    if ":function:" not in value:
+        return value
+
+    if not value.startswith("arn:"):
+        return value.split(":function:")[-1]
+
+    try:
+        spec = parse_arn(value)
+    except ArnParseError as exc:
+        _lambda_ref_error(value, optimized, str(exc))
+    if spec.service != "lambda":
+        _lambda_ref_error(value, optimized, f"expected Lambda ARN, got {spec.service!r}")
+
+    parts = spec.resource.split(":", 2)
+    if len(parts) < 2 or parts[0] != "function":
+        _lambda_ref_error(value, optimized, "expected resource shape function:<name>[:qualifier]")
+
+    if spec.account_id != get_account_id():
+        if optimized:
+            raise _ExecutionError(
+                "Lambda.AWSLambdaException",
+                f"User is not authorized to access function {value}",
+            )
+        raise _ExecutionError(
+            "States.Runtime",
+            f"The resource '{value}' belongs to a different account. "
+            f"Expected '{get_account_id()}', was '{spec.account_id}'.",
+        )
+
+    if spec.region != get_region():
+        if optimized:
+            raise _ExecutionError(
+                "Lambda.ResourceNotFoundException",
+                f"Functions from '{spec.region}' are not reachable in this region ('{get_region()}')",
+            )
+        raise _ExecutionError(
+            "States.Runtime",
+            f"The resource '{value}' belongs to a different region. "
+            f"Expected '{get_region()}', was '{spec.region}'.",
+        )
+
+    return value
 
 
 def _next_or_end(state_def):
@@ -2882,8 +4045,9 @@ def _invoke_nested_start_execution_sync(resource, input_data):
         )
 
     if payload.get("status") != "SUCCEEDED":
-        error, cause = _nested_execution_failure(payload)
-        raise _ExecutionError(error, cause)
+        # The response has no error or cause for a stopped child, so read its record.
+        child = _executions.get(payload.get("executionArn")) or payload
+        raise _ExecutionError(*_nested_execution_failure(child))
 
     output_value = payload.get("output") or "{}"
     if resource.endswith(".sync:2") and isinstance(output_value, str):
@@ -2927,19 +4091,31 @@ def _nested_start_execution_request(input_data):
     return request
 
 
-def _nested_execution_failure(payload):
-    output = payload.get("output")
-    if isinstance(output, str):
-        try:
-            decoded = json.loads(output)
-        except json.JSONDecodeError:
-            decoded = None
-        if isinstance(decoded, dict) and decoded.get("Error"):
-            return decoded["Error"], decoded.get("Cause", "")
+def _nested_execution_failure(child):
+    """Return the error and cause that a .sync parent Task fails with when its child doesn't succeed.
 
-    execution_arn = payload.get("executionArn", "")
-    status = payload.get("status", "FAILED")
-    return "States.TaskFailed", f"Nested execution {execution_arn} ended with status {status}"
+    AWS always uses States.TaskFailed. The cause is the child's DescribeExecution
+    response as compact JSON with sorted keys.
+    """
+    describe = {
+        "ExecutionArn": child.get("executionArn"),
+        "Input": child.get("input", "{}"),
+        "InputDetails": {"Included": True},
+        "Name": child.get("name"),
+        "RedriveCount": 0,
+        # AWS reported REDRIVABLE for a FAILED, TIMED_OUT and ABORTED child.
+        "RedriveStatus": "REDRIVABLE",
+        "StartDate": _iso_to_epoch_ms(child.get("startDate")),
+        "StateMachineArn": child.get("stateMachineArn"),
+        "Status": child.get("status"),
+        "StopDate": _iso_to_epoch_ms(child.get("stopDate")),
+    }
+    # AWS leaves out both keys for a timed-out child, which has no error or cause.
+    if child.get("error"):
+        describe["Error"] = child["error"]
+    if child.get("cause"):
+        describe["Cause"] = child["cause"]
+    return "States.TaskFailed", json.dumps(describe, separators=(",", ":"), sort_keys=True)
 
 
 def _invoke_sqs_send_message(resource, input_data):
@@ -2951,7 +4127,13 @@ def _invoke_sqs_send_message(resource, input_data):
         return input_data
     try:
         url = input_data.get("QueueUrl", "")
-        result = sqs._act_send_message(input_data, url)
+        payload = dict(input_data)
+        body = payload.get("MessageBody")
+        if isinstance(body, (dict, list)):
+            # SFN serialises an object MessageBody to JSON text before calling
+            # SQS (which requires a string body).
+            payload["MessageBody"] = json.dumps(body)
+        result = sqs._act_send_message(payload, url)
         return result
     except sqs._Err as e:
         raise _ExecutionError(f"SQS.{e.code}", e.message)
@@ -2997,7 +4179,10 @@ def _invoke_dynamodb(op_name, input_data):
     status, _, body = fn(input_data)
     result = json.loads(body) if body else {}
     if status >= 400:
-        error_type = result.get("__type", "DynamoDB.AmazonDynamoDBException")
+        # Optimized integrations use DynamoDB.*, unlike the SDK's DynamoDb.*.
+        # The service wire error may be bare, already prefixed, or #-qualified.
+        error_name = result.get("__type", "AmazonDynamoDBException").rsplit("#", 1)[-1].rsplit(".", 1)[-1]
+        error_type = f"DynamoDB.{error_name}"
         raise _ExecutionError(error_type, result.get("message", ""))
     return result
 
@@ -3019,9 +4204,45 @@ def _invoke_ecs_run_task(resource, input_data):
     if is_sync and result.get("tasks"):
         task_arns = [t["taskArn"] for t in result["tasks"]]
         cluster = ecs_data.get("cluster", "default")
-        result = _poll_ecs_tasks(cluster, task_arns)
+        task = _poll_ecs_tasks(cluster, task_arns)["tasks"][0]
+        # As on AWS, the state's result (or its failure's cause) is the stopped task itself.
+        document = _ecs_task_document(task)
+        if _ecs_task_failed(cluster, task):
+            raise _ExecutionError("States.TaskFailed", json.dumps(document))
+        return document
 
     return result
+
+
+def _ecs_task_failed(cluster, task):
+    """Whether a stopped task failed: an essential container exited non-zero, or none exited (it never started)."""
+    from ministack.services import ecs
+
+    stored = ecs._resolve_task(task.get("taskArn", ""), ecs._resolve_cluster_name(cluster) or cluster) or {}
+    essentials = stored.get("_container_essentials") or []
+    exits = [c.get("exitCode") for i, c in enumerate(task.get("containers", []))
+             if (essentials[i] if i < len(essentials) else True)]
+    return not any(code is not None for code in exits) or any(code not in (None, 0) for code in exits)
+
+
+def _ecs_task_document(task):
+    """An ECS task as the optimized integration reports it: PascalCase keys, epoch-millisecond timestamps."""
+    from ministack.services import ecs
+
+    def millis(value):
+        if isinstance(value, str):
+            return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp() * 1000)
+        return int(value * 1000) if isinstance(value, (int, float)) else value
+
+    def convert(value):
+        if isinstance(value, list):
+            return [convert(v) for v in value]
+        if not isinstance(value, dict):
+            return value
+        return {(k[:1].upper() + k[1:]): (millis(v) if k in ecs._ECS_TIMESTAMP_FIELDS else convert(v))
+                for k, v in value.items()}
+
+    return convert(task)
 
 
 def _poll_ecs_tasks(cluster, task_arns):
@@ -3042,14 +4263,42 @@ def _poll_ecs_tasks(cluster, task_arns):
     raise _ExecutionError("States.Timeout", "ECS tasks did not complete in time")
 
 
+def _invoke_glue_start_job_run(resource, input_data):
+    """arn:aws:states:::glue:startJobRun[.sync]"""
+    result = _dispatch_aws_sdk_json(_AWS_SDK_SERVICE_MAP["glue"], "glue", "startJobRun", input_data)
+    if resource.rstrip("/").endswith(".sync"):
+        return _poll_glue_job_run(input_data["JobName"], result["JobRunId"])
+    # Step Functions adds the request's JobName to the StartJobRun response.
+    return {"JobName": input_data["JobName"], **result}
+
+
+def _poll_glue_job_run(job_name, run_id):
+    """Poll GetJobRun until the run ends. A run that does not succeed fails the task."""
+    while True:
+        # Not scaled: SFN_WAIT_SCALE=0 would turn the poll into a busy loop.
+        time.sleep(1)
+        job_run = _dispatch_aws_sdk_json(
+            _AWS_SDK_SERVICE_MAP["glue"], "glue", "getJobRun", {"JobName": job_name, "RunId": run_id})["JobRun"]
+        # The optimized integration gives timestamps as epoch milliseconds, not the aws-sdk ISO strings.
+        for field in ("StartedOn", "LastModifiedOn", "CompletedOn"):
+            if field in job_run:
+                job_run[field] = int(datetime.fromisoformat(job_run[field].replace("Z", "+00:00")).timestamp() * 1000)
+        if job_run["JobRunState"] == "SUCCEEDED":
+            return job_run
+        if job_run["JobRunState"] in ("FAILED", "ERROR", "TIMEOUT", "STOPPED"):
+            raise _ExecutionError("States.TaskFailed", json.dumps(job_run))
+
+
 def _pascal_to_camel(d):
-    """Convert top-level PascalCase keys to camelCase for ECS internals."""
+    """Recursively convert PascalCase keys to camelCase for ECS internals."""
+    if isinstance(d, list):
+        return [_pascal_to_camel(v) for v in d]
     if not isinstance(d, dict):
         return d
     out = {}
     for k, v in d.items():
         new_key = k[0].lower() + k[1:] if k else k
-        out[new_key] = v
+        out[new_key] = _pascal_to_camel(v)
     return out
 
 
@@ -3071,6 +4320,8 @@ _AWS_SDK_SERVICE_MAP = {
         "param_case": "lower-camel",
     },
     "logs": {"target_prefix": "Logs_20140328", "protocol": "json"},
+    "cloudwatchlogs": {"target_prefix": "Logs_20140328", "protocol": "json",
+                       "param_case": "lower-camel", "service_key": "logs"},
     "ssm": {"target_prefix": "AmazonSSM", "protocol": "json"},
     "eventbridge": {"target_prefix": "AWSEvents", "protocol": "json", "service_key": "events"},
     "kinesis": {"target_prefix": "Kinesis_20131202", "protocol": "json"},
@@ -3092,7 +4343,9 @@ _AWS_SDK_SERVICE_MAP = {
     "rdsdata": {"protocol": "rest-json", "service_key": "rds-data"},
     # REST-XML services: per-op path templates, header/querystring routing, XML responses
     "s3": {"protocol": "rest-xml", "service_key": "s3"},
+    "route53": {"protocol": "rest-xml", "service_key": "route53"},
     "lambda": {"protocol": "rest"},
+    "scheduler": {"protocol": "rest"},
 }
 
 # Map lowercase service names used in aws-sdk ARNs to the PascalCase prefix
@@ -3103,6 +4356,7 @@ _AWS_SDK_ERROR_PREFIX = {
     "dynamodb": "DynamoDb",
     "sfn": "Sfn",
     "logs": "CloudWatchLogs",
+    "cloudwatchlogs": "CloudWatchLogs",
     "ssm": "Ssm",
     "eventbridge": "EventBridge",
     "kinesis": "Kinesis",
@@ -3122,6 +4376,19 @@ _AWS_SDK_ERROR_PREFIX = {
     "rdsdata": "RdsData",
     "s3": "S3",
     "lambda": "Lambda",
+    "scheduler": "Scheduler",
+}
+
+_AWS_SDK_ERROR_CODE_OVERRIDES = {
+    "rds": {
+        "GlobalClusterNotFoundFault": "GlobalClusterNotFoundException",
+        "DBClusterNotFoundFault": "DbClusterNotFoundException",
+        "GlobalClusterAlreadyExistsFault": "GlobalClusterAlreadyExistsException",
+        "InvalidGlobalClusterStateFault": "InvalidGlobalClusterStateException",
+        "InvalidDBClusterStateFault": "InvalidDbClusterStateException",
+        "InvalidParameterCombination": "RdsException",
+        "InvalidParameterValue": "RdsException",
+    },
 }
 
 
@@ -3134,6 +4401,7 @@ def _prefix_sdk_error(service_name: str, error_code: str) -> str:
     """
     if error_code.startswith("States."):
         return error_code
+    error_code = _AWS_SDK_ERROR_CODE_OVERRIDES.get(service_name, {}).get(error_code, error_code)
     prefix = _AWS_SDK_ERROR_PREFIX.get(service_name, service_name.capitalize())
     if error_code.startswith(f"{prefix}."):
         return error_code
@@ -3172,10 +4440,16 @@ def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
             f"Service '{service_key}' is not available in MiniStack",
         )
 
-    if service_info.get("param_case") == "lower-camel":
-        wire_data = _convert_keys_to_camel(input_data or {})
-    else:
-        wire_data = input_data
+    wire_data = _sdk_json_params(service_info, service_key, pascal_action, input_data)
+    # Secrets Manager's SFN SDK integration takes literal UTF-8 text for
+    # SecretBinary; its HTTP API takes base64. Translate only at this boundary,
+    # without changing the state input or guessing whether the text is base64.
+    if (service_name == "secretsmanager"
+            and pascal_action in {"CreateSecret", "PutSecretValue"}
+            and isinstance(wire_data, dict)
+            and isinstance(wire_data.get("SecretBinary"), str)):
+        wire_data = dict(wire_data)
+        wire_data["SecretBinary"] = base64.b64encode(wire_data["SecretBinary"].encode("utf-8")).decode("ascii")
     body = json.dumps(wire_data)
     headers = {
         "x-amz-target": target,
@@ -3186,25 +4460,14 @@ def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
         ),
     }
 
-    # Service handlers are async def but perform no real I/O, so we can
-    # drive the coroutine synchronously — this avoids conflicts with the
-    # already-running asyncio event loop.
-    coro = handler("POST", "/", headers, body, {})
-    try:
-        coro.send(None)
-    except StopIteration as stop:
-        status, resp_headers, resp_body = stop.value
-    else:
-        # If the coroutine didn't finish in one step it truly needs async;
-        # fall back to the event loop (only reachable if a handler awaits).
-        coro.close()
-        loop = asyncio.new_event_loop()
-        try:
-            status, resp_headers, resp_body = loop.run_until_complete(
-                handler("POST", "/", headers, body, {})
-            )
-        finally:
-            loop.close()
+    # Service handlers are async def and may now genuinely await (services that
+    # drive Docker run that work off the event loop), so they cannot be driven
+    # by hand with ``coro.send(None)``: the first step would execute with no
+    # running loop and raise "no running event loop". Schedule on the loop that
+    # is actually serving and wait here. This runs on a Step Functions execution
+    # thread, never on the loop itself, so the wait cannot deadlock.
+    status, resp_headers, resp_body = app.call_service_handler_sync(
+        handler, "POST", "/", headers, body, {})
 
     decoded = resp_body.decode("utf-8") if isinstance(resp_body, bytes) else resp_body
     result = json.loads(decoded) if decoded else {}
@@ -3214,11 +4477,77 @@ def _dispatch_aws_sdk_json(service_info, service_name, action, input_data):
         error_msg = result.get("message", result.get("Message", str(result)))
         raise _ExecutionError(_prefix_sdk_error(service_name, error_type), error_msg)
 
-    # For JSON-protocol services, only convert top-level keys to avoid
-    # mangling user-defined data (e.g. DynamoDB attribute names).
-    if isinstance(result, dict):
-        return {_api_name_to_sfn_key(k): v for k, v in result.items()}
-    return result
+    if (service_name == "secretsmanager" and pascal_action == "GetSecretValue"
+            and isinstance(result, dict) and "SecretBinary" in result):
+        result["SecretBinary"] = base64.b64decode(result["SecretBinary"]).decode("utf-8", errors="replace")
+
+    return _sdk_json_result(service_key, pascal_action, result)
+
+
+# The AWS SDK for Java v2 renames a member it cannot use as named, and Step
+# Functions returns that name: DynamoDB's NULL attribute value is Nul.
+_SDK_MEMBER_NAME_OVERRIDES = {("AttributeValue", "NULL"): "Nul"}
+
+
+def _sdk_json_result(service_key, action, result):
+    """A JSON-protocol aws-sdk result shaped by the operation's output model, as Step Functions returns it."""
+    model = _service_model(service_key)
+    shape = (model.operation_model(action).output_shape
+             if model is not None and action in model.operation_names else None)
+    if shape is None:
+        if isinstance(result, dict):
+            return {_api_name_to_sfn_key(k): v for k, v in result.items()}
+        return result
+    return _sdk_json_value(result, shape)
+
+
+def _sdk_json_value(value, shape):
+    if shape.type_name == "structure" and isinstance(value, dict):
+        return {
+            _SDK_MEMBER_NAME_OVERRIDES.get((shape.name, key), _api_name_to_sfn_key(key)):
+                _sdk_json_value(item, shape.members[key]) if key in shape.members else item
+            for key, item in value.items() if item is not None
+        }
+    if shape.type_name == "list" and isinstance(value, list):
+        return [_sdk_json_value(item, shape.member) for item in value]
+    if shape.type_name == "map" and isinstance(value, dict):
+        return {key: _sdk_json_value(item, shape.value) for key, item in value.items()}
+    if shape.type_name == "timestamp" and _is_num(value):
+        moment = datetime.fromtimestamp(value, timezone.utc)
+        return moment.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return value
+
+
+_SDK_PARAM_NAME_OVERRIDES = {(shape, sdk): wire for (shape, wire), sdk in _SDK_MEMBER_NAME_OVERRIDES.items()}
+
+
+def _sdk_json_params(service_info, service_key, action, input_data):
+    """aws-sdk Parameters on the wire, renamed by the operation's input model; map keys are data."""
+    model = _service_model(service_key)
+    shape = (model.operation_model(action).input_shape
+             if model is not None and action in model.operation_names else None)
+    if shape is None:
+        if service_info.get("param_case") == "lower-camel":
+            return _convert_keys_to_camel(input_data or {})
+        return input_data
+    return _sdk_json_param_value(input_data or {}, shape)
+
+
+def _sdk_json_param_value(value, shape):
+    if shape.type_name == "structure" and isinstance(value, dict) and not getattr(shape, "is_document_type", False):
+        by_sdk_name = {_api_name_to_sfn_key(name): name for name in shape.members}
+        renamed = {}
+        for key, item in value.items():
+            name = (key if key in shape.members
+                    else _SDK_PARAM_NAME_OVERRIDES.get((shape.name, key)) or by_sdk_name.get(key, key))
+            member = shape.members.get(name)
+            renamed[name] = _sdk_json_param_value(item, member) if member is not None else item
+        return renamed
+    if shape.type_name == "list" and isinstance(value, list):
+        return [_sdk_json_param_value(item, shape.member) for item in value]
+    if shape.type_name == "map" and isinstance(value, dict):
+        return {key: _sdk_json_param_value(item, shape.value) for key, item in value.items()}
+    return value
 
 
 def _flatten_query_params(data, prefix=""):
@@ -3247,22 +4576,76 @@ def _flatten_query_params(data, prefix=""):
     return params
 
 
-_EC2_QUERY_LIST_NAME_OVERRIDES = {
-    "Filters": "Filter",
-    "Values": "Value",
-    "GroupIds": "GroupId",
-    "GroupNames": "GroupName",
-    "TagSpecifications": "TagSpecification",
-    "Tags": "Tag",
+# Wire names EC2 numbers list parameters under. Mostly the singular of the SDK
+# member name (VolumeIds -> VolumeId.N), but sometimes the plural
+# (IpPermissions.N) and sometimes a different word (Resources -> ResourceId.N).
+# A wrong name is dropped silently — the call still succeeds and the parameter
+# never applies — so the exceptions are listed rather than guessed. Generated
+# from the botocore EC2 model (queryName, else capitalized locationName) for the
+# actions ec2.py serves; see check_sfn_ec2_list_params.py.
+_EC2_QUERY_LIST_NAMES = {
+    "ExecutableUsers": "ExecutableBy",
+    "Groups": "SecurityGroupId",
+    "IpPermissions": "IpPermissions",
+    "IpRanges": "IpRanges",
+    "Ipv6Ranges": "Ipv6Ranges",
+    "LaunchTemplateConfigs": "LaunchTemplateConfigs",
+    "Overrides": "Overrides",
+    "OwnerIds": "Owner",
+    "Resources": "ResourceId",
+    "RestorableByUserIds": "RestorableBy",
+    "TunnelOptions": "TunnelOptions",
+    "UserIdGroupPairs": "Groups",
+    "Versions": "LaunchTemplateVersion",
+}
+
+# Names spelled both ways across those actions, so they cannot go above. The
+# enclosing list settles most — PrefixListIds is plural inside an IpPermission
+# and singular in DescribePrefixLists — the rest are top-level, where only the
+# action can.
+_EC2_QUERY_LIST_NAMES_BY_PARENT = {
+    ("IpPermissions", "PrefixListIds"): "PrefixListIds",
+    ("NetworkInterfaces", "Ipv6Addresses"): "Ipv6Addresses",
+    ("NetworkInterfaces", "PrivateIpAddresses"): "PrivateIpAddresses",
+}
+
+_EC2_QUERY_LIST_NAMES_BY_ACTION = {
+    ("CreateNetworkInterface", "Ipv6Addresses"): "Ipv6Addresses",
+    ("CreateNetworkInterface", "PrivateIpAddresses"): "PrivateIpAddresses",
+    ("DescribeVpcClassicLinkDnsSupport", "VpcIds"): "VpcIds",
+    ("ModifySnapshotAttribute", "GroupNames"): "UserGroup",
 }
 
 
-def _flatten_ec2_query_params(data, prefix=""):
+def _ec2_query_list_name(key, action=None, parent=""):
+    """Wire name EC2 numbers a list parameter under: VolumeIds -> VolumeId.N."""
+    # Most specific context first: enclosing list, then action, then the names
+    # that are the same everywhere.
+    if (parent, key) in _EC2_QUERY_LIST_NAMES_BY_PARENT:
+        return _EC2_QUERY_LIST_NAMES_BY_PARENT[(parent, key)]
+    if (action, key) in _EC2_QUERY_LIST_NAMES_BY_ACTION:
+        return _EC2_QUERY_LIST_NAMES_BY_ACTION[(action, key)]
+    if key in _EC2_QUERY_LIST_NAMES:
+        return _EC2_QUERY_LIST_NAMES[key]
+    # Everything else is the singular of an English plural: Entries -> Entry,
+    # Ipv4Prefixes -> Ipv4Prefix, VolumeIds -> VolumeId.
+    if len(key) < 2 or not key.endswith("s") or key.endswith("ss"):
+        return key
+    if key.endswith("ies") and len(key) > 3:
+        return key[:-3] + "y"
+    if key.endswith(("ses", "xes", "zes", "ches", "shes")):
+        return key[:-2]
+    return key[:-1]
+
+
+def _flatten_ec2_query_params(data, prefix="", action=None, parent=""):
     """Flatten EC2 query params using EC2's numbered-list convention.
 
     Most query services in MiniStack use ``member.N`` in the Step Functions
     adapter. EC2's Query API expects bare numbered lists for the shapes used
-    here (e.g. ``Filter.1.Value.1`` and ``GroupId.1``).
+    here (e.g. ``Filter.1.Value.1`` and ``GroupId.1``). ``action`` and
+    ``parent`` — the list this one is nested in — select the names EC2 spells
+    differently depending on where they appear.
     """
     params = {}
     if not isinstance(data, dict):
@@ -3270,14 +4653,15 @@ def _flatten_ec2_query_params(data, prefix=""):
     for key, value in data.items():
         full_key = f"{prefix}{key}" if not prefix else f"{prefix}.{key}"
         if isinstance(value, dict):
-            params.update(_flatten_ec2_query_params(value, full_key))
+            # A struct member does not rename its children; the enclosing list does.
+            params.update(_flatten_ec2_query_params(value, full_key, action, parent))
         elif isinstance(value, list):
-            list_key = _EC2_QUERY_LIST_NAME_OVERRIDES.get(key, key)
+            list_key = _ec2_query_list_name(key, action, parent)
             full_list_key = f"{prefix}{list_key}" if not prefix else f"{prefix}.{list_key}"
             for i, item in enumerate(value, 1):
                 item_key = f"{full_list_key}.{i}"
                 if isinstance(item, dict):
-                    params.update(_flatten_ec2_query_params(item, item_key))
+                    params.update(_flatten_ec2_query_params(item, item_key, action, key))
                 else:
                     params[item_key] = str(item)
         elif isinstance(value, bool):
@@ -3294,16 +4678,21 @@ _XML_NUMERIC_FIELDS = frozenset({
     "MonitoringInterval", "PromotionTier", "DbInstancePort",
     "MaxAllocatedStorage", "StorageThroughput",
 })
-# Empty self-closing XML elements that should become [] not "".
+# Known AWS query-protocol list wrappers.  These remain lists for empty,
+# singleton, and multi-item responses, including irregular wrapper/item names.
 _XML_LIST_WRAPPER_TAGS = frozenset({
     "Parameters", "DBClusterMembers", "VpcSecurityGroups",
     "AvailabilityZones", "Subnets", "ReadReplicaDBInstanceIdentifiers",
     "ReadReplicaDBClusterIdentifiers", "DBSecurityGroups",
-    "OptionGroupMemberships", "StatusInfos", "DomainMemberships",
+    "OptionGroupMemberships", "OptionGroupsList", "StatusInfos", "DomainMemberships",
     "AssociatedRoles", "TagList", "ProcessorFeatures",
-    "EnabledCloudwatchLogsExports", "GlobalClusterMembers",
-    "DBParameterGroups", "DBInstances", "DBClusters",
+    "EnabledCloudwatchLogsExports", "GlobalClusterMembers", "GlobalClusters",
+    "DBParameterGroups", "DBInstances", "DBClusters", "Readers",
     "SupportedNetworkTypes",
+    "Roles", "Users", "Groups", "Policies", "AttachedPolicies", "PolicyNames",
+    "InstanceProfiles", "ServerCertificateMetadataList", "AccessKeyMetadata",
+    "Metrics", "Dimensions", "MetricAlarms", "CompositeAlarms",
+    "MetricDataResults", "Datapoints", "QueueUrls",
 })
 _XML_BOOLEAN_FIELDS = frozenset({
     "MultiAZ", "Multiaz", "StorageEncrypted", "DeletionProtection",
@@ -3311,7 +4700,8 @@ _XML_BOOLEAN_FIELDS = frozenset({
     "CopyTagsToSnapshot", "IamDatabaseAuthenticationEnabled",
     "PerformanceInsightsEnabled", "HttpEndpointEnabled",
     "CrossAccountClone", "CustomerOwnedIpEnabled",
-    "IsStorageConfigUpgradeAvailable", "IsWriter",
+    "IsStorageConfigUpgradeAvailable", "IsWriter", "IsDataLossAllowed",
+    "IsTruncated",
 })
 
 
@@ -3357,11 +4747,11 @@ def _xml_element_to_dict(element):
         return tag, text
 
     # Detect list-wrapper elements: all children share the same tag name AND
-    # the parent looks like a plural wrapper (e.g. DBClusters→DBCluster,
-    # AvailabilityZones→AvailabilityZone) or children use the generic
-    # "member" tag.  We require either multiple children OR a plural naming
-    # pattern to avoid false positives on single-child result wrappers like
-    # <CreateDBClusterParameterGroupResult><DBClusterParameterGroup>...</>
+    # the parent is a known wrapper, looks like a plural wrapper (e.g.
+    # DBClusters→DBCluster, AvailabilityZones→AvailabilityZone), or children
+    # use the generic "member" tag.  Known wrappers cover AWS names whose item
+    # tag cannot be inferred from the wrapper name (e.g.
+    # VpcSecurityGroups→VpcSecurityGroupMembership).
     child_tags = {(c.tag.split("}")[-1] if "}" in c.tag else c.tag) for c in children}
     if len(child_tags) == 1:
         child_tag_name = next(iter(child_tags))
@@ -3372,7 +4762,7 @@ def _xml_element_to_dict(element):
             or (tag.endswith("Ids") and child_tag_name == "Id")
         )
         has_multiple = len(children) > 1
-        if is_member or is_plural or has_multiple:
+        if tag in _XML_LIST_WRAPPER_TAGS or is_member or is_plural or has_multiple:
             # Treat as a list.
             items = []
             for child in children:
@@ -3404,16 +4794,38 @@ _AWS_ACRONYMS = frozenset({
 })
 
 # Most query-protocol RDS params expand SDK-style "Db" to wire-format "DB".
-# RemoveFromGlobalCluster is the AWS-shape exception: its member is
+# Some global-cluster operations are AWS-shape exceptions: their members use
 # "DbClusterIdentifier", and sending "DBClusterIdentifier" is ignored.
 _QUERY_PARAM_NAME_OVERRIDES = {
+    # RDS spells this request member with mixed-case ``Vpc``. The shared
+    # acronym converter expands it to ``VPCSecurityGroupIds``, which the RDS
+    # handler correctly ignores as an unknown Query API parameter.
+    ("rds", "CreateDBCluster"): {
+        "VpcSecurityGroupIds": "VpcSecurityGroupIds",
+    },
+    ("rds", "ModifyDBCluster"): {
+        "VpcSecurityGroupIds": "VpcSecurityGroupIds",
+    },
     ("rds", "RemoveFromGlobalCluster"): {
         "DbClusterIdentifier": "DbClusterIdentifier",
     },
+    ("rds", "SwitchoverGlobalCluster"): {
+        "TargetDbClusterIdentifier": "TargetDbClusterIdentifier",
+    },
+    ("rds", "FailoverGlobalCluster"): {
+        "TargetDbClusterIdentifier": "TargetDbClusterIdentifier",
+    },
     ("ec2", "CreateSecurityGroup"): {
         "Description": "GroupDescription",
-        "VpcId": "VpcId",
     },
+}
+
+# Lambda's REST/JSON wire format is mixed-case, so most SFN SDK-convention keys
+# already match the wire form (VpcConfig, TracingConfig, S3Bucket, ...). The
+# divergent all-caps acronym field below would otherwise be silently ignored by
+# the Lambda handler, which reads the wire name.
+_LAMBDA_SFN_TO_WIRE_KEYS = {
+    "KmsKeyArn": "KMSKeyArn",
 }
 
 
@@ -3431,20 +4843,36 @@ def _sfn_key_to_api_name(name):
     return "".join(t.upper() if t in _AWS_ACRONYMS else t for t in tokens)
 
 
-def _convert_params_to_api_names(data, name_overrides=None):
-    """Recursively convert SFN SDK-style param names to AWS wire-format names."""
+def _convert_params_to_api_names(data, name_overrides=None, expand_acronyms=True):
+    """Recursively convert SFN SDK-style param names to AWS wire-format names.
+
+    ``expand_acronyms=False`` for services like EC2 whose wire names carry no uppercase acronym.
+    """
     if isinstance(data, dict):
         converted = {}
         for key, value in data.items():
             if name_overrides and key in name_overrides:
                 wire_key = name_overrides[key]
-            else:
+            elif expand_acronyms:
                 wire_key = _sfn_key_to_api_name(key)
-            converted[wire_key] = _convert_params_to_api_names(value, name_overrides)
+            else:
+                wire_key = key
+            converted[wire_key] = _convert_params_to_api_names(value, name_overrides, expand_acronyms)
         return converted
     if isinstance(data, list):
-        return [_convert_params_to_api_names(item, name_overrides) for item in data]
+        return [_convert_params_to_api_names(item, name_overrides, expand_acronyms) for item in data]
     return data
+
+
+def _normalize_lambda_rest_input(input_data):
+    """Rename top-level Lambda REST keys whose SFN and wire names differ."""
+    if not isinstance(input_data, dict):
+        return input_data
+    out = dict(input_data)
+    for sfn_key, wire_key in _LAMBDA_SFN_TO_WIRE_KEYS.items():
+        if sfn_key in out and wire_key not in out:
+            out[wire_key] = out.pop(sfn_key)
+    return out
 
 
 def _api_name_to_sfn_key(name):
@@ -3453,17 +4881,14 @@ def _api_name_to_sfn_key(name):
     SFN uses the Java SDK V2 naming convention: consecutive uppercase characters
     (acronyms) are lowered except the last one when followed by a lowercase char.
     Examples: DBClusters -> DbClusters, DBClusterArn -> DbClusterArn,
-              IAMDatabaseAuthenticationEnabled -> IamDatabaseAuthenticationEnabled
+              IAMDatabaseAuthenticationEnabled -> IamDatabaseAuthenticationEnabled,
+              SS -> Ss
     """
     if not name:
         return name
     result = []
     i = 0
     while i < len(name):
-        if i == 0:
-            result.append(name[i].upper())
-            i += 1
-            continue
         if name[i].isupper():
             j = i
             while j < len(name) and name[j].isupper():
@@ -3482,7 +4907,8 @@ def _api_name_to_sfn_key(name):
         else:
             result.append(name[i])
             i += 1
-    return "".join(result)
+    key = "".join(result)
+    return key[0].upper() + key[1:]
 
 
 def _convert_keys_to_sfn_convention(obj):
@@ -3509,45 +4935,147 @@ def _query_item_list(value):
     return value if isinstance(value, list) else [value]
 
 
-def _normalize_ec2_security_group(group):
-    if not isinstance(group, dict):
-        return group
-    if "groupDescription" in group:
-        group["Description"] = group.pop("groupDescription")
-    if "tagSet" in group:
-        group["Tags"] = _query_item_list(group.pop("tagSet"))
+def _normalize_sqs_attribute_map(result):
+    """Repeated <Attribute><Name>/<Value> children as the SDK's Attributes map."""
+    items = result if isinstance(result, list) else [result]
+    attributes = {}
+    for item in items:
+        if isinstance(item, dict) and "Name" in item:
+            attributes[item["Name"]] = item.get("Value", "")
+    return {"Attributes": attributes}
 
-    for permission_key in ("ipPermissions", "ipPermissionsEgress"):
-        if permission_key not in group:
-            continue
-        permissions = _query_item_list(group[permission_key])
-        for permission in permissions:
-            if not isinstance(permission, dict):
-                continue
-            for list_key in ("ipRanges", "ipv6Ranges", "prefixListIds"):
-                if list_key in permission:
-                    permission[list_key] = _query_item_list(permission[list_key])
-            if "groups" in permission:
-                permission["UserIdGroupPairs"] = _query_item_list(permission.pop("groups"))
-        group[permission_key] = permissions
-    return group
+# EC2 reuses some names depending on parent. Special case for flattening
+_EC2_FIELDS_BY_PARENT = {
+    ("attachmentSet", "status"): "State",
+    ("instancesSet", "groupSet"): "SecurityGroups",
+    ("instancesSet", "reason"): "StateTransitionReason",
+    ("ipPermissions", "groups"): "UserIdGroupPairs",
+    ("ipPermissionsEgress", "groups"): "UserIdGroupPairs",
+    ("productCodes", "productCode"): "ProductCodeId",
+    ("productCodes", "type"): "ProductCodeType",
+    ("snapshotSet", "status"): "State",
+    ("volumeSet", "status"): "State",
+}
+
+# EC2 reuses some names depending on action. Special case for flattening
+_EC2_FIELDS_BY_ACTION = {
+    ("AttachVolume", "status"): "State",
+    ("CreateSnapshot", "status"): "State",
+    ("CreateVolume", "status"): "State",
+    ("DetachVolume", "status"): "State",
+    ("StartInstances", "instancesSet"): "StartingInstances",
+    ("StopInstances", "instancesSet"): "StoppingInstances",
+    ("TerminateInstances", "instancesSet"): "TerminatingInstances",
+}
+
+
+# Elements whose SDK plural is not "<name minus Set> + s".
+_EC2_GENERIC_NAME_OVERRIDES = {
+    # Members that keep the Set suffix
+    "cidrBlockAssociationSet": "CidrBlockAssociationSet",
+    "ipv6CidrBlockAssociationSet": "Ipv6CidrBlockAssociationSet",
+    # Members whose SDK name the suffix rule cannot reach at all.
+    "keySet": "KeyPairs",
+    "volumeModificationSet": "VolumesModifications",
+    "fleetInstanceSet": "Instances",
+    "groupDescription": "Description",
+    "instanceState": "State",
+    "blockDeviceMapping": "BlockDeviceMappings",
+    "securityGroupInfo": "SecurityGroups",
+    "dnsName": "PublicDnsName",
+    "ipAddress": "PublicIpAddress",
+}
+
+_EC2_GENERIC_NUMERIC_FIELDS = frozenset({
+    "size", "iops", "throughput", "code", "coreCount", "threadsPerCore",
+    "amiLaunchIndex", "fromPort", "toPort", "volumeSize", "deviceIndex",
+    "partitionNumber", "ruleNumber", "port",
+})
+
+_EC2_GENERIC_BOOLEAN_FIELDS = frozenset({
+    "encrypted", "multiAttachEnabled", "deleteOnTermination", "sourceDestCheck",
+    "ebsOptimized", "enaSupport", "fastRestored", "isDefault", "default",
+    "mapPublicIpOnLaunch", "enableDnsSupport", "enableDnsHostnames", "primary",
+    "associatePublicIpAddress", "egress", "return", "requesterManaged",
+})
+
+# Members that are arrays even though they don't end with Set
+_EC2_LIST_FIELDS = frozenset({
+    "blockDeviceMapping", "groups", "ipPermissions", "ipPermissionsEgress",
+    "ipRanges", "ipv6Ranges", "prefixListIds", "productCodes", "securityGroupInfo",
+})
+
+def _ec2_generic_sdk_name(wire_name, action=None, parent=""):
+    """SDK member name for a wire element: context first, then the flat rules."""
+    if not wire_name:
+        return wire_name
+    # Special case for scoped fields
+    scoped = _EC2_FIELDS_BY_PARENT.get((parent, wire_name))
+    if scoped is None:
+        scoped = _EC2_FIELDS_BY_ACTION.get((action, wire_name)) if not parent else None
+    if scoped is not None:
+        return scoped
+
+    if wire_name in _EC2_GENERIC_NAME_OVERRIDES:
+        return _EC2_GENERIC_NAME_OVERRIDES[wire_name]
+    if wire_name.endswith("Set") and len(wire_name) > 3:
+        # The member is the base, pluralised. A base already in the plural is left alone
+        # (instancesSet -> Instances); the rest follow English, so Entry -> Entries and
+        # InstanceStatus -> InstanceStatuses rather than Entrys and InstanceStatus.
+        base = wire_name[:-3]
+        base = base[0].upper() + base[1:]
+        if base.endswith("y") and base[-2:-1].lower() not in "aeiou":
+            return base[:-1] + "ies"
+        if base.lower().endswith(("us", "ss", "x", "z", "ch", "sh")):
+            return base + "es"
+        return base if base.endswith("s") else base + "s"
+    return wire_name[0].upper() + wire_name[1:]
+
+def _apply_ec2_generic(wire_key, value, action=None, parent=""):
+    """Shape one wire element into its SDK form with the current type."""
+
+    # An empty element parses to {} with some XML readers and "" with others.
+    if not value and (wire_key.endswith("Set") or wire_key in _EC2_LIST_FIELDS):
+        return []
+    if isinstance(value, dict):
+        # Flatten wrapped list
+        if set(value) == {"item"}:
+            return [_apply_ec2_generic(wire_key, item, action, parent)
+                    for item in _query_item_list(value)]
+
+        return {_ec2_generic_sdk_name(k, action, wire_key): _apply_ec2_generic(k, v, action, wire_key)
+                for k, v in value.items()}
+    if isinstance(value, list):
+        return [_apply_ec2_generic(wire_key, item, action, parent) for item in value]
+
+    # Convert int and bool.
+    if wire_key in _EC2_GENERIC_NUMERIC_FIELDS and isinstance(value, str) and value.strip():
+        try:
+            return int(value)
+        except ValueError:
+            return value
+    if wire_key in _EC2_GENERIC_BOOLEAN_FIELDS:
+        return {"true": True, "false": False}.get(value, value)
+
+    # Return element as str is default
+    return value
 
 
 def _normalize_query_response(service_key, action, result):
+    # GetQueueAttributes is the one Query result that arrives as a list, so it is
+    # handled before the struct guard below.
+    if service_key == "sqs" and action == "GetQueueAttributes":
+        return _normalize_sqs_attribute_map(result)
     if not isinstance(result, dict):
         return result
-    if service_key == "ec2" and action == "DescribeSecurityGroups":
-        raw_groups = result.pop("securityGroupInfo", None)
-        if raw_groups is not None:
-            if isinstance(raw_groups, dict) and "item" in raw_groups:
-                raw_groups = raw_groups["item"]
-            if raw_groups == "":
-                groups = []
-            elif isinstance(raw_groups, list):
-                groups = raw_groups
-            else:
-                groups = [raw_groups]
-            result["SecurityGroups"] = [_normalize_ec2_security_group(group) for group in groups]
+    if service_key == "ec2":
+        shaped = {}
+        for wire_key, value in result.items():
+            if wire_key.lower() == "requestid":
+                continue
+            shaped[_ec2_generic_sdk_name(wire_key, action)] = _apply_ec2_generic(
+                wire_key, value, action)
+        return shaped
     return result
 
 
@@ -3572,13 +5100,15 @@ def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
     # Convert SFN SDK-style param names (DbSubnetGroupName) to wire-format
     # names (DBSubnetGroupName) before flattening to query params.
     name_overrides = _QUERY_PARAM_NAME_OVERRIDES.get((service_key, pascal_action))
-    wire_data = _convert_params_to_api_names(input_data, name_overrides)
+    # EC2 is the exception: its serialiser only capitalises the first letter
+    wire_data = _convert_params_to_api_names(input_data, name_overrides, expand_acronyms=service_key != "ec2")
     form_params = {"Action": pascal_action}
     if service_key == "ec2":
-        form_params.update(_flatten_ec2_query_params(wire_data))
+        form_params.update(_flatten_ec2_query_params(wire_data, action=pascal_action))
     else:
         form_params.update(_flatten_query_params(wire_data))
-    body = urlencode(form_params)
+    # Query-protocol handlers follow HTTP-server contract and take body as bytes.
+    body = urlencode(form_params).encode("utf-8")
 
     headers = {
         "content-type": "application/x-www-form-urlencoded",
@@ -3588,20 +5118,9 @@ def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
         ),
     }
 
-    coro = handler("POST", "/", headers, body, {})
-    try:
-        coro.send(None)
-    except StopIteration as stop:
-        status, resp_headers, resp_body = stop.value
-    else:
-        coro.close()
-        loop = asyncio.new_event_loop()
-        try:
-            status, resp_headers, resp_body = loop.run_until_complete(
-                handler("POST", "/", headers, body, {})
-            )
-        finally:
-            loop.close()
+    # Scheduled on the serving loop — see _dispatch_aws_sdk_json.
+    status, resp_headers, resp_body = app.call_service_handler_sync(
+        handler, "POST", "/", headers, body, {})
 
     decoded = resp_body.decode("utf-8") if isinstance(resp_body, bytes) else resp_body
 
@@ -3637,9 +5156,9 @@ def _dispatch_aws_sdk_query(service_info, service_name, action, input_data):
             result_key = f"{pascal_action}Result"
             if result_key in result:
                 result = result[result_key]
-            # Drop ResponseMetadata
+        if isinstance(result, dict):
             result.pop("ResponseMetadata", None)
-            result = _normalize_query_response(service_key, pascal_action, result)
+        result = _normalize_query_response(service_key, pascal_action, result)
         return _convert_keys_to_sfn_convention(result)
     except ET.ParseError:
         raise _ExecutionError("States.Runtime", f"Failed to parse {service_name} XML response")
@@ -3691,20 +5210,9 @@ def _dispatch_aws_sdk_rest_json(service_info, service_name, action, input_data):
         ),
     }
 
-    coro = handler("POST", path, headers, body, {})
-    try:
-        coro.send(None)
-    except StopIteration as stop:
-        status, resp_headers, resp_body = stop.value
-    else:
-        coro.close()
-        loop = asyncio.new_event_loop()
-        try:
-            status, resp_headers, resp_body = loop.run_until_complete(
-                handler("POST", path, headers, body, {})
-            )
-        finally:
-            loop.close()
+    # Scheduled on the serving loop — see _dispatch_aws_sdk_json.
+    status, resp_headers, resp_body = app.call_service_handler_sync(
+        handler, "POST", path, headers, body, {})
 
     decoded = resp_body.decode("utf-8") if isinstance(resp_body, bytes) else resp_body
 
@@ -3742,8 +5250,10 @@ def _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data
         )
 
     pascal_action = action[0].upper() + action[1:] if action else action
-    input_data = input_data or {}
+    input_data = _normalize_lambda_rest_input(input_data or {})
     query_params = {}
+    method = "GET"
+    body = b""
 
     if pascal_action == "GetAlias":
         function_name = input_data.get("FunctionName", "")
@@ -3752,17 +5262,60 @@ def _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data
             "/2015-03-31/functions/"
             f"{quote(str(function_name), safe=':')}/aliases/{quote(str(alias_name), safe='')}"
         )
-    elif pascal_action == "GetFunctionConfiguration":
+    elif pascal_action in {"GetFunction", "GetFunctionConfiguration"}:
         function_name = input_data.get("FunctionName", "")
-        path = f"/2015-03-31/functions/{quote(str(function_name), safe=':')}/configuration"
+        path = f"/2015-03-31/functions/{quote(str(function_name), safe=':')}"
+        if pascal_action == "GetFunctionConfiguration":
+            path += "/configuration"
         qualifier = input_data.get("Qualifier")
         if qualifier is not None:
             query_params["Qualifier"] = str(qualifier)
+    elif pascal_action == "CreateFunction":
+        method = "POST"
+        path = "/2015-03-31/functions"
+        body = json.dumps(input_data).encode("utf-8")
+    elif pascal_action == "UpdateFunctionConfiguration":
+        method = "PUT"
+        function_name = input_data.get("FunctionName", "")
+        path = f"/2015-03-31/functions/{quote(str(function_name), safe=':')}/configuration"
+        body = json.dumps(
+            {key: value for key, value in input_data.items() if key != "FunctionName"}
+        ).encode("utf-8")
+    elif pascal_action == "UpdateFunctionCode":
+        method = "PUT"
+        function_name = input_data.get("FunctionName", "")
+        path = f"/2015-03-31/functions/{quote(str(function_name), safe=':')}/code"
+        body = json.dumps(
+            {key: value for key, value in input_data.items() if key != "FunctionName"}
+        ).encode("utf-8")
+    elif pascal_action == "CreateAlias":
+        method = "POST"
+        function_name = input_data.get("FunctionName", "")
+        path = f"/2015-03-31/functions/{quote(str(function_name), safe=':')}/aliases"
+        body = json.dumps(
+            {key: value for key, value in input_data.items() if key != "FunctionName"}
+        ).encode("utf-8")
+    elif pascal_action == "UpdateAlias":
+        method = "PUT"
+        function_name = input_data.get("FunctionName", "")
+        alias_name = input_data.get("Name", "")
+        path = (
+            "/2015-03-31/functions/"
+            f"{quote(str(function_name), safe=':')}/aliases/{quote(str(alias_name), safe='')}"
+        )
+        body = json.dumps(
+            {
+                key: value
+                for key, value in input_data.items()
+                if key not in ("FunctionName", "Name")
+            }
+        ).encode("utf-8")
     else:
         raise _ExecutionError(
             "States.Runtime",
             f"aws-sdk:{service_name}:{action} is not yet implemented in MiniStack "
-            "(lambda REST dispatcher covers getAlias and getFunctionConfiguration)",
+            "(lambda REST dispatcher covers createFunction, updateFunctionConfiguration, "
+            "updateFunctionCode, createAlias, updateAlias, getAlias, getFunction, and getFunctionConfiguration)",
         )
 
     # Embed the current SFN execution's account ID as the access-key segment
@@ -3782,26 +5335,11 @@ def _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data
         ),
     }
 
-    # Drive the async handler synchronously. SFN state execution runs inside
-    # the request's event loop, so spawning a fresh loop here would raise
-    # "Cannot run the event loop while another loop is running". The Lambda
-    # REST handlers we dispatch to (GetAlias, GetFunctionConfiguration) only
-    # touch in-memory dicts and never await, so a single ``coro.send(None)``
-    # completes via ``StopIteration`` with the response tuple.
-    coro = handler("GET", path, headers, b"", query_params)
-    try:
-        coro.send(None)
-    except StopIteration as stop:
-        status, resp_headers, resp_body = stop.value
-    else:
-        # Fallback for an async handler that does await — extremely rare on
-        # this dispatch surface, but guard so we don't return None silently.
-        coro.close()
-        raise _ExecutionError(
-            "States.Runtime",
-            f"aws-sdk:{service_name}:{action} handler awaited unexpectedly; "
-            "cannot drive from sync SFN executor",
-        )
+    # Scheduled on the serving loop — see _dispatch_aws_sdk_json. This replaces
+    # a guard that failed the execution outright when a handler awaited; that is
+    # now an ordinary, supported case.
+    status, resp_headers, resp_body = app.call_service_handler_sync(
+        handler, method, path, headers, body, query_params)
 
     decoded = resp_body.decode("utf-8") if isinstance(resp_body, bytes) else resp_body
     if status >= 400:
@@ -3820,7 +5358,156 @@ def _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data
     except (json.JSONDecodeError, TypeError):
         return decoded
 
-    return _convert_keys_to_sfn_convention(result)
+    output = _convert_keys_to_sfn_convention(result)
+    if pascal_action == "GetFunction" and isinstance(result, dict):
+        # Tags and environment variables are user maps, not SDK member names.
+        if "Tags" in result:
+            output["Tags"] = result["Tags"]
+        environment = result.get("Configuration", {}).get("Environment", {})
+        if "Variables" in environment:
+            output["Configuration"]["Environment"]["Variables"] = environment["Variables"]
+    return output
+
+
+# EventBridge Scheduler REST routes: action -> (method, path, {member: querystring}).
+# The other members go in the JSON body for POST/PUT. Task output keeps the
+# Scheduler member names unchanged.
+_SCHEDULER_ROUTES = {
+    "CreateSchedule": ("POST", "/schedules/{Name}", {}),
+    "GetSchedule": ("GET", "/schedules/{Name}", {"GroupName": "groupName"}),
+    "UpdateSchedule": ("PUT", "/schedules/{Name}", {}),
+    "DeleteSchedule": ("DELETE", "/schedules/{Name}", {"GroupName": "groupName"}),
+    "ListSchedules": ("GET", "/schedules", {
+        "GroupName": "ScheduleGroup", "NamePrefix": "NamePrefix", "State": "State"}),
+    "CreateScheduleGroup": ("POST", "/schedule-groups/{Name}", {}),
+    "GetScheduleGroup": ("GET", "/schedule-groups/{Name}", {}),
+    "DeleteScheduleGroup": ("DELETE", "/schedule-groups/{Name}", {}),
+    "ListScheduleGroups": ("GET", "/schedule-groups", {"NamePrefix": "NamePrefix"}),
+}
+
+_SCHEDULER_TIMESTAMPS = ("CreationDate", "LastModificationDate", "StartDate", "EndDate")
+
+
+def _scheduler_timestamp_out(value):
+    """Epoch seconds as the ISO-8601 UTC string a task outputs (milliseconds only when non-zero)."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return value
+    try:
+        millis = int(round(value * 1000))
+        text = datetime.fromtimestamp(millis // 1000, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    except (ValueError, OverflowError, OSError):
+        # A number from Parameters outside the datetime range is shown as it was stored.
+        return value
+    if millis % 1000:
+        text += f".{millis % 1000:03d}"
+    return text + "Z"
+
+
+_SCHEDULER_TIMESTAMP_IN = re.compile(
+    r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.(\d+))?(Z|[+-]\d\d:[0-5]\d)")
+
+
+def _scheduler_timestamp_in(value):
+    """An ISO-8601 timestamp string from Parameters as epoch seconds, cut to milliseconds."""
+    match = _SCHEDULER_TIMESTAMP_IN.fullmatch(value) if isinstance(value, str) else None
+    if not match:
+        return value
+    year, month, day, hour, minute, second, fraction, zone = match.groups()
+    offset = timedelta(0)
+    if zone != "Z":
+        offset = timedelta(hours=int(zone[1:3]), minutes=int(zone[4:6])) * (1 if zone[0] == "+" else -1)
+    try:
+        # An impossible date, an offset of a day or more, or an instant outside
+        # years 1-9999 in UTC is left for Scheduler.
+        parsed = datetime(int(year), int(month), int(day), int(hour), int(minute), int(second),
+                          tzinfo=timezone(offset)).astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        return value
+    millis = int((fraction or "").ljust(3, "0")[:3])
+    return int(parsed.timestamp()) + millis / 1000
+
+
+def _dispatch_aws_sdk_scheduler_rest(service_info, service_name, action, input_data):
+    """Dispatch the EventBridge Scheduler REST aws-sdk calls."""
+    from urllib.parse import quote
+
+    from ministack import app
+
+    service_key = service_info.get("service_key", service_name)
+    handler = app.SERVICE_HANDLERS.get(service_key)
+    if not handler:
+        raise _ExecutionError(
+            "States.Runtime",
+            f"Service '{service_key}' is not available in MiniStack",
+        )
+
+    pascal_action = action[0].upper() + action[1:] if action else action
+    route = _SCHEDULER_ROUTES.get(pascal_action)
+    if route is None:
+        raise _ExecutionError(
+            "States.Runtime",
+            f"aws-sdk:{service_name}:{action} is not yet implemented in MiniStack "
+            "(scheduler dispatcher covers createSchedule, getSchedule, updateSchedule, "
+            "deleteSchedule, listSchedules, createScheduleGroup, getScheduleGroup, "
+            "deleteScheduleGroup, and listScheduleGroups)",
+        )
+    method, path, query_members = route
+
+    members = dict(input_data or {})
+    if "{Name}" in path:
+        path = path.replace("{Name}", quote(str(members.pop("Name", "")), safe=""))
+    query_params = {
+        wire: str(members.pop(member))
+        for member, wire in query_members.items()
+        if member in members
+    }
+    for member in ("StartDate", "EndDate"):
+        if member in members:
+            members[member] = _scheduler_timestamp_in(members[member])
+    target = members.get("Target")
+    if isinstance(target, dict) and isinstance(target.get("Input"), (dict, list)):
+        # Target.Input is a string member; a JSON object or array is sent as compact JSON text.
+        members["Target"] = {**target, "Input": json.dumps(
+            target["Input"], separators=(",", ":"), ensure_ascii=False)}
+    body = json.dumps(members).encode("utf-8") if method in ("POST", "PUT") else b""
+
+    # Same account and region as the execution; see _dispatch_aws_sdk_lambda_rest.
+    caller_account = get_account_id()
+    headers = {
+        "content-type": "application/json",
+        "host": f"{service_key}.{get_region()}.amazonaws.com",
+        "authorization": (
+            f"AWS4-HMAC-SHA256 Credential={caller_account}/20260101/"
+            f"{get_region()}/{service_key}/aws4_request"
+        ),
+    }
+
+    status, _resp_headers, resp_body = app.call_service_handler_sync(
+        handler, method, path, headers, body, query_params)
+
+    decoded = resp_body.decode("utf-8") if isinstance(resp_body, bytes) else resp_body
+    if status >= 400:
+        try:
+            err_data = json.loads(decoded)
+            code = err_data.get("__type") or "ServiceException"
+            msg = err_data.get("Message") or decoded
+        except Exception:
+            code, msg = "ServiceException", decoded
+        raise _ExecutionError(
+            _prefix_sdk_error(service_name, code),
+            f"{msg} (Service: Scheduler, Status Code: {status}, Request ID: {new_uuid()}) "
+            "(SDK Attempt Count: 1)",
+        )
+
+    result = json.loads(decoded) if decoded else {}
+    records = [result]
+    for list_key in ("Schedules", "ScheduleGroups"):
+        records.extend(result.get(list_key) or [])
+    for record in records:
+        for member in _SCHEDULER_TIMESTAMPS:
+            if member in record:
+                record[member] = _scheduler_timestamp_out(record[member])
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -3845,6 +5532,10 @@ def _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data
 #                  not a wrapped list).
 #   header_outputs:{HTTP-header-name: OutputFieldPascalCase} response headers
 #                  to fold into the result dict (e.g. ETag from PUT/COPY).
+#   metadata_output: collect the dynamic x-amz-meta-* response headers into a
+#                  result "Metadata" map (prefix stripped). Needed because
+#                  header_outputs maps exact header names and user metadata
+#                  arrives as N dynamic headers.
 #
 # Phase 1 covers non-Body operations (no GetObject/PutObject). Body shape for
 # aws-sdk:s3:getObject/putObject is convention-based (Java SDK V2 → base64) and
@@ -3912,6 +5603,7 @@ _S3_OP_SPECS = {
             "last-modified": "LastModified",
             "x-amz-version-id": "VersionId",
         },
+        "metadata_output": True,
     },
     "CopyObject": {
         "method": "PUT", "path": "/{Bucket}/{Key+}",
@@ -3951,9 +5643,30 @@ _S3_OP_SPECS = {
     },
 }
 
+# Route 53 wraps XML lists ("<Changes><Change/></Changes>") where S3 repeats the parent element,
+# hence list_members. The zone id is substituted verbatim: botocore's fix_route53_ids runs inside
+# boto3, not Step Functions, and AWS rejects the "/hostedzone/" form.
+_ROUTE53_OP_SPECS = {
+    "ChangeResourceRecordSets": {
+        "method": "POST", "path": "/2013-04-01/hostedzone/{Id}/rrset/",
+        "path_params": {"Id": "HostedZoneId"},
+        "body_field": "ChangeBatch",
+        # Unlike S3, the request element wraps the input field rather than being it.
+        "body_wrapper": "ChangeResourceRecordSetsRequest",
+        "body_xmlns": "https://route53.amazonaws.com/doc/2013-04-01/",
+        "list_members": {"Changes": "Change", "ResourceRecords": "ResourceRecord"},
+    },
+}
 
-def _s3_substitute_path(template, input_data):
-    """Substitute {Bucket} and {Key+} placeholders. {Key+} preserves slashes."""
+# Keyed by service, like _REST_JSON_ACTION_PATHS: the protocol is shared, the op specs are not.
+_REST_XML_OP_SPECS = {
+    "s3": _S3_OP_SPECS,
+    "route53": _ROUTE53_OP_SPECS,
+}
+
+
+def _rest_xml_substitute_path(template, input_data, spec=None):
+    """Substitute path placeholders: S3's {Bucket}/{Key+}, plus the spec's path_params."""
     out = template
     if "{Bucket}" in out:
         bucket = input_data.get("Bucket", "")
@@ -3961,13 +5674,22 @@ def _s3_substitute_path(template, input_data):
     if "{Key+}" in out:
         key = input_data.get("Key", "")
         out = out.replace("{Key+}", key)
+    for placeholder, field in ((spec or {}).get("path_params") or {}).items():
+        out = out.replace("{" + placeholder + "}", str(input_data.get(field, "")))
     return out
 
 
-def _s3_build_xml_body(root_name, payload):
-    """Build a minimal XML body for the small handful of ops that need one."""
+def _rest_xml_build_body(root_name, payload, list_members=None, xmlns=None):
+    """Build a minimal XML body for the small handful of ops that need one.
+
+    A list is emitted as a repeated parent element ("<Contents/><Contents/>", S3's shape) unless
+    list_members names its member element, in which case it is wrapped
+    ("<Changes><Change/></Changes>", Route 53's shape). Getting this wrong is silent: the handler
+    finds no members and reads the change batch as empty.
+    """
     import xml.etree.ElementTree as ET
-    root = ET.Element(root_name)
+    list_members = list_members or {}
+    root = ET.Element(root_name, {"xmlns": xmlns} if xmlns else {})
 
     def _emit(parent, name, value):
         if isinstance(value, dict):
@@ -3975,8 +5697,14 @@ def _s3_build_xml_body(root_name, payload):
             for k, v in value.items():
                 _emit(child, k, v)
         elif isinstance(value, list):
-            for item in value:
-                _emit(parent, name, item)
+            member = list_members.get(name)
+            if member:
+                wrapper = ET.SubElement(parent, name)
+                for item in value:
+                    _emit(wrapper, member, item)
+            else:
+                for item in value:
+                    _emit(parent, name, item)
         else:
             child = ET.SubElement(parent, name)
             child.text = "" if value is None else str(value)
@@ -4019,7 +5747,7 @@ def _s3_normalize_lists(parsed, list_fields):
 
 
 def _dispatch_aws_sdk_rest_xml(service_info, service_name, action, input_data):
-    """Dispatch an aws-sdk integration call to a REST-XML protocol service (S3)."""
+    """Dispatch an aws-sdk integration call to a REST-XML protocol service."""
     import xml.etree.ElementTree as ET
     from urllib.parse import quote, urlencode
 
@@ -4034,17 +5762,19 @@ def _dispatch_aws_sdk_rest_xml(service_info, service_name, action, input_data):
         )
 
     pascal_action = action[0].upper() + action[1:] if action else action
-    spec = _S3_OP_SPECS.get(pascal_action)
+    op_specs = _REST_XML_OP_SPECS.get(service_key) or {}
+    spec = op_specs.get(pascal_action)
     if not spec:
+        covered = ", ".join(sorted(op_specs)) or "no operations"
         raise _ExecutionError(
             "States.Runtime",
             f"aws-sdk:{service_name}:{action} is not yet implemented in MiniStack "
-            "(rest-xml dispatcher Phase 1 covers list/head/copy/delete/tagging operations)",
+            f"(rest-xml dispatcher covers: {covered})",
         )
 
     input_data = input_data or {}
     method = spec["method"]
-    path = _s3_substitute_path(spec["path"], input_data)
+    path = _rest_xml_substitute_path(spec["path"], input_data, spec)
 
     # S3 handler routes by the query_params dict, not by parsing the path —
     # so build the dict and ALSO append a query string for handlers that
@@ -4076,7 +5806,13 @@ def _dispatch_aws_sdk_rest_xml(service_info, service_name, action, input_data):
     body = b""
     body_field = spec.get("body_field")
     if body_field and body_field in input_data:
-        body = _s3_build_xml_body(spec.get("body_root", body_field), input_data[body_field])
+        wrapper = spec.get("body_wrapper")
+        root_name = wrapper or spec.get("body_root", body_field)
+        payload = {body_field: input_data[body_field]} if wrapper else input_data[body_field]
+        # SDK-convention names have to go out as wire names: route53 ignores <Ttl> and stores no TTL.
+        payload = _convert_params_to_api_names(payload)
+        body = _rest_xml_build_body(root_name, payload, spec.get("list_members"),
+                                    spec.get("body_xmlns"))
         headers["content-type"] = "application/xml"
         headers["content-length"] = str(len(body))
 
@@ -4084,39 +5820,37 @@ def _dispatch_aws_sdk_rest_xml(service_info, service_name, action, input_data):
     # passing the raw path with "?..." would treat "?list-type=2" as part of
     # the bucket name. Send the query-less path; the dict is the source of
     # truth for query routing.
-    coro = handler(method, path, headers, body, query_dict)
-    try:
-        coro.send(None)
-    except StopIteration as stop:
-        status, resp_headers, resp_body = stop.value
-    else:
-        coro.close()
-        loop = asyncio.new_event_loop()
-        try:
-            status, resp_headers, resp_body = loop.run_until_complete(
-                handler(method, path, headers, body, query_dict)
-            )
-        finally:
-            loop.close()
+    # Scheduled on the serving loop — see _dispatch_aws_sdk_json.
+    status, resp_headers, resp_body = app.call_service_handler_sync(
+        handler, method, path, headers, body, query_dict)
 
     decoded = resp_body.decode("utf-8") if isinstance(resp_body, bytes) else (resp_body or "")
     norm_resp_headers = {k.lower(): v for k, v in (resp_headers or {}).items()}
 
     if status >= 400:
-        code = "S3Exception"
-        message = decoded or f"S3 returned status {status}"
+        # Same shape as before for S3 ("S3.S3Exception", "S3 returned status 404") without
+        # hardcoding it: the prefix map already knows what each service is called.
+        prefix = _AWS_SDK_ERROR_PREFIX.get(service_name, service_name.capitalize())
+        code = f"{prefix}Exception"
+        message = decoded or f"{prefix} returned status {status}"
         if decoded:
             try:
                 err_root = ET.fromstring(decoded)
-                code_el = err_root.find("Code")
-                msg_el = err_root.find("Message")
-                if code_el is not None and code_el.text:
-                    code = code_el.text
-                if msg_el is not None and msg_el.text:
-                    message = msg_el.text
+                # Route 53 nests Code/Message under <Error> with a default xmlns, so match local
+                # names anywhere rather than find("Code").
+                found = {}
+                for el in err_root.iter():
+                    local = el.tag.split("}")[-1] if "}" in el.tag else el.tag
+                    if local in ("Code", "Message") and local not in found and el.text:
+                        found[local] = el.text
+                code = found.get("Code", code)
+                message = found.get("Message", message)
             except ET.ParseError:
                 pass
-        raise _ExecutionError(f"S3.{code}", message)
+        # Named after the SDK exception class: S3.NoSuchBucketException.
+        if not code.endswith("Exception"):
+            code += "Exception"
+        raise _ExecutionError(_prefix_sdk_error(service_name, code), message)
 
     result = {}
     if decoded.strip():
@@ -4146,7 +5880,20 @@ def _dispatch_aws_sdk_rest_xml(service_info, service_name, action, input_data):
 
     result = _s3_normalize_lists(result, spec.get("list_fields") or ())
 
-    return _convert_keys_to_sfn_convention(result)
+    converted = _convert_keys_to_sfn_convention(result)
+
+    # User metadata keys are returned verbatim by AWS (S3 lowercases them on
+    # write), so they must be attached AFTER the SFN key conversion — running
+    # them through _api_name_to_sfn_key would turn "shardcount" into
+    # "Shardcount" and break $.Metadata.<key> paths.
+    if spec.get("metadata_output"):
+        converted["Metadata"] = {
+            hname[len("x-amz-meta-"):]: value
+            for hname, value in norm_resp_headers.items()
+            if hname.startswith("x-amz-meta-")
+        }
+
+    return converted
 
 
 def _invoke_aws_sdk_integration(resource, input_data):
@@ -4178,6 +5925,8 @@ def _invoke_aws_sdk_integration(resource, input_data):
         return _dispatch_aws_sdk_rest_xml(service_info, service_name, action, input_data)
     elif protocol == "rest" and service_name == "lambda":
         return _dispatch_aws_sdk_lambda_rest(service_info, service_name, action, input_data)
+    elif protocol == "rest" and service_name == "scheduler":
+        return _dispatch_aws_sdk_scheduler_rest(service_info, service_name, action, input_data)
     else:
         raise _ExecutionError(
             "States.Runtime",
@@ -4186,9 +5935,33 @@ def _invoke_aws_sdk_integration(resource, input_data):
         )
 
 
+def _invoke_events_put_events(resource, input_data):
+    """arn:aws:states:::events:putEvents — actually publish to EventBridge.
+
+    Without this the task fell through to the passthrough at the end of
+    _invoke_resource: it reported SUCCEEDED but never delivered the event, so a
+    state machine that emits notifications completed green while the target
+    never fired.
+    """
+    try:
+        from ministack.services import eventbridge
+    except ImportError:
+        logger.warning("eventbridge module unavailable; returning passthrough")
+        return input_data
+    status, _, body = eventbridge._put_events(input_data)
+    result = json.loads(body) if body else {}
+    if status >= 400:
+        raise _ExecutionError(
+            result.get("__type", "EventBridge.EventBridgeException"),
+            result.get("message", ""),
+        )
+    return result
+
+
 _SERVICE_DISPATCH = {
     "arn:aws:states:::sqs:sendMessage": _invoke_sqs_send_message,
     "arn:aws:states:::sns:publish": _invoke_sns_publish,
+    "arn:aws:states:::events:putEvents": _invoke_events_put_events,
     "arn:aws:states:::dynamodb:putItem": lambda r, d: _invoke_dynamodb("putItem", d),
     "arn:aws:states:::dynamodb:getItem": lambda r, d: _invoke_dynamodb("getItem", d),
     "arn:aws:states:::dynamodb:deleteItem": lambda r, d: _invoke_dynamodb(
@@ -4198,18 +5971,22 @@ _SERVICE_DISPATCH = {
         "updateItem", d
     ),
     "arn:aws:states:::ecs:runTask": _invoke_ecs_run_task,
+    "arn:aws:states:::glue:startJobRun": _invoke_glue_start_job_run,
 }
 
 
 def reset():
     _state_machines.clear()
     _executions.clear()
+    with _history_page_tokens_lock:
+        _history_page_tokens.clear()
     _task_tokens.clear()
     _tags.clear()
     _activities.clear()
     _activity_tasks.clear()
     _state_machine_versions.clear()
     _state_machine_aliases.clear()
+    _map_runs.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -4270,6 +6047,8 @@ def _publish_state_machine_version(data):
         "type": sm.get("type", "STANDARD"),
         "loggingConfiguration": copy.deepcopy(
             sm.get("loggingConfiguration", {"level": "OFF"})),
+        "encryptionConfiguration": copy.deepcopy(
+            sm.get("encryptionConfiguration") or _default_encryption()),
     }
     return json_response({
         "stateMachineVersionArn": version_arn,
@@ -4318,10 +6097,7 @@ def _list_state_machine_versions(data):
     # AWS returns versions in descending creationDate order (newest first).
     matching.sort(key=lambda v: v["creationDate"], reverse=True)
 
-    max_results = data.get("maxResults") or len(matching)
-    return json_response({
-        "stateMachineVersions": matching[:max_results],
-    })
+    return _offset_page(data, "stateMachineVersions", matching)
 
 
 # ---------------------------------------------------------------------------
@@ -4517,7 +6293,4 @@ def _list_state_machine_aliases(data):
         })
     matching.sort(key=lambda a: a["creationDate"], reverse=True)
 
-    max_results = data.get("maxResults") or len(matching)
-    return json_response({
-        "stateMachineAliases": matching[:max_results],
-    })
+    return _offset_page(data, "stateMachineAliases", matching)

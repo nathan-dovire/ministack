@@ -1,0 +1,2848 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
+"""
+Asyncio Postgres wire-protocol proxy with Aurora DSQL validation.
+
+One proxy per DSQL cluster: clients connect to the proxy on the cluster's
+localhost port; the proxy forwards frames to a real Postgres backend after
+enforcing DSQL's PostgreSQL-compatibility subset.
+
+Both wire protocols are validated: the simple ``Q`` protocol (psql, psycopg2)
+and the extended ``Parse``/``Bind``/``Execute`` protocol (pgjdbc, pgx, asyncpg,
+psycopg3, and every ORM that uses prepared statements).
+
+Transaction state is taken from the backend's ``ReadyForQuery`` status byte
+rather than inferred from statement text, so it stays correct no matter which
+protocol a client uses to send ``BEGIN``/``COMMIT``.
+
+Documented limitations:
+- ``CREATE INDEX ASYNC`` / ``ALTER TABLE ASYNC`` executed over the extended
+  protocol run their rewritten DDL at ``Execute`` time on the proxy's own
+  backend connection; a client that ``Parse``s such a statement and never
+  ``Execute``s it registers no job.
+- Type/name parsing is heuristic regex work, not a real SQL parser. Statement
+  splitting, comment stripping, parenthesis matching and the locking-clause
+  rule are lexer-aware (string literals, dollar quotes, quoted identifiers and
+  nested comments), but the remaining clause-level analysis is still pattern
+  matching.
+- The locking-clause rule is syntactic: DSQL refuses a share-mode clause when
+  the plan would actually take a share lock, so it accepts one that cannot
+  reach a relation (``SELECT 1 FOR SHARE``) or that a stronger clause on the
+  same relation supersedes (``SELECT * FROM (SELECT id FROM t FOR UPDATE) x
+  FOR SHARE``). Both are no-ops; the proxy refuses them anyway rather than
+  model the planner's strongest-lock-wins merge.
+- Foreign keys are enforced by the backend, so a referencing write and a
+  concurrent change to the referenced key wait on a row lock where DSQL
+  resolves them optimistically and fails the loser with ``40001`` (OC000).
+- Transaction row counting is static (``VALUES`` tuples only); ``INSERT ...
+  SELECT`` / ``UPDATE`` / ``DELETE`` affected-row counts are not tracked.
+- OC001 emulation is optimistic: the catalog version bumps on forwarded DDL,
+  not on successful commit.
+"""
+
+import asyncio
+import logging
+import re
+import secrets
+import string
+import struct
+import time
+from datetime import datetime, timezone
+
+logger = logging.getLogger("pgproxy")
+
+
+# ---------------------------------------------------------------------------
+# Wire-protocol constants and frame helpers
+# ---------------------------------------------------------------------------
+
+_SSL_REQUEST = 80877103
+_GSSENC_REQUEST = 80877104
+_CANCEL_REQUEST = 80877102
+_PROTOCOL_3 = 196608
+
+# ParameterStatus sent at startup. Drivers depend on these: one that decodes
+# timestamptz by TimeZone can stall on the first value without it. Values
+# as real DSQL reports them (measured, eu-central-1 2026-10-04), bar the
+# per-session session_authorization.
+_STARTUP_PARAMS = (
+    ("server_version", "16.4"),
+    ("server_encoding", "UTF8"),
+    ("client_encoding", "UTF8"),
+    ("DateStyle", "ISO, MDY"),
+    ("IntervalStyle", "postgres"),
+    ("TimeZone", "UTC"),
+    ("integer_datetimes", "on"),
+    ("standard_conforming_strings", "on"),
+    ("application_name", ""),
+    ("is_superuser", "off"),
+    ("default_transaction_read_only", "off"),
+    ("in_hot_standby", "off"),
+)
+
+_TEXT_OID = 25
+
+
+def _frame(type_byte, payload):
+    return type_byte + struct.pack("!I", len(payload) + 4) + payload
+
+
+def _error_response(sqlstate, message, detail=None):
+    payload = (
+        b"SERROR\0VERROR\0"
+        + b"C" + sqlstate.encode() + b"\0"
+        + b"M" + message.encode() + b"\0"
+        + (b"D" + detail.encode() + b"\0" if detail else b"")
+        + b"\0"
+    )
+    return _frame(b"E", payload)
+
+
+def _notice_response(severity, sqlstate, message):
+    payload = (
+        b"S" + severity.encode() + b"\0V" + severity.encode() + b"\0"
+        + b"C" + sqlstate.encode() + b"\0"
+        + b"M" + message.encode() + b"\0"
+        + b"\0"
+    )
+    return _frame(b"N", payload)
+
+
+def _ready(status=b"I"):
+    return _frame(b"Z", status)
+
+
+def _command_complete(tag):
+    return _frame(b"C", tag.encode() + b"\0")
+
+
+def _row_description(cols):
+    """cols: names, or (name, type_oid) tuples."""
+    out = struct.pack("!H", len(cols))
+    for col in cols:
+        name, oid = col if isinstance(col, tuple) else (col, _TEXT_OID)
+        # table oid, column attnum, type oid, typlen, typmod, format
+        out += name.encode() + b"\0" + struct.pack("!IhIhih", 0, 0, oid, -1, -1, 0)
+    return _frame(b"T", out)
+
+
+def _data_row(values):
+    out = struct.pack("!H", len(values))
+    for v in values:
+        if v is None:
+            out += struct.pack("!i", -1)
+        else:
+            b = str(v).encode()
+            out += struct.pack("!I", len(b)) + b
+    return _frame(b"D", out)
+
+
+def _client_greeting():
+    out = _frame(b"R", struct.pack("!I", 0))  # AuthenticationOk
+    for key, value in _STARTUP_PARAMS:
+        out += _frame(b"S", key.encode() + b"\0" + value.encode() + b"\0")
+    out += _frame(b"K", struct.pack("!II", secrets.randbelow(2**31), secrets.randbelow(2**31)))
+    out += _ready(b"I")
+    return out
+
+
+async def _read_frame(reader):
+    type_byte = await reader.readexactly(1)
+    (length,) = struct.unpack("!I", await reader.readexactly(4))
+    payload = await reader.readexactly(length - 4)
+    return type_byte, payload
+
+
+# ---------------------------------------------------------------------------
+# Job registry (CREATE INDEX ASYNC / sys.jobs emulation)
+# ---------------------------------------------------------------------------
+
+_proxies = {}  # cluster_id -> asyncio.Server
+_jobs = {}  # cluster_id -> [job dict]
+_catalog_versions = {}  # cluster_id -> int, bumped on every DDL statement
+
+# DSQL job ids are 26 base32 characters (a UUID); wait_for_job refuses any
+# other text with 22P02 "Unable to convert text to UUID".
+_ID_ALPHABET = string.ascii_lowercase + "234567"
+
+_JOB_COLUMNS = (
+    "job_id", "status", "details", "job_type", "class_id", "object_id",
+    "object_name", "start_time", "update_time",
+)
+# Column types sys.jobs declares on real DSQL (measured, eu-central-1
+# 2026-10-04); the rest are text. Drivers decode values by these oids.
+_OID_OID, _TIMESTAMPTZ_OID = 26, 1184
+_JOB_COLUMN_TYPES = {
+    "class_id": _OID_OID, "object_id": _OID_OID,
+    "start_time": _TIMESTAMPTZ_OID, "update_time": _TIMESTAMPTZ_OID,
+}
+# Catalog a job's object lives in: pg_class for an index, pg_constraint for
+# a constraint validation.
+_JOB_CLASS_IDS = {"INDEX_BUILD": "1259", "VALIDATE_CONSTRAINT": "2606"}
+# What CREATE INDEX ASYNC / ALTER TABLE ASYNC answer, as on real DSQL.
+_JOB_COMMAND_TAGS = {"INDEX_BUILD": "CREATE INDEX", "VALIDATE_CONSTRAINT": "ALTER TABLE"}
+
+
+def _pg_timestamptz(value):
+    """Postgres' text output for a UTC timestamptz (DSQL keeps whole seconds).
+
+    Jobs persisted by older versions hold ISO 8601 strings; they render the
+    same way.
+    """
+    if isinstance(value, str) and "T" in value:
+        value = datetime.fromisoformat(value)
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S+00")
+    return value
+
+
+def get_jobs(cluster_id):
+    return list(_jobs.get(cluster_id, []))
+
+
+def clear_jobs(cluster_id=None):
+    """Drop job registry entries — one cluster, or all when no id is given."""
+    if cluster_id is None:
+        _jobs.clear()
+        _catalog_versions.clear()
+    else:
+        _jobs.pop(cluster_id, None)
+        _catalog_versions.pop(cluster_id, None)
+
+
+def _bump_catalog(cluster_id):
+    """Record a catalog change (any DDL) for a cluster."""
+    _catalog_versions[cluster_id] = _catalog_versions.get(cluster_id, 0) + 1
+    return _catalog_versions[cluster_id]
+
+
+def _register_job(cluster_id, object_name, job_type="INDEX_BUILD",
+                  status="completed", details=None):
+    now = _pg_timestamptz(datetime.now(timezone.utc))
+    job = {
+        "job_id": "".join(secrets.choice(_ID_ALPHABET) for _ in range(26)),
+        "status": status,
+        "details": details,
+        "job_type": job_type,
+        "class_id": _JOB_CLASS_IDS.get(job_type, "1259"),
+        "object_id": str(16384 + secrets.randbelow(100000)),
+        "object_name": object_name,
+        "start_time": now,
+        "update_time": now,
+    }
+    _jobs.setdefault(cluster_id, []).append(job)
+    return job
+
+
+# ---------------------------------------------------------------------------
+# SQL lexing primitives
+#
+# Everything that scans SQL text (statement splitting, comment stripping,
+# parenthesis matching, tokenizing) goes through _skip_noise so that literals,
+# dollar-quoted bodies, quoted identifiers and comments can never be mistaken
+# for structure. Without this a ';' or ')' inside a literal silently truncates
+# the text a validation rule sees, and the rule passes on the fragment.
+# ---------------------------------------------------------------------------
+
+_DOLLAR_TAG_RE = re.compile(r"\$(?:[A-Za-z_]\w*)?\$")
+
+
+def _skip_noise(sql, i):
+    """If ``sql[i]`` opens a literal/identifier/comment, return the index just
+    past it; otherwise return ``i`` unchanged."""
+    n = len(sql)
+    ch = sql[i]
+    if ch == "'":
+        # E'...' uses backslash escapes; ordinary literals only double the quote
+        # (standard_conforming_strings is on).
+        escapes = i > 0 and sql[i - 1] in "Ee" and (
+            i == 1 or not (sql[i - 2].isalnum() or sql[i - 2] == "_")
+        )
+        j = i + 1
+        while j < n:
+            if escapes and sql[j] == "\\":
+                j += 2
+                continue
+            if sql[j] == "'":
+                if j + 1 < n and sql[j + 1] == "'":
+                    j += 2
+                    continue
+                return j + 1
+            j += 1
+        return n
+    if ch == '"':
+        j = i + 1
+        while j < n:
+            if sql[j] == '"':
+                if j + 1 < n and sql[j + 1] == '"':
+                    j += 2
+                    continue
+                return j + 1
+            j += 1
+        return n
+    if ch == "$":
+        m = _DOLLAR_TAG_RE.match(sql, i)
+        if m:
+            tag = m.group(0)
+            close = sql.find(tag, m.end())
+            return close + len(tag) if close >= 0 else n
+        return i
+    if sql.startswith("--", i):
+        nl = sql.find("\n", i)
+        return n if nl < 0 else nl + 1
+    if sql.startswith("/*", i):
+        depth, j = 0, i
+        while j < n:
+            if sql.startswith("/*", j):
+                depth += 1
+                j += 2
+            elif sql.startswith("*/", j):
+                depth -= 1
+                j += 2
+                if depth == 0:
+                    return j
+            else:
+                j += 1
+        return n
+    return i
+
+
+def strip_leading_comments(sql):
+    """Drop leading whitespace and comments.
+
+    Every validation rule anchors on the first keyword, so a leading ``--`` or
+    ``/* */`` comment would otherwise disable the validator wholesale. Migration
+    tools routinely prefix their SQL with comments.
+    """
+    i, n = 0, len(sql)
+    while i < n:
+        if sql[i].isspace():
+            i += 1
+            continue
+        j = _skip_noise(sql, i) if sql.startswith(("--", "/*"), i) else i
+        if j == i:
+            break
+        i = j
+    return sql[i:]
+
+
+def _match_paren(sql, start):
+    """Index of the ``)`` matching the ``(`` at ``start``, or -1."""
+    depth, i, n = 0, start, len(sql)
+    while i < n:
+        j = _skip_noise(sql, i)
+        if j != i:
+            i = j
+            continue
+        if sql[i] == "(":
+            depth += 1
+        elif sql[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _find_char(sql, i, chars):
+    """Index of the next character in ``chars`` outside literals/comments."""
+    n = len(sql)
+    while i < n:
+        j = _skip_noise(sql, i)
+        if j != i:
+            i = j
+            continue
+        if sql[i] in chars:
+            return i
+        i += 1
+    return -1
+
+
+# One SQL identifier: double-quoted (case kept, "" escapes a quote) or bare
+# (folded to lower case by the server). ``_IDENT_PATH`` covers a dotted name
+# in any mix of the two, so schema."Tbl".col is one match.
+_IDENT = r'(?:"(?:[^"]|"")*"|[^\W\d][\w$]*)'
+_IDENT_PATH = rf"{_IDENT}(?:\s*\.\s*{_IDENT})*"
+_IDENT_RE = re.compile(_IDENT)
+_NAME_RE = re.compile(r"[^\W\d][\w$]*")
+
+
+def fold_identifier(raw):
+    """Normalize one identifier to the name the server actually stores.
+
+    A quoted identifier keeps its case verbatim (with ``""`` collapsed to a
+    single quote); a bare one folds to lower case. So ``id``, ``ID`` and
+    ``"id"`` all name the same column, while ``"ID"`` names a different one.
+    Returns ``(name, was_quoted)``.
+    """
+    raw = raw.strip()
+    if len(raw) >= 2 and raw.startswith('"') and raw.endswith('"'):
+        return raw[1:-1].replace('""', '"'), True
+    return raw.lower(), False
+
+
+def identifier_path(raw):
+    """Normalized parts of a dotted identifier: ``s."T".c`` -> ``[s, T, c]``."""
+    return [fold_identifier(m.group(0))[0] for m in _IDENT_RE.finditer(raw)]
+
+
+_OP_CHARS = "+-*/<>=~!@#%^&|?"
+_PUNCT_CHARS = "().,;[]:"
+
+
+def _sql_tokens(sql):
+    """Lex SQL into ``(kind, text)`` pairs, dropping whitespace and comments.
+
+    Kinds: ``name`` (bare identifier or keyword, folded to lower case),
+    ``qname`` (quoted identifier, verbatim), ``str`` (string or dollar-quoted
+    literal), ``op`` (a maximal run of operator characters, the way the server
+    lexes one), ``punct`` (a single ``().,;[]:`` character) and ``other``
+    (numbers, ``$1`` placeholders, anything else).
+    """
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch.isspace():
+            i += 1
+            continue
+        j = _skip_noise(sql, i)
+        if j != i:  # literal, quoted identifier or comment
+            if ch == '"':
+                yield "qname", sql[i + 1 : j - 1].replace('""', '"')
+            elif ch in "'$":
+                yield "str", sql[i:j]
+            i = j
+            continue
+        m = _NAME_RE.match(sql, i)
+        if m:
+            yield "name", m.group(0).lower()
+            i = m.end()
+            continue
+        if ch in _OP_CHARS:
+            k = i + 1
+            while k < n and sql[k] in _OP_CHARS:
+                k += 1
+            yield "op", sql[i:k]
+            i = k
+            continue
+        yield ("punct" if ch in _PUNCT_CHARS else "other"), ch
+        i += 1
+
+
+# ---------------------------------------------------------------------------
+# DSQL validator (pure, unit-testable)
+# ---------------------------------------------------------------------------
+
+
+class DsqlError:
+    """Validator rejection: rendered as a PG ErrorResponse."""
+
+    def __init__(self, sqlstate, message, detail=None):
+        self.sqlstate = sqlstate
+        self.message = message
+        self.detail = detail
+
+    def __repr__(self):
+        return f"DsqlError({self.sqlstate!r}, {self.message!r})"
+
+
+class Rewrite:
+    """Statement must be rewritten before forwarding to the backend."""
+
+    def __init__(self, sql, kind, object_name="", table="", job_type="INDEX_BUILD"):
+        self.sql = sql
+        self.kind = kind
+        self.object_name = object_name
+        self.table = table
+        self.job_type = job_type
+
+    def __repr__(self):
+        return f"Rewrite({self.sql!r}, kind={self.kind!r})"
+
+
+class TxnState:
+    """Per-connection transaction discipline tracking.
+
+    ``in_txn`` is authoritative from the backend's ReadyForQuery status byte
+    (see ``note_backend_status``) — inferring it from statement text alone goes
+    wrong the moment a client sends BEGIN or COMMIT over the extended protocol,
+    and a stranded ``in_txn`` makes the validator reject perfectly valid
+    autocommit statements. The per-transaction counters below still come from
+    statement text, since the wire protocol does not report them.
+    """
+
+    def __init__(self):
+        self.in_txn = False
+        self.ddl_seen = False
+        self.dml_seen = False
+        self.started_at = None  # monotonic ts at BEGIN (duration limit)
+        self.rows_est = 0  # static row estimate (VALUES tuples) in this txn
+        self.bytes_est = 0  # cumulative DML payload bytes in this txn
+        self.aborted = False  # backend reported a failed transaction block
+        self.synthetic_abort = False  # *we* rejected a statement mid-transaction
+
+    def copy(self):
+        other = TxnState()
+        other.in_txn = self.in_txn
+        other.ddl_seen = self.ddl_seen
+        other.dml_seen = self.dml_seen
+        other.started_at = self.started_at
+        other.rows_est = self.rows_est
+        other.bytes_est = self.bytes_est
+        other.aborted = self.aborted
+        other.synthetic_abort = self.synthetic_abort
+        return other
+
+    def begin(self):
+        self.in_txn = True
+        self.ddl_seen = self.dml_seen = False
+        self.started_at = time.monotonic()
+        self.rows_est = self.bytes_est = 0
+        self.aborted = self.synthetic_abort = False
+
+    def reset(self):
+        self.in_txn = False
+        self.ddl_seen = self.dml_seen = False
+        self.started_at = None
+        self.rows_est = self.bytes_est = 0
+        self.aborted = self.synthetic_abort = False
+
+    def note_backend_status(self, status):
+        """Reconcile with a backend ReadyForQuery status byte (I / T / E)."""
+        if status == b"I":
+            self.reset()
+        elif status == b"T":
+            if not self.in_txn:
+                self.begin()
+            self.aborted = False
+        elif status == b"E":
+            self.in_txn = True
+            self.aborted = True
+
+    def apply(self, sql):
+        cls = classify_statement(sql)
+        if cls == "tcl_begin":
+            self.begin()
+        elif cls == "tcl_end":
+            self.reset()
+        elif cls == "ddl":
+            self.ddl_seen = True
+        elif cls == "dml":
+            self.dml_seen = True
+            if self.in_txn:
+                self.rows_est += _values_tuple_count(sql)
+                self.bytes_est += len(sql.encode("utf-8", "replace"))
+
+
+_DDL_KEYWORDS = {"CREATE", "ALTER", "DROP"}
+_DML_KEYWORDS = {"INSERT", "UPDATE", "DELETE"}
+_TCL_BEGIN = {"BEGIN", "START"}
+_TCL_END = {"COMMIT", "END", "ROLLBACK", "ABORT"}
+
+
+def _cte_main_keyword(sql):
+    """Leading keyword of the statement a ``WITH`` clause feeds.
+
+    ``WITH x AS (...) INSERT INTO ...`` is an INSERT, not an unclassified
+    statement — otherwise CTE-leading writes escape every DML rule.
+    """
+    m = re.match(r"\s*WITH\s+(?:RECURSIVE\s+)?", sql, re.I)
+    if not m:
+        return None
+    i = m.end()
+    while True:
+        opening = _find_char(sql, i, "(")
+        if opening < 0:
+            return None
+        close = _match_paren(sql, opening)
+        if close < 0:
+            return None
+        tail = sql[close + 1:].lstrip()
+        if tail.startswith(","):
+            i = close + 1
+            continue
+        km = re.match(r"([A-Za-z]+)", tail)
+        if not km:
+            return None
+        word = km.group(1).upper()
+        # Column list or AS [NOT] MATERIALIZED — the body is still ahead.
+        if word in ("AS", "NOT", "MATERIALIZED"):
+            i = close + 1
+            continue
+        return word
+
+
+def _explain_inner(sql):
+    """Statement executed by ``EXPLAIN ANALYZE``, or None.
+
+    Plain EXPLAIN only plans, so it stays unclassified; EXPLAIN ANALYZE really
+    does run the underlying DML.
+    """
+    m = re.match(r"\s*EXPLAIN\s*", sql, re.I)
+    if not m:
+        return None
+    i, analyze = m.end(), False
+    if i < len(sql) and sql[i] == "(":
+        close = _match_paren(sql, i)
+        if close < 0:
+            return None
+        opts = sql[i + 1:close]
+        analyze = bool(
+            re.search(r"\bANALYZ?[ES]E?\b(?!\s+(?:false|off|0))", opts, re.I)
+        )
+        i = close + 1
+    else:
+        while True:
+            wm = re.match(r"\s*(ANALYZE|ANALYSE|VERBOSE)\b", sql[i:], re.I)
+            if not wm:
+                break
+            if wm.group(1).upper() in ("ANALYZE", "ANALYSE"):
+                analyze = True
+            i += wm.end()
+    return sql[i:] if analyze else None
+
+
+def classify_statement(sql):
+    """Classify one statement: ddl | dml | tcl_begin | tcl_end | other."""
+    s = strip_leading_comments(sql)
+    m = re.match(r"\s*([A-Za-z]+)", s)
+    if not m:
+        return "other"
+    kw = m.group(1).upper()
+    if kw == "WITH":
+        kw = _cte_main_keyword(s) or kw
+    elif kw == "EXPLAIN":
+        inner = _explain_inner(s)
+        return classify_statement(inner) if inner is not None else "other"
+    if kw in _DDL_KEYWORDS or (kw == "AWS" and _AWS_IAM_RE.match(s)):
+        return "ddl"
+    if kw in _DML_KEYWORDS:
+        return "dml"
+    if kw in _TCL_BEGIN:
+        return "tcl_begin"
+    if kw in _TCL_END:
+        return "tcl_end"
+    return "other"
+
+
+def split_statements(sql):
+    """Split a ``Q`` batch on ';' outside literals, comments and quoted names."""
+    out, last, i, n = [], 0, 0, len(sql)
+    while i < n:
+        j = _skip_noise(sql, i)
+        if j != i:
+            i = j
+            continue
+        if sql[i] == ";":
+            out.append(sql[last:i])
+            last = i + 1
+        i += 1
+    out.append(sql[last:])
+    return [s.strip() for s in out if s.strip()]
+
+
+def _values_tuple_count(sql):
+    """Count row tuples in an INSERT ... VALUES (...), (...), ... statement.
+
+    Static estimate for the 3,000-rows-per-transaction limit; INSERT ...
+    SELECT / UPDATE / DELETE row counts can't be known without executing.
+    """
+    m = re.search(r"\bVALUES\b", sql, re.I)
+    if not m or not re.match(r"\s*INSERT\b", sql, re.I):
+        return 0
+    start = sql.find("(", m.end())
+    if start < 0:
+        return 0
+    count, depth = 0, 0
+    in_str = False
+    for i in range(start, len(sql)):
+        ch = sql[i]
+        if ch == "'":
+            in_str = not in_str
+        elif in_str:
+            continue
+        elif ch == "(":
+            if depth == 0:
+                count += 1
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0 and i + 1 < len(sql) and sql[i + 1:].lstrip()[:1] not in (",",):
+                break
+    return count
+
+
+# --- Denylist (rule 1) ------------------------------------------------------
+
+_DENYLIST = (
+    (r"CREATE\s+DATABASE\b", "CREATE DATABASE"),
+    (r"CREATE\s+TYPE\b", "CREATE TYPE"),
+    (r"CREATE\s+EXTENSION\b", "CREATE EXTENSION"),
+    (r"CREATE\s+TRIGGER\b", "CREATE TRIGGER"),
+    (r"CREATE\s+(OR\s+REPLACE\s+)?PROCEDURE\b", "CREATE PROCEDURE"),
+    (r"CREATE\s+TABLESPACE\b", "CREATE TABLESPACE"),
+    (r"CREATE\s+MATERIALIZED\s+VIEW\b", "materialized views"),
+    (r"CREATE\s+(TEMP|TEMPORARY|UNLOGGED)\s+TABLE\b", "temporary/unlogged tables"),
+    (r"COPY\b", "COPY"),
+    (r"LISTEN\b", "LISTEN"),
+    (r"NOTIFY\b", "NOTIFY"),
+    (r"UNLISTEN\b", "UNLISTEN"),
+    (r"TRUNCATE\b", "TRUNCATE"),
+    (r"DO\b", "DO"),
+    (r"SAVEPOINT\b", "SAVEPOINT"),
+    (r"LOCK\b", "LOCK TABLE"),
+    (r"CREATE\s+RULE\b", "CREATE RULE"),
+    (r"CREATE\s+(OR\s+REPLACE\s+)?AGGREGATE\b", "CREATE AGGREGATE"),
+    (r"CREATE\s+DOMAIN\b", "CREATE DOMAIN"),
+    (r"CREATE\s+CAST\b", "CREATE CAST"),
+    (r"CREATE\s+COLLATION\b", "CREATE COLLATION"),
+    (r"CREATE\s+(OR\s+REPLACE\s+)?OPERATOR\b", "CREATE OPERATOR"),
+    (r"CREATE\s+PUBLICATION\b", "CREATE PUBLICATION"),
+    (r"CREATE\s+SUBSCRIPTION\b", "CREATE SUBSCRIPTION"),
+    (r"CREATE\s+(FOREIGN\s+TABLE|SERVER|FOREIGN\s+DATA\s+WRAPPER)\b",
+     "foreign data wrappers"),
+    (r"VACUUM\b", "VACUUM"),
+    (r"CLUSTER\b", "CLUSTER"),
+    (r"REINDEX\b", "REINDEX"),
+    (r"ALTER\s+SYSTEM\b", "ALTER SYSTEM"),
+    (r"PREPARE\s+TRANSACTION\b", "prepared transactions"),
+    (r"(COMMIT|ROLLBACK)\s+PREPARED\b", "prepared transactions"),
+)
+
+
+def _check_denylist(sql):
+    for pattern, thing in _DENYLIST:
+        if re.match(r"\s*" + pattern, sql, re.I):
+            return DsqlError("0A000", f"{thing} is not supported")
+    m = re.match(r"\s*CREATE\s+(OR\s+REPLACE\s+)?FUNCTION\b", sql, re.I)
+    if m:
+        lang = re.search(r"\bLANGUAGE\s+['\"]?([A-Za-z0-9_]+)", sql, re.I)
+        if lang and lang.group(1).lower() != "sql":
+            return DsqlError("0A000", f"LANGUAGE {lang.group(1)} is not supported")
+    if re.match(r"\s*(CREATE|ALTER)\s+TABLE\b", sql, re.I) or re.match(
+        r"\s*CREATE\s+(TEMP|TEMPORARY|UNLOGGED)\s+TABLE\b", sql, re.I
+    ):
+        if re.search(r"\bPARTITION\s+BY\b|\bPARTITION\s+OF\b|\bINHERITS\b", sql, re.I):
+            return DsqlError("0A000", "table partitioning is not supported")
+        if re.search(r"\bEXCLUDE\b", sql, re.I) and not re.match(
+            r"\s*ALTER\s+TABLE\b", sql, re.I
+        ):
+            # On ALTER TABLE it is an ADD CONSTRAINT form, refused as one.
+            return DsqlError("0A000", "the EXCLUDE constraint is not supported")
+    return None
+
+
+# --- Column types (rule 2) --------------------------------------------------
+
+# Normalized allowlist of DSQL-supported column types.
+_TYPE_ALIASES = {
+    "smallint": "smallint", "int2": "smallint",
+    "integer": "integer", "int": "integer", "int4": "integer",
+    "bigint": "bigint", "int8": "bigint",
+    "real": "real", "float4": "real",
+    "double precision": "double precision", "float8": "double precision",
+    "numeric": "numeric", "decimal": "numeric", "dec": "numeric",
+    "character": "character", "char": "character", "bpchar": "character",
+    "character varying": "character varying", "varchar": "character varying",
+    "text": "text",
+    "date": "date",
+    "time": "time", "time without time zone": "time",
+    "time with time zone": "time with time zone", "timetz": "time with time zone",
+    "timestamp": "timestamp", "timestamp without time zone": "timestamp",
+    "timestamp with time zone": "timestamp with time zone",
+    "timestamptz": "timestamp with time zone",
+    "interval": "interval",
+    "boolean": "boolean", "bool": "boolean",
+    "bytea": "bytea", "uuid": "uuid", "json": "json", "jsonb": "jsonb",
+}
+
+# Keywords that terminate the type portion of a column definition.
+_COL_CONSTRAINT_KEYWORDS = {
+    "not", "null", "default", "primary", "unique", "check", "references",
+    "collate", "generated", "constraint", "storage",
+}
+
+# Field-qualified interval types: interval year, interval day to second, ...
+_INTERVAL_RE = re.compile(
+    r"interval(\s+(year|month|day|hour|minute|second)"
+    r"(\s+to\s+(year|month|day|hour|minute|second))?)?$"
+)
+
+# Table-level constraint starters inside CREATE TABLE (...).
+_TABLE_CONSTRAINT_STARTERS = {
+    "primary", "unique", "check", "constraint", "foreign", "like", "exclude",
+}
+
+
+def _split_top_level(body):
+    """Split a parenthesised body on commas at paren depth 0."""
+    parts, depth, last, i, n = [], 0, 0, 0, len(body)
+    while i < n:
+        j = _skip_noise(body, i)
+        if j != i:
+            i = j
+            continue
+        ch = body[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(body[last:i])
+            last = i + 1
+        i += 1
+    if body[last:]:
+        parts.append(body[last:])
+    return parts
+
+
+def _normalize_type(raw):
+    """Return (normalized, display) for a raw type string, or None."""
+    raw = raw.strip()
+    if not raw:
+        return None
+    is_array = False
+    while raw.rstrip().endswith("[]"):
+        is_array = True
+        raw = raw.rstrip()[:-2]
+    display = re.sub(r"\s+", " ", raw.strip())
+    # strip precision/scale and trailing modifiers: numeric(18,6), varchar(10)
+    base = re.sub(r"\(.*?\)", "", display)
+    base = re.sub(r"\s+", " ", base).strip().lower()
+    if is_array:
+        return None, display + "[]"
+    if _INTERVAL_RE.match(base):
+        return "interval", display
+    normalized = _TYPE_ALIASES.get(base)
+    return (normalized, display) if normalized else (None, display)
+
+
+def _type_from_tokens(tokens):
+    """Given column-def tokens after the column name, extract the type."""
+    type_tokens = []
+    for tok in tokens:
+        word = re.sub(r"\(.*", "", tok).lower()
+        if word in _COL_CONSTRAINT_KEYWORDS:
+            break
+        type_tokens.append(tok)
+    return " ".join(type_tokens)
+
+
+def _check_type(raw_type):
+    """Return a DsqlError if the raw type string is not DSQL-supported."""
+    result = _normalize_type(raw_type)
+    if result is None:
+        return None
+    normalized, display = result
+    if normalized is None:
+        return DsqlError("0A000", f'type "{display}" is not supported')
+    return None
+
+
+def _check_identity(col_def, raw_type):
+    """DSQL supports identity columns on bigint columns only."""
+    if re.search(r"\bGENERATED\b", col_def, re.I) and re.search(
+        r"\bAS\s+IDENTITY\b", col_def, re.I
+    ):
+        result = _normalize_type(raw_type)
+        if result and result[0] is not None and result[0] != "bigint":
+            return DsqlError(
+                "0A000", "identity columns are only supported on bigint columns"
+            )
+    return None
+
+
+def _check_column_types(sql):
+    m = re.match(
+        r"\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[\w\".]+\s*", sql, re.I
+    )
+    if m:
+        rest = sql[m.end():]
+        if not rest.lstrip().startswith("("):
+            return None  # CREATE TABLE ... AS / PARTITION OF / LIKE-only
+        start = sql.index("(", m.end())
+        end = _match_paren(sql, start)
+        if end < 0:
+            return None
+        for part in _split_top_level(sql[start + 1 : end]):
+            tokens = part.strip().split()
+            if not tokens:
+                continue
+            if tokens[0].strip('"').lower() in _TABLE_CONSTRAINT_STARTERS:
+                continue
+            raw_type = _type_from_tokens(tokens[1:])
+            err = _check_type(raw_type)
+            if err:
+                return err
+            err = _check_identity(part, raw_type)
+            if err:
+                return err
+        return None
+    m = re.match(r"\s*ALTER\s+TABLE\b", sql, re.I)
+    if m:
+        # One action per part: a statement can add several columns at once.
+        for part in _split_top_level(sql):
+            add = re.search(
+                r"\bADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?([\w\"]+)\s+",
+                part, re.I,
+            )
+            if not add:
+                continue
+            tail = part[add.end():]
+            tokens = tail.split()
+            raw_type = _type_from_tokens(tokens)
+            err = _check_type(raw_type)
+            if err:
+                return err
+            err = _check_identity(tail, raw_type)
+            if err:
+                return err
+    return None
+
+
+# --- ALTER TABLE subset (AWS alter-table-syntax-support) ---------------------
+
+# DSQL supports only a subset of ALTER TABLE actions: ADD COLUMN (no inline
+# DEFAULT/NOT NULL — handled in _check_denylist), DROP COLUMN (one or more
+# columns, but not a primary key column — needs a catalog probe, so it lives in
+# _check_drop_column rather than here), SET/DROP
+# DEFAULT, DROP NOT NULL, DROP EXPRESSION, identity actions, SET STORAGE,
+# ADD CONSTRAINT ... CHECK / FOREIGN KEY ... NOT VALID, ADD CONSTRAINT ...
+# UNIQUE USING INDEX, ALTER CONSTRAINT, DROP CONSTRAINT, RENAME, SET SCHEMA,
+# OWNER TO, and the async VALIDATE CONSTRAINT form (handled as a Rewrite in
+# validate()).
+def _check_alter_table(sql):
+    if not re.match(r"\s*ALTER\s+TABLE\b", sql, re.I):
+        return None
+    if re.search(
+        r"\bALTER\s+COLUMN\s+[\w\"]+\s+(?:SET\s+DATA\s+)?TYPE\b", sql, re.I
+    ):
+        return DsqlError("0A000", "ALTER COLUMN TYPE is not supported")
+    if re.search(r"\bSET\s+NOT\s+NULL\b", sql, re.I):
+        return DsqlError(
+            "0A000", "SET NOT NULL is not supported (only DROP NOT NULL)"
+        )
+    if re.search(r"\bALTER\s+(?:COLUMN\s+)?[\w\"]+\s+SET\s+STATISTICS\b", sql, re.I):
+        # Exact message from real DSQL (eu-central-1, 2026-10-04).
+        return DsqlError(
+            "0A000",
+            "unsupported ALTER TABLE ALTER COLUMN ... SET STATISTICS statement",
+        )
+    add = re.search(r"\bADD\s+(?:CONSTRAINT\s+[\w\"]+\s+)?(\w+)", sql, re.I)
+    if add and add.group(1).upper() != "COLUMN":
+        what = add.group(1).upper()
+        # Only two ADD CONSTRAINT forms exist: a CHECK or FOREIGN KEY added
+        # NOT VALID, and UNIQUE USING INDEX. Every other one draws the same
+        # message, whatever the constraint (measured, eu-central-1).
+        refused = (
+            what in ("PRIMARY", "EXCLUDE")
+            or (what == "UNIQUE"
+                and not re.search(r"\bUNIQUE\s+USING\s+INDEX\b", sql, re.I))
+            or (what in ("CHECK", "FOREIGN")
+                and not re.search(r"\bNOT\s+VALID\b", sql, re.I))
+        )
+        if refused:
+            return DsqlError(
+                "0A000", "unsupported ALTER TABLE ADD CONSTRAINT statement"
+            )
+    err = _check_add_column(sql)
+    if err:
+        return err
+    # ADD GENERATED ... AS IDENTITY requires an explicit CACHE value.
+    if re.search(r"\bADD\s+GENERATED\b", sql, re.I) and re.search(
+        r"\bIDENTITY\b", sql, re.I
+    ):
+        if not re.search(r"\bCACHE\s+\d+", sql, re.I):
+            return DsqlError(
+                "0A000",
+                "ADD GENERATED AS IDENTITY requires an explicit CACHE value",
+            )
+    return None
+
+
+# ALTER TABLE ADD COLUMN takes a name, a type and an optional STORAGE mode —
+# nothing else. Every column constraint draws one message, a bare NULL (which
+# constrains nothing) and COLLATE apart (measured, eu-central-1 2026-08-30).
+_ADD_COLUMN_RE = re.compile(
+    rf"\bADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?({_IDENT})\s+(.+)$",
+    re.I | re.S,
+)
+
+
+def _check_add_column(sql):
+    for part in _split_top_level(sql):
+        # ALTER COLUMN x ADD GENERATED ... is an identity action, not a column.
+        if re.search(r"\bALTER\s+(?:COLUMN\s+)?[\w\"]+\s+ADD\b", part, re.I):
+            continue
+        m = _ADD_COLUMN_RE.search(part)
+        if not m:
+            continue
+        name, quoted = fold_identifier(m.group(1))
+        if not quoted and name in _TABLE_CONSTRAINT_STARTERS:
+            continue  # ADD <table constraint>, handled above
+        tokens = m.group(2).split()
+        raw_type = _type_from_tokens(tokens)
+        tail = tokens[len(raw_type.split()):]
+        i = 0
+        while i < len(tail):
+            word = tail[i].upper().rstrip(",")
+            if word == "NULL":
+                i += 1
+            elif word == "STORAGE":
+                i += 2
+            elif word == "COLLATE":
+                return DsqlError("0A000", "COLLATE clause not supported")
+            else:
+                return DsqlError(
+                    "0A000",
+                    "ALTER TABLE ADD COLUMN with constraint not supported",
+                )
+    return None
+
+
+# --- Foreign keys (AWS create-table-syntax-support, 2026-08-26) -------------
+
+# A foreign key is otherwise plain PostgreSQL — the referential actions, both
+# match types and deferrability all behave as they do on the backend, so the
+# only DSQL-specific rules are that ALTER TABLE must add one NOT VALID
+# (_check_alter_table) and that DEFERRABLE applies to foreign keys alone.
+# Cheap gate: only tokenize a statement that could carry a deferral.
+_DEFERRABLE_RE = re.compile(r"\bDEFERRABLE\b|\bINITIALLY\s+DEFERRED\b", re.I)
+
+
+def _check_deferrable(sql):
+    if not _DEFERRABLE_RE.search(sql):
+        return None
+    m = re.match(
+        r"\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[\w\".]+\s*", sql, re.I
+    )
+    is_alter = bool(re.match(r"\s*ALTER\s+TABLE\b", sql, re.I))
+    if m and sql[m.end():].lstrip().startswith("("):
+        start = sql.index("(", m.end())
+        end = _match_paren(sql, start)
+        if end < 0:
+            return None
+        body = sql[start + 1 : end]
+    elif is_alter:
+        body = sql
+    else:
+        return None
+    for part in _split_top_level(body):
+        words = [t for k, t in _sql_tokens(part) if k == "name"]
+        pairs = list(zip(words, words[1:]))
+        # NOT DEFERRABLE is the default, so only an actual deferral counts.
+        if not any(
+            w == "deferrable" and (i == 0 or words[i - 1] != "not")
+            for i, w in enumerate(words)
+        ) and ("initially", "deferred") not in pairs:
+            continue
+        # ALTER CONSTRAINT only ever targets a foreign key constraint.
+        if ("alter", "constraint") in pairs:
+            continue
+        if "references" in words or ("foreign", "key") in pairs:
+            continue
+        if "check" in words:
+            return DsqlError(
+                "0A000", "CHECK constraints cannot be marked DEFERRABLE"
+            )
+        if is_alter and "unique" in words:
+            return DsqlError(
+                "0A000",
+                "ALTER TABLE / ADD CONSTRAINT UNIQUE / DEFERRED / "
+                "INITIALLY DEFERRED not supported",
+            )
+        return DsqlError("0A000", "DEFERRABLE constraint not supported")
+    return None
+
+
+# IDENTITY columns and sequences: CACHE must be 1 or >= 65536.
+def _check_cache_value(sql):
+    if not re.match(r"\s*(CREATE|ALTER)\s+(TABLE|SEQUENCE)\b", sql, re.I):
+        return None
+    m = re.search(r"\bCACHE\s+(\d+)", sql, re.I)
+    if m:
+        n = int(m.group(1))
+        if n != 1 and n < 65536:
+            return DsqlError("0A000", "CACHE must be 1 or at least 65536")
+    return None
+
+
+# DSQL index rules, verified against a live Aurora DSQL cluster (Aug 2026):
+# index creation is always asynchronous — plain CREATE INDEX fails with
+# "unsupported mode". No CONCURRENTLY, no USING (not even btree). IF NOT
+# EXISTS requires a name (grammar). Expression index keys are supported, but
+# every function must be immutable (42P17) and INCLUDE columns can't be
+# expressions. At most 8 key columns per index (54011); 24 indexes per table
+# is enforced at runtime.
+#
+# Partial indexes (WHERE predicate) are supported since 2026-09-15. The
+# predicate follows the same immutability rule as key expressions; the proxy
+# checks it up front so a bad predicate fails the submit, not the job.
+#
+# Error precedence (measured, eu-central-1 2026-10-04): name-grammar →
+# CONCURRENTLY → USING → key count → mode → predicate (subquery, then
+# immutability) → key-expression immutability → INCLUDE expressions. The key
+# count comes before the mode: a plain CREATE INDEX on 9 columns draws 54011.
+_VOLATILE_FUNCTIONS = frozenset({
+    "now", "random", "setseed", "nextval", "currval", "lastval", "setval",
+    "gen_random_uuid", "uuid_generate_v1", "uuid_generate_v4",
+    "txid_current", "pg_backend_pid", "pg_notification_queue_usage",
+    "current_setting", "set_config", "version", "clock_timestamp",
+    "statement_timestamp", "transaction_timestamp", "timeofday",
+})
+
+
+def _check_index_rules(sql):
+    m = _INDEX_RE.match(sql) or _INDEX_ASYNC_RE.match(sql)
+    if not m:
+        return None
+    # IF NOT EXISTS without a name is a grammar error on real DSQL.
+    if re.search(r"\bIF\s+NOT\s+EXISTS\b", sql, re.I) and not m.group(1):
+        return DsqlError("42601", 'syntax error at or near "ON"')
+    if re.search(r"\bCONCURRENTLY\b", sql, re.I):
+        return DsqlError("0A000", "CONCURRENTLY not supported for CREATE INDEX")
+    if re.search(r"\bUSING\s+\w+", sql, re.I):
+        return DsqlError("0A000", "USING not supported for CREATE INDEX")
+    start = sql.find("(", m.end())
+    end = _match_paren(sql, start) if start >= 0 else -1
+    parts = _split_top_level(sql[start + 1 : end]) if end > 0 else []
+    if len(parts) > 8:
+        return DsqlError(
+            "54011", "more than 8 column keys in an index are not supported"
+        )
+    if not _INDEX_ASYNC_RE.match(sql):
+        return DsqlError(
+            "0A000", "unsupported mode. please use CREATE INDEX ASYNC."
+        )
+    if end < 0:
+        return None
+    # Neither INCLUDE (...) nor NULLS [NOT] DISTINCT can hold a WHERE, so the
+    # first one after the key list starts the partial-index predicate.
+    pred = re.search(r"\bWHERE\b", sql[end + 1 :], re.I)
+    if pred:
+        predicate = sql[end + 1 + pred.end() :]
+        if re.search(r"\bSELECT\b", _strip_literals(predicate), re.I):
+            return DsqlError("0A000", "cannot use subquery in index predicate")
+        if _calls_volatile_function(predicate):
+            return DsqlError(
+                "42P17", "functions in index predicate must be marked IMMUTABLE"
+            )
+    if any(_calls_volatile_function(part) for part in parts):
+        # Same code/message the backend (and real DSQL) produce; the proxy
+        # fails fast so CREATE INDEX ASYNC rejects at submit time instead of
+        # returning a job_id.
+        return DsqlError(
+            "42P17", "functions in index expression must be marked IMMUTABLE"
+        )
+    # INCLUDE columns are non-key: expressions are not supported there.
+    inc = re.search(r"\bINCLUDE\s*\(", sql[end:], re.I)
+    if inc:
+        istart = end + inc.end() - 1
+        iend = _match_paren(sql, istart)
+        if iend > 0 and any(
+            "(" in p for p in _split_top_level(sql[istart + 1 : iend])
+        ):
+            return DsqlError(
+                "0A000", "expressions are not supported in included columns"
+            )
+    return None
+
+
+def _strip_literals(text):
+    return re.sub(r"'(?:[^']|'')*'", "''", text)
+
+
+def _calls_volatile_function(text):
+    return any(
+        fn.lower() in _VOLATILE_FUNCTIONS
+        for fn in re.findall(r"(\w+)\s*\(", _strip_literals(text))
+    )
+
+
+_ALTER_ASYNC_VALIDATE_RE = re.compile(
+    r"\s*ALTER\s+TABLE\s+ASYNC\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?"
+    r"([\w\".]+)\s*\*?\s*VALIDATE\s+CONSTRAINT\s+([\w\"]+)",
+    re.I,
+)
+
+
+def rewrite_alter_async(sql):
+    """Strip the DSQL-only ASYNC keyword from ALTER TABLE ASYNC."""
+    return re.sub(r"(ALTER\s+TABLE)\s+ASYNC", r"\1", sql, count=1, flags=re.I)
+
+
+# --- CREATE INDEX ASYNC (rules 3 & 4) ---------------------------------------
+
+_INDEX_ASYNC_RE = re.compile(
+    r"\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+ASYNC\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+    r"(?:([\w\".]+)\s+)?ON\s+(?:ONLY\s+)?(?:USING\s+\w+\s+)?([\w\".]+)",
+    re.I,
+)
+
+_INDEX_RE = re.compile(
+    r"\s*CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:CONCURRENTLY\s+)?"
+    r"(?:IF\s+NOT\s+EXISTS\s+)?(?:([\w\".]+)\s+)?ON\s+(?:ONLY\s+)?"
+    r"(?:USING\s+\w+\s+)?([\w\".]+)",
+    re.I,
+)
+
+
+def rewrite_index_async(sql):
+    """Strip the DSQL-only ASYNC keyword from CREATE [UNIQUE] INDEX ASYNC."""
+    return re.sub(
+        r"(CREATE\s+(?:UNIQUE\s+)?INDEX)\s+ASYNC", r"\1", sql, count=1, flags=re.I
+    )
+
+
+def _index_object_name(sql, on_end, index_name, table):
+    """Schema-qualified index name for the sys.jobs object_name field.
+
+    Unnamed indexes get DSQL's documented auto-name ``<table>_<col>_..._idx``
+    in the table's schema (default ``public``).
+    """
+    schema, _, bare_table = table.rpartition(".")
+    schema = schema.strip('"') or "public"
+    bare_table = bare_table.strip('"')
+    if index_name:
+        if "." in index_name:
+            return index_name
+        return f"{schema}.{index_name.strip(chr(34))}"
+    cols = []
+    start = sql.find("(", on_end)
+    if start >= 0:
+        end = _match_paren(sql, start)
+        if end > 0:
+            for part in _split_top_level(sql[start + 1 : end]):
+                tokens = part.strip().split()
+                if tokens:
+                    ident = re.match(r'[A-Za-z_"][\w"]*', tokens[0])
+                    if ident:
+                        cols.append(ident.group(0).strip('"'))
+    suffix = "_" + "_".join(cols) if cols else ""
+    return f"{schema}.{bare_table}{suffix}_idx"
+
+
+# --- sys.jobs / sys.wait_for_job (rules 5 & 6) ------------------------------
+
+_SYS_JOBS_RE = re.compile(r"\s*SELECT\s+(.+?)\s+FROM\s+sys\.jobs\b", re.I | re.S)
+_JOB_ID_FILTER_RE = re.compile(
+    r"job_id\s*=\s*(?:'([^']*)'|\$(\d+))(?:\s*::\s*\w+)?", re.I
+)
+_WAIT_JOB_RE = re.compile(
+    r"\s*(SELECT|CALL)\s+sys\.wait_for_job\s*\(\s*"
+    r"(?:job_id\s*\)\s*'([^']*)'|'([^']*)'(?:\s*::\s*\w+)?\s*\)"
+    r"|\$(\d+)(?:\s*::\s*\w+)?\s*\))",
+    re.I,
+)
+_JOB_ID_RE = re.compile(r"[a-z2-7]{26}")
+
+
+class BindParam:
+    """A ``$n`` placeholder whose value only arrives with Bind."""
+
+    def __init__(self, index):
+        self.index = index
+
+    def __eq__(self, other):
+        return isinstance(other, BindParam) and other.index == self.index
+
+    def __repr__(self):
+        return f"BindParam({self.index})"
+
+
+def match_sys_jobs(sql):
+    """Return (columns, job_id_filter) if this queries sys.jobs, else False.
+
+    ``columns`` is None for ``SELECT *``; ``job_id_filter`` is None when
+    there is no ``WHERE job_id = '<id>'`` clause.
+    """
+    m = _SYS_JOBS_RE.match(sql)
+    if not m:
+        return False
+    select_list = m.group(1).strip()
+    columns = None
+    if select_list != "*":
+        columns = [c.strip().strip('"') for c in select_list.split(",")]
+    f = _JOB_ID_FILTER_RE.search(sql)
+    if not f:
+        return columns, None
+    return columns, (BindParam(int(f.group(2))) if f.group(2) else f.group(1))
+
+
+def match_wait_for_job(sql):
+    """The job id ``sys.wait_for_job`` is called with, or None.
+
+    A ``BindParam`` when the id is a ``$n`` placeholder (the client binds it
+    over the extended protocol). Accepts the literal forms
+    ``sys.wait_for_job('<id>')`` and ``sys.wait_for_job(job_id) '<id>'``.
+    """
+    m = _WAIT_JOB_RE.match(sql)
+    if not m:
+        return None
+    if m.group(4):
+        return BindParam(int(m.group(4)))
+    return m.group(2) or m.group(3)
+
+
+def _wait_is_call(sql):
+    m = _WAIT_JOB_RE.match(sql)
+    return bool(m) and m.group(1).upper() == "CALL"
+
+
+# --- Locking clauses (measured against Aurora DSQL, 2026-08-18) -------------
+
+# DSQL supports two locking clauses, FOR UPDATE and FOR KEY SHARE (added
+# 2026-08-25), each with its optional OF / NOWAIT / SKIP LOCKED tail. Neither
+# restricts the query the clause locks — no WHERE clause, a non-key column, an
+# inequality, IN/OR, a join and a table without a primary key all lock fine.
+_UNSUPPORTED_LOCKS = (("no", "key", "update"), ("share",))
+# Cheap gate: only tokenize a statement that could carry one of those.
+_LOCK_CLAUSE_RE = re.compile(r"\bFOR\s+(?:NO\s+KEY\s+UPDATE|SHARE)\b", re.I)
+
+
+def _check_locking_clause(sql):
+    """Refuse every locking clause but FOR UPDATE and FOR KEY SHARE.
+
+    The check reads the statement's tokens, so ``FOR SHARE`` inside a string
+    literal is text rather than a clause. A clause nested in a CTE or subquery
+    still counts, and an earlier FOR UPDATE does not excuse a later share
+    clause — both measured against a live cluster.
+    """
+    if not _LOCK_CLAUSE_RE.search(sql):
+        return None
+    toks = list(_sql_tokens(sql))
+    for i, (kind, text) in enumerate(toks):
+        if kind != "name" or text != "for":
+            continue
+        words = tuple(t for k, t in toks[i + 1 : i + 4] if k == "name")
+        if any(words[: len(lock)] == lock for lock in _UNSUPPORTED_LOCKS):
+            # Verbatim from the service.
+            return DsqlError(
+                "0A000",
+                "locking clauses other than FOR UPDATE/FOR KEY SHARE "
+                "are not supported",
+            )
+    return None
+
+
+# --- Top-level validator -----------------------------------------------------
+
+
+# DSQL-specific planner settings (all boolean). Postgres takes any dotted name
+# as an untyped placeholder, so the backend would accept SET ... = 'banana';
+# real DSQL rejects it. The backend container starts with each one set to its
+# DSQL default (dsql.py), so SHOW and RESET behave too.
+DSQL_SETTINGS = {
+    "dsql.enable_batched_nestloop": "on",  # 2026-09-11
+}
+
+# Settings DSQL refuses to change (SET, SET LOCAL, set_config); RESET and
+# SET ... TO DEFAULT are accepted. Observed, not exhaustive (eu-central-1,
+# 2026-10-04): planner switches like enable_hashjoin and search_path are
+# settable.
+_UNSETTABLE_PARAMS = frozenset({
+    "default_statistics_target", "statement_timeout", "work_mem",
+})
+
+_SET_RE = re.compile(
+    r"\s*SET\s+(?:SESSION\s+|LOCAL\s+)?([\w.]+)\s*(?:=|\bTO\b)\s*(.*?)\s*;?\s*$",
+    re.I | re.S,
+)
+_RESET_RE = re.compile(r"\s*RESET\s+([\w.]+)", re.I)
+_SET_CONFIG_RE = re.compile(
+    r"\bset_config\s*\(\s*'([^']*)'\s*,\s*'((?:[^']|'')*)'", re.I
+)
+
+
+def _parse_pg_bool(value):
+    """Postgres parse_bool: case-insensitive unique prefixes, plus 1/0."""
+    v = value.strip().lower()
+    if v in ("1", "0"):
+        return True
+    if len(v) >= 2 and v in ("on", "off"[: len(v)]):
+        return True
+    return bool(v) and any(w.startswith(v) for w in ("true", "false", "yes", "no"))
+
+
+def _check_setting(name, values):
+    """Rules for one assignment; ``values`` is None for RESET / TO DEFAULT."""
+    name = name.lower()
+    if name.startswith("dsql.") and name not in DSQL_SETTINGS:
+        # Exact message and detail from real DSQL (eu-central-1, 2026-10-04).
+        return DsqlError(
+            "42602",
+            f'invalid configuration parameter name "{name}"',
+            '"dsql" is a reserved prefix.',
+        )
+    if values is None:
+        return None
+    if name in _UNSETTABLE_PARAMS:
+        return DsqlError(
+            "0A000", f'setting configuration parameter "{name}" not supported'
+        )
+    if name in DSQL_SETTINGS and values:
+        if len(values) > 1:
+            return DsqlError("22023", f"SET {name} takes only one argument")
+        if not _parse_pg_bool(values[0]):
+            return DsqlError("22023", f'parameter "{name}" requires a Boolean value')
+    return None
+
+
+def _unquote(value):
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        return value[1:-1]
+    return value
+
+
+_ALTER_STATISTICS_TARGET_RE = re.compile(
+    r"\s*ALTER\s+STATISTICS\s+.+?\s+SET\s+STATISTICS\s+(-?\d+)", re.I | re.S
+)
+
+
+def _check_statistics_target(sql):
+    """DSQL caps statistics targets at 100 (Postgres allows 10000)."""
+    m = _ALTER_STATISTICS_TARGET_RE.match(sql)
+    if m and int(m.group(1)) > 100:
+        # Exact message from real DSQL (eu-central-1, 2026-10-04).
+        return DsqlError(
+            "22023",
+            f"statistics target {m.group(1)} exceeds maximum allowed value of 100",
+        )
+    return None
+
+
+def _check_settings(sql):
+    m = _SET_RE.match(sql)
+    if m:
+        raw = m.group(2)
+        values = (
+            None if raw.upper() == "DEFAULT"
+            else [_unquote(v.strip()) for v in _split_top_level(raw)]
+        )
+        return _check_setting(m.group(1), values)
+    m = _RESET_RE.match(sql)
+    if m:
+        return _check_setting(m.group(1), None)
+    for name, value in _SET_CONFIG_RE.findall(sql):
+        err = _check_setting(name, [value.replace("''", "'")])
+        if err:
+            return err
+    return None
+
+
+def validate(sql, txn_state=None):
+    """Validate one statement. Returns DsqlError | Rewrite | None.
+
+    Read-only with respect to ``txn_state`` — the caller applies state
+    changes (``TxnState.apply``) once the statement is actually forwarded.
+    """
+    s = strip_leading_comments(sql).strip()
+    if not s:
+        return None
+
+    if txn_state is not None and txn_state.in_txn:
+        cls = classify_statement(s)
+        if cls == "ddl":
+            if txn_state.ddl_seen:
+                return DsqlError(
+                    "25006", "only one DDL statement can be run in a transaction"
+                )
+            if txn_state.dml_seen:
+                return DsqlError(
+                    "25006", "DDL and DML statements cannot be mixed in a transaction"
+                )
+        elif cls == "dml" and txn_state.ddl_seen:
+            return DsqlError(
+                "25006", "DDL and DML statements cannot be mixed in a transaction"
+            )
+        # Documented DSQL transaction limits (messages are approximations).
+        if (
+            txn_state.started_at is not None
+            and time.monotonic() - txn_state.started_at > 300
+        ):
+            return DsqlError(
+                "25006", "transaction exceeded the 5 minute duration limit"
+            )
+
+    # Row/size limits apply to any transaction, including an implicit
+    # single-statement one. Row counting is static (VALUES tuples) —
+    # INSERT ... SELECT and UPDATE/DELETE affected-row counts are not
+    # enforced.
+    if txn_state is not None and classify_statement(s) == "dml":
+        rows_est = txn_state.rows_est if txn_state.in_txn else 0
+        bytes_est = txn_state.bytes_est if txn_state.in_txn else 0
+        if rows_est + _values_tuple_count(s) > 3000:
+            return DsqlError(
+                "25006", "transaction exceeds the 3,000 row limit"
+            )
+        if bytes_est + len(s.encode("utf-8", "replace")) > 10 * 1024 * 1024:
+            return DsqlError(
+                "25006", "transaction exceeds the 10 MiB size limit"
+            )
+
+    err = _check_denylist(s)
+    if err:
+        return err
+    err = _check_alter_table(s)
+    if err:
+        return err
+    err = _check_deferrable(s)
+    if err:
+        return err
+    err = _check_cache_value(s)
+    if err:
+        return err
+    err = _check_column_types(s)
+    if err:
+        return err
+    err = _check_index_rules(s)
+    if err:
+        return err
+    err = _check_locking_clause(s)
+    if err:
+        return err
+    err = _check_settings(s)
+    if err:
+        return err
+    err = _check_statistics_target(s)
+    if err:
+        return err
+
+    m = _ALTER_ASYNC_VALIDATE_RE.match(s)
+    if m:
+        table = m.group(1)
+        schema, _, bare = table.rpartition(".")
+        object_name = (schema.strip('"') or "public") + "." + bare.strip('"')
+        return Rewrite(
+            rewrite_alter_async(s),
+            kind="index_async",
+            object_name=object_name,
+            table=table,
+            job_type="VALIDATE_CONSTRAINT",
+        )
+
+    m = _INDEX_ASYNC_RE.match(s)
+    if m:
+        index_name, table = m.group(1), m.group(2)
+        return Rewrite(
+            rewrite_index_async(s),
+            kind="index_async",
+            object_name=_index_object_name(s, m.end(), index_name, table),
+            table=table,
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Proxy connection handling
+# ---------------------------------------------------------------------------
+
+
+class _Conn:
+    def __init__(self, cluster_id):
+        self.cluster_id = cluster_id
+        self.user = "admin"  # the role the client signed in as
+        self.database = "postgres"
+        self.txn = TxnState()
+        self.capture = None  # asyncio.Queue while swallowing backend frames
+        self.catalog_version = None  # last catalog version this conn has seen
+        # One entry per forwarded statement still owed a result: the command tag
+        # to report for an AWS IAM statement sent to the backend as DO, else None.
+        self.result_tags = []
+        # Extended-protocol state, reset at each Sync.
+        self.ext_skip = False  # dropping messages until Sync after an error
+        self.ext_forwarded = False  # any message reached the backend this cycle
+        self.ext_stmts = {}  # prepared statement name -> {"sql", "synth"}
+        self.ext_portals = {}  # portal name -> the same entry
+
+
+async def _read_startup(reader):
+    (length,) = struct.unpack("!I", await reader.readexactly(4))
+    body = await reader.readexactly(length - 4)
+    (code,) = struct.unpack("!I", body[:4])
+    return code, body[4:]
+
+
+def _parse_startup_params(payload):
+    parts = payload.split(b"\0")
+    params = {}
+    for i in range(0, len(parts) - 1, 2):
+        if parts[i]:
+            params[parts[i].decode("utf-8", "replace")] = parts[i + 1].decode(
+                "utf-8", "replace"
+            )
+    return params
+
+
+async def _connect_backend(host, port, database, attempts=20, delay=0.5):
+    """Open a backend connection with trust auth and complete its startup.
+
+    Retries briefly: docker-proxy accepts (then drops) connections while the
+    postgres entrypoint is still initialising, and containers can bounce.
+    """
+    last_err = None
+    for _ in range(attempts):
+        try:
+            return await _connect_backend_once(host, port, database)
+        except Exception as e:
+            last_err = e
+            await asyncio.sleep(delay)
+    raise RuntimeError(f"backend {host}:{port} not reachable: {last_err}")
+
+
+async def _connect_backend_once(host, port, database):
+    reader, writer = await asyncio.open_connection(host, port)
+    params = b"user\0postgres\0database\0" + database.encode() + b"\0\0"
+    payload = struct.pack("!I", _PROTOCOL_3) + params
+    try:
+        writer.write(struct.pack("!I", len(payload) + 4) + payload)
+        await writer.drain()
+        while True:
+            type_byte, payload = await _read_frame(reader)
+            if type_byte == b"E":
+                raise RuntimeError(f"backend startup failed: {payload!r}")
+            if type_byte == b"R":
+                (code,) = struct.unpack("!I", payload[:4])
+                if code != 0:
+                    raise RuntimeError(f"backend requested unsupported auth method {code}")
+            elif type_byte == b"Z":
+                return reader, writer
+    except BaseException:
+        writer.close()
+        raise
+
+
+async def _backend_relay(conn, b_reader, c_writer):
+    """Forward backend frames to the client (or to the capture queue).
+
+    ReadyForQuery carries the backend's own view of the transaction block, so
+    it is the authoritative source for ``in_txn`` regardless of which protocol
+    the client used to open or close the transaction.
+    """
+    while True:
+        type_byte, payload = await _read_frame(b_reader)
+        if type_byte == b"Z" and payload:
+            conn.txn.note_backend_status(payload[:1])
+        if conn.capture is None and conn.result_tags:
+            type_byte, payload = _relabel_iam_result(conn, type_byte, payload)
+        if type_byte == b"Z":
+            conn.result_tags.clear()
+        if conn.capture is not None:
+            conn.capture.put_nowait((type_byte, payload))
+        else:
+            c_writer.write(_frame(type_byte, payload))
+            await c_writer.drain()
+
+
+def _relabel_iam_result(conn, type_byte, payload):
+    """Report an AWS IAM statement's DO result under its own command tag."""
+    tag = conn.result_tags[0]
+    if type_byte in (b"C", b"E", b"I", b"s"):
+        conn.result_tags.pop(0)
+        if tag and type_byte == b"C":
+            return type_byte, tag.encode() + b"\0"
+    if tag and type_byte in (b"N", b"E"):
+        return type_byte, _without_context(payload)
+    return type_byte, payload
+
+
+async def _run_backend_capture(conn, b_writer, sql):
+    """Send a query to the backend and swallow its frames until ReadyForQuery."""
+    queue = asyncio.Queue()
+    conn.capture = queue
+    try:
+        b_writer.write(_frame(b"Q", sql.encode() + b"\0"))
+        await b_writer.drain()
+        frames = []
+        while True:
+            type_byte, payload = await queue.get()
+            frames.append((type_byte, payload))
+            if type_byte == b"Z":
+                return frames
+    finally:
+        conn.capture = None
+
+
+async def _index_count(conn, b_writer, table):
+    """Count the table's existing indexes via pg_indexes. None on probe error."""
+    schema, _, bare = table.rpartition(".")
+    schema = schema.strip('"') or "public"
+    bare = bare.strip('"')
+    return await _probe_count(
+        conn,
+        b_writer,
+        "SELECT count(*) FROM pg_indexes "
+        f"WHERE schemaname = '{schema}' AND tablename = '{bare}'",
+    )
+
+
+async def _probe_count(conn, b_writer, query):
+    """Run a single-integer probe on the backend. None on probe error."""
+    try:
+        frames = await _run_backend_capture(conn, b_writer, query)
+    except Exception:
+        return None
+    for type_byte, payload in frames:
+        if type_byte == b"E":
+            return None
+        if type_byte == b"D":
+            try:
+                (nfields,) = struct.unpack("!H", payload[:2])
+                if nfields != 1:
+                    return None
+                (vlen,) = struct.unpack("!i", payload[2:6])
+                return int(payload[6 : 6 + vlen])
+            except Exception:
+                return None
+    return None
+
+
+def _status(conn):
+    """ReadyForQuery status byte for the client's current transaction block."""
+    if conn.txn.aborted or conn.txn.synthetic_abort:
+        return b"E"
+    return b"T" if conn.txn.in_txn else b"I"
+
+
+def _reject(conn, c_writer, err):
+    """Send an ErrorResponse for a statement the backend never saw.
+
+    Inside an explicit transaction this has to poison the block the way a real
+    error would: Postgres (and DSQL) refuse every later statement with 25P02
+    until the transaction ends. The backend is still in a clean transaction, so
+    the proxy tracks the abort itself.
+    """
+    if conn.txn.in_txn:
+        conn.txn.synthetic_abort = True
+    c_writer.write(_error_response(err.sqlstate, err.message, err.detail) + _ready(_status(conn)))
+
+
+_ABORTED_ERR = DsqlError(
+    "25P02",
+    "current transaction is aborted, commands ignored until end of "
+    "transaction block",
+)
+
+
+def _abort_gate(conn, sql):
+    """After a synthetic abort, only the statement that ends the block runs.
+
+    Returns (error, forward_sql). ``forward_sql`` replaces COMMIT with ROLLBACK
+    so the aborted work is discarded and the client sees the ``ROLLBACK``
+    command tag, exactly as Postgres reports a committed-but-failed block.
+    """
+    if not conn.txn.synthetic_abort:
+        return None, sql
+    if classify_statement(sql) != "tcl_end":
+        return _ABORTED_ERR, sql
+    conn.txn.synthetic_abort = False
+    if re.match(r"\s*(COMMIT|END)\b", strip_leading_comments(sql), re.I):
+        return None, "ROLLBACK"
+    return None, sql
+
+
+def _relation_literal(parts):
+    """Quote a normalized name path back into SQL: ``[s, T] -> "s"."T"``.
+
+    Quoting every part keeps the exact case the catalog holds, so a relation
+    created as ``"MyTable"`` resolves as itself instead of case-folding away.
+    """
+    return ".".join('"' + part.replace('"', '""') + '"' for part in parts)
+
+
+async def _primary_key_columns(conn, b_writer, relation):
+    """Primary key columns of ``relation`` (a normalized name path).
+
+    None when the probe failed or the relation could not be resolved, so the
+    caller forwards and lets the backend answer. An unqualified name resolves
+    through the backend's search_path, exactly as the client's own statement
+    would; a schema-qualified one is looked up in that schema.
+    """
+    if not relation:
+        return None
+    literal = _relation_literal(relation).replace("'", "''")
+    try:
+        frames = await _run_backend_capture(
+            conn,
+            b_writer,
+            "SELECT a.attname FROM pg_index i JOIN pg_attribute a "
+            "ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) "
+            f"WHERE i.indrelid = '{literal}'::regclass AND i.indisprimary",
+        )
+    except Exception:
+        return None
+    cols = []
+    for type_byte, payload in frames:
+        if type_byte == b"E":
+            return None
+        if type_byte == b"D":
+            (nfields,) = struct.unpack("!H", payload[:2])
+            if nfields == 1:
+                (vlen,) = struct.unpack("!i", payload[2:6])
+                cols.append(payload[6 : 6 + vlen].decode("utf-8", "replace"))
+    return cols
+
+
+# ALTER TABLE ... DROP COLUMN is supported (multiple columns in one statement
+# are fine), but dropping a primary key column is not. The COLUMN keyword is
+# optional in Postgres, so the action keywords that merely start with DROP —
+# DROP CONSTRAINT / DEFAULT / NOT NULL / EXPRESSION / IDENTITY — have to be
+# told apart from a bare column name.
+_DROP_COLUMN_RE = re.compile(
+    rf"\bDROP\s+(?:COLUMN\s+)?(?:IF\s+EXISTS\s+)?({_IDENT})", re.I
+)
+_DROP_NON_COLUMN_ACTIONS = frozenset(
+    ("constraint", "default", "not", "expression", "identity")
+)
+_ALTER_TABLE_TARGET_RE = re.compile(
+    rf"\s*ALTER\s+TABLE\s+(?:ASYNC\s+)?(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?"
+    rf"({_IDENT_PATH})",
+    re.I,
+)
+
+
+def dropped_columns(sql):
+    """Column names an ALTER TABLE statement drops (may be several).
+
+    Names come back normalized the way the server stores them, so they can be
+    compared against catalog names directly.
+    """
+    if not re.match(r"\s*ALTER\s+TABLE\b", sql, re.I):
+        return []
+    cols = []
+    for m in _DROP_COLUMN_RE.finditer(sql):
+        name, quoted = fold_identifier(m.group(1))
+        if not quoted and name in _DROP_NON_COLUMN_ACTIONS:
+            continue
+        cols.append(name)
+    return cols
+
+
+async def _check_drop_column(conn, b_writer, sql):
+    """Refuse to drop a primary key column (AWS DSQL, 2026-08-03)."""
+    cols = dropped_columns(sql)
+    if not cols:
+        return None
+    m = _ALTER_TABLE_TARGET_RE.match(sql)
+    if not m:
+        return None
+    pk_cols = await _primary_key_columns(
+        conn, b_writer, identifier_path(m.group(1))
+    )
+    if not pk_cols:
+        return None  # probe failed or no primary key — let the backend answer
+    keys = set(pk_cols)
+    for col in cols:
+        if col in keys:
+            # Exact message from real DSQL (verified in eu-west-2, Aug 2026).
+            return DsqlError("0A000", f"cannot drop primary key column {col}")
+    return None
+
+
+# At most 5 extended statistics objects per table (AWS DSQL, 2026-08-27).
+# Message and SQLSTATE measured on real DSQL (eu-central-1, 2026-10-04).
+_CREATE_STATISTICS_RE = re.compile(
+    r"\s*CREATE\s+STATISTICS\b.*\bFROM\s+([\w\".]+)\s*;?\s*$", re.I | re.S
+)
+_STATISTICS_LIMIT_ERR = DsqlError(
+    "54000", "more than 5 extended statistics per table are not allowed"
+)
+
+
+async def _check_statistics_limit(conn, b_writer, sql):
+    m = _CREATE_STATISTICS_RE.match(sql)
+    if not m:
+        return None
+    # regclass resolves the name the way the backend will (search_path,
+    # quoting); an unknown table fails the probe and the backend answers.
+    count_sql = (
+        "SELECT count(*) FROM pg_statistic_ext "
+        f"WHERE stxrelid = '{m.group(1)}'::regclass"
+    )
+    before = await _probe_count(conn, b_writer, count_sql)
+    if before is None or before < 5:
+        return None
+    # At the limit, dry-run the statement and roll it back. DSQL reports the
+    # statement's own errors (fewer than two columns, an unknown column) ahead
+    # of the limit, and IF NOT EXISTS on an existing name is still a no-op;
+    # only a statement that would really add a sixth object is refused.
+    if conn.txn.in_txn:
+        begin = "SAVEPOINT ministack_statistics"
+        undo = (
+            "ROLLBACK TO SAVEPOINT ministack_statistics; "
+            "RELEASE SAVEPOINT ministack_statistics"
+        )
+    else:
+        begin, undo = "BEGIN", "ROLLBACK"
+    after = None
+    await _run_backend_capture(conn, b_writer, begin)
+    try:
+        frames = await _run_backend_capture(conn, b_writer, sql)
+        if not any(t == b"E" for t, _ in frames):
+            after = await _probe_count(conn, b_writer, count_sql)
+    finally:
+        await _run_backend_capture(conn, b_writer, undo)
+    if after is not None and after > before:
+        return _STATISTICS_LIMIT_ERR
+    return None
+
+
+_ASYNC_BATCH_ERR = DsqlError(
+    "0A000", "asynchronous DDL is not supported in multi-statement queries"
+)
+
+
+def _sys_jobs_rows(conn, cols, job_filter):
+    jobs = get_jobs(conn.cluster_id)
+    if job_filter is not None:
+        jobs = [j for j in jobs if j["job_id"] == job_filter]
+    return {
+        "cols": [(c, _JOB_COLUMN_TYPES.get(c, _TEXT_OID)) for c in cols],
+        "rows": [
+            [_pg_timestamptz(job[c]) if c.endswith("_time") else job[c] for c in cols]
+            for job in jobs
+        ],
+        "tag": f"SELECT {len(jobs)}",
+    }
+
+
+def _wait_columns(call):
+    # Real DSQL: wait_for_job is a procedure whose one OUT parameter is
+    # ``succeeded`` (bool), so CALL answers a "succeeded" column and the CALL
+    # tag (measured, eu-central-1 2026-10-04). The SELECT form, which DSQL
+    # refuses with 42809, is kept as a lenient alias.
+    return [("succeeded" if call else "wait_for_job", 16)]  # bool oid
+
+
+def _wait_for_job_rows(conn, job_id, call):
+    if call and (job_id is None or not _JOB_ID_RE.fullmatch(job_id)):
+        return DsqlError("22P02", "Unable to convert text to UUID")
+    known = any(
+        j["job_id"] == job_id and j["status"] == "completed"
+        for j in get_jobs(conn.cluster_id)
+    )
+    return {
+        "cols": _wait_columns(call),
+        "rows": [["t" if known else "f"]],
+        "tag": "CALL" if call else "SELECT 1",
+    }
+
+
+def _deferred(cols, param, resolve):
+    """A synthetic result that needs a bound parameter: resolved at Bind."""
+    return {
+        "cols": cols,
+        "nparams": param.index,
+        "resolve": lambda params: resolve(
+            params[param.index - 1] if len(params) >= param.index else None
+        ),
+    }
+
+
+# --- AWS IAM GRANT / REVOKE and sys.iam_pg_role_mappings -------------------
+#
+# Measured on Aurora DSQL, eu-west-1 2026-10-26. The mappings live in the
+# definition of a real sys.iam_pg_role_mappings view that a GRANT or REVOKE
+# rewrites in the client's transaction, so a rollback undoes it.
+
+_AWS_IAM_RE = re.compile(r"\s*AWS\s+IAM\s+(GRANT|REVOKE)\b", re.I)
+_IAM_ARN_RE = re.compile(r"arn:[^:]+:iam::")
+_IAM_VIEW_SQL = (
+    "VIEW sys.iam_pg_role_mappings AS "
+    "SELECT v.iam_oid, v.arn COLLATE \"C\" AS arn, v.pg_role_oid, r.rolname AS pg_role_name, "
+    "g.oid AS grantor_pg_role_oid, v.grantor AS grantor_pg_role_name "
+    "FROM (VALUES {rows}) AS v(iam_oid, arn, pg_role_oid, grantor) "
+    "JOIN pg_roles r ON r.oid = v.pg_role_oid LEFT JOIN pg_roles g ON g.rolname = v.grantor"
+)
+_IAM_NO_ROWS = "(0::oid, ''::text, 0::oid, ''::name)"
+_IAM_ROW_FORMAT = "(%s::oid, %L::text, %s::oid, %L::name)"
+_IAM_LOCK = "pg_advisory_xact_lock(hashtext('sys.iam_pg_role_mappings'))"
+_IAM_SETUP_SQL = (
+    f"SELECT {_IAM_LOCK}; "
+    "DO $$ BEGIN CREATE ROLE admin WITH LOGIN; "
+    "EXCEPTION WHEN duplicate_object OR unique_violation THEN NULL; END $$; "
+    "DO $$ BEGIN CREATE SCHEMA IF NOT EXISTS sys; "
+    "EXCEPTION WHEN duplicate_schema OR unique_violation THEN NULL; END $$; "
+    "DO $$ BEGIN IF to_regclass('sys.iam_pg_role_mappings') IS NULL THEN CREATE "
+    + _IAM_VIEW_SQL.replace("{rows}", _IAM_NO_ROWS)
+    + "; END IF; EXCEPTION WHEN duplicate_table OR unique_violation THEN NULL; END $$"
+)
+_DROP_ROLE_RE = re.compile(
+    r"\s*DROP\s+(?:ROLE|USER|GROUP)\s+(?:IF\s+EXISTS\s+)?(.*?)\s*;?\s*$", re.I | re.S
+)
+_iam_ready = set()  # (cluster_id, database) pairs with admin and the view in place
+
+
+class IamTrust:
+    """A parsed ``AWS IAM GRANT <role> TO '<arn>'[, ...]`` (or REVOKE ... FROM)."""
+
+    def __init__(self, action, role, arns):
+        self.action = action
+        self.role = role
+        self.arns = arns
+
+    @property
+    def tag(self):
+        return f"AWS IAM {self.action}"
+
+
+_IAM_TOKEN_RE = re.compile(
+    r"\s*(?:(?P<str>'(?:[^']|'')*')|(?P<qid>\"(?:[^\"]|\"\")*\")"
+    r"|(?P<word>[A-Za-z_][A-Za-z0-9_$]*)|(?P<punct>.))",
+    re.S,
+)
+
+
+def _iam_tokens(text):
+    tokens, i, n = [], 0, len(text)
+    while i < n:
+        if text[i].isspace():
+            i += 1
+            continue
+        if text.startswith(("--", "/*"), i):
+            i = _skip_noise(text, i)
+            continue
+        m = _IAM_TOKEN_RE.match(text, i)
+        tokens.append((m.lastgroup, m.group(m.lastgroup)))
+        i = m.end()
+    return tokens
+
+
+def _iam_syntax_error(token):
+    if token is None:
+        return DsqlError("42601", "syntax error at end of input")
+    return DsqlError("42601", f'syntax error at or near "{token[1]}"')
+
+
+def match_aws_iam(sql):
+    """IamTrust for an ``AWS IAM GRANT``/``REVOKE``, a DsqlError, or None."""
+    m = _AWS_IAM_RE.match(sql)
+    if not m:
+        return None
+    action = m.group(1).upper()
+    tokens = _iam_tokens(sql[m.end():].rstrip().rstrip(";"))
+    pos = 0
+
+    def take():
+        nonlocal pos
+        token = tokens[pos] if pos < len(tokens) else None
+        pos += 1
+        return token
+
+    role_token = take()
+    if role_token is None or role_token[0] not in ("word", "qid"):
+        return _iam_syntax_error(role_token)
+    role, _ = fold_identifier(role_token[1])
+
+    keyword = take()
+    if keyword is None or keyword[0] != "word" or keyword[1].upper() != (
+        "TO" if action == "GRANT" else "FROM"
+    ):
+        return _iam_syntax_error(keyword)
+
+    arns = []
+    while True:
+        literal = take()
+        if literal is None or literal[0] != "str":
+            return _iam_syntax_error(literal)
+        arn = literal[1][1:-1].replace("''", "'")
+        if arn not in arns:
+            arns.append(arn)
+        separator = take()
+        if separator is None:
+            break
+        if separator != ("punct", ","):
+            return _iam_syntax_error(separator)
+
+    for arn in arns:
+        if not _IAM_ARN_RE.match(arn):
+            return DsqlError("0P000", "IAM role must look like an IAM ARN")
+    return IamTrust(action, role, arns)
+
+
+def _sql_literal(value):
+    """A literal that reads the same whatever ``standard_conforming_strings`` is."""
+    return "E'" + value.replace("\\", "\\\\").replace("'", "''") + "'"
+
+
+def _iam_trust_sql(trust, grantor):
+    """One DO block that applies an IamTrust, raising DSQL's errors and notices."""
+    role = _sql_literal(trust.role)
+    arns = "ARRAY[" + ", ".join(_sql_literal(a) for a in trust.arns) + "]::text[]"
+    view = _sql_literal("CREATE OR REPLACE " + _IAM_VIEW_SQL)
+    row_format = _sql_literal(_IAM_ROW_FORMAT)
+    current_rows = (
+        f"SELECT string_agg(format({row_format}, m.iam_oid, m.arn, m.pg_role_oid, "
+        "m.grantor_pg_role_name), ', ') INTO _rows FROM sys.iam_pg_role_mappings m"
+    )
+    if trust.action == "GRANT":
+        loop = (
+            "SELECT m.grantor_pg_role_name INTO _grantor FROM sys.iam_pg_role_mappings m "
+            "WHERE m.arn = _arn AND m.pg_role_oid = _role_oid; "
+            "IF FOUND THEN RAISE NOTICE '%', format('IAM role \"%s\" has already been granted "
+            f"access to role \"%s\" by role \"%s\"', _arn, {role}, _grantor); CONTINUE; END IF; "
+            "SELECT m.iam_oid INTO _oid FROM sys.iam_pg_role_mappings m WHERE m.arn = _arn LIMIT 1; "
+            "IF _oid IS NULL THEN "
+            "SELECT (max(m.iam_oid)::int8 + 1)::oid INTO _oid FROM sys.iam_pg_role_mappings m; "
+            "_oid := COALESCE(_oid, pg_nextoid('pg_authid', 'oid', 'pg_authid_oid_index')); "
+            "WHILE EXISTS (SELECT 1 FROM pg_authid WHERE oid = _oid) LOOP "
+            "_oid := (_oid::int8 + 1)::oid; END LOOP; END IF; "
+            f"{current_rows}; "
+            f"_rows := concat_ws(', ', _rows, format({row_format}, _oid, _arn, _role_oid, "
+            f"{_sql_literal(grantor)})); "
+        )
+    else:
+        loop = (
+            "IF NOT EXISTS (SELECT 1 FROM sys.iam_pg_role_mappings m "
+            "WHERE m.arn = _arn AND m.pg_role_oid = _role_oid) THEN "
+            "RAISE WARNING '%', format('IAM role \"%s\" has not been granted access to role "
+            f"\"%s\"', _arn, {role}); CONTINUE; END IF; "
+            f"{current_rows} WHERE NOT (m.arn = _arn AND m.pg_role_oid = _role_oid); "
+            f"_rows := COALESCE(_rows, {_sql_literal(_IAM_NO_ROWS)}); "
+        )
+    body = (
+        "DECLARE _role_oid oid; _arn text; _grantor name; _oid oid; _rows text; BEGIN "
+        f"SELECT oid INTO _role_oid FROM pg_roles WHERE rolname = {role}; "
+        "IF _role_oid IS NULL THEN RAISE EXCEPTION USING ERRCODE = '42704', "
+        f"MESSAGE = format('role \"%s\" does not exist', {role}); END IF; "
+        f"PERFORM {_IAM_LOCK}; "
+        f"FOREACH _arn IN ARRAY {arns} LOOP {loop}"
+        f"EXECUTE replace({view}, '{{rows}}', _rows); END LOOP; END"
+    )
+    return _do_block(body)
+
+
+def _do_block(body):
+    tag = "$iam$"
+    while tag in body:
+        tag = f"$iam_{secrets.token_hex(4)}$"
+    return f"DO {tag} {body} {tag}"
+
+
+def _without_context(payload):
+    """An ErrorResponse/NoticeResponse payload without its PL/pgSQL CONTEXT field."""
+    fields = [f for f in payload.split(b"\0") if f and f[:1] != b"W"]
+    return b"\0".join(fields) + b"\0\0"
+
+
+async def _prepare_backend(conn, b_reader, b_writer):
+    """Give a database the admin role and sys.iam_pg_role_mappings DSQL has, once."""
+    key = (conn.cluster_id, conn.database)
+    if key in _iam_ready:
+        return
+    b_writer.write(_frame(b"Q", _IAM_SETUP_SQL.encode() + b"\0"))
+    await b_writer.drain()
+    error = None
+    while True:
+        type_byte, payload = await _read_frame(b_reader)
+        if type_byte == b"E" and error is None:
+            error = "%s %s" % _error_payload_fields(payload)
+        if type_byte == b"Z":
+            break
+    if error:
+        logger.warning(
+            "pgproxy: could not create sys.iam_pg_role_mappings (cluster %s, database %s): %s",
+            conn.cluster_id, conn.database, error,
+        )
+        return
+    _iam_ready.add(key)
+
+
+async def _run_iam_trust(conn, b_writer, trust):
+    """Apply an IamTrust on the backend; return (frames for the client, backend_error)."""
+    frames = await _run_backend_capture(conn, b_writer, _iam_trust_sql(trust, conn.user))
+    backend_err = next((p for t, p in frames if t == b"E"), None)
+    if backend_err is not None:
+        return None, _without_context(backend_err)
+    conn.catalog_version = _bump_catalog(conn.cluster_id)
+    out = b"".join(_frame(t, _without_context(p)) for t, p in frames if t == b"N")
+    return out + _command_complete(trust.tag), None
+
+
+def _drop_role_sql(conn, sql):
+    """A DO block that refuses (2BP01) to drop a role with an IAM mapping, else runs the DROP."""
+    m = _DROP_ROLE_RE.match(sql)
+    if not m or (conn.cluster_id, conn.database) not in _iam_ready:
+        return None
+    names = [fold_identifier(n)[0] for n in _split_top_level(m.group(1)) if n.strip()]
+    if not names:
+        return None
+    body = (
+        "DECLARE _name name; BEGIN "
+        "SELECT m.pg_role_name INTO _name FROM sys.iam_pg_role_mappings m WHERE m.pg_role_name IN ("
+        + ", ".join(_sql_literal(n) for n in names) + ") LIMIT 1; "
+        "IF FOUND THEN RAISE EXCEPTION USING ERRCODE = '2BP01', MESSAGE = "
+        "format('role \"%s\" cannot be dropped because some objects depend on it', _name); "
+        f"END IF; EXECUTE {_sql_literal(sql.rstrip().rstrip(';'))}; END"
+    )
+    return _do_block(body)
+
+
+def _check_iam(conn, s, txn):
+    """IamTrust or DsqlError for an AWS IAM statement, else None."""
+    trust = match_aws_iam(s)
+    if trust is None or isinstance(trust, DsqlError):
+        return trust
+    if txn.in_txn and txn.ddl_seen:
+        return DsqlError("0A000", "multiple ddl statements not supported in a transaction")
+    result = validate(s, txn)
+    if isinstance(result, DsqlError):
+        return result
+    if trust.action == "GRANT" and trust.role == conn.user:
+        return DsqlError(
+            "42501",
+            f'permission denied to grant IAM trust with role "{trust.role}"',
+            f'Only roles with the ADMIN option on role "{trust.role}" may grant '
+            "IAM trust to this role.",
+        )
+    return trust
+
+
+async def _plan_statement(conn, s, b_writer, allow_probe=True):
+    """Decide what to do with one statement, for either wire protocol.
+
+    Returns ``(kind, payload)`` where kind is one of:
+      "error"    — payload is a DsqlError to report
+      "rows"     — payload describes a synthetic result set (sys.jobs etc.)
+      "rewrite"  — payload is a Rewrite to run on the backend as a job
+      "iam"      — payload is an IamTrust to apply
+      "relabel"  — payload is (sql, tag): run sql, report it under tag
+      "forward"  — payload is None; relay the statement untouched
+
+    ``allow_probe`` is False when the backend is mid extended-protocol
+    sequence, where injecting a probe query would break the protocol. The
+    text-only rules still apply; only the rules that need to look at backend
+    state are skipped.
+    """
+    matched = match_sys_jobs(s)
+    if matched is not False:
+        columns, job_filter = matched
+        cols = list(columns) if columns else list(_JOB_COLUMNS)
+        bad = [c for c in cols if c not in _JOB_COLUMNS]
+        if bad:
+            return "error", DsqlError("42703", f'column "{bad[0]}" does not exist')
+        if isinstance(job_filter, BindParam):
+            return "rows", _deferred(
+                [(c, _JOB_COLUMN_TYPES.get(c, _TEXT_OID)) for c in cols],
+                job_filter, lambda v: _sys_jobs_rows(conn, cols, v),
+            )
+        return "rows", _sys_jobs_rows(conn, cols, job_filter)
+
+    job_id = match_wait_for_job(s)
+    if job_id is not None:
+        call = _wait_is_call(s)
+        if isinstance(job_id, BindParam):
+            return "rows", _deferred(
+                _wait_columns(call), job_id,
+                lambda v: _wait_for_job_rows(conn, v, call),
+            )
+        result = _wait_for_job_rows(conn, job_id, call)
+        if isinstance(result, DsqlError):
+            return "error", result
+        return "rows", result
+
+    trust = _check_iam(conn, s, conn.txn)
+    if isinstance(trust, DsqlError):
+        return "error", trust
+    if trust is not None:
+        return "iam", trust
+
+    result = validate(s, conn.txn)
+    if isinstance(result, DsqlError):
+        return "error", result
+    if isinstance(result, Rewrite) and result.kind == "index_async":
+        if not allow_probe:
+            return "error", _ASYNC_BATCH_ERR
+        if result.job_type == "INDEX_BUILD" and result.table:
+            count = await _index_count(conn, b_writer, result.table)
+            if count is not None and count >= 24:
+                return "error", DsqlError(
+                    "0A000",
+                    f"table {result.table} already has the maximum of 24 indexes",
+                )
+        return "rewrite", result
+
+    if allow_probe:
+        err = await _check_drop_column(conn, b_writer, s)
+        if err:
+            return "error", err
+        err = await _check_statistics_limit(conn, b_writer, s)
+        if err:
+            return "error", err
+
+    drop = _drop_role_sql(conn, s)
+    if drop:
+        return "relabel", (drop, "DROP ROLE")
+    return "forward", None
+
+
+def _note_catalog(conn, s):
+    if classify_statement(s) == "ddl":
+        conn.catalog_version = _bump_catalog(conn.cluster_id)
+    else:
+        conn.catalog_version = _catalog_versions.get(conn.cluster_id, 0)
+
+
+def _stale_catalog(conn):
+    """OC001: this connection's cached catalog is behind another session's DDL."""
+    return (
+        conn.txn.in_txn
+        and conn.catalog_version is not None
+        and conn.catalog_version < _catalog_versions.get(conn.cluster_id, 0)
+    )
+
+
+_OC001_ERR = DsqlError(
+    "40001", "schema has been updated by another transaction (OC001)"
+)
+
+
+async def _rollback_stale(conn, b_writer):
+    await _run_backend_capture(conn, b_writer, "ROLLBACK")
+    conn.txn.apply("ROLLBACK")
+    conn.catalog_version = _catalog_versions.get(conn.cluster_id, 0)
+
+
+def _synth_columns(kind, result):
+    return result["cols"] if kind == "rows" else ["job_id"]
+
+
+def _error_payload_fields(payload):
+    """SQLSTATE and primary message out of an ErrorResponse payload."""
+    fields = {}
+    for field in payload.split(b"\0"):
+        if field:
+            fields[field[:1]] = field[1:].decode("utf-8", "replace")
+    return fields.get(b"C", ""), fields.get(b"M", "")
+
+
+async def _run_rewrite(conn, b_writer, rewrite):
+    """Execute a rewritten ASYNC statement; return (job, backend_error)."""
+    frames = await _run_backend_capture(conn, b_writer, rewrite.sql)
+    backend_err = next((p for t, p in frames if t == b"E"), None)
+    if backend_err is not None:
+        sqlstate, message = _error_payload_fields(backend_err)
+        # Data that does not satisfy the constraint (or a duplicate key for a
+        # unique index) fails the job, not its submission: DSQL answers with a
+        # job_id and reports the failure through sys.jobs. Anything else — an
+        # unresolvable relation, a syntax error — is refused on the spot. In a
+        # transaction the backend is left aborted, so relay there either way.
+        if sqlstate.startswith("23") and not conn.txn.in_txn:
+            if sqlstate == "23505" and rewrite.job_type == "INDEX_BUILD":
+                # DSQL's own wording (measured, eu-central-1 2026-10-04).
+                message = "found duplicate key(s) while validating index uniqueness"
+            job = _register_job(
+                conn.cluster_id, rewrite.object_name, rewrite.job_type,
+                status="failed", details=message,
+            )
+            return job, None
+        return None, backend_err
+    conn.catalog_version = _bump_catalog(conn.cluster_id)
+    job = _register_job(conn.cluster_id, rewrite.object_name, rewrite.job_type)
+    return job, None
+
+
+async def _handle_query(conn, sql, b_writer, c_writer):
+    txn = conn.txn
+    stmts = split_statements(sql)
+
+    if len(stmts) == 1:
+        s = strip_leading_comments(stmts[0])
+
+        # A statement rejected earlier in this transaction poisoned the block.
+        err, forward_sql = _abort_gate(conn, s)
+        if err:
+            c_writer.write(
+                _error_response(err.sqlstate, err.message, err.detail) + _ready(_status(conn))
+            )
+            await c_writer.drain()
+            return
+        if forward_sql != s:  # COMMIT of an aborted block -> ROLLBACK
+            txn.apply(forward_sql)
+            b_writer.write(_frame(b"Q", forward_sql.encode() + b"\0"))
+            await b_writer.drain()
+            return
+
+        # OC001: abort like real DSQL (40001); the next attempt sees the fresh
+        # catalog and succeeds.
+        if _stale_catalog(conn):
+            await _rollback_stale(conn, b_writer)
+            _reject(conn, c_writer, _OC001_ERR)
+            await c_writer.drain()
+            return
+
+        kind, result = await _plan_statement(conn, s, b_writer)
+        if kind == "rows" and "resolve" in result:
+            # A $n placeholder means nothing outside the extended protocol.
+            kind, result = "error", DsqlError(
+                "42P02", f"there is no parameter ${result['nparams']}"
+            )
+        if kind == "error":
+            _reject(conn, c_writer, result)
+            await c_writer.drain()
+            return
+        if kind == "rows":
+            # One join, not a growing bytes append -- per-row += re-copies the
+            # whole response for every row, quadratic in result-set size.
+            frames = [_row_description(result["cols"])]
+            frames.extend(_data_row(row) for row in result["rows"])
+            frames.append(_command_complete(result["tag"]))
+            out = b"".join(frames)
+            c_writer.write(out + _ready(_status(conn)))
+            await c_writer.drain()
+            return
+        if kind == "relabel":
+            _note_catalog(conn, s)
+            txn.apply(s)
+            conn.result_tags = [result[1]]
+            b_writer.write(_frame(b"Q", result[0].encode() + b"\0"))
+            await b_writer.drain()
+            return
+        if kind == "iam":
+            txn.apply(s)
+            out, backend_err = await _run_iam_trust(conn, b_writer, result)
+            if backend_err is not None:
+                c_writer.write(_frame(b"E", backend_err) + _ready(_status(conn)))
+            else:
+                c_writer.write(out + _ready(_status(conn)))
+            await c_writer.drain()
+            return
+        if kind == "rewrite":
+            txn.apply(s)
+            # Run the rewritten statement on the backend, swallow its
+            # response, and synthesize the DSQL job_id result set.
+            job, backend_err = await _run_rewrite(conn, b_writer, result)
+            if backend_err is not None:
+                c_writer.write(_frame(b"E", backend_err) + _ready(_status(conn)))
+                await c_writer.drain()
+                return
+            out = _row_description(["job_id"])
+            out += _data_row([job["job_id"]])
+            out += _command_complete(_JOB_COMMAND_TAGS.get(result.job_type, "SELECT 1"))
+            c_writer.write(out + _ready(_status(conn)))
+            await c_writer.drain()
+            return
+
+        _note_catalog(conn, s)
+        txn.apply(s)
+        b_writer.write(_frame(b"Q", sql.encode() + b"\0"))
+        await b_writer.drain()
+        return
+
+    # Multi-statement batch (implicit transaction): validate every statement
+    # up front, then forward the batch verbatim.
+    if stmts:
+        # An aborted block only accepts an explicit rollback; forwarding a
+        # batch that opened with COMMIT would commit work the client was told
+        # had failed.
+        if conn.txn.synthetic_abort:
+            if re.match(
+                r"\s*(ROLLBACK|ABORT)\b", strip_leading_comments(stmts[0]), re.I
+            ):
+                conn.txn.synthetic_abort = False
+            else:
+                c_writer.write(
+                    _error_response(_ABORTED_ERR.sqlstate, _ABORTED_ERR.message)
+                    + _ready(_status(conn))
+                )
+                await c_writer.drain()
+                return
+        sim = txn.copy()
+        explicit = False
+        batch, tags = [], []
+        if not sim.in_txn and len(stmts) > 1:
+            sim.in_txn = True  # implicit transaction
+        for s in stmts:
+            if classify_statement(s) == "tcl_begin":
+                explicit = True
+            trust = _check_iam(conn, strip_leading_comments(s), sim)
+            if isinstance(trust, IamTrust):
+                batch.append(_iam_trust_sql(trust, conn.user))
+                tags.append(trust.tag)
+                sim.apply(s)
+                continue
+            result = trust or validate(s, sim)
+            drop = None if isinstance(result, (DsqlError, Rewrite)) else _drop_role_sql(conn, s)
+            if drop:
+                batch.append(drop)
+                tags.append("DROP ROLE")
+                sim.apply(s)
+                continue
+            if isinstance(result, (DsqlError, Rewrite)):
+                if isinstance(result, Rewrite):
+                    # ASYNC rewrites only supported for single statements.
+                    result = DsqlError(
+                        "0A000",
+                        "asynchronous DDL is not supported in multi-statement queries",
+                    )
+                _reject(conn, c_writer, result)
+                await c_writer.drain()
+                return
+            batch.append(s)
+            tags.append(None if strip_leading_comments(s) else False)
+            sim.apply(s)
+        if any(tags):
+            sql = "\n;\n".join(batch)
+            conn.result_tags = [t for t in tags if t is not False]
+        if txn.in_txn or explicit:
+            txn.in_txn, txn.ddl_seen, txn.dml_seen = (
+                sim.in_txn,
+                sim.ddl_seen,
+                sim.dml_seen,
+            )
+            txn.started_at, txn.rows_est, txn.bytes_est = (
+                sim.started_at,
+                sim.rows_est,
+                sim.bytes_est,
+            )
+        # else: implicit batch committed — connection stays idle.
+        if any(classify_statement(st) == "ddl" for st in stmts):
+            conn.catalog_version = _bump_catalog(conn.cluster_id)
+        else:
+            conn.catalog_version = _catalog_versions.get(conn.cluster_id, 0)
+
+    b_writer.write(_frame(b"Q", sql.encode() + b"\0"))
+    await b_writer.drain()
+
+
+# ---------------------------------------------------------------------------
+# Extended query protocol (Parse / Bind / Describe / Execute / Close / Sync)
+#
+# pgjdbc, pgx, asyncpg, psycopg3 and every ORM built on prepared statements
+# send SQL this way. Validating only the simple 'Q' protocol would let all of
+# them past the DSQL subset entirely.
+# ---------------------------------------------------------------------------
+
+
+def _two_strings(payload):
+    """The two leading NUL-terminated strings of a Parse or Bind payload."""
+    first = payload.index(b"\0")
+    second = payload.index(b"\0", first + 1)
+    return (
+        payload[:first].decode("utf-8", "replace"),
+        payload[first + 1 : second].decode("utf-8", "replace"),
+    )
+
+
+def _target_name(payload):
+    """('S'|'P', name) of a Describe or Close payload."""
+    return payload[:1], payload[1:].split(b"\0")[0].decode("utf-8", "replace")
+
+
+def _parse_payload(name, sql):
+    return name.encode() + b"\0" + sql.encode() + b"\0" + struct.pack("!H", 0)
+
+
+async def _ext_forward(conn, b_writer, type_byte, payload):
+    conn.ext_forwarded = True
+    b_writer.write(_frame(type_byte, payload))
+    await b_writer.drain()
+
+
+async def _ext_error(conn, c_writer, err):
+    """Report an error and enter skip-until-Sync, per the protocol spec."""
+    if conn.txn.in_txn:
+        conn.txn.synthetic_abort = True
+    conn.ext_skip = True
+    c_writer.write(_error_response(err.sqlstate, err.message, err.detail))
+    await c_writer.drain()
+
+
+async def _ext_parse(conn, payload, b_writer, c_writer):
+    try:
+        name, sql = _two_strings(payload)
+    except ValueError:
+        await _ext_forward(conn, b_writer, b"P", payload)
+        return
+    s = strip_leading_comments(sql).strip()
+    entry = {"sql": s, "synth": None}
+    if not s:
+        conn.ext_stmts[name] = entry
+        await _ext_forward(conn, b_writer, b"P", payload)
+        return
+
+    err, forward_sql = _abort_gate(conn, s)
+    if err:
+        await _ext_error(conn, c_writer, err)
+        return
+    if forward_sql != s:  # COMMIT of an aborted block -> ROLLBACK
+        entry["sql"] = forward_sql
+        conn.ext_stmts[name] = entry
+        await _ext_forward(conn, b_writer, b"P", _parse_payload(name, forward_sql))
+        return
+
+    # Probes and rewrites need the backend to be idle; it is not once anything
+    # in this pipelined batch has been forwarded.
+    allow_probe = not conn.ext_forwarded
+    if allow_probe and _stale_catalog(conn):
+        await _rollback_stale(conn, b_writer)
+        await _ext_error(conn, c_writer, _OC001_ERR)
+        return
+
+    kind, result = await _plan_statement(conn, s, b_writer, allow_probe=allow_probe)
+    if kind == "error":
+        await _ext_error(conn, c_writer, result)
+        return
+    if kind in ("rows", "rewrite"):
+        entry["synth"] = (kind, result)
+        conn.ext_stmts[name] = entry
+        c_writer.write(_frame(b"1", b""))  # ParseComplete
+        await c_writer.drain()
+        return
+    if kind == "iam":
+        kind, result = "relabel", (_iam_trust_sql(result, conn.user), result.tag)
+    if kind == "relabel":
+        entry["tag"] = result[1]
+        sql_end = payload.index(b"\0", payload.index(b"\0") + 1)
+        payload = name.encode() + b"\0" + result[0].encode() + payload[sql_end:]
+    conn.ext_stmts[name] = entry
+    await _ext_forward(conn, b_writer, b"P", payload)
+
+
+async def _ext_bind(conn, payload, b_writer, c_writer):
+    try:
+        portal, stmt = _two_strings(payload)
+    except ValueError:
+        await _ext_forward(conn, b_writer, b"B", payload)
+        return
+    entry = conn.ext_stmts.get(stmt)
+    if entry is None:
+        await _ext_forward(conn, b_writer, b"B", payload)
+        return
+    if entry["synth"] is None:
+        conn.ext_portals[portal] = entry
+        await _ext_forward(conn, b_writer, b"B", payload)
+        return
+    kind, result = entry["synth"]
+    if kind == "rows" and "resolve" in result:
+        resolved = result["resolve"](_bind_params(payload))
+        if isinstance(resolved, DsqlError):
+            await _ext_error(conn, c_writer, resolved)
+            return
+        entry = {**entry, "synth": ("rows", resolved)}
+    conn.ext_portals[portal] = entry
+    c_writer.write(_frame(b"2", b""))  # BindComplete
+    await c_writer.drain()
+
+
+def _bind_params(payload):
+    """Parameter values of a Bind payload, as text (None for NULL)."""
+    try:
+        i = payload.index(b"\0")
+        i = payload.index(b"\0", i + 1) + 1
+        (nfmt,) = struct.unpack("!H", payload[i : i + 2])
+        i += 2 + 2 * nfmt
+        (nparams,) = struct.unpack("!H", payload[i : i + 2])
+        i += 2
+        values = []
+        for _ in range(nparams):
+            (vlen,) = struct.unpack("!i", payload[i : i + 4])
+            i += 4
+            if vlen < 0:
+                values.append(None)
+                continue
+            # A job id is text; its binary encoding is the same UTF-8 bytes.
+            values.append(payload[i : i + vlen].decode("utf-8", "replace"))
+            i += vlen
+        return values
+    except (ValueError, struct.error):
+        return []
+
+
+async def _ext_describe(conn, payload, b_writer, c_writer):
+    target, name = _target_name(payload)
+    store = conn.ext_stmts if target == b"S" else conn.ext_portals
+    entry = store.get(name)
+    if entry is None or entry["synth"] is None:
+        await _ext_forward(conn, b_writer, b"D", payload)
+        return
+    out = b""
+    if target == b"S":
+        kind, result = entry["synth"]
+        nparams = result.get("nparams", 0) if kind == "rows" else 0
+        out += _frame(  # ParameterDescription: every placeholder is text
+            b"t", struct.pack("!H", nparams) + struct.pack("!I", 25) * nparams
+        )
+    out += _row_description(_synth_columns(*entry["synth"]))
+    c_writer.write(out)
+    await c_writer.drain()
+
+
+async def _ext_execute(conn, payload, b_writer, c_writer):
+    name = payload.split(b"\0")[0].decode("utf-8", "replace")
+    entry = conn.ext_portals.get(name)
+    if entry is None or entry["synth"] is None:
+        if entry is not None and entry["sql"]:
+            _note_catalog(conn, entry["sql"])
+            conn.txn.apply(entry["sql"])
+        conn.result_tags.append(entry and entry.get("tag"))
+        await _ext_forward(conn, b_writer, b"E", payload)
+        return
+
+    kind, result = entry["synth"]
+    if kind == "rows":
+        out = b"".join(_data_row(row) for row in result["rows"])
+        c_writer.write(out + _command_complete(result["tag"]))
+        await c_writer.drain()
+        return
+
+    conn.txn.apply(entry["sql"])
+    job, backend_err = await _run_rewrite(conn, b_writer, result)
+    if backend_err is not None:
+        conn.ext_skip = True
+        c_writer.write(_frame(b"E", backend_err))
+        await c_writer.drain()
+        return
+    c_writer.write(
+        _data_row([job["job_id"]])
+        + _command_complete(_JOB_COMMAND_TAGS.get(result.job_type, "SELECT 1"))
+    )
+    await c_writer.drain()
+
+
+async def _ext_close(conn, payload, b_writer, c_writer):
+    target, name = _target_name(payload)
+    store = conn.ext_stmts if target == b"S" else conn.ext_portals
+    entry = store.pop(name, None)
+    if entry is None or entry["synth"] is None:
+        await _ext_forward(conn, b_writer, b"C", payload)
+        return
+    c_writer.write(_frame(b"3", b""))  # CloseComplete
+    await c_writer.drain()
+
+
+async def _ext_sync(conn, b_writer, c_writer):
+    forwarded = conn.ext_forwarded
+    conn.ext_skip = False
+    conn.ext_forwarded = False
+    conn.ext_portals.pop("", None)  # the unnamed portal dies at Sync
+    if forwarded:
+        # The backend answers with its own ReadyForQuery, which also refreshes
+        # our transaction state via _backend_relay.
+        b_writer.write(_frame(b"S", b""))
+        await b_writer.drain()
+        return
+    c_writer.write(_ready(_status(conn)))
+    await c_writer.drain()
+
+
+async def _handle_extended(conn, type_byte, payload, b_writer, c_writer):
+    if conn.ext_skip and type_byte != b"S":
+        return  # after an error, everything is ignored until Sync
+    if type_byte == b"P":
+        await _ext_parse(conn, payload, b_writer, c_writer)
+    elif type_byte == b"B":
+        await _ext_bind(conn, payload, b_writer, c_writer)
+    elif type_byte == b"D":
+        await _ext_describe(conn, payload, b_writer, c_writer)
+    elif type_byte == b"E":
+        await _ext_execute(conn, payload, b_writer, c_writer)
+    elif type_byte == b"C":
+        await _ext_close(conn, payload, b_writer, c_writer)
+    elif type_byte == b"S":
+        await _ext_sync(conn, b_writer, c_writer)
+    elif type_byte == b"H":  # Flush
+        if conn.ext_forwarded:
+            await _ext_forward(conn, b_writer, b"H", payload)
+        else:
+            await c_writer.drain()
+
+
+_EXTENDED_TYPES = frozenset((b"P", b"B", b"D", b"E", b"C", b"S", b"H"))
+
+
+async def _handle_client(cluster_id, backend_host, backend_port, c_reader, c_writer):
+    conn = _Conn(cluster_id)
+    b_writer = None
+    relay = None
+    try:
+        # Startup phase (no type byte): SSL/GSS negotiation, then StartupMessage.
+        while True:
+            code, payload = await _read_startup(c_reader)
+            if code in (_SSL_REQUEST, _GSSENC_REQUEST):
+                c_writer.write(b"N")
+                await c_writer.drain()
+                continue
+            if code == _CANCEL_REQUEST:
+                return
+            if code == _PROTOCOL_3:
+                params = _parse_startup_params(payload)
+                break
+            return  # unknown startup packet — close
+
+        # Authenticate the client ourselves: any user/password is accepted
+        # (IAM auth tokens are client-side SigV4 presigning).
+        c_writer.write(_client_greeting())
+        await c_writer.drain()
+
+        database = params.get("database") or "postgres"
+        conn.user = params.get("user") or conn.user
+        conn.database = database
+        b_reader, b_writer = await _connect_backend(
+            backend_host, backend_port, database
+        )
+        await _prepare_backend(conn, b_reader, b_writer)
+        relay = asyncio.create_task(_backend_relay(conn, b_reader, c_writer))
+
+        while True:
+            type_byte, payload = await _read_frame(c_reader)
+            if type_byte == b"X":  # Terminate
+                break
+            if type_byte == b"Q":
+                sql = payload[:-1].decode("utf-8", "replace") if payload.endswith(b"\0") else payload.decode("utf-8", "replace")
+                await _handle_query(conn, sql, b_writer, c_writer)
+            elif type_byte in _EXTENDED_TYPES:
+                await _handle_extended(conn, type_byte, payload, b_writer, c_writer)
+            else:
+                # Everything else relays verbatim (d/c/f COPY frames, F...).
+                b_writer.write(_frame(type_byte, payload))
+                await b_writer.drain()
+    except (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError, OSError):
+        pass
+    except Exception:
+        logger.exception("pgproxy: error in client connection (cluster %s)", cluster_id)
+    finally:
+        if relay is not None:
+            relay.cancel()
+        for w in (b_writer, c_writer):
+            if w is not None:
+                try:
+                    w.close()
+                except Exception:
+                    pass
+
+
+# ---------------------------------------------------------------------------
+# Public proxy lifecycle
+# ---------------------------------------------------------------------------
+
+
+async def start_proxy(cluster_id, listen_port, backend_host, backend_port):
+    """Bind one proxy listener for a cluster. Idempotent per cluster."""
+    if cluster_id in _proxies:
+        return
+
+    async def handler(reader, writer):
+        await _handle_client(cluster_id, backend_host, backend_port, reader, writer)
+
+    server = await asyncio.start_server(handler, "0.0.0.0", listen_port)
+    _proxies[cluster_id] = server
+    logger.info(
+        "pgproxy: cluster %s listening on port %d -> %s:%d",
+        cluster_id, listen_port, backend_host, backend_port,
+    )
+
+
+async def stop_proxy(cluster_id):
+    server = _proxies.pop(cluster_id, None)
+    if server is not None:
+        server.close()
+        await server.wait_closed()
+    _jobs.pop(cluster_id, None)
+    for key in [k for k in _iam_ready if k[0] == cluster_id]:
+        _iam_ready.discard(key)
+
+
+async def stop_all_proxies():
+    for cluster_id in list(_proxies):
+        await stop_proxy(cluster_id)

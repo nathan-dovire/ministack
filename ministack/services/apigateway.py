@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 API Gateway HTTP API v2 Emulator.
 
@@ -42,6 +44,7 @@ Data plane:
 
 import asyncio
 import base64
+import codecs
 import json
 import logging
 import os
@@ -51,12 +54,45 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from ministack.core.responses import AccountScopedDict, error_response_json, get_account_id, get_region, new_uuid
+from ministack.core.arn import ArnParseError, execute_api_arn, execute_api_route_arn, parse_arn
+from ministack.core.concurrency import run_reentrant
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    AccountScopedDict,
+    get_account_id,
+    get_region,
+    new_uuid,
+    request_scope,
+)
 
 _HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _PORT = os.environ.get("GATEWAY_PORT", "4566")
 
 logger = logging.getLogger("apigateway")
+
+_PCT_RUN_RE = re.compile(r"(?:%[0-9A-Fa-f]{2})+")
+
+
+def decode_http_api_path(raw_path: str) -> str:
+    """Decode a request path the way an HTTP API builds ``rawPath``: every escape
+    decodes except ``%25``, so ``a%252Eb`` arrives as ``a%252Eb``, not ``a%2Eb``."""
+
+    def _decode(match):
+        run, out, pending = match.group(0), [], bytearray()
+        for i in range(0, len(run), 3):
+            byte = int(run[i + 1 : i + 3], 16)
+            if byte == 0x25:
+                if pending:
+                    out.append(pending.decode("utf-8", "replace"))
+                    pending.clear()
+                out.append("%25")
+            else:
+                pending.append(byte)
+        if pending:
+            out.append(pending.decode("utf-8", "replace"))
+        return "".join(out)
+
+    return _PCT_RUN_RE.sub(_decode, raw_path)
 
 
 def _timeout_from_env(env_name: str, default_seconds: float) -> float:
@@ -84,24 +120,47 @@ async def _urlopen_async(request_or_url, timeout_seconds: float):
     return await asyncio.to_thread(_urlopen_sync, request_or_url, timeout_seconds)
 
 
-REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 _PROXY_TIMEOUT_SECONDS = _timeout_from_env("MINISTACK_APIGW_PROXY_TIMEOUT_SECONDS", 30.0)
 _JWKS_TIMEOUT_SECONDS = _timeout_from_env("MINISTACK_APIGW_JWKS_TIMEOUT_SECONDS", 5.0)
 
 # ---- Module-level state ----
-_apis = AccountScopedDict()          # api_id -> api object
-_routes = AccountScopedDict()        # api_id -> {route_id -> route object}
-_integrations = AccountScopedDict()  # api_id -> {integration_id -> integration object}
-_stages = AccountScopedDict()        # api_id -> {stage_name -> stage object}
-_deployments = AccountScopedDict()   # api_id -> {deployment_id -> deployment object}
-_authorizers = AccountScopedDict()   # api_id -> {authorizer_id -> authorizer object}
-_api_tags = AccountScopedDict()      # resource_arn -> {key -> value}
-_route_responses = AccountScopedDict()         # api_id -> {route_id -> {rr_id -> route_response}}
-_integration_responses = AccountScopedDict()   # api_id -> {integration_id -> {ir_id -> int_response}}
+_apis = AccountRegionScopedDict()          # api_id -> api object
+_routes = AccountRegionScopedDict()        # api_id -> {route_id -> route object}
+_integrations = AccountRegionScopedDict()  # api_id -> {integration_id -> integration object}
+_stages = AccountRegionScopedDict()        # api_id -> {stage_name -> stage object}
+_deployments = AccountRegionScopedDict()   # api_id -> {deployment_id -> deployment object}
+_authorizers = AccountRegionScopedDict()   # api_id -> {authorizer_id -> authorizer object}
+# Data-plane cache of REQUEST (Lambda) authorizer OUTPUT — not the allow/deny
+# verdict — keyed by (account, region, api_id, authorizer_id, stage, identity
+# values). Value: (expiry_epoch, result, context), where `result` is the policy
+# document for an IAM policy response and the `isAuthorized` boolean for a
+# simple response. A cached policy is re-evaluated against every request's own
+# route ARN, which is what makes the documented behaviour work: "By default,
+# API Gateway uses the cached authorizer response for all routes of an API that
+# use the authorizer" — the *response* carries over, so the canonical
+# `Resource: event['routeArn']` policy still only grants the one route it was
+# issued for. A simple response has no resource dimension ("the authorizer's
+# response fully allows or denies all API requests that match the cached
+# identity source values"), so there the verdict itself is the cached result.
+# Ephemeral (not persisted); honors authorizerResultTtlInSeconds. Mirrors the
+# REST (v1) authorizer cache in apigateway_v1.py.
+_authorizer_cache = {}
+# Entries are keyed on caller-supplied identity values, so the cache is capped
+# rather than left to grow with every distinct token a long-lived instance sees.
+_AUTHORIZER_CACHE_MAX = 1024
+# AWS's default when CreateAuthorizer omits authorizerResultTtlInSeconds.
+_DEFAULT_AUTHORIZER_TTL = 300
+_api_tags = AccountRegionScopedDict()      # resource_arn -> {key -> value}
+_route_responses = AccountRegionScopedDict()         # api_id -> {route_id -> {rr_id -> route_response}}
+_integration_responses = AccountRegionScopedDict()   # api_id -> {integration_id -> {ir_id -> int_response}}
 # JWKS cache is account-scoped because issuer URLs in MiniStack can resolve
 # to per-account local Cognito user pools — the same URL string may legitimately
 # serve different keys in different accounts.
 _jwks_cache = AccountScopedDict()
+# OIDC discovery documents ({issuer}/.well-known/openid-configuration) are cached
+# by issuer (account-scoped, like _jwks_cache) so the jwks_uri lookup does not
+# hit the network on every request.
+_oidc_config_cache = AccountScopedDict()
 
 # WebSocket connection registry — connections are not per-account-scoped at the store level
 # because the @connections management API may arrive on any host/account; instead we store
@@ -163,7 +222,12 @@ def _apigw_error(code: str, message: str, status: int) -> tuple:
 
 
 def _api_arn(api_id: str) -> str:
-    return f"arn:aws:apigateway:{get_region()}::/apis/{api_id}"
+    return _api_resource_arn(api_id)
+
+
+def _api_resource_arn(api_id: str, *segments: str) -> str:
+    suffix = "".join(f"/{segment}" for segment in segments)
+    return f"arn:aws:apigateway:{get_region()}::/apis/{api_id}{suffix}"
 
 
 def _extract_lambda_ref_from_integration_uri(uri: str) -> str:
@@ -214,17 +278,86 @@ def get_state() -> dict:
     }
 
 
+def _legacy_account_items(restored):
+    if isinstance(restored, AccountScopedDict):
+        return restored._data.items()
+    if isinstance(restored, dict):
+        account_id = get_account_id()
+        return [((account_id, key), value) for key, value in restored.items()]
+    return ()
+
+
+def _legacy_region(region_store, account_id, key):
+    if isinstance(region_store, AccountScopedDict):
+        return region_store.get_scoped(account_id, None, key)
+    if isinstance(region_store, dict):
+        return region_store.get(key)
+    return None
+
+
+def _restore_api_store(restored, region_store):
+    if isinstance(restored, AccountRegionScopedDict):
+        _apis.update(restored)
+        return {
+            (account_id, api_id): region
+            for (account_id, region, api_id), _api in _apis.all_items()
+        }
+
+    regions = {}
+    boot_region = get_region()
+    for (account_id, api_id), api in _legacy_account_items(restored):
+        region = _legacy_region(region_store, account_id, api_id) or boot_region
+        _apis.set_scoped(account_id, region, api_id, api)
+        regions[(account_id, api_id)] = region
+    return regions
+
+
+def _restore_child_store(store, restored, api_regions):
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return
+
+    boot_region = get_region()
+    for (account_id, api_id), value in _legacy_account_items(restored):
+        region = api_regions.get((account_id, api_id), boot_region)
+        store.set_scoped(account_id, region, api_id, value)
+
+
+def _region_from_apigateway_arn(resource_arn: str) -> str | None:
+    try:
+        parsed = parse_arn(resource_arn)
+    except (ArnParseError, TypeError):
+        return None
+    if parsed.service != "apigateway":
+        return None
+    return parsed.region or None
+
+
+def _restore_api_tags(restored):
+    if isinstance(restored, AccountRegionScopedDict):
+        _api_tags.update(restored)
+        return
+
+    boot_region = get_region()
+    for (account_id, resource_arn), tags in _legacy_account_items(restored):
+        region = _region_from_apigateway_arn(resource_arn) or boot_region
+        _api_tags.set_scoped(account_id, region, resource_arn, tags)
+
+
 def load_persisted_state(data: dict) -> None:
     """Restore module state from a previously persisted snapshot."""
-    _apis.update(data.get("apis", {}))
-    _routes.update(data.get("routes", {}))
-    _integrations.update(data.get("integrations", {}))
-    _stages.update(data.get("stages", {}))
-    _deployments.update(data.get("deployments", {}))
-    _authorizers.update(data.get("authorizers", {}))
-    _api_tags.update(data.get("api_tags", {}))
-    _route_responses.update(data.get("route_responses", {}))
-    _integration_responses.update(data.get("integration_responses", {}))
+    if not data:
+        return
+
+    api_regions = _restore_api_store(data.get("apis", {}), data.get("api_regions", {}))
+    _restore_child_store(_routes, data.get("routes", {}), api_regions)
+    _restore_child_store(_integrations, data.get("integrations", {}), api_regions)
+    _restore_child_store(_stages, data.get("stages", {}), api_regions)
+    _restore_child_store(_deployments, data.get("deployments", {}), api_regions)
+    _restore_child_store(_authorizers, data.get("authorizers", {}), api_regions)
+    _restore_api_tags(data.get("api_tags", {}))
+    _restore_child_store(_route_responses, data.get("route_responses", {}), api_regions)
+    _restore_child_store(_integration_responses, data.get("integration_responses", {}), api_regions)
 
 
 # ---- Control plane router ----
@@ -233,7 +366,9 @@ async def handle_request(method, path, headers, body, query_params):
     """Route API Gateway v2 control plane requests."""
     # Dispatch v1 REST API requests first
     parts = [p for p in path.strip("/").split("/") if p]
-    if parts and parts[0] in ("restapis", "apikeys", "usageplans", "domainnames", "tags", "account"):
+    if parts and parts[0] in ("restapis", "apikeys", "usageplans", "domainnames", "tags", "account",
+                              "clientcertificates", "domainnameaccessassociations",
+                              "rejectdomainnameaccessassociations"):
         from ministack.services import apigateway_v1
         return await apigateway_v1.handle_request(method, path, headers, body, query_params)
 
@@ -252,7 +387,7 @@ async def handle_request(method, path, headers, body, query_params):
     # /v2/tags/{resourceArn} — tags endpoint
     if resource == "tags":
         # resourceArn may contain slashes; rejoin everything after "tags/"
-        resource_arn = "/".join(parts[2:]) if len(parts) > 2 else ""
+        resource_arn = urllib.parse.unquote("/".join(parts[2:])) if len(parts) > 2 else ""
         if method == "GET":
             return _get_tags(resource_arn)
         if method == "POST":
@@ -262,6 +397,35 @@ async def handle_request(method, path, headers, body, query_params):
             if isinstance(tag_keys, str):
                 tag_keys = [tag_keys]
             return _untag_resource(resource_arn, tag_keys)
+
+    if resource == "domainnames":
+        name = urllib.parse.unquote(parts[2]) if len(parts) > 2 else None
+        mapping_id = parts[4] if len(parts) > 4 else None
+        if not name:
+            if method == "POST":
+                return _create_domain_name(data)
+            if method == "GET":
+                return _get_domain_names(query_params)
+        elif len(parts) > 3 and parts[3] == "apimappings":
+            if not mapping_id:
+                if method == "POST":
+                    return _create_api_mapping(name, data)
+                if method == "GET":
+                    return _get_api_mappings(name, query_params)
+            else:
+                if method == "GET":
+                    return _get_api_mapping(name, mapping_id)
+                if method == "PATCH":
+                    return _update_api_mapping(name, mapping_id, data)
+                if method == "DELETE":
+                    return _delete_api_mapping(name, mapping_id)
+        elif len(parts) == 3:
+            if method == "GET":
+                return _get_domain_name(name)
+            if method == "PATCH":
+                return _update_domain_name(name, data)
+            if method == "DELETE":
+                return _delete_domain_name(name)
 
     if resource == "apis":
         api_id = parts[2] if len(parts) > 2 else None
@@ -273,7 +437,7 @@ async def handle_request(method, path, headers, body, query_params):
             if method == "POST":
                 return _create_api(data)
             if method == "GET":
-                return _get_apis()
+                return _get_apis(query_params)
 
         # /v2/apis/{apiId}
         if api_id and not sub:
@@ -284,6 +448,10 @@ async def handle_request(method, path, headers, body, query_params):
             if method == "PATCH":
                 return _update_api(api_id, data)
 
+        # /v2/apis/{apiId}/cors
+        if api_id and sub == "cors" and method == "DELETE":
+            return _delete_cors_configuration(api_id)
+
         # /v2/apis/{apiId}/routes[/{routeId}[/routeresponses[/{routeResponseId}]]]
         if api_id and sub == "routes":
             rr_segment = parts[5] if len(parts) > 5 else None
@@ -292,13 +460,13 @@ async def handle_request(method, path, headers, body, query_params):
                 if method == "POST":
                     return _create_route(api_id, data)
                 if method == "GET":
-                    return _get_routes(api_id)
+                    return _get_routes(api_id, query_params)
             elif rr_segment == "routeresponses":
                 if not rr_id:
                     if method == "POST":
                         return _create_route_response(api_id, sub_id, data)
                     if method == "GET":
-                        return _get_route_responses(api_id, sub_id)
+                        return _get_route_responses(api_id, sub_id, query_params)
                 else:
                     if method == "GET":
                         return _get_route_response(api_id, sub_id, rr_id)
@@ -322,13 +490,13 @@ async def handle_request(method, path, headers, body, query_params):
                 if method == "POST":
                     return _create_integration(api_id, data)
                 if method == "GET":
-                    return _get_integrations(api_id)
+                    return _get_integrations(api_id, query_params)
             elif ir_segment == "integrationresponses":
                 if not ir_id:
                     if method == "POST":
                         return _create_integration_response(api_id, sub_id, data)
                     if method == "GET":
-                        return _get_integration_responses(api_id, sub_id)
+                        return _get_integration_responses(api_id, sub_id, query_params)
                 else:
                     if method == "GET":
                         return _get_integration_response(api_id, sub_id, ir_id)
@@ -350,7 +518,7 @@ async def handle_request(method, path, headers, body, query_params):
                 if method == "POST":
                     return _create_stage(api_id, data)
                 if method == "GET":
-                    return _get_stages(api_id)
+                    return _get_stages(api_id, query_params)
             else:
                 if method == "GET":
                     return _get_stage(api_id, sub_id)
@@ -365,7 +533,7 @@ async def handle_request(method, path, headers, body, query_params):
                 if method == "POST":
                     return _create_deployment(api_id, data)
                 if method == "GET":
-                    return _get_deployments(api_id)
+                    return _get_deployments(api_id, query_params)
             else:
                 if method == "GET":
                     return _get_deployment(api_id, sub_id)
@@ -378,7 +546,7 @@ async def handle_request(method, path, headers, body, query_params):
                 if method == "POST":
                     return _create_authorizer(api_id, data)
                 if method == "GET":
-                    return _get_authorizers(api_id)
+                    return _get_authorizers(api_id, query_params)
             else:
                 if method == "GET":
                     return _get_authorizer(api_id, sub_id)
@@ -453,6 +621,36 @@ def _b64url_decode(segment: str) -> bytes:
     return base64.urlsafe_b64decode(padded.encode("utf-8"))
 
 
+def _iam_caller_identity_v2(headers, query_params):
+    """The payload-2.0 ``requestContext.authorizer.iam`` block for an AWS_IAM
+    route — field names per the AWS-maintained typed event model
+    (aws-lambda-go ``APIGatewayV2HTTPRequestContextAuthorizerIAMDescription``).
+    Key resolution only; unknown keys return None and the event carries no
+    authorizer block."""
+    from ministack.core.iam_evaluator import resolve_caller_identity
+    from ministack.core.router import extract_access_key_id
+
+    info = resolve_caller_identity(extract_access_key_id(headers, query_params))
+    if not info:
+        return None
+    iam = {
+        "accessKey": info["accessKey"],
+        "accountId": info["accountId"],
+        "callerId": info["userId"] or None,
+        "principalOrgId": info.get("principalOrgId"),
+        "userArn": info["userArn"] or None,
+        "userId": info["userId"] or None,
+    }
+    session = info.get("session") or {}
+    if session.get("_identity_id"):
+        iam["cognitoIdentity"] = {
+            "amr": session.get("_cognito_amr") or [],
+            "identityId": session.get("_identity_id"),
+            "identityPoolId": session.get("_identity_pool_id"),
+        }
+    return iam
+
+
 def _jwt_unauthorized(message: str = "Unauthorized") -> tuple:
     return 401, {"Content-Type": "application/json"}, json.dumps({"message": message}).encode("utf-8")
 
@@ -493,7 +691,38 @@ def _extract_token_from_identity_source(identity_source, headers: dict, query_pa
     return None
 
 
-def _resolve_jwks_url(authorizer: dict) -> str | None:
+async def _fetch_oidc_jwks_uri(issuer: str) -> str | None:
+    """Resolve an issuer's jwks_uri via OIDC discovery, cached per issuer.
+
+    Reads {issuer}/.well-known/openid-configuration and returns its jwks_uri.
+    Returns None (and caches the miss) if discovery is unavailable so callers
+    can fall back to the conventional path.
+    """
+    issuer = issuer.rstrip("/")
+    cached = _oidc_config_cache.get(issuer)
+    now = time.time()
+    if cached and cached.get("expiresAt", 0) > now:
+        return cached.get("jwks_uri")
+    jwks_uri = None
+    try:
+        url = f"{issuer}/.well-known/openid-configuration"
+        _, _, body = await _urlopen_async(url, _JWKS_TIMEOUT_SECONDS)
+        jwks_uri = (json.loads(body or b"{}") or {}).get("jwks_uri")
+    except (OSError, ValueError, json.JSONDecodeError):
+        jwks_uri = None
+    if not isinstance(jwks_uri, str) or not jwks_uri.strip():
+        jwks_uri = None
+    if jwks_uri is not None:
+        # Mirror _fetch_jwks (line ~543) which hardcodes `now + 7200`; no
+        # separate env knob for OIDC discovery — it shares the JWT-auth
+        # external-fetch path.
+        _oidc_config_cache[issuer] = {"jwks_uri": jwks_uri, "expiresAt": now + 7200}
+    else:
+        _oidc_config_cache[issuer] = {"jwks_uri": None, "expiresAt": now + 60}
+    return jwks_uri
+
+
+async def _resolve_jwks_url(authorizer: dict) -> str | None:
     jwt_cfg = authorizer.get("jwtConfiguration") or {}
     issuer = jwt_cfg.get("issuer") or jwt_cfg.get("Issuer")
     if not issuer:
@@ -502,7 +731,8 @@ def _resolve_jwks_url(authorizer: dict) -> str | None:
     if issuer.startswith("https://cognito-idp.") and ".amazonaws.com/" in issuer:
         pool_id = issuer.rsplit("/", 1)[-1]
         return f"http://{_HOST}:{_PORT}/{pool_id}/.well-known/jwks.json"
-    return f"{issuer}/.well-known/jwks.json"
+    discovered = await _fetch_oidc_jwks_uri(issuer)
+    return discovered or f"{issuer}/.well-known/jwks.json"
 
 
 async def _fetch_jwks(url: str) -> dict:
@@ -572,7 +802,7 @@ async def _validate_jwt_authorizer(route: dict, authorizer: dict, headers: dict,
         return None, None, _jwt_unauthorized()
 
     kid = header.get("kid")
-    jwks_url = _resolve_jwks_url(authorizer)
+    jwks_url = await _resolve_jwks_url(authorizer)
     if not kid or not jwks_url:
         return None, None, _jwt_unauthorized()
 
@@ -627,6 +857,345 @@ async def _validate_jwt_authorizer(route: dict, authorizer: dict, headers: dict,
     return claims, token_scopes, None
 
 
+# ---- Data plane: REQUEST (Lambda) authorizers ----
+#
+# HTTP APIs support two authorizer types: JWT (handled inline above via
+# _validate_jwt_authorizer) and REQUEST, which invokes a Lambda function. A
+# route referencing a REQUEST authorizer carries `authorizationType: CUSTOM`
+# (the authorizer resource's own `authorizerType` is REQUEST; the route's
+# AuthorizationType enum has no REQUEST value — same route/authorizer type
+# split as REST/v1). Unlike JWT, ministack never invoked the Lambda at all —
+# _handle_execute_in_scope only branched on `auth_type == "JWT"`, so a CUSTOM
+# route fell through exactly like an unauthenticated `NONE` route. This
+# mirrors the same gap AWS Gateway (REST, v1) had before it was closed for
+# TOKEN/REQUEST authorizers there (see apigateway_v1._authorize_request_v1) —
+# closing it here for HTTP API (v2) too.
+
+
+def _authorizer_arn_matches(pattern, arn):
+    """Match an authorizer IAM policy Resource against a route ARN, honoring
+    `*`/`?` globs. Mirrors apigateway_v1._arn_matches."""
+    regex = "^" + re.escape(pattern).replace(r"\*", ".*").replace(r"\?", ".") + "$"
+    return re.match(regex, arn) is not None
+
+
+def _evaluate_authorizer_policy(policy_doc, route_arn):
+    """Evaluate a REQUEST authorizer's IAM policy against the route ARN.
+
+    Returns "Deny" (explicit deny matched — always wins), "Allow" (an Allow
+    matched and no Deny did), or "NoMatch" (implicit deny — no statement
+    matched). Mirrors apigateway_v1._evaluate_policy.
+    """
+    if not isinstance(policy_doc, dict):
+        return "NoMatch"
+    statements = policy_doc.get("Statement") or []
+    if isinstance(statements, dict):
+        statements = [statements]
+    allow = False
+    for st in statements:
+        if not isinstance(st, dict):
+            continue
+        resources = st.get("Resource")
+        if isinstance(resources, str):
+            resources = [resources]
+        if not any(_authorizer_arn_matches(r, route_arn) for r in (resources or [])):
+            continue
+        if st.get("Effect") == "Deny":
+            return "Deny"
+        if st.get("Effect") == "Allow":
+            allow = True
+    return "Allow" if allow else "NoMatch"
+
+
+def _request_authorizer_identity_sources(identity_source, headers, query_params, stage_vars,
+                                        context=None):
+    """Resolve a REQUEST authorizer's identitySource list to (all_present, values).
+
+    HTTP API identitySource entries use `$request.header.*` / `$request.querystring.*`
+    / `$stageVariables.*` (unlike REST's `method.request.*`), WebSocket APIs
+    `route.request.header.*` / `route.request.querystring.*` / `stageVariables.*`. Returns whether
+    every declared source is present+non-empty and the ordered values (used
+    for the cache-key). Mirrors apigateway_v1._request_identity_sources.
+    """
+    present = True
+    values = []
+    for src in (identity_source or []):
+        if not isinstance(src, str):
+            continue
+        if src.startswith(("route.request.", "stageVariables.")):
+            src = "$" + src.removeprefix("route.")
+        val = ""
+        if src.startswith("$request.header."):
+            val = headers.get(src[len("$request.header."):].lower()) or ""
+        elif src.startswith("$request.querystring."):
+            qn = src[len("$request.querystring."):]
+            qv = (query_params or {}).get(qn)
+            val = (qv[0] if isinstance(qv, list) else qv) or ""
+        elif src.startswith("$stageVariables."):
+            val = (stage_vars or {}).get(src[len("$stageVariables."):]) or ""
+        elif src.startswith("$context."):
+            val = (context or {}).get(src[len("$context."):]) or ""
+        values.append(val)
+        if not val:
+            present = False
+    return present, values
+
+
+def _authorizer_ttl(authorizer):
+    """``authorizerResultTtlInSeconds`` as a non-negative int.
+
+    CreateAuthorizer already defaults the field to ``_DEFAULT_AUTHORIZER_TTL``,
+    so a record reaching here without one was reshaped by UpdateAuthorizer —
+    which copies whatever the request body carried and never validates it.
+    Absent and unparsable therefore mean the same thing and both fall back to
+    the AWS default, instead of silently disabling caching in one case and
+    raising in the other. An explicit 0 still disables it.
+    """
+    raw = authorizer.get("authorizerResultTtlInSeconds")
+    if raw is None or raw == "":
+        return _DEFAULT_AUTHORIZER_TTL
+    try:
+        return max(int(raw), 0)
+    except (TypeError, ValueError):
+        return _DEFAULT_AUTHORIZER_TTL
+
+
+def _cache_authorizer_result(key, expires_at, result, context):
+    """Store one authorizer result, keeping ``_authorizer_cache`` bounded.
+
+    Expired entries are dropped once the cap is reached; if that is not enough,
+    the oldest insertions are evicted.
+    """
+    if len(_authorizer_cache) >= _AUTHORIZER_CACHE_MAX:
+        now = time.time()
+        for stale in [k for k, v in _authorizer_cache.items() if v[0] <= now]:
+            del _authorizer_cache[stale]
+        while len(_authorizer_cache) >= _AUTHORIZER_CACHE_MAX:
+            del _authorizer_cache[next(iter(_authorizer_cache))]
+    _authorizer_cache[key] = (expires_at, result, context)
+
+
+async def _invoke_request_authorizer_lambda(authorizer, event, account_id, region):
+    """Invoke a REQUEST authorizer's Lambda; its response object, or None if it failed or answered no object."""
+    from ministack.services import lambda_svc
+
+    lambda_ref = _extract_lambda_ref_from_integration_uri(authorizer.get("authorizerUri", ""))
+    func_data, func_config, func_name = lambda_svc._get_func_record_for_ref_in_scope(
+        lambda_ref, account_id=account_id, region=region,
+    )
+    if func_data is None or func_config is None:
+        return None
+    exec_record = lambda_svc._execution_record_for_config(func_data, func_config)
+    result = await run_reentrant(
+        lambda_svc._execute_function_with_config_scope, exec_record, event,
+        thread_name="ministack-apigw-authorizer",
+    )
+    if not result or result.get("error"):
+        return None
+    payload = result.get("body")
+    if isinstance(payload, bytes):
+        payload = payload.decode("utf-8", errors="replace")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except json.JSONDecodeError:
+            return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _raw_query_string(query_params, raw_query_string=None):
+    """rawQueryString: the query string as the client sent it. Without one (an internal caller),
+    re-encode the URL-decoded parameters: a raw space breaks lambda_http (http::Uri rejects it ->
+    502), and a decoded '='/'&' inside a value would corrupt the query structure. safe="" encodes
+    everything except RFC-3986 unreserved (#1035)."""
+    if raw_query_string is not None:
+        return raw_query_string
+    return "&".join(
+        f"{urllib.parse.quote(k, safe='')}={urllib.parse.quote(val, safe='')}"
+        for k, vals in (query_params or {}).items() for val in vals
+    )
+
+
+async def _authorize_request_v2(
+    api_id, stage, route, method, path, resource_path,
+    headers, query_params, path_params, stage_vars,
+    owner_account_id, owner_region, raw_query_string=None,
+):
+    """Enforce a REQUEST-type Lambda authorizer before an HTTP API route's
+    integration runs.
+
+    Returns ``(error_response, authorizer_lambda_context)``: when
+    ``error_response`` is not None the caller must short-circuit with it;
+    otherwise ``authorizer_lambda_context`` (possibly None) is injected into
+    the integration event's ``requestContext.authorizer.lambda``, matching
+    real AWS's context-delivery key for HTTP API Lambda authorizers (JWT
+    authorizers deliver under `.jwt` instead — see _validate_jwt_authorizer).
+
+    Honors `authorizerPayloadFormatVersion` (1.0 -> REST-shaped event, IAM
+    policy response only; 2.0 -> the newer event shape, with either a simple
+    `{isAuthorized, context}` response when `enableSimpleResponses` is set,
+    or the same IAM policy response format as 1.0 otherwise) and
+    `authorizerResultTtlInSeconds` caching, mirroring
+    apigateway_v1._authorize_request_v1's REQUEST branch.
+    """
+    authorizer_id = route.get("authorizerId")
+    authorizer = _authorizers.get(api_id, {}).get(authorizer_id) if authorizer_id else None
+    if not authorizer:
+        return (500, {"Content-Type": "application/json"}, json.dumps({"message": "Internal Server Error"}).encode()), None
+
+    route_arn = execute_api_arn(owner_region, owner_account_id, api_id, stage, method, path)
+    payload_version = str(authorizer.get("authorizerPayloadFormatVersion") or "2.0")
+    simple_response = payload_version == "2.0" and bool(authorizer.get("enableSimpleResponses"))
+    ttl = _authorizer_ttl(authorizer)
+
+    identity_source = authorizer.get("identitySource") or []
+    context = {
+        "routeKey": route.get("routeKey", "$default"), "stage": stage, "apiId": api_id,
+        "accountId": owner_account_id, "httpMethod": method, "path": path,
+        "domainName": f"{api_id}.execute-api.{_HOST}",
+        "identity.sourceIp": "127.0.0.1", "identity.userAgent": headers.get("user-agent", ""),
+    }
+    all_present, id_values = _request_authorizer_identity_sources(
+        identity_source, headers, query_params, stage_vars, context
+    )
+    # "To enable caching, your authorizer must have at least one identity
+    # source": the identity values ARE the cache key, so with none declared
+    # there is nothing to key on and every caller would otherwise be served
+    # the first caller's result.
+    caching = ttl > 0 and bool(identity_source)
+    # A declared identity source missing from the request is a 401 without
+    # invoking the Lambda, cached or not.
+    if identity_source and not all_present:
+        return (401, {"Content-Type": "application/json"}, b'{"message":"Unauthorized"}'), None
+    identity_values = tuple(id_values)
+
+    if payload_version == "1.0":
+        qs_params = {k: v[0] for k, v in query_params.items()} if query_params else None
+        mv_qs_params = {k: list(v) for k, v in query_params.items()} if query_params else None
+        event = {
+            "type": "REQUEST",
+            "methodArn": route_arn,
+            "resource": resource_path,
+            "path": path,
+            "httpMethod": method,
+            "headers": dict(headers),
+            "multiValueHeaders": {k: [v] for k, v in headers.items()},
+            "queryStringParameters": qs_params,
+            "multiValueQueryStringParameters": mv_qs_params,
+            "pathParameters": path_params or None,
+            "stageVariables": stage_vars or None,
+            "requestContext": {
+                "stage": stage,
+                "resourcePath": resource_path,
+                "httpMethod": method,
+                "apiId": api_id,
+                "accountId": owner_account_id,
+            },
+        }
+    else:
+        qs = {k: ",".join(v) for k, v in query_params.items()} if query_params else None
+        raw_qs = _raw_query_string(query_params, raw_query_string)
+        event = {
+            "version": "2.0",
+            "type": "REQUEST",
+            "routeArn": route_arn,
+            "identitySource": id_values,
+            "routeKey": route.get("routeKey", "$default"),
+            "rawPath": path,
+            "rawQueryString": raw_qs,
+            "headers": dict(headers),
+            "queryStringParameters": qs,
+            "pathParameters": path_params or None,
+            "stageVariables": stage_vars or None,
+            "requestContext": {
+                "accountId": owner_account_id,
+                "apiId": api_id,
+                "domainName": f"{api_id}.execute-api.{_HOST}",
+                "http": {
+                    "method": method,
+                    "path": path,
+                    "protocol": "HTTP/1.1",
+                    "sourceIp": "127.0.0.1",
+                    "userAgent": headers.get("user-agent", ""),
+                },
+                "requestId": new_uuid(),
+                "routeKey": route.get("routeKey", "$default"),
+                "stage": stage,
+            },
+        }
+
+    # TTL cache: a hit replays the authorizer's OUTPUT without invoking the
+    # Lambda. For an IAM policy response that output is the policy, evaluated
+    # below against this request's own route ARN — never a stored verdict, so a
+    # cached Allow issued for one route or one stage cannot answer another. The
+    # account, region and stage are part of the key because `_authorizers` is
+    # an AccountRegionScopedDict (the same api_id exists per account/region)
+    # and because a stage is an independent deployment of the API.
+    ckey = (owner_account_id, owner_region, api_id, authorizer_id, stage, identity_values)
+    cached = None
+    if caching:
+        hit = _authorizer_cache.get(ckey)
+        if hit and hit[0] > time.time():
+            cached = (hit[1], hit[2])
+
+    if cached is None:
+        payload = await _invoke_request_authorizer_lambda(authorizer, event, owner_account_id, owner_region)
+        if payload is None:
+            return (500, {"Content-Type": "application/json"}, json.dumps({"message": "Internal Server Error"}).encode()), None
+
+        raw_ctx = payload.get("context") or {}
+        if not isinstance(raw_ctx, dict):
+            return (500, {"Content-Type": "application/json"}, json.dumps({"message": "Internal Server Error"}).encode()), None
+
+        if simple_response:
+            authorized = payload.get("isAuthorized")
+            if not isinstance(authorized, bool):
+                # "If ... your Lambda authorizer returns a response in an
+                # invalid format, clients receive a 500 Internal Server Error."
+                # Truthiness is not enough here: `"false"` is a truthy string,
+                # and treating it as an Allow would grant access on a response
+                # that plainly denies it.
+                return (500, {"Content-Type": "application/json"}, json.dumps({"message": "Internal Server Error"}).encode()), None
+            outcome = authorized
+            auth_ctx = dict(raw_ctx)
+        else:
+            policy_doc = payload.get("policyDocument")
+            if not isinstance(policy_doc, dict):
+                # Same invalid-response-format 500: a response without a policy
+                # document is a misconfigured authorizer, not an implicit deny.
+                return (500, {"Content-Type": "application/json"}, json.dumps({"message": "Internal Server Error"}).encode()), None
+            outcome = policy_doc
+            if payload_version == "1.0":
+                # Payload format 1.0 is wire-identical to REST: context values
+                # reach the backend stringified, matching
+                # apigateway_v1._stringify_context.
+                auth_ctx = {
+                    k: ("true" if v is True else "false" if v is False else str(v))
+                    for k, v in raw_ctx.items() if v is not None
+                }
+            else:
+                auth_ctx = dict(raw_ctx)
+            principal_id = payload.get("principalId")
+            if principal_id is not None:
+                auth_ctx["principalId"] = str(principal_id) if payload_version == "1.0" else principal_id
+
+        # A well-formed response is cached whichever way it decided — AWS caches
+        # a returned Deny for the full TTL exactly like an Allow. Only the
+        # invalid-format and invocation-failure paths above are never cached, so
+        # a misconfigured authorizer is re-invoked instead of pinning a 500.
+        cached = (outcome, auth_ctx)
+        if caching:
+            _cache_authorizer_result(ckey, time.time() + ttl, *cached)
+
+    outcome, auth_ctx = cached
+    if isinstance(outcome, bool):
+        if not outcome:
+            return _jwt_forbidden(), None
+    elif _evaluate_authorizer_policy(outcome, route_arn) != "Allow":
+        return _jwt_forbidden(), None
+    return None, auth_ctx
+
+
 def _is_reserved_header(name: str) -> bool:
     lc = (name or "").lower()
     if lc in _RESERVED_HEADER_EXACT:
@@ -667,6 +1236,9 @@ def _resolve_mapping_atom(expr: str, *, request_headers: dict, request_query: di
         if path.startswith("authorizer.claims."):
             claim_path = path[len("authorizer.claims.") :]
             return _get_claim(context_vars.get("authorizer.jwt.claims") or {}, claim_path)
+        if path.startswith("authorizer.lambda."):
+            claim_path = path[len("authorizer.lambda.") :]
+            return _get_claim(context_vars.get("authorizer.lambda") or {}, claim_path)
         return context_vars.get(path)
     return expr
 
@@ -756,11 +1328,39 @@ def _apply_request_parameter_mappings(
     return out_headers, out_query, out_path
 
 
-async def handle_execute(api_id, stage, path, method, headers, body, query_params):
+async def handle_execute(api_id, stage, path, method, headers, body, query_params, raw_query_string=None):
     """Execute an API request through a deployed API (data plane)."""
+    scope = find_api_scope(api_id)
+    if scope is None:
+        return _http_api_not_found()
+    owner_account_id, owner_region = scope
+
+    from ministack.core.responses import _request_account_id, _request_region
+
+    account_token = _request_account_id.set(owner_account_id)
+    region_token = _request_region.set(owner_region)
+    try:
+        return await _handle_execute_in_scope(
+            api_id, stage, path, method, headers, body, query_params,
+            owner_account_id, owner_region, raw_query_string,
+        )
+    finally:
+        _request_account_id.reset(account_token)
+        _request_region.reset(region_token)
+
+
+def _http_api_not_found():
+    """AWS's 404 for a request no stage or route of an HTTP API matches."""
+    return 404, {"Content-Type": "application/json"}, b'{"message":"Not Found"}'
+
+
+async def _handle_execute_in_scope(
+    api_id, stage, path, method, headers, body, query_params,
+    owner_account_id, owner_region, raw_query_string=None,
+):
     api = _apis.get(api_id)
     if not api:
-        return 404, {"Content-Type": "application/json"}, json.dumps({"message": "Not Found"}).encode()
+        return _http_api_not_found()
 
     # CORS preflight: served from the API's corsConfiguration before any route
     # matching, because AWS responds to OPTIONS itself without invoking the
@@ -771,11 +1371,13 @@ async def handle_execute(api_id, stage, path, method, headers, body, query_param
 
     api_stages = _stages.get(api_id, {})
     if stage not in api_stages and stage != "$default":
-        return 404, {"Content-Type": "application/json"}, json.dumps({"message": f"Stage '{stage}' not found"}).encode()
+        return _http_api_not_found()
 
-    route = _match_route(api_id, method, path)
+    # AWS selects the route of a path with extra leading slashes as if it had one.
+    route_path_in = "/" + path.lstrip("/")
+    route = _match_route(api_id, method, route_path_in)
     if not route:
-        return 404, {"Content-Type": "application/json"}, json.dumps({"message": "No route found"}).encode()
+        return _http_api_not_found()
 
     request_headers = {k.lower(): v for k, v in (headers or {}).items()}
     route_key = route.get("routeKey", "$default")
@@ -783,11 +1385,14 @@ async def handle_execute(api_id, stage, path, method, headers, body, query_param
     rk_parts = route_key.split(" ", 1)
     if len(rk_parts) == 2:
         route_path = rk_parts[1]
-    path_params = _extract_path_params(route_path, path) if route_path else {}
+    path_params = _extract_path_params(route_path, route_path_in) if route_path else {}
 
+    stage_vars = _get_stage_variables(api_id, stage)
     auth_type = (route.get("authorizationType") or "NONE").upper()
     authorizer_claims = None
     authorizer_scopes = []
+    authorizer_lambda_ctx = None
+    authorizer_iam = None
     if auth_type == "JWT":
         authorizer_id = route.get("authorizerId")
         if not authorizer_id:
@@ -800,6 +1405,26 @@ async def handle_execute(api_id, stage, path, method, headers, body, query_param
             return auth_error
         authorizer_claims = claims or {}
         authorizer_scopes = scopes or []
+    elif auth_type == "AWS_IAM":
+        # Same stance as REST (v1): signatures are never verified; a request
+        # with no Authorization header is rejected, a resolvable access key
+        # fills requestContext.authorizer.iam (aws-lambda-go event shape).
+        if not any(k.lower() == "authorization" for k in request_headers):
+            return _jwt_forbidden()
+        authorizer_iam = _iam_caller_identity_v2(request_headers, query_params or {})
+    elif auth_type == "CUSTOM":
+        # A route's AuthorizationType is CUSTOM when it references a Lambda
+        # (REQUEST-type) authorizer — same convention as REST (v1): the
+        # authorizer resource's own `authorizerType` is REQUEST, but the
+        # *route* is tagged CUSTOM, not REQUEST (confirmed against the
+        # apigatewayv2 CreateRoute/CreateAuthorizer service models).
+        auth_error, authorizer_lambda_ctx = await _authorize_request_v2(
+            api_id, stage, route, method, path, (route_path or path),
+            request_headers, query_params or {}, path_params, stage_vars,
+            owner_account_id, owner_region, raw_query_string,
+        )
+        if auth_error is not None:
+            return auth_error
 
     raw_target = route.get("target", "").replace("integrations/", "")
     # Target is "{integrationId}" — the current Ref / CFN physical ID.
@@ -811,7 +1436,6 @@ async def handle_execute(api_id, stage, path, method, headers, body, query_param
         return 500, {"Content-Type": "application/json"}, json.dumps({"message": "No integration configured"}).encode()
 
     integration_type = integration.get("integrationType", "")
-    stage_vars = _get_stage_variables(api_id, stage)
     context_vars = {
         "requestId": new_uuid(),
         "httpMethod": method,
@@ -820,6 +1444,7 @@ async def handle_execute(api_id, stage, path, method, headers, body, query_param
         "stage": stage,
         "authorizer.jwt.claims": authorizer_claims or {},
         "authorizer.jwt.scopes": authorizer_scopes,
+        "authorizer.lambda": authorizer_lambda_ctx or {},
     }
 
     if integration_type == "AWS_PROXY":
@@ -836,6 +1461,11 @@ async def handle_execute(api_id, stage, path, method, headers, body, query_param
             (path_params or None),
             authorizer_claims=authorizer_claims,
             authorizer_scopes=authorizer_scopes,
+            authorizer_lambda_context=authorizer_lambda_ctx,
+            authorizer_iam=authorizer_iam,
+            owner_account_id=owner_account_id,
+            owner_region=owner_region,
+            raw_query_string=raw_query_string,
         )
     elif integration_type == "HTTP_PROXY":
         mapped_headers, mapped_query, mapped_path = _apply_request_parameter_mappings(
@@ -867,10 +1497,42 @@ async def handle_execute(api_id, stage, path, method, headers, body, query_param
     return response
 
 
+def _route_specificity(method: str, route_path: str) -> tuple:
+    """Rank a candidate route by how specifically it matches a request.
+
+    Real API Gateway selects the most specific match with this priority
+    (docs, "Routing API requests"): (1) a full match for route+method, then
+    (2) a match with a greedy ``{proxy+}`` path variable, then (3) ``$default``.
+    So the *primary* discriminator is full-match-beats-greedy — a full match
+    always outranks a greedy one, even one with more literal segments. The tuple
+    is compared lexicographically (higher is more specific):
+
+      1. Non-greedy (full match) over greedy (``{proxy+}`` catch-all).
+      2. Number of literal (non-parameter) path segments — a static path beats
+         one with placeholders.
+      3. Explicit method over ``ANY`` — ``POST /items`` beats ``ANY /items``.
+    """
+    segments = route_path.strip("/").split("/")
+    literal_segments = sum(
+        1 for s in segments if not (s.startswith("{") and s.endswith("}"))
+    )
+    is_greedy = any(s == "{proxy+}" for s in segments)
+    return (0 if is_greedy else 1, literal_segments, 0 if method == "ANY" else 1)
+
+
 def _match_route(api_id, method, path):
-    """Find the best matching route for method+path. $default route is the fallback."""
+    """Find the best matching route for method+path. $default route is the fallback.
+
+    All routes matching the request are ranked by specificity (see
+    ``_route_specificity``) and the most specific one wins, mirroring real API
+    Gateway. This matters when a dedicated route (e.g. ``POST /items``) and a
+    greedy catch-all (e.g. ``ANY /{proxy+}``) both match: the dedicated route
+    must win regardless of which was registered first.
+    """
     routes = _routes.get(api_id, {})
-    # First pass: look for a specific method+path match (skip $default)
+    # First pass: collect every specific method+path match (skip $default).
+    best_route = None
+    best_specificity = None
     for route in routes.values():
         key = route.get("routeKey", "")
         if key == "$default":
@@ -879,12 +1541,28 @@ def _match_route(api_id, method, path):
         if len(parts) == 2:
             r_method, r_path = parts
             if (r_method == "ANY" or r_method == method) and _path_matches(r_path, path):
-                return route
+                specificity = _route_specificity(r_method, r_path)
+                if best_specificity is None or specificity > best_specificity:
+                    best_route, best_specificity = route, specificity
+    if best_route is not None:
+        return best_route
     # Second pass: $default catch-all
     for route in routes.values():
         if route.get("routeKey") == "$default":
             return route
     return None
+
+
+def route_authorization_type(api_id, stage, method, path):
+    """The authorizationType of the route an HTTP API request reaches, or None."""
+    scope = find_api_scope(api_id)
+    if scope is None:
+        return None
+    with request_scope(*scope):
+        if stage not in _stages.get(api_id, {}) and stage != "$default":
+            return None
+        route = _match_route(api_id, method, "/" + path.lstrip("/"))
+    return (route.get("authorizationType") or "NONE").upper() if route else None
 
 
 def _extract_path_params(route_path: str, request_path: str) -> dict | None:
@@ -921,6 +1599,32 @@ def _path_matches(route_path: str, request_path: str) -> bool:
     return _extract_path_params(route_path, request_path) is not None
 
 
+def _v2_request_body_is_text(content_type: str | None) -> bool:
+    """Whether an HTTP API (v2) request body is delivered as a UTF-8 string.
+
+    Real AWS delivers the body as text (``isBase64Encoded`` false) only for a
+    whitelist of content types; everything else — including a missing content
+    type and ``application/x-www-form-urlencoded`` — is base64-encoded. The docs
+    don't enumerate this, so the set below was verified against live AWS.
+    """
+    ct = (content_type or "").split(";", 1)[0].strip().lower()
+    return ct.startswith("text/") or ct in (
+        "application/json",
+        "application/xml",
+        "application/javascript",
+    )
+
+
+def _jwt_claim_to_string(value):
+    """API Gateway hands every JWT claim to a Lambda as a string: numbers as digits,
+    booleans as true/false, and an array as its items in brackets, e.g. "[admin dev]"."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "[" + " ".join(_jwt_claim_to_string(v) for v in value) + "]"
+    return json.dumps(value)
+
+
 async def _invoke_lambda_proxy(
     integration,
     api_id,
@@ -935,6 +1639,11 @@ async def _invoke_lambda_proxy(
     *,
     authorizer_claims=None,
     authorizer_scopes=None,
+    authorizer_lambda_context=None,
+    authorizer_iam=None,
+    owner_account_id=None,
+    owner_region=None,
+    raw_query_string=None,
 ):
     """Invoke a Lambda function using the API Gateway v2 proxy event format."""
     from ministack.services import lambda_svc
@@ -944,26 +1653,35 @@ async def _invoke_lambda_proxy(
     # Unwrap to the inner Lambda ARN before parsing name + qualifier (#409).
     # Bare Lambda ARNs and plain function names keep working via the fallback.
     lambda_ref = _extract_lambda_ref_from_integration_uri(integration.get("integrationUri", ""))
-    func_name, qualifier = lambda_svc._resolve_name_and_qualifier(lambda_ref)
-    func_data, func_config = lambda_svc._get_func_record_for_qualifier(func_name, qualifier)
-    if func_data is None:
+    func_data, func_config, func_name = lambda_svc._get_func_record_for_ref_in_scope(
+        lambda_ref,
+        account_id=owner_account_id,
+        region=owner_region,
+    )
+    if func_data is None or func_config is None:
         return 502, {"Content-Type": "application/json"}, json.dumps({
-            "message": f"Lambda function '{func_name}'" +
-                       (f" (qualifier '{qualifier}')" if qualifier else "") +
-                       " not found"
+            "message": f"Lambda function '{lambda_ref or func_name}' not found"
         }).encode()
 
     # Build API Gateway v2 proxy event (payload format 2.0)
     # AWS API Gateway v2 joins multi-value query params with commas
     qs = {k: ",".join(v) for k, v in query_params.items()} if query_params else None
-    raw_qs = "&".join(f"{k}={val}" for k, vals in query_params.items() for val in vals)
+    raw_qs = _raw_query_string(query_params, raw_query_string)
+    # Binary request bodies are base64-encoded with isBase64Encoded=true; only
+    # the text content types AWS recognizes are passed through as UTF-8 strings.
+    if body:
+        if _v2_request_body_is_text(headers.get("content-type")):
+            req_body, req_is_base64 = body.decode("utf-8", errors="replace"), False
+        else:
+            req_body, req_is_base64 = base64.b64encode(body).decode("ascii"), True
+    else:
+        req_body, req_is_base64 = None, False
     event = {
         "version": "2.0",
         "routeKey": route_key,
         "rawPath": path,
         "rawQueryString": raw_qs,
         "headers": dict(headers),
-        "queryStringParameters": qs,
         "requestContext": {
             "accountId": get_account_id(),
             "apiId": api_id,
@@ -982,31 +1700,77 @@ async def _invoke_lambda_proxy(
             "timeEpoch": int(time.time() * 1000),
         },
         "pathParameters": path_params,
-        "body": body.decode("utf-8", errors="replace") if body else None,
-        "isBase64Encoded": False,
+        "isBase64Encoded": req_is_base64,
     }
+    # Real AWS omits body entirely for a bodyless request rather than sending
+    # it as null — same isAPIGatewayProxyEventV2 rejection as
+    # queryStringParameters below (undefined/a string are accepted, null is
+    # not), so this broke every GET/DELETE-style request with no payload.
+    if req_body is not None:
+        event["body"] = req_body
+    # Real AWS omits queryStringParameters entirely when there is no query
+    # string, rather than sending it as null — strict event-shape validators
+    # (e.g. Powertools' isAPIGatewayProxyEventV2) accept undefined/a record
+    # but reject null, so a present-but-null key fails every request lacking
+    # a query string.
+    if qs:
+        event["queryStringParameters"] = qs
     if authorizer_claims is not None:
         event["requestContext"]["authorizer"] = {
             "jwt": {
-                "claims": authorizer_claims or {},
+                "claims": {k: _jwt_claim_to_string(v) for k, v in (authorizer_claims or {}).items()},
                 "scopes": authorizer_scopes or [],
             }
         }
+    elif authorizer_lambda_context is not None:
+        event["requestContext"]["authorizer"] = {"lambda": authorizer_lambda_context}
+    elif authorizer_iam is not None:
+        event["requestContext"]["authorizer"] = {"iam": authorizer_iam}
 
     # Route through the central _execute_function dispatcher so CloudWatch
     # Logs emission and Docker log output work for API Gateway invocations.
     # Response shaping (throttle→429, error→502, body→envelope) goes through
     # the shared helper so v1/v2 stay consistent and we get 429s on
     # ConcurrentInvocationLimitExceeded.
-    exec_record = {"config": func_config, "code_zip": func_data.get("code_zip")}
-    result = await asyncio.to_thread(lambda_svc._execute_function, exec_record, event)
+    exec_record = lambda_svc._execution_record_for_config(func_data, func_config)
+    result = await run_reentrant(lambda_svc._execute_function_with_config_scope, exec_record, event,
+                                 thread_name="ministack-apigw-invoke")
     lambda_response, _ = lambda_svc.lambda_execute_result_to_api_proxy_response(result)
 
     status = lambda_response.get("statusCode", 200)
     resp_headers = {"Content-Type": "application/json"}
-    resp_headers.update(lambda_response.get("headers", {}))
+    # Apply the Lambda's headers, letting each override any case-insensitive
+    # default already present. HTTP field names are case-insensitive (RFC 9110
+    # §5.1), so a lowercase `content-type` from the function must replace the
+    # seeded `Content-Type`, not ship alongside it — the same case-insensitive
+    # handling #750 applied to the v1 multiValueHeaders merge.
+    for k, v in (lambda_response.get("headers") or {}).items():
+        lower_k = k.lower()
+        for existing in [h for h in resp_headers if h.lower() == lower_k]:
+            del resp_headers[existing]
+        resp_headers[k] = v
+    # Payload format 2.0 delivers cookies via the top-level `cookies` array,
+    # which AWS turns into one Set-Cookie header per entry. Observed AWS
+    # behavior when both `cookies` and a `Set-Cookie` in `headers` are
+    # returned: both ship, with the array's entries emitted first followed by
+    # any header Set-Cookie. Merge case-insensitively on the header key, then
+    # reassign under the canonical `Set-Cookie`. _send_response expands the
+    # list into one Set-Cookie line per entry.
+    cookies = lambda_response.get("cookies")
+    if cookies:
+        prior = []
+        for existing in [h for h in resp_headers if h.lower() == "set-cookie"]:
+            val = resp_headers.pop(existing)
+            prior.extend(val if isinstance(val, (list, tuple)) else [val])
+        resp_headers["Set-Cookie"] = list(cookies) + prior
     resp_body = lambda_response.get("body", "")
-    if isinstance(resp_body, str):
+    # A base64-encoded body (isBase64Encoded=true) is decoded to its raw bytes
+    # before sending. HTTP APIs (v2) honor this unconditionally — there is no
+    # binaryMediaTypes negotiation as in REST (v1) — so a true flag always means
+    # "the body string is base64; emit the decoded bytes."
+    if lambda_response.get("isBase64Encoded") and isinstance(resp_body, str):
+        resp_body = base64.b64decode(resp_body)
+    elif isinstance(resp_body, str):
         resp_body = resp_body.encode("utf-8")
     elif isinstance(resp_body, dict):
         resp_body = json.dumps(resp_body, ensure_ascii=False).encode("utf-8")
@@ -1046,7 +1810,33 @@ async def _invoke_http_proxy(integration, path, method, headers, body, query_par
 
 # ---- Control plane: APIs ----
 
-def _resolve_custom_api_id(tags: dict, existing: "AccountScopedDict") -> str | None:
+def find_api_owner(api_id):
+    """The account owning HTTP or WebSocket API ``api_id``, or None. Only for invoking it."""
+    for (stored_account, _region, stored_api_id), _api in _apis.all_items():
+        if stored_api_id == api_id:
+            return stored_account
+    return None
+
+
+def find_api_scope(api_id):
+    """Return (account_id, region) owning api_id within the ambient account."""
+    account_id = get_account_id()
+    for (stored_account, region, stored_api_id), _api in _apis.all_items():
+        if stored_account == account_id and stored_api_id == api_id:
+            return stored_account, region
+    return None
+
+
+def stages_for_api(api_id):
+    """Return stages for api_id after resolving the v2 data-plane owner scope."""
+    scope = find_api_scope(api_id)
+    if scope is None:
+        return {}
+    account_id, region = scope
+    return _stages.get_scoped(account_id, region, api_id, {})
+
+
+def _resolve_custom_api_id(tags: dict, existing: "AccountRegionScopedDict") -> str | None:
     """Return a caller-pinned API id from the ``ms-custom-id`` tag, or None
     if no tag is set (issue #400).
 
@@ -1066,11 +1856,24 @@ def _resolve_custom_api_id(tags: dict, existing: "AccountScopedDict") -> str | N
     custom = tags.get("ms-custom-id")
     if not custom:
         return None
-    if custom in existing:
+    if existing is _apis and find_api_scope(str(custom)) is not None:
+        raise ValueError(
+            f"API id '{custom}' (from ms-custom-id tag) is already in use"
+        )
+    if existing is not _apis and custom in existing:
         raise ValueError(
             f"API id '{custom}' (from ms-custom-id tag) is already in use"
         )
     return str(custom)
+
+
+def _api_endpoint_scheme(protocol):
+    """AWS's apiEndpoint scheme once the gateway serves TLS; http otherwise."""
+    from ministack.core import tls as _tls
+
+    if not _tls.use_ssl_enabled():
+        return "http"
+    return "wss" if protocol == "WEBSOCKET" else "https"
 
 
 def _create_api(data):
@@ -1089,7 +1892,7 @@ def _create_api(data):
         "apiId": api_id,
         "name": data.get("name", "unnamed"),
         "protocolType": protocol,
-        "apiEndpoint": f"http://{api_id}.execute-api.{_HOST}:{_PORT}",
+        "apiEndpoint": f"{_api_endpoint_scheme(protocol)}://{api_id}.execute-api.{_HOST}:{_PORT}",
         "createdDate": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "routeSelectionExpression": data.get("routeSelectionExpression", default_rse),
         "apiKeySelectionExpression": data.get("apiKeySelectionExpression", "$request.header.x-api-key"),
@@ -1101,6 +1904,8 @@ def _create_api(data):
     }
     if data.get("corsConfiguration"):
         api["corsConfiguration"] = data["corsConfiguration"]
+    if data.get("ipAddressType"):
+        api["ipAddressType"] = data["ipAddressType"]
     _apis[api_id] = api
     _routes[api_id] = {}
     _integrations[api_id] = {}
@@ -1117,17 +1922,29 @@ def _get_api(api_id):
     return _apigw_response(api)
 
 
-def _get_apis():
-    return _apigw_response({"items": list(_apis.values())})
+def _get_apis(query_params=None):
+    return _page(list(_apis.values()), query_params)
+
+
+def _api_not_found(api_id):
+    return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
+
+
+def _require_api(api_id):
+    if api_id not in _apis:
+        return _api_not_found(api_id)
+    return None
 
 
 def _delete_api(api_id):
+    if api_id not in _apis:
+        return _api_not_found(api_id)
+    _delete_api_tag_resources(api_id)
     _apis.pop(api_id, None)
     _routes.pop(api_id, None)
     _integrations.pop(api_id, None)
     _stages.pop(api_id, None)
     _deployments.pop(api_id, None)
-    _api_tags.pop(_api_arn(api_id), None)
     return 204, {}, b""
 
 
@@ -1135,18 +1952,69 @@ def _update_api(api_id, data):
     api = _apis.get(api_id)
     if not api:
         return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
-    for k in ("name", "corsConfiguration", "routeSelectionExpression",
-              "disableSchemaValidation", "disableExecuteApiEndpoint", "version"):
+    for k in ("name", "routeSelectionExpression", "apiKeySelectionExpression",
+              "disableSchemaValidation", "disableExecuteApiEndpoint", "version",
+              "description", "ipAddressType"):
         if k in data:
             api[k] = data[k]
+    # A CORS configuration is replaced wholesale, never removed here: the API
+    # has DeleteCorsConfiguration for that, so an empty one is nothing to
+    # apply. A caller that means to remove it deletes it.
+    if data.get("corsConfiguration"):
+        api["corsConfiguration"] = data["corsConfiguration"]
     return _apigw_response(api)
+
+
+def _delete_cors_configuration(api_id):
+    """DeleteCorsConfiguration: the operation that removes an HTTP API's CORS
+    configuration (UpdateApi replaces it, it cannot clear it)."""
+    api = _apis.get(api_id)
+    if not api:
+        return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
+    api.pop("corsConfiguration", None)
+    return 204, {}, b""
 
 
 # ---- Control plane: Routes ----
 
+_WS_AUTHORIZER_TYPE_MESSAGE = (
+    "Invalid authorizer type. Only REQUEST authorizer type is supported on WEBSOCKET protocol Apis."
+)
+
+
+def _ws_authorizer_type_message(api_id, authorizer_type):
+    """The BadRequestException message a WebSocket API answers for an authorizer type it does not support."""
+    if _apis.get(api_id, {}).get("protocolType") == "WEBSOCKET" and authorizer_type != "REQUEST":
+        return _WS_AUTHORIZER_TYPE_MESSAGE
+    return None
+
+
+def _ws_route_authorization_message(api_id, route_key, authorization_type):
+    """The BadRequestException message a WebSocket API answers for route authorization it does not support."""
+    if _apis.get(api_id, {}).get("protocolType") != "WEBSOCKET" or (authorization_type or "NONE") == "NONE":
+        return None
+    if route_key != "$connect":
+        return "Currently, authorization is restricted to the $connect route only"
+    if authorization_type == "JWT":
+        return "Currently, JWT authorization type is restricted to APIs with a protocol type of HTTP"
+    return None
+
+
+def _ws_route_authorization_error(api_id, route_key, authorization_type):
+    """The BadRequestException a WebSocket API answers for route authorization it does not support."""
+    message = _ws_route_authorization_message(api_id, route_key, authorization_type)
+    return _apigw_error("BadRequestException", message, 400) if message else None
+
+
+_ROUTE_SELECTION_EXPRESSIONS = ("modelSelectionExpression", "routeResponseSelectionExpression")
+_STAGE_OPTIONAL_FIELDS = ("accessLogSettings", "clientCertificateId", "deploymentId")
+
+
 def _create_route(api_id, data):
     if api_id not in _apis:
-        return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
+        return _api_not_found(api_id)
+    if err := _ws_route_authorization_error(api_id, data.get("routeKey", "$default"), data.get("authorizationType")):
+        return err
     route_id = new_uuid()[:8]
     route = {
         "routeId": route_id,
@@ -1164,15 +2032,22 @@ def _create_route(api_id, data):
         route["requestModels"] = data["requestModels"]
     if data.get("requestParameters"):
         route["requestParameters"] = data["requestParameters"]
+    for k in _ROUTE_SELECTION_EXPRESSIONS:
+        if data.get(k):
+            route[k] = data[k]
     _routes.setdefault(api_id, {})[route_id] = route
     return _apigw_response(route, 201)
 
 
-def _get_routes(api_id):
-    return _apigw_response({"items": list(_routes.get(api_id, {}).values())})
+def _get_routes(api_id, query_params=None):
+    if err := _require_api(api_id):
+        return err
+    return _page(list(_routes.get(api_id, {}).values()), query_params)
 
 
 def _get_route(api_id, route_id):
+    if err := _require_api(api_id):
+        return err
     route = _routes.get(api_id, {}).get(route_id)
     if not route:
         return _apigw_error("NotFoundException", f"Route {route_id} not found", 404)
@@ -1180,9 +2055,15 @@ def _get_route(api_id, route_id):
 
 
 def _update_route(api_id, route_id, data):
+    if err := _require_api(api_id):
+        return err
     route = _routes.get(api_id, {}).get(route_id)
     if not route:
         return _apigw_error("NotFoundException", f"Route {route_id} not found", 404)
+    if err := _ws_route_authorization_error(
+        api_id, data.get("routeKey", route["routeKey"]), data.get("authorizationType", route.get("authorizationType")),
+    ):
+        return err
     for k in (
         "routeKey",
         "target",
@@ -1207,7 +2088,7 @@ def _update_route(api_id, route_id, data):
                 route.pop("authorizationScopes", None)
         else:
             route[k] = v
-    for rk in ("requestModels", "requestParameters"):
+    for rk in ("requestModels", "requestParameters", *_ROUTE_SELECTION_EXPRESSIONS):
         if rk not in data:
             continue
         v = data.get(rk)
@@ -1219,26 +2100,42 @@ def _update_route(api_id, route_id, data):
 
 
 def _delete_route(api_id, route_id):
+    if err := _require_api(api_id):
+        return err
     _routes.get(api_id, {}).pop(route_id, None)
+    _api_tags.pop(_api_resource_arn(api_id, "routes", route_id), None)
     return 204, {}, b""
 
 
 # ---- Control plane: Integrations ----
 
+_INTEGRATION_OPTIONAL_FIELDS = (
+    "connectionId", "credentialsArn", "integrationSubtype", "passthroughBehavior",
+    "templateSelectionExpression", "tlsConfig",
+)
+
+
 def _create_integration(api_id, data):
     if api_id not in _apis:
-        return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
+        return _api_not_found(api_id)
     int_id = new_uuid()[:8]
+    websocket = _apis[api_id].get("protocolType") == "WEBSOCKET"
+    integration_type = data.get("integrationType", "AWS_PROXY")
+    # Lambda proxy on an HTTP API takes 1.0 or 2.0; every other integration only 1.0.
+    default_pfv = "2.0" if integration_type == "AWS_PROXY" and not websocket else "1.0"
     integration = {
         "integrationId": int_id,
-        "integrationType": data.get("integrationType", "AWS_PROXY"),
+        "integrationType": integration_type,
         "integrationUri": data.get("integrationUri", ""),
         "integrationMethod": data.get("integrationMethod", "POST"),
-        "payloadFormatVersion": data.get("payloadFormatVersion", "2.0"),
-        "timeoutInMillis": data.get("timeoutInMillis", 30000),
+        "payloadFormatVersion": data.get("payloadFormatVersion", default_pfv),
+        "timeoutInMillis": data.get("timeoutInMillis", 29000 if websocket else 30000),
         "connectionType": data.get("connectionType", "INTERNET"),
         "description": data.get("description", ""),
     }
+    for k in _INTEGRATION_OPTIONAL_FIELDS:
+        if data.get(k):
+            integration[k] = data[k]
     if data.get("requestParameters"):
         integration["requestParameters"] = data["requestParameters"]
     if data.get("requestTemplates"):
@@ -1254,11 +2151,15 @@ def _create_integration(api_id, data):
     return _apigw_response(integration, 201)
 
 
-def _get_integrations(api_id):
-    return _apigw_response({"items": list(_integrations.get(api_id, {}).values())})
+def _get_integrations(api_id, query_params=None):
+    if err := _require_api(api_id):
+        return err
+    return _page(list(_integrations.get(api_id, {}).values()), query_params)
 
 
 def _get_integration(api_id, int_id):
+    if err := _require_api(api_id):
+        return err
     integration = _integrations.get(api_id, {}).get(int_id)
     if not integration:
         return _apigw_error("NotFoundException", f"Integration {int_id} not found", 404)
@@ -1266,17 +2167,20 @@ def _get_integration(api_id, int_id):
 
 
 def _update_integration(api_id, int_id, data):
+    if err := _require_api(api_id):
+        return err
     integration = _integrations.get(api_id, {}).get(int_id)
     if not integration:
         return _apigw_error("NotFoundException", f"Integration {int_id} not found", 404)
     for k in ("integrationType", "integrationUri", "integrationMethod",
               "payloadFormatVersion", "timeoutInMillis", "connectionType",
               "description", "requestParameters", "requestTemplates", "responseParameters",
-              "contentHandlingStrategy"):
+              "contentHandlingStrategy", *_INTEGRATION_OPTIONAL_FIELDS):
         if k not in data:
             continue
         v = data[k]
-        if k in ("requestParameters", "requestTemplates", "responseParameters"):
+        if k in ("requestParameters", "requestTemplates", "responseParameters",
+                 *_INTEGRATION_OPTIONAL_FIELDS):
             if v:
                 integration[k] = v
             else:
@@ -1292,7 +2196,10 @@ def _update_integration(api_id, int_id, data):
 
 
 def _delete_integration(api_id, int_id):
+    if err := _require_api(api_id):
+        return err
     _integrations.get(api_id, {}).pop(int_id, None)
+    _api_tags.pop(_api_resource_arn(api_id, "integrations", int_id), None)
     return 204, {}, b""
 
 
@@ -1300,7 +2207,7 @@ def _delete_integration(api_id, int_id):
 
 def _create_stage(api_id, data):
     if api_id not in _apis:
-        return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
+        return _api_not_found(api_id)
     stage_name = data.get("stageName", "$default")
     stage = {
         "stageName": stage_name,
@@ -1313,15 +2220,22 @@ def _create_stage(api_id, data):
         "routeSettings": data.get("routeSettings", {}),
         "tags": data.get("tags", {}),
     }
+    stage.update({k: data[k] for k in _STAGE_OPTIONAL_FIELDS if data.get(k)})
     _stages.setdefault(api_id, {})[stage_name] = stage
+    if data.get("tags"):
+        _api_tags[_api_resource_arn(api_id, "stages", stage_name)] = dict(data.get("tags", {}))
     return _apigw_response(stage, 201)
 
 
-def _get_stages(api_id):
-    return _apigw_response({"items": list(_stages.get(api_id, {}).values())})
+def _get_stages(api_id, query_params=None):
+    if err := _require_api(api_id):
+        return err
+    return _page(list(_stages.get(api_id, {}).values()), query_params)
 
 
 def _get_stage(api_id, stage_name):
+    if err := _require_api(api_id):
+        return err
     stage = _stages.get(api_id, {}).get(stage_name)
     if not stage:
         return _apigw_error("NotFoundException", f"Stage '{stage_name}' not found", 404)
@@ -1329,6 +2243,8 @@ def _get_stage(api_id, stage_name):
 
 
 def _update_stage(api_id, stage_name, data):
+    if err := _require_api(api_id):
+        return err
     stage = _stages.get(api_id, {}).get(stage_name)
     if not stage:
         return _apigw_error("NotFoundException", f"Stage '{stage_name}' not found", 404)
@@ -1336,12 +2252,22 @@ def _update_stage(api_id, stage_name, data):
               "defaultRouteSettings", "routeSettings"):
         if k in data:
             stage[k] = data[k]
+    for k in _STAGE_OPTIONAL_FIELDS:
+        if k not in data:
+            continue
+        if data[k]:
+            stage[k] = data[k]
+        else:
+            stage.pop(k, None)
     stage["lastUpdatedDate"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     return _apigw_response(stage)
 
 
 def _delete_stage(api_id, stage_name):
+    if err := _require_api(api_id):
+        return err
     _stages.get(api_id, {}).pop(stage_name, None)
+    _api_tags.pop(_api_resource_arn(api_id, "stages", stage_name), None)
     return 204, {}, b""
 
 
@@ -1349,7 +2275,7 @@ def _delete_stage(api_id, stage_name):
 
 def _create_deployment(api_id, data):
     if api_id not in _apis:
-        return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
+        return _api_not_found(api_id)
     deployment_id = new_uuid()[:8]
     deployment = {
         "deploymentId": deployment_id,
@@ -1361,11 +2287,15 @@ def _create_deployment(api_id, data):
     return _apigw_response(deployment, 201)
 
 
-def _get_deployments(api_id):
-    return _apigw_response({"items": list(_deployments.get(api_id, {}).values())})
+def _get_deployments(api_id, query_params=None):
+    if err := _require_api(api_id):
+        return err
+    return _page(list(_deployments.get(api_id, {}).values()), query_params)
 
 
 def _get_deployment(api_id, deployment_id):
+    if err := _require_api(api_id):
+        return err
     deployment = _deployments.get(api_id, {}).get(deployment_id)
     if not deployment:
         return _apigw_error("NotFoundException", f"Deployment {deployment_id} not found", 404)
@@ -1373,27 +2303,364 @@ def _get_deployment(api_id, deployment_id):
 
 
 def _delete_deployment(api_id, deployment_id):
+    if err := _require_api(api_id):
+        return err
     _deployments.get(api_id, {}).pop(deployment_id, None)
+    _api_tags.pop(_api_resource_arn(api_id, "deployments", deployment_id), None)
     return 204, {}, b""
 
 
 # ---- Control plane: Tags ----
 
+def _invalid_tag_resource_arn(resource_arn: str):
+    return _apigw_error(
+        "BadRequestException",
+        f"Invalid API Gateway v2 ResourceArn: {resource_arn}",
+        400,
+    )
+
+
+def _tag_resource_not_found(resource_arn: str):
+    return _apigw_error(
+        "NotFoundException",
+        f"API Gateway v2 resource not found: {resource_arn}",
+        404,
+    )
+
+
+def _api_exists_in_request_region(api_id: str) -> bool:
+    return api_id in _apis
+
+
+def _validate_tag_resource_arn(resource_arn: str) -> tuple[str | None, tuple | None]:
+    try:
+        spec = parse_arn(resource_arn)
+    except ArnParseError:
+        return None, _invalid_tag_resource_arn(resource_arn)
+
+    if (
+        spec.partition != "aws"
+        or spec.service != "apigateway"
+        or not spec.region
+        or spec.region != get_region()
+        or spec.account_id != ""
+        or not spec.resource.startswith("/")
+    ):
+        return None, _invalid_tag_resource_arn(resource_arn)
+
+    segments = spec.resource[1:].split("/")
+    if not segments or any(segment == "" for segment in segments):
+        return None, _invalid_tag_resource_arn(resource_arn)
+    if len(segments) == 2 and segments[0] == "domainnames":
+        from ministack.services import apigateway_v1 as v1
+        if segments[1] not in v1._domain_names:
+            return None, _tag_resource_not_found(resource_arn)
+        return _domain_arn(segments[1]), None
+    if len(segments) not in (2, 4) or segments[0] != "apis":
+        return None, _invalid_tag_resource_arn(resource_arn)
+
+    api_id = segments[1]
+    if not _api_exists_in_request_region(api_id):
+        return None, _tag_resource_not_found(resource_arn)
+    if len(segments) == 2:
+        return _api_arn(api_id), None
+
+    resource_type, resource_id = segments[2], segments[3]
+    if resource_type != "stages":
+        return None, _invalid_tag_resource_arn(resource_arn)
+    if resource_id not in _stages.get(api_id, {}):
+        return None, _tag_resource_not_found(resource_arn)
+    return _api_resource_arn(api_id, resource_type, resource_id), None
+
+
+def _delete_api_tag_resources(api_id: str):
+    api_arn = _api_arn(api_id)
+    nested_prefix = f"{api_arn}/"
+    for resource_arn in list(_api_tags):
+        if resource_arn == api_arn or resource_arn.startswith(nested_prefix):
+            _api_tags.pop(resource_arn, None)
+
+
+def _tag_store(canonical_arn: str):
+    """Domain name tags are shared with API Gateway v1."""
+    if "::/domainnames/" in canonical_arn:
+        from ministack.services import apigateway_v1 as v1
+        return v1._v1_tags
+    return _api_tags
+
+
 def _get_tags(resource_arn: str):
-    tags = _api_tags.get(resource_arn, {})
+    canonical_arn, err = _validate_tag_resource_arn(resource_arn)
+    if err:
+        return err
+    tags = _tag_store(canonical_arn).get(canonical_arn, {})
     return _apigw_response({"tags": tags})
 
 
 def _tag_resource(resource_arn: str, data: dict):
+    canonical_arn, err = _validate_tag_resource_arn(resource_arn)
+    if err:
+        return err
     tags = data.get("tags", {})
-    _api_tags.setdefault(resource_arn, {}).update(tags)
+    _tag_store(canonical_arn).setdefault(canonical_arn, {}).update(tags)
     return 201, {}, b""
 
 
 def _untag_resource(resource_arn: str, tag_keys: list):
-    existing = _api_tags.get(resource_arn, {})
+    canonical_arn, err = _validate_tag_resource_arn(resource_arn)
+    if err:
+        return err
+    existing = _tag_store(canonical_arn).get(canonical_arn, {})
     for key in tag_keys:
         existing.pop(key, None)
+    return 204, {}, b""
+
+
+# ---- Control plane: Domain names and API mappings ----
+# One resource with v1 custom domains: records, base path mappings and tags live in apigateway_v1.
+
+_ROUTING_V2_TO_V1 = {
+    "API_MAPPING_ONLY": "BASE_PATH_MAPPING_ONLY",
+    "ROUTING_RULE_ONLY": "ROUTING_RULE_ONLY",
+    "ROUTING_RULE_THEN_API_MAPPING": "ROUTING_RULE_THEN_BASE_PATH_MAPPING",
+}
+_ROUTING_V1_TO_V2 = {v1: v2 for v2, v1 in _ROUTING_V2_TO_V1.items()}
+
+
+def _domain_arn(domain_name):
+    return f"arn:aws:apigateway:{get_region()}::/domainnames/{domain_name}"
+
+
+def _domain_not_found():
+    return _apigw_error("NotFoundException", "Invalid domain name identifier specified", 404)
+
+
+def _domain_view(record):
+    from ministack.services import apigateway_v1 as v1
+    endpoint = record.get("endpointConfiguration") or {}
+    endpoint_type = (endpoint.get("types") or ["REGIONAL"])[0]
+    regional = endpoint_type == "REGIONAL"
+    config = {
+        "apiGatewayDomainName": record["regionalDomainName" if regional else "distributionDomainName"],
+        "certificateArn": record.get("regionalCertificateArn" if regional else "certificateArn") or None,
+        "certificateName": record.get("regionalCertificateName" if regional else "certificateName") or None,
+        "domainNameStatus": "AVAILABLE",
+        "endpointType": endpoint_type,
+        "hostedZoneId": record["regionalHostedZoneId" if regional else "distributionHostedZoneId"],
+        "ipAddressType": endpoint.get("ipAddressType", "ipv4"),
+        "securityPolicy": record.get("securityPolicy", "TLS_1_2"),
+        "ownershipVerificationCertificateArn": record.get("ownershipVerificationCertificateArn") or None,
+    }
+    arn = _domain_arn(record["domainName"])
+    return {
+        "apiMappingSelectionExpression": "$request.basepath",
+        "domainName": record["domainName"],
+        "domainNameArn": arn,
+        "domainNameConfigurations": [config],
+        "mutualTlsAuthentication": record.get("mutualTlsAuthentication") or None,
+        "routingMode": _ROUTING_V1_TO_V2.get(record.get("routingMode"), "API_MAPPING_ONLY"),
+        "tags": dict(v1._v1_tags.get(arn) or record.get("tags") or {}),
+    }
+
+
+def _apply_domain_configuration(record, configs):
+    config = (configs or [{}])[0]
+    endpoint_type = config.get("endpointType", "REGIONAL")
+    record["endpointConfiguration"] = {"types": [endpoint_type],
+                                       "ipAddressType": config.get("ipAddressType", "ipv4")}
+    arn_key, name_key = (("regionalCertificateArn", "regionalCertificateName")
+                         if endpoint_type == "REGIONAL" else ("certificateArn", "certificateName"))
+    record[arn_key] = config.get("certificateArn", "")
+    record[name_key] = config.get("certificateName", "")
+    record["securityPolicy"] = config.get("securityPolicy", "TLS_1_2")
+    record["ownershipVerificationCertificateArn"] = config.get("ownershipVerificationCertificateArn", "")
+
+
+def _create_domain_name(data):
+    from ministack.services import apigateway_v1 as v1
+    name = data.get("domainName")
+    if not name:
+        return _apigw_error("BadRequestException", "Domain name is required", 400)
+    if name in v1._domain_names:
+        return _apigw_error("ConflictException", "The domain name you provided already exists.", 409)
+    if data.get("routingMode", "API_MAPPING_ONLY") not in _ROUTING_V2_TO_V1:
+        return _apigw_error("BadRequestException", f"Invalid routingMode: {data['routingMode']}", 400)
+    record = {
+        "domainName": name,
+        "certificateName": "",
+        "certificateArn": "",
+        "regionalCertificateName": "",
+        "regionalCertificateArn": "",
+        "distributionDomainName": f"d{new_uuid().replace('-', '')[:13]}.cloudfront.net",
+        "distributionHostedZoneId": "Z2FDTNDATAQYW2",
+        "regionalDomainName": f"d-{new_uuid().replace('-', '')[:10]}.execute-api.{get_region()}.amazonaws.com",
+        "regionalHostedZoneId": "Z1UJRXOUMOOFQ8",
+        "mutualTlsAuthentication": data.get("mutualTlsAuthentication") or {},
+        "routingMode": _ROUTING_V2_TO_V1[data.get("routingMode", "API_MAPPING_ONLY")],
+        "tags": {},
+    }
+    _apply_domain_configuration(record, data.get("domainNameConfigurations"))
+    v1._domain_names[name] = record
+    v1._base_path_mappings[name] = {}
+    if data.get("tags"):
+        v1._v1_tags[_domain_arn(name)] = dict(data["tags"])
+    return _apigw_response(_domain_view(record), 201)
+
+
+def _get_domain_name(name):
+    from ministack.services import apigateway_v1 as v1
+    record = v1._domain_names.get(name)
+    return _apigw_response(_domain_view(record)) if record else _domain_not_found()
+
+
+def _page(items, query_params):
+    """One page of items for maxResults/nextToken, or a BadRequestException response."""
+    def value(key):
+        v = (query_params or {}).get(key)
+        return v[0] if isinstance(v, list) else v
+    try:
+        start = int(value("nextToken") or 0)
+        limit = int(value("maxResults") or len(items) or 1)
+    except ValueError:
+        return _apigw_error("BadRequestException", "Invalid nextToken or maxResults", 400)
+    page = {"items": items[start:start + limit]}
+    if start + limit < len(items):
+        page["nextToken"] = str(start + limit)
+    return _apigw_response(page)
+
+
+def _get_domain_names(query_params):
+    from ministack.services import apigateway_v1 as v1
+    return _page([_domain_view(r) for r in v1._domain_names.values()], query_params)
+
+
+def _update_domain_name(name, data):
+    from ministack.services import apigateway_v1 as v1
+    record = v1._domain_names.get(name)
+    if not record:
+        return _domain_not_found()
+    if "routingMode" in data and data["routingMode"] not in _ROUTING_V2_TO_V1:
+        return _apigw_error("BadRequestException", f"Invalid routingMode: {data['routingMode']}", 400)
+    if "domainNameConfigurations" in data:
+        _apply_domain_configuration(record, data["domainNameConfigurations"])
+    if "mutualTlsAuthentication" in data:
+        record["mutualTlsAuthentication"] = data["mutualTlsAuthentication"] or {}
+    if "routingMode" in data:
+        record["routingMode"] = _ROUTING_V2_TO_V1[data["routingMode"]]
+    return _apigw_response(_domain_view(record))
+
+
+def _delete_domain_name(name):
+    from ministack.services import apigateway_v1 as v1
+    if name not in v1._domain_names:
+        return _domain_not_found()
+    v1._domain_names.pop(name, None)
+    v1._base_path_mappings.pop(name, None)
+    v1._v1_tags.pop(_domain_arn(name), None)
+    return 204, {}, b""
+
+
+def _mapping_view(base_path, mapping):
+    return {
+        "apiId": mapping["restApiId"],
+        "apiMappingId": mapping.setdefault("_apiMappingId", new_uuid().replace("-", "")[:6]),
+        "apiMappingKey": "" if base_path == "(none)" else base_path,
+        "stage": mapping["stage"],
+    }
+
+
+def _domain_mappings(name):
+    """The domain's base path mappings, or a NotFoundException response."""
+    from ministack.services import apigateway_v1 as v1
+    if name not in v1._domain_names:
+        return None, _domain_not_found()
+    return v1._base_path_mappings.setdefault(name, {}), None
+
+
+def _find_mapping(mappings, mapping_id):
+    for base_path, mapping in mappings.items():
+        if _mapping_view(base_path, mapping)["apiMappingId"] == mapping_id:
+            return base_path, mapping
+    return None, None
+
+
+def _api_mapping_not_found():
+    return _apigw_error("NotFoundException", "Invalid API mapping identifier specified", 404)
+
+
+def _check_mapping_target(api_id, stage):
+    from ministack.services import apigateway_v1 as v1
+    if api_id in _apis:
+        stages = _stages.get(api_id, {})
+    elif api_id in v1._rest_apis:
+        stages = v1._stages_v1.get(api_id, {})
+    else:
+        return _apigw_error("NotFoundException", "Invalid API identifier specified", 404)
+    if stage not in stages:
+        return _apigw_error("BadRequestException", "Invalid stage identifier specified", 400)
+    return None
+
+
+def _create_api_mapping(name, data):
+    mappings, err = _domain_mappings(name)
+    if err:
+        return err
+    api_id, stage = data.get("apiId"), data.get("stage")
+    if not api_id or not stage:
+        return _apigw_error("BadRequestException", "ApiId and Stage are required", 400)
+    if err := _check_mapping_target(api_id, stage):
+        return err
+    base_path = data.get("apiMappingKey") or "(none)"
+    if base_path in mappings:
+        return _apigw_error("ConflictException", "ApiMapping key already exists for this domain name", 409)
+    mappings[base_path] = {"basePath": base_path, "restApiId": api_id, "stage": stage}
+    return _apigw_response(_mapping_view(base_path, mappings[base_path]), 201)
+
+
+def _get_api_mapping(name, mapping_id):
+    mappings, err = _domain_mappings(name)
+    if err:
+        return err
+    base_path, mapping = _find_mapping(mappings, mapping_id)
+    return _apigw_response(_mapping_view(base_path, mapping)) if mapping else _api_mapping_not_found()
+
+
+def _get_api_mappings(name, query_params):
+    mappings, err = _domain_mappings(name)
+    if err:
+        return err
+    return _page([_mapping_view(k, m) for k, m in mappings.items()], query_params)
+
+
+def _update_api_mapping(name, mapping_id, data):
+    mappings, err = _domain_mappings(name)
+    if err:
+        return err
+    base_path, mapping = _find_mapping(mappings, mapping_id)
+    if not mapping:
+        return _api_mapping_not_found()
+    api_id = data.get("apiId") or mapping["restApiId"]
+    stage = data.get("stage") or mapping["stage"]
+    if err := _check_mapping_target(api_id, stage):
+        return err
+    new_path = (data["apiMappingKey"] or "(none)") if "apiMappingKey" in data else base_path
+    if new_path != base_path and new_path in mappings:
+        return _apigw_error("ConflictException", "ApiMapping key already exists for this domain name", 409)
+    mapping["restApiId"], mapping["stage"] = api_id, stage
+    if new_path != base_path:
+        mapping["basePath"] = new_path
+        mappings[new_path] = mappings.pop(base_path)
+    return _apigw_response(_mapping_view(new_path, mapping))
+
+
+def _delete_api_mapping(name, mapping_id):
+    mappings, err = _domain_mappings(name)
+    if err:
+        return err
+    base_path, mapping = _find_mapping(mappings, mapping_id)
+    if not mapping:
+        return _api_mapping_not_found()
+    mappings.pop(base_path)
     return 204, {}, b""
 
 
@@ -1401,7 +2668,9 @@ def _untag_resource(resource_arn: str, tag_keys: list):
 
 def _create_authorizer(api_id, data):
     if api_id not in _apis:
-        return _apigw_error("NotFoundException", f"API {api_id} not found", 404)
+        return _api_not_found(api_id)
+    if message := _ws_authorizer_type_message(api_id, data.get("authorizerType")):
+        return _apigw_error("BadRequestException", message, 400)
     auth_id = new_uuid()[:8]
     authorizer = {
         "authorizerId": auth_id,
@@ -1411,19 +2680,27 @@ def _create_authorizer(api_id, data):
         "jwtConfiguration": data.get("jwtConfiguration", {}),
         "authorizerUri": data.get("authorizerUri", ""),
         "authorizerPayloadFormatVersion": data.get("authorizerPayloadFormatVersion", "2.0"),
-        "authorizerResultTtlInSeconds": data.get("authorizerResultTtlInSeconds", 300),
+        "authorizerResultTtlInSeconds": data.get(
+            "authorizerResultTtlInSeconds", _DEFAULT_AUTHORIZER_TTL
+        ),
         "enableSimpleResponses": data.get("enableSimpleResponses", False),
         "authorizerCredentialsArn": data.get("authorizerCredentialsArn", ""),
     }
+    if data.get("identityValidationExpression"):
+        authorizer["identityValidationExpression"] = data["identityValidationExpression"]
     _authorizers.setdefault(api_id, {})[auth_id] = authorizer
     return _apigw_response(authorizer, 201)
 
 
-def _get_authorizers(api_id):
-    return _apigw_response({"items": list(_authorizers.get(api_id, {}).values())})
+def _get_authorizers(api_id, query_params=None):
+    if err := _require_api(api_id):
+        return err
+    return _page(list(_authorizers.get(api_id, {}).values()), query_params)
 
 
 def _get_authorizer(api_id, auth_id):
+    if err := _require_api(api_id):
+        return err
     authorizer = _authorizers.get(api_id, {}).get(auth_id)
     if not authorizer:
         return _apigw_error("NotFoundException", f"Authorizer {auth_id} not found", 404)
@@ -1431,19 +2708,24 @@ def _get_authorizer(api_id, auth_id):
 
 
 def _update_authorizer(api_id, auth_id, data):
+    if err := _require_api(api_id):
+        return err
     authorizer = _authorizers.get(api_id, {}).get(auth_id)
     if not authorizer:
         return _apigw_error("NotFoundException", f"Authorizer {auth_id} not found", 404)
     for k in ("name", "identitySource", "jwtConfiguration", "authorizerUri",
               "authorizerPayloadFormatVersion", "authorizerResultTtlInSeconds",
-              "enableSimpleResponses", "authorizerCredentialsArn"):
+              "enableSimpleResponses", "authorizerCredentialsArn", "identityValidationExpression"):
         if k in data:
             authorizer[k] = data[k]
     return _apigw_response(authorizer)
 
 
 def _delete_authorizer(api_id, auth_id):
+    if err := _require_api(api_id):
+        return err
     _authorizers.get(api_id, {}).pop(auth_id, None)
+    _api_tags.pop(_api_resource_arn(api_id, "authorizers", auth_id), None)
     return 204, {}, b""
 
 
@@ -1454,6 +2736,7 @@ def reset():
     _stages.clear()
     _deployments.clear()
     _authorizers.clear()
+    _authorizer_cache.clear()
     _api_tags.clear()
     _route_responses.clear()
     _integration_responses.clear()
@@ -1473,6 +2756,8 @@ def reset():
 # ==========================================================================
 
 def _create_route_response(api_id, route_id, data):
+    if err := _require_api(api_id):
+        return err
     routes = _routes.get(api_id, {})
     if route_id not in routes:
         return _apigw_error("NotFoundException", f"Route {route_id} not found", 404)
@@ -1489,12 +2774,20 @@ def _create_route_response(api_id, route_id, data):
     return _apigw_response(rr, 201)
 
 
-def _get_route_responses(api_id, route_id):
+def _get_route_responses(api_id, route_id, query_params=None):
+    if err := _require_api(api_id):
+        return err
+    if route_id not in _routes.get(api_id, {}):
+        return _apigw_error("NotFoundException", f"Route {route_id} not found", 404)
     items = list(_route_responses.get(api_id, {}).get(route_id, {}).values())
-    return _apigw_response({"items": items})
+    return _page(items, query_params)
 
 
 def _get_route_response(api_id, route_id, rr_id):
+    if err := _require_api(api_id):
+        return err
+    if route_id not in _routes.get(api_id, {}):
+        return _apigw_error("NotFoundException", f"Route {route_id} not found", 404)
     rr = _route_responses.get(api_id, {}).get(route_id, {}).get(rr_id)
     if not rr:
         return _apigw_error("NotFoundException", f"RouteResponse {rr_id} not found", 404)
@@ -1502,6 +2795,10 @@ def _get_route_response(api_id, route_id, rr_id):
 
 
 def _update_route_response(api_id, route_id, rr_id, data):
+    if err := _require_api(api_id):
+        return err
+    if route_id not in _routes.get(api_id, {}):
+        return _apigw_error("NotFoundException", f"Route {route_id} not found", 404)
     rr = _route_responses.get(api_id, {}).get(route_id, {}).get(rr_id)
     if not rr:
         return _apigw_error("NotFoundException", f"RouteResponse {rr_id} not found", 404)
@@ -1512,6 +2809,10 @@ def _update_route_response(api_id, route_id, rr_id, data):
 
 
 def _delete_route_response(api_id, route_id, rr_id):
+    if err := _require_api(api_id):
+        return err
+    if route_id not in _routes.get(api_id, {}):
+        return _apigw_error("NotFoundException", f"Route {route_id} not found", 404)
     _route_responses.get(api_id, {}).get(route_id, {}).pop(rr_id, None)
     return 204, {}, b""
 
@@ -1521,6 +2822,8 @@ def _delete_route_response(api_id, route_id, rr_id):
 # ==========================================================================
 
 def _create_integration_response(api_id, integration_id, data):
+    if err := _require_api(api_id):
+        return err
     integs = _integrations.get(api_id, {})
     if integration_id not in integs:
         return _apigw_error("NotFoundException", f"Integration {integration_id} not found", 404)
@@ -1538,12 +2841,20 @@ def _create_integration_response(api_id, integration_id, data):
     return _apigw_response(ir, 201)
 
 
-def _get_integration_responses(api_id, integration_id):
+def _get_integration_responses(api_id, integration_id, query_params=None):
+    if err := _require_api(api_id):
+        return err
+    if integration_id not in _integrations.get(api_id, {}):
+        return _apigw_error("NotFoundException", f"Integration {integration_id} not found", 404)
     items = list(_integration_responses.get(api_id, {}).get(integration_id, {}).values())
-    return _apigw_response({"items": items})
+    return _page(items, query_params)
 
 
 def _get_integration_response(api_id, integration_id, ir_id):
+    if err := _require_api(api_id):
+        return err
+    if integration_id not in _integrations.get(api_id, {}):
+        return _apigw_error("NotFoundException", f"Integration {integration_id} not found", 404)
     ir = _integration_responses.get(api_id, {}).get(integration_id, {}).get(ir_id)
     if not ir:
         return _apigw_error("NotFoundException", f"IntegrationResponse {ir_id} not found", 404)
@@ -1551,6 +2862,10 @@ def _get_integration_response(api_id, integration_id, ir_id):
 
 
 def _update_integration_response(api_id, integration_id, ir_id, data):
+    if err := _require_api(api_id):
+        return err
+    if integration_id not in _integrations.get(api_id, {}):
+        return _apigw_error("NotFoundException", f"Integration {integration_id} not found", 404)
     ir = _integration_responses.get(api_id, {}).get(integration_id, {}).get(ir_id)
     if not ir:
         return _apigw_error("NotFoundException", f"IntegrationResponse {ir_id} not found", 404)
@@ -1562,6 +2877,10 @@ def _update_integration_response(api_id, integration_id, ir_id, data):
 
 
 def _delete_integration_response(api_id, integration_id, ir_id):
+    if err := _require_api(api_id):
+        return err
+    if integration_id not in _integrations.get(api_id, {}):
+        return _apigw_error("NotFoundException", f"Integration {integration_id} not found", 404)
     _integration_responses.get(api_id, {}).get(integration_id, {}).pop(ir_id, None)
     return 204, {}, b""
 
@@ -1575,19 +2894,23 @@ def _api_protocol(api_id: str) -> str | None:
 
     WebSocket connections arrive on the execute-api host before we've resolved
     which account owns the api. We scan every AccountScopedDict bucket to find
-    the owning account, then return (protocol, account_id).
+    the owning account and region.
     """
     info = _api_owner(api_id)
     return info[0] if info else None
 
 
 def _api_owner(api_id: str):
-    """Return (protocolType, owner_account_id) for an API or None if unknown."""
-    # AccountScopedDict stores keys as (account_id, original_key). Walk internals
-    # so we can find the owning account without knowing it up front.
-    for (acct, key), api in _apis._data.items():
+    """Return (protocolType, owner_account_id, owner_region) for an API or None."""
+    # WebSocket dispatch arrives before we know the owning account or region, so
+    # scan every account+region slot directly.
+    for (acct, region, key), api in _apis.all_items():
         if key == api_id:
-            return (api.get("protocolType", "HTTP"), acct)
+            return (
+                api.get("protocolType", "HTTP"),
+                acct,
+                region,
+            )
     return None
 
 
@@ -1629,7 +2952,42 @@ def _evaluate_route_selection(expr: str, payload_text: str) -> str:
     return "$default"
 
 
-async def _invoke_ws_lambda(api_id: str, account_id: str, route: dict, stage: str,
+def _ws_request_context(api_id: str, route_key: str, stage: str, connection_id: str, event_type: str,
+                        request_id: str, source_ip: str, headers: dict) -> dict:
+    """requestContext of a WebSocket event, shared by route integrations and the $connect authorizer."""
+    now_ms = int(time.time() * 1000)
+    return {
+        "routeKey": route_key,
+        "eventType": event_type,
+        "extendedRequestId": new_uuid(),
+        "requestTime": time.strftime("%d/%b/%Y:%H:%M:%S +0000"),
+        "stage": stage,
+        "connectedAt": now_ms,
+        "requestTimeEpoch": now_ms,
+        "identity": {"sourceIp": source_ip, "userAgent": headers.get("user-agent", "")},
+        "requestId": request_id,
+        "domainName": f"{api_id}.execute-api.{_HOST}",
+        "connectionId": connection_id,
+        "apiId": api_id,
+    }
+
+
+def _ws_connect_fields(headers: dict, query_params: dict | None) -> dict:
+    """Handshake headers and query string as a $connect event carries them."""
+    # AWS flattens single-valued QS params to string, keeps multi-valued as lists.
+    return {
+        "headers": dict(headers),
+        "multiValueHeaders": {k: [v] for k, v in headers.items()},
+        "queryStringParameters": {
+            k: (v[-1] if isinstance(v, list) else v) for k, v in query_params.items()
+        } if query_params else None,
+        "multiValueQueryStringParameters": {
+            k: (v if isinstance(v, list) else [v]) for k, v in query_params.items()
+        } if query_params else None,
+    }
+
+
+async def _invoke_ws_lambda(api_id: str, account_id: str, region: str, route: dict, stage: str,
                             connection_id: str, event_type: str, message_id: str,
                             body_text: str, source_ip: str, headers: dict,
                             query_params: dict | None = None, **kwargs) -> dict | None:
@@ -1687,25 +3045,20 @@ async def _invoke_ws_lambda(api_id: str, account_id: str, route: dict, stage: st
     # Same unwrap path as HTTP (#409): APIGW integrationUri is the wrapper form
     # that nests the Lambda ARN between /functions/ and /invocations.
     lambda_ref = _extract_lambda_ref_from_integration_uri(integration.get("integrationUri", ""))
-    func_name, qualifier = lambda_svc._resolve_name_and_qualifier(lambda_ref)
-    func_data, func_config = lambda_svc._get_func_record_for_qualifier(func_name, qualifier)
-    if func_data is None:
+    _parsed_name, qualifier = lambda_svc._resolve_name_and_qualifier(lambda_ref)
+    func_data, func_config, func_name = lambda_svc._get_func_record_for_ref_in_scope(
+        lambda_ref,
+        account_id=account_id,
+        region=region,
+    )
+    if func_data is None or func_config is None:
         return None
 
-    request_context = {
-        "routeKey": route.get("routeKey", "$default"),
-        "eventType": event_type,
-        "extendedRequestId": new_uuid(),
-        "requestTime": time.strftime("%d/%b/%Y:%H:%M:%S +0000"),
-        "stage": stage,
-        "connectedAt": int(time.time() * 1000),
-        "requestTimeEpoch": int(time.time() * 1000),
-        "identity": {"sourceIp": source_ip, "userAgent": headers.get("user-agent", "")},
-        "requestId": message_id,
-        "domainName": f"{api_id}.execute-api.{_HOST}",
-        "connectionId": connection_id,
-        "apiId": api_id,
-    }
+    request_context = _ws_request_context(
+        api_id, route.get("routeKey", "$default"), stage, connection_id, event_type, message_id, source_ip, headers,
+    )
+    if kwargs.get("authorizer") is not None:
+        request_context["authorizer"] = kwargs["authorizer"]
     if event_type == "DISCONNECT":
         # Populated by handle_websocket from the ASGI disconnect message.
         request_context["disconnectReason"] = kwargs.get("disconnect_reason", "")
@@ -1719,21 +3072,7 @@ async def _invoke_ws_lambda(api_id: str, account_id: str, route: dict, stage: st
         "isBase64Encoded": False,
     }
     if event_type == "CONNECT":
-        event["headers"] = dict(headers)
-        event["multiValueHeaders"] = {k: [v] for k, v in headers.items()}
-        if query_params:
-            # AWS flattens single-valued QS params to string, keeps multi-valued as lists.
-            event["queryStringParameters"] = {
-                k: (v[-1] if isinstance(v, list) else v)
-                for k, v in query_params.items()
-            }
-            event["multiValueQueryStringParameters"] = {
-                k: (v if isinstance(v, list) else [v])
-                for k, v in query_params.items()
-            }
-        else:
-            event["queryStringParameters"] = None
-            event["multiValueQueryStringParameters"] = None
+        event.update(_ws_connect_fields(headers, query_params))
 
     runtime = func_config.get("Runtime", "")
     code_zip = func_data.get("code_zip")
@@ -1745,16 +3084,99 @@ async def _invoke_ws_lambda(api_id: str, account_id: str, route: dict, stage: st
         # SDK invoke path populates and forcing a cold start on every WS
         # message. That's why pre-warming the function via the SDK didn't
         # help WebSocket dispatch — keys didn't match.
-        worker = get_or_create_worker(
-            func_name, func_config, code_zip,
-            qualifier=qualifier or "$LATEST",
+        def _invoke_worker():
+            worker = get_or_create_worker(
+                func_name, func_config, code_zip,
+                qualifier=qualifier or "$LATEST",
+            )
+            return worker.invoke(event, message_id)
+
+        result = await run_reentrant(
+            lambda_svc._run_with_function_config_scope,
+            func_config,
+            _invoke_worker,
         )
-        result = await asyncio.to_thread(worker.invoke, event, message_id)
         if result.get("status") == "error":
             return {"statusCode": 500, "body": result.get("error", "")}
         return result.get("result", {})
-    # Image/unsupported runtime stub — success without body.
-    return {"statusCode": 200, "body": ""}
+    # Image and other runtimes run through the central dispatcher, as HTTP API routes do.
+    exec_record = lambda_svc._execution_record_for_config(func_data, func_config)
+    result = await run_reentrant(lambda_svc._execute_function_with_config_scope, exec_record, event,
+                                 thread_name="ministack-apigw-ws-invoke")
+    return lambda_svc.lambda_execute_result_to_api_proxy_response(result)[0]
+
+
+_WS_DENY_REASONS = {
+    "Deny": "with an explicit deny in an identity-based policy",
+    "NoMatch": "because no identity-based policy allows the execute-api:Invoke action",
+}
+
+
+def _authorize_ws_iam(scope, connect_arn, headers, query_params, region):
+    """``(status, message)`` refusing an AWS_IAM $connect, or None; signature and policy are checked under AUTH=true."""
+    from ministack.app import AUTH
+    from ministack.core.iam_evaluator import AuthError, authenticate_handshake, enforce
+    from ministack.core.router import extract_access_key_id
+
+    access_key = extract_access_key_id(headers, query_params)
+    if not access_key:
+        return 403, "Missing Authentication Token"
+    denied = AUTH and authenticate_handshake(scope, "execute-api")
+    if not isinstance(denied, AuthError):
+        denied = AUTH and enforce(access_key, "execute-api:Invoke", "apigateway", region, resource_arn=connect_arn)
+    if isinstance(denied, AuthError):
+        return 403, denied.message
+    if denied:
+        reason = _WS_DENY_REASONS["Deny" if denied.decision == "Deny" else "NoMatch"]
+        return 403, (f"User: {denied.principal_arn} is not authorized to perform: execute-api:Invoke "
+                     f"on resource: {connect_arn} {reason}")
+    return None
+
+
+async def _authorize_ws_connect(api_id, route, request_context, headers, query_params, account_id, region):
+    """Run the $connect REQUEST authorizer: ``(refusal, context)``, a refusal being ``(status, message)``."""
+    from ministack.services.apigateway_v1 import _stringify_context
+
+    authorizer = _authorizers.get(api_id, {}).get(route.get("authorizerId") or "")
+    if not authorizer:
+        return (500, ""), None
+    stage = request_context["stage"]
+    stage_vars = _get_stage_variables(api_id, stage)
+    present, _values = _request_authorizer_identity_sources(
+        authorizer.get("identitySource"), headers, query_params, stage_vars,
+    )
+    if not present:
+        return (401, "Unauthorized"), None
+    method_arn = execute_api_route_arn(region, account_id, api_id, stage, "$connect")
+    event = {
+        "type": "REQUEST",
+        "methodArn": method_arn,
+        **_ws_connect_fields(headers, query_params),
+        "stageVariables": stage_vars,
+        "requestContext": {**request_context, "messageDirection": "IN"},
+    }
+    payload = await _invoke_request_authorizer_lambda(authorizer, event, account_id, region)
+    policy = (payload or {}).get("policyDocument")
+    if not isinstance(policy, dict) or not isinstance(payload.get("context") or {}, dict):
+        return (500, ""), None
+    decision = _evaluate_authorizer_policy(policy, method_arn)
+    if decision != "Allow":
+        return (403, f"User is not authorized to access this resource {_WS_DENY_REASONS[decision]}"), None
+    context = _stringify_context(payload.get("context"))
+    if payload.get("principalId") is not None:
+        context["principalId"] = str(payload["principalId"])
+    return None, context
+
+
+async def _refuse_ws_handshake(scope, send, status, message, connection_id, request_id):
+    """Answer the upgrade with an HTTP error response, as API Gateway does."""
+    if "websocket.http.response" not in (scope.get("extensions") or {}):
+        await send({"type": "websocket.close", "code": 1008})
+        return
+    body = json.dumps({"message": message, "connectionId": connection_id, "requestId": request_id}).encode()
+    await send({"type": "websocket.http.response.start", "status": status,
+                "headers": [(b"content-type", b"application/json")]})
+    await send({"type": "websocket.http.response.body", "body": body})
 
 
 async def handle_websocket(scope, receive, send, api_id: str, path_override: str | None = None):
@@ -1781,7 +3203,7 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
         await send({"type": "websocket.close", "code": 1008})
         return
 
-    protocol, account_id = owner
+    protocol, account_id, owner_region = owner
 
     # Stage parsing: Host-based URLs look like wss://{apiId}.execute-api.../stage;
     # path-based compat URLs (#401) use path_override with the rewritten path.
@@ -1790,7 +3212,7 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
     path = path_override if path_override is not None else scope.get("path", "")
     path_parts = path.lstrip("/").split("/", 1)
     tentative = path_parts[0] if path_parts and path_parts[0] else "$default"
-    configured_stages = _stages.get(api_id, {})
+    configured_stages = _stages.get_scoped(account_id, owner_region, api_id, {})
     if tentative in configured_stages:
         stage = tentative
     elif "$default" in configured_stages:
@@ -1820,16 +3242,45 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
     connection_id = new_uuid().replace("-", "")[:16]
 
     # Set account context so downstream Lambda invocations see the right tenant.
-    from ministack.core.responses import _request_account_id
-    token = _request_account_id.set(account_id)
+    from ministack.core.responses import _request_account_id, _request_region
+    account_token = _request_account_id.set(account_id)
+    region_token = _request_region.set(owner_region)
     try:
         # $connect hook
         connect_route = _match_ws_route(api_id, "$connect")
+        authorizer_context = None
         if connect_route is not None:
+            auth_type = (connect_route.get("authorizationType") or "NONE").upper()
+            connect_request_id = new_uuid()
+            refusal = None
+            if auth_type == "CUSTOM":
+                refusal, authorizer_context = await _authorize_ws_connect(
+                    api_id, connect_route,
+                    _ws_request_context(api_id, "$connect", stage, connection_id, "CONNECT",
+                                        connect_request_id, source_ip, headers),
+                    headers, query_params, account_id, owner_region,
+                )
+            elif auth_type == "AWS_IAM":
+                refusal = _authorize_ws_iam(
+                    scope, execute_api_route_arn(owner_region, account_id, api_id, stage, "$connect"),
+                    headers, query_params, owner_region,
+                )
+            elif auth_type == "JWT":
+                # only a route restored from state saved before the route checks existed
+                logger.warning(
+                    "WebSocket API %s: JWT authorization on $connect is not supported, refusing the handshake",
+                    api_id,
+                )
+                refusal = (500, "")
+            if refusal:
+                await _refuse_ws_handshake(scope, send, *refusal, connection_id, connect_request_id)
+                return
+
             resp = await _invoke_ws_lambda(
-                api_id, account_id, connect_route, stage, connection_id,
-                "CONNECT", new_uuid(), "", source_ip, headers,
+                api_id, account_id, owner_region, connect_route, stage, connection_id,
+                "CONNECT", connect_request_id, "", source_ip, headers,
                 query_params=query_params,
+                authorizer=authorizer_context,
             )
             status = int((resp or {}).get("statusCode", 200))
             if status < 200 or status >= 300:
@@ -1868,18 +3319,22 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
                     continue
                 if item is None:
                     return
-                if isinstance(item, bytes):
-                    await send({"type": "websocket.send", "bytes": item})
-                else:
-                    await send({"type": "websocket.send", "text": str(item)})
+                await send({"type": "websocket.send", "text": item})
 
         drain_task = asyncio.create_task(_drain_outbox())
 
         disconnect_code = 1005  # 1005 = "no status rcvd" per RFC 6455, matches AWS default
         disconnect_reason = ""
+        # DeleteConnection sets close_event; the server then closes the socket.
+        closed_by_delete = asyncio.ensure_future(close_event.wait())
         try:
             while True:
-                message = await receive()
+                receiving = asyncio.ensure_future(receive())
+                await asyncio.wait({receiving, closed_by_delete}, return_when=asyncio.FIRST_COMPLETED)
+                if not receiving.done():
+                    receiving.cancel()
+                    break
+                message = receiving.result()
                 mtype = message.get("type")
                 if mtype == "websocket.disconnect":
                     disconnect_code = int(message.get("code", 1005) or 1005)
@@ -1903,8 +3358,8 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
                     continue
                 msg_id = new_uuid()
                 resp = await _invoke_ws_lambda(
-                    api_id, account_id, route, stage, connection_id, "MESSAGE",
-                    msg_id, payload, source_ip, headers,
+                    api_id, account_id, owner_region, route, stage, connection_id, "MESSAGE",
+                    msg_id, payload, source_ip, headers, authorizer=authorizer_context,
                 )
                 if resp is None:
                     continue
@@ -1912,36 +3367,36 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
                 if body:
                     if isinstance(body, (dict, list)):
                         body = json.dumps(body)
-                    if isinstance(body, bytes):
-                        await send({"type": "websocket.send", "bytes": body})
-                    else:
-                        await send({"type": "websocket.send", "text": str(body)})
+                    await send({"type": "websocket.send", "text": str(body)})
         finally:
             close_event.set()
+            closed_by_delete.cancel()
             try:
                 await drain_task
             except Exception:
                 pass
             _ws_connections.pop(connection_id, None)
-            # Fire $disconnect route best-effort.
-            disconnect_route = _match_ws_route(api_id, "$disconnect")
-            if disconnect_route is not None:
-                try:
-                    await _invoke_ws_lambda(
-                        api_id, account_id, disconnect_route, stage, connection_id,
-                        "DISCONNECT", new_uuid(), "", source_ip, headers,
-                        disconnect_code=disconnect_code,
-                        disconnect_reason=disconnect_reason,
-                    )
-                except Exception:
-                    logger.exception("error firing $disconnect")
+            # "The $disconnect route is executed after the connection is closed."
             try:
                 await send({"type": "websocket.close", "code": 1000})
             except Exception:
                 pass
+            disconnect_route = _match_ws_route(api_id, "$disconnect")
+            if disconnect_route is not None:
+                try:
+                    await _invoke_ws_lambda(
+                        api_id, account_id, owner_region, disconnect_route, stage, connection_id,
+                        "DISCONNECT", new_uuid(), "", source_ip, headers,
+                        disconnect_code=disconnect_code,
+                        disconnect_reason=disconnect_reason,
+                        authorizer=authorizer_context,
+                    )
+                except Exception:
+                    logger.exception("error firing $disconnect")
     finally:
         try:
-            _request_account_id.reset(token)
+            _request_region.reset(region_token)
+            _request_account_id.reset(account_token)
         except Exception:
             pass
 
@@ -1949,6 +3404,29 @@ async def handle_websocket(scope, receive, send, api_id: str, path_override: str
 # ==========================================================================
 # @connections management API
 # ==========================================================================
+
+def _replace_like_api_gateway(error: UnicodeDecodeError) -> tuple[str, int]:
+    """Replace one invalid UTF-8 sequence with U+FFFD, as API Gateway does for PostToConnection data.
+
+    API Gateway replaces the same bytes as Python's ``errors="replace"`` except for an encoded
+    surrogate: ED followed by A0-BF, plus one continuation byte if present, becomes a single
+    U+FFFD where Python emits one per byte.
+    """
+    data, start = error.object, error.start
+    if data[start] == 0xED and start + 1 < len(data) and 0xA0 <= data[start + 1] <= 0xBF:
+        end = start + 2
+        if end < len(data) and 0x80 <= data[end] <= 0xBF:
+            end += 1
+        return "\ufffd", end
+    return "\ufffd", error.end
+
+
+codecs.register_error("ministack-apigateway-replace", _replace_like_api_gateway)
+
+
+def _post_to_connection_text(data: bytes) -> str:
+    return data.decode("utf-8", errors="ministack-apigateway-replace")
+
 
 async def handle_connections_api(method: str, api_id: str, stage: str,
                                   connection_id: str, body: bytes, headers: dict):
@@ -1966,7 +3444,7 @@ async def handle_connections_api(method: str, api_id: str, stage: str,
     """
     conn = _ws_connections.get(connection_id)
     if not conn or conn.get("apiId") != api_id:
-        return 410, {"Content-Type": "application/json"}, json.dumps(
+        return 410, {"Content-Type": "application/json", "x-amzn-ErrorType": "GoneException"}, json.dumps(
             {"message": "GoneException"}
         ).encode()
 
@@ -1974,7 +3452,7 @@ async def handle_connections_api(method: str, api_id: str, stage: str,
         # Push the message into the connection outbox; drain_task will forward it.
         try:
             if body:
-                await conn["outbox"].put(body)
+                await conn["outbox"].put(_post_to_connection_text(body))
         except Exception as exc:
             return 500, {"Content-Type": "application/json"}, json.dumps(
                 {"message": str(exc)}
@@ -1990,6 +3468,7 @@ async def handle_connections_api(method: str, api_id: str, stage: str,
         return 200, {"Content-Type": "application/json"}, json.dumps(payload).encode()
 
     if method == "DELETE":
+        _ws_connections.pop(connection_id, None)
         ev = conn.get("close_event")
         if ev is not None:
             try:

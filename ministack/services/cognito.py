@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 Amazon Cognito Service Emulator.
 
@@ -7,8 +9,9 @@ Covers two boto3 clients:
 
 User Pools operations:
   CreateUserPool, DeleteUserPool, DescribeUserPool, ListUserPools, UpdateUserPool,
+  AddCustomAttributes,
   CreateUserPoolClient, DeleteUserPoolClient, DescribeUserPoolClient,
-  ListUserPoolClients, UpdateUserPoolClient,
+  ListUserPoolClients, UpdateUserPoolClient, GetUICustomization, SetUICustomization,
   AdminCreateUser, AdminDeleteUser, AdminGetUser, ListUsers,
   AdminSetUserPassword, AdminUpdateUserAttributes,
   AdminInitiateAuth, AdminRespondToAuthChallenge,
@@ -17,13 +20,16 @@ User Pools operations:
   GetUser, UpdateUserAttributes, DeleteUser,
   AdminAddUserToGroup, AdminRemoveUserFromGroup,
   AdminListGroupsForUser, AdminListUserAuthEvents,
+  AdminUpdateAuthEventFeedback, UpdateAuthEventFeedback,
   CreateGroup, DeleteGroup, GetGroup, ListGroups,
   AdminConfirmSignUp, AdminDisableUser, AdminEnableUser,
   AdminResetUserPassword, AdminUserGlobalSignOut,
   GlobalSignOut, RevokeToken,
   CreateUserPoolDomain, DeleteUserPoolDomain, DescribeUserPoolDomain,
+  UpdateUserPoolDomain,
   CreateIdentityProvider, DescribeIdentityProvider, UpdateIdentityProvider,
   DeleteIdentityProvider, ListIdentityProviders, GetIdentityProviderByIdentifier,
+  AdminLinkProviderForUser, AdminDisableProviderForUser,
   GetUserPoolMfaConfig, SetUserPoolMfaConfig,
   AssociateSoftwareToken, VerifySoftwareToken,
   TagResource, UntagResource, ListTagsForResource.
@@ -33,12 +39,18 @@ Identity Pools operations:
   ListIdentityPools, UpdateIdentityPool,
   GetId, GetCredentialsForIdentity, GetOpenIdToken,
   SetIdentityPoolRoles, GetIdentityPoolRoles,
+  SetPrincipalTagAttributeMap, GetPrincipalTagAttributeMap,
   ListIdentities, DescribeIdentity, MergeDeveloperIdentities,
   UnlinkDeveloperIdentity, UnlinkIdentity,
   TagResource, UntagResource, ListTagsForResource.
 
 Data-plane endpoints (path-based, form-encoded):
-  GET  /oauth2/authorize   — redirect to external SAML/OIDC IdP
+  GET  /oauth2/authorize   — redirect to external SAML/OIDC IdP, or serve the Hosted UI
+                             sign-in form (single-page, or multi-step choice-based
+                             sign-in when the client's ExplicitAuthFlows includes
+                             ALLOW_USER_AUTH)
+  POST /login              — process Hosted UI sign-in submissions (single-page or
+                             choice-based) and redirect with an authorization code
   POST /saml2/idpresponse  — receive SAML assertion, create user, issue auth code
   POST /oauth2/token       — exchange authorization_code or client_credentials for tokens
 
@@ -52,30 +64,41 @@ Wire protocol:
 import base64
 import copy
 import hashlib
+import hmac
 import html as html_mod
 import json
 import logging
 import os
 import re
 import secrets
+import shutil
 import string
+import struct
+import threading
 import time
 import zlib
 from datetime import datetime, timezone
-from urllib.parse import parse_qs, quote, urlencode
+from urllib.parse import parse_qs, quote, unquote, urlencode
 from xml.etree.ElementTree import Element, SubElement
 from xml.etree.ElementTree import tostring as xml_tostring
 
 from defusedxml.ElementTree import fromstring as safe_xml_parse
 
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import run_reentrant
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
     get_region,
-    json_response,
+    get_request_client_ip,
     new_uuid,
+    set_request_account_id,
+    set_request_region,
+)
+from ministack.core.responses import (
+    json_response as _core_json_response,
 )
 
 logger = logging.getLogger("cognito")
@@ -94,32 +117,96 @@ _JWKS_KEY: dict = {}
 # key to STATE_DIR so all processes share the same key.
 _STATE_DIR = os.environ.get("STATE_DIR", "/tmp/ministack-state")
 _RSA_KEY_PATH = os.path.join(_STATE_DIR, "cognito-rsa-key.pem")
+_RSA_KEY_LOCK_PATH = f"{_RSA_KEY_PATH}.lock"
 
 try:
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric import rsa
 
-    _rsa_key = None
-    if os.path.exists(_RSA_KEY_PATH):
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+
+    def _load_rsa_key_from_disk(path=_RSA_KEY_PATH):
         try:
-            with open(_RSA_KEY_PATH, "rb") as _f:
-                _rsa_key = serialization.load_pem_private_key(_f.read(), password=None)
+            with open(path, "rb") as _f:
+                return serialization.load_pem_private_key(_f.read(), password=None)
         except Exception:
-            _rsa_key = None
-    if _rsa_key is None:
-        _rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            return None
+
+    def _open_rsa_key_lock_file():
+        while True:
+            try:
+                return open(_RSA_KEY_LOCK_PATH, "a")
+            except IsADirectoryError:
+                # Recover lock directories left by earlier MiniStack versions.
+                # rmdir only removes a directory, so a concurrent process that
+                # already converted the path to the new lock file cannot have
+                # its live lock stolen here.
+                try:
+                    os.rmdir(_RSA_KEY_LOCK_PATH)
+                except (FileNotFoundError, NotADirectoryError):
+                    continue
+                continue
+
+    def _persist_or_load_rsa_key(_key, path=_RSA_KEY_PATH):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        _pem = _key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        _tmp_path = f"{path}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
         try:
-            os.makedirs(_STATE_DIR, exist_ok=True)
-            _pem = _rsa_key.private_bytes(
-                encoding=serialization.Encoding.PEM,
-                format=serialization.PrivateFormat.PKCS8,
-                encryption_algorithm=serialization.NoEncryption(),
-            )
-            with open(_RSA_KEY_PATH, "wb") as _f:
+            # A file lock gives process-safe creation/repair without relying
+            # on hard links, and the OS releases it if a process exits mid-repair.
+            if fcntl is not None:
+                with _open_rsa_key_lock_file() as _lock_file:
+                    fcntl.flock(_lock_file.fileno(), fcntl.LOCK_EX)
+                    # Another process may have generated or repaired the shared
+                    # key first. Reload that winner so pytest workers and the
+                    # server expose the same JWKS.
+                    _disk_key = _load_rsa_key_from_disk(path)
+                    if _disk_key is not None:
+                        return _disk_key
+                    with open(_tmp_path, "xb") as _f:
+                        _f.write(_pem)
+                        _f.flush()
+                        os.fsync(_f.fileno())
+                    os.replace(_tmp_path, path)
+                    _tmp_path = None
+                    return _key
+            # Platforms without fcntl still get a stable signing key in-process
+            # and best-effort atomic persistence across restarts.
+            _disk_key = _load_rsa_key_from_disk(path)
+            if _disk_key is not None:
+                return _disk_key
+            with open(_tmp_path, "xb") as _f:
                 _f.write(_pem)
+                _f.flush()
+                os.fsync(_f.fileno())
+            os.replace(_tmp_path, path)
+            _tmp_path = None
+            return _key
+        finally:
+            if _tmp_path is not None:
+                try:
+                    os.unlink(_tmp_path)
+                except FileNotFoundError:
+                    pass
+
+    def _persist_or_load_rsa_key_best_effort(_key, path=_RSA_KEY_PATH):
+        try:
+            return _persist_or_load_rsa_key(_key, path)
         except Exception:
             # Persistence is best-effort — if it fails, fall back to in-memory key.
-            pass
+            return _key
+
+    _rsa_key = _load_rsa_key_from_disk() if os.path.exists(_RSA_KEY_PATH) else None
+    if _rsa_key is None:
+        _rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        _rsa_key = _persist_or_load_rsa_key_best_effort(_rsa_key)
     _RSA_PRIVATE_KEY = _rsa_key
 
     _pub = _rsa_key.public_key()
@@ -154,12 +241,76 @@ except ImportError:
     }
 
 
+# Each user pool has two keys of its own, one for access tokens and one for ID
+# tokens. They live in STATE_DIR beside the shared key so other processes sign alike.
+_POOL_KEYS_DIR = os.path.join(_STATE_DIR, "cognito-pool-keys")
+_POOL_KEY_USES = ("access", "id")
+_pool_keys: dict = {}  # (pool id, use) -> (private key, JWK), a cache of the key files
+_pool_keys_lock = threading.Lock()
+
+
+_DOCUMENT_MEMBERS = frozenset(('Settings', 'CredentialCreationOptions'))
+
+
+def _drop_none(value):
+    """AWS omits unset members; it never sends null. Document members pass through as given."""
+    if isinstance(value, dict):
+        return {k: v if k in _DOCUMENT_MEMBERS else _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
+def json_response(data, status=200, **kwargs):
+    return _core_json_response(_drop_none(data), status, **kwargs)
+
+
+def _pool_signing_key(pool_id: str, use: str):
+    """The private key and JWK the pool signs `use` tokens with, or (None, None) without cryptography."""
+    if _RSA_PRIVATE_KEY is None or not re.fullmatch(r"[\w-]+", pool_id or ""):
+        return None, None
+    with _pool_keys_lock:
+        cached = _pool_keys.get((pool_id, use))
+        if cached:
+            return cached
+        path = os.path.join(_POOL_KEYS_DIR, f"{pool_id}-{use}.pem")
+        key = _load_rsa_key_from_disk(path) if os.path.exists(path) else None
+        if key is None:
+            key = _persist_or_load_rsa_key_best_effort(
+                rsa.generate_private_key(public_exponent=65537, key_size=2048), path)
+        public = key.public_key()
+        der = public.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+        numbers = public.public_numbers()
+        jwk = {
+            "kty": "RSA",
+            "alg": "RS256",
+            "use": "sig",
+            "kid": base64.b64encode(hashlib.sha256(der).digest()).decode(),
+            "n": _int_to_base64url(numbers.n, 256),
+            "e": _int_to_base64url(numbers.e, 3),
+        }
+        _pool_keys[(pool_id, use)] = (key, jwk)
+        return key, jwk
+
+
+def _drop_pool_keys(pool_id: str) -> None:
+    for use in _POOL_KEY_USES:
+        _pool_keys.pop((pool_id, use), None)
+        try:
+            os.unlink(os.path.join(_POOL_KEYS_DIR, f"{pool_id}-{use}.pem"))
+        except OSError:
+            pass
+
+
 def well_known_jwks(pool_id: str):
     """Return JWKS JSON for /{poolId}/.well-known/jwks.json."""
-    return 200, {"Content-Type": "application/json"}, json.dumps({"keys": [_JWKS_KEY]}).encode()
+    keys = [_pool_signing_key(pool_id, use)[1] for use in _POOL_KEY_USES]
+    keys = [k for k in keys if k] or [_JWKS_KEY]
+    return 200, {"Content-Type": "application/json"}, json.dumps({"keys": keys}).encode()
 
 
-def well_known_openid_configuration(pool_id: str, region: str | None = None, host: str | None = None):
+def well_known_openid_configuration(pool_id: str, region: str | None = None,
+                                    host: str | None = None, scheme: str = "http"):
     """Return OpenID Connect discovery document.
 
     `issuer` matches the JWT `iss` claim (real AWS URL) so OIDC clients that
@@ -168,9 +319,16 @@ def well_known_openid_configuration(pool_id: str, region: str | None = None, hos
     and /logout are actually served (added by PR #344). Real AWS serves these
     on the pool-domain host; MiniStack serves them on the gateway.
     """
-    r = region or get_region()
+    # The discovery `issuer` MUST match the JWT `iss` claim — OIDC clients that
+    # verify `iss == discovery.issuer` break otherwise. _fake_token derives `iss`
+    # from the pool's region (encoded in pool_id), so do the same here. The
+    # `region` argument from the request scope is only used as a last-resort
+    # fallback for malformed pool_ids.
+    r = _pool_region(pool_id) if pool_id else (region or get_region())
     issuer = f"https://cognito-idp.{r}.amazonaws.com/{pool_id}"
-    base = f"http://{host}" if host else f"http://{_MINISTACK_HOST}:{_MINISTACK_PORT}"
+    # Behind a TLS terminator every URL in the document has to be https, or it
+    # disagrees with the https issuer and discovery fails.
+    base = f"{scheme}://{host}" if host else f"{scheme}://{_MINISTACK_HOST}:{_MINISTACK_PORT}"
     pool_base = f"{base}/{pool_id}"
     doc = {
         "issuer": issuer,
@@ -192,7 +350,6 @@ def well_known_openid_configuration(pool_id: str, region: str | None = None, hos
     }
     return 200, {"Content-Type": "application/json"}, json.dumps(doc).encode()
 
-REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _MINISTACK_PORT = os.environ.get("GATEWAY_PORT", os.environ.get("EDGE_PORT", "4566"))
 
@@ -203,13 +360,163 @@ _SAML_NS = {
 }
 
 # ---------------------------------------------------------------------------
+# User pool schema attributes
+# ---------------------------------------------------------------------------
+# Every user pool carries the standard OIDC attribute set, and DescribeUserPool
+# returns it in `SchemaAttributes` (never `Schema` — that name only exists on the
+# CreateUserPool/UpdateUserPool *request*). Custom attributes are returned with
+# a `custom:` prefix, developer-only ones with `dev:`.
+#   https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_UserPoolType.html
+#   https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_SchemaAttributeType.html
+#   https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-settings-attributes.html
+# Clients diff against this list — the Terraform provider, for one, drops an
+# attribute from state only when it matches the standard entry field for field —
+# so the shapes below mirror what the real service answers with.
+
+_ATTRIBUTE_CUSTOM_PREFIX = "custom:"
+_ATTRIBUTE_DEV_PREFIX = "dev:"
+_MAX_CUSTOM_ATTRIBUTES = 50
+
+
+def _standard_string_attribute(name, min_length="0", max_length="2048"):
+    return {
+        "Name": name,
+        "AttributeDataType": "String",
+        "DeveloperOnlyAttribute": False,
+        "Mutable": True,
+        "Required": False,
+        "StringAttributeConstraints": {
+            "MinLength": min_length,
+            "MaxLength": max_length,
+        },
+    }
+
+
+def _standard_boolean_attribute(name):
+    return {
+        "Name": name,
+        "AttributeDataType": "Boolean",
+        "DeveloperOnlyAttribute": False,
+        "Mutable": True,
+        "Required": False,
+    }
+
+
+_STANDARD_SCHEMA_ATTRIBUTES = [
+    _standard_string_attribute("sub", min_length="1"),
+    _standard_string_attribute("name"),
+    _standard_string_attribute("given_name"),
+    _standard_string_attribute("family_name"),
+    _standard_string_attribute("middle_name"),
+    _standard_string_attribute("nickname"),
+    _standard_string_attribute("preferred_username"),
+    _standard_string_attribute("profile"),
+    _standard_string_attribute("picture"),
+    _standard_string_attribute("website"),
+    _standard_string_attribute("email"),
+    _standard_boolean_attribute("email_verified"),
+    _standard_string_attribute("gender"),
+    _standard_string_attribute("birthdate", min_length="10", max_length="10"),
+    _standard_string_attribute("zoneinfo"),
+    _standard_string_attribute("locale"),
+    _standard_string_attribute("phone_number"),
+    _standard_boolean_attribute("phone_number_verified"),
+    _standard_string_attribute("address"),
+    {
+        "Name": "updated_at",
+        "AttributeDataType": "Number",
+        "DeveloperOnlyAttribute": False,
+        "Mutable": True,
+        "Required": False,
+        "NumberAttributeConstraints": {"MinValue": "0"},
+    },
+]
+# `sub` is the one standard attribute that is immutable and required.
+for _attr in _STANDARD_SCHEMA_ATTRIBUTES:
+    if _attr["Name"] == "sub":
+        _attr["Mutable"] = False
+        _attr["Required"] = True
+del _attr
+
+_STANDARD_ATTRIBUTES_BY_NAME = {a["Name"]: a for a in _STANDARD_SCHEMA_ATTRIBUTES}
+
+
+def _schema_attribute_name(raw) -> str:
+    """Return the stored attribute name, prefixing custom/developer attributes.
+
+    AWS: "When you add an attribute with a Name value of MyAttribute, Amazon
+    Cognito creates the custom attribute custom:MyAttribute", and dev:MyAttribute
+    when DeveloperOnlyAttribute is true. A caller that already sent the prefix
+    (as a round-tripped DescribeUserPool response does) keeps it.
+    """
+    name = (raw.get("Name") or "").strip()
+    if (name in _STANDARD_ATTRIBUTES_BY_NAME
+            or name.startswith(_ATTRIBUTE_CUSTOM_PREFIX)
+            or name.startswith(_ATTRIBUTE_DEV_PREFIX)):
+        return name
+    prefix = (_ATTRIBUTE_DEV_PREFIX if raw.get("DeveloperOnlyAttribute")
+              else _ATTRIBUTE_CUSTOM_PREFIX)
+    return f"{prefix}{name}"
+
+
+def _normalize_schema_attribute(raw: dict) -> dict:
+    """Fill a request SchemaAttributeType out to its DescribeUserPool shape.
+
+    Overriding a standard attribute (a pool that makes `email` required, say)
+    starts from the standard entry, so unspecified fields keep the values the
+    real service reports rather than dropping out of the response.
+    """
+    name = _schema_attribute_name(raw)
+    base = _STANDARD_ATTRIBUTES_BY_NAME.get(name)
+    attr = copy.deepcopy(base) if base else {
+        "Name": name,
+        "AttributeDataType": "String",
+        "DeveloperOnlyAttribute": False,
+        "Mutable": False,
+        "Required": False,
+    }
+    attr["Name"] = name
+    for key in ("AttributeDataType",):
+        if raw.get(key):
+            attr[key] = raw[key]
+    for key in ("DeveloperOnlyAttribute", "Mutable", "Required"):
+        if key in raw:
+            attr[key] = bool(raw[key])
+    for key in ("StringAttributeConstraints", "NumberAttributeConstraints"):
+        if raw.get(key):
+            attr[key] = dict(raw[key])
+    return attr
+
+
+def _build_schema_attributes(schema) -> list:
+    """Standard attributes plus the caller's, as DescribeUserPool returns them."""
+    attrs = copy.deepcopy(_STANDARD_SCHEMA_ATTRIBUTES)
+    index = {a["Name"]: i for i, a in enumerate(attrs)}
+    for raw in schema or []:
+        if not isinstance(raw, dict):
+            continue
+        attr = _normalize_schema_attribute(raw)
+        if attr["Name"] in index:
+            attrs[index[attr["Name"]]] = attr
+        else:
+            index[attr["Name"]] = len(attrs)
+            attrs.append(attr)
+    return attrs
+
+
+def _custom_attribute_count(pool) -> int:
+    return sum(1 for a in pool.get("SchemaAttributes", [])
+               if a["Name"].startswith((_ATTRIBUTE_CUSTOM_PREFIX, _ATTRIBUTE_DEV_PREFIX)))
+
+
+# ---------------------------------------------------------------------------
 # In-memory state — User Pools (cognito-idp)
 # ---------------------------------------------------------------------------
 
-_user_pools = AccountScopedDict()
+_user_pools = AccountRegionScopedDict()
 # pool_id -> {
 #   Id, Name, Arn, CreationDate, LastModifiedDate, Status,
-#   Policies, Schema, AutoVerifiedAttributes, UsernameAttributes,
+#   Policies, SchemaAttributes, AutoVerifiedAttributes, UsernameAttributes,
 #   MfaConfiguration, EstimatedNumberOfUsers,
 #   AdminCreateUserConfig, UserPoolTags,
 #   Domain (str|None),
@@ -217,32 +524,41 @@ _user_pools = AccountScopedDict()
 #   _users:   {username -> user_dict},
 #   _groups:  {group_name -> group_dict},
 #   _identity_providers: {provider_name -> provider_dict},
+#   _resource_servers: {identifier -> resource_server_dict},
+#   _ui_customizations: {client_id or ALL -> UICustomizationType},
+#   _managed_login_brandings: {branding_id -> branding_dict},
 # }
 
-_pool_domain_map = AccountScopedDict()   # domain -> pool_id
+_pool_domain_map = AccountRegionScopedDict()   # domain -> pool_id
 
 # ---------------------------------------------------------------------------
 # In-memory state — OAuth2 Authorization Codes & Refresh Tokens
 # ---------------------------------------------------------------------------
 
-_authorization_codes: dict[str, dict] = {}   # code -> {client_id, pool_id, redirect_uri, scope, username, nonce, expires_at, code_challenge, code_challenge_method}
+_authorization_codes: dict[str, dict] = {}   # code -> {client_id, pool_id, redirect_uri, scope, username, nonce, expires_at, code_challenge, code_challenge_method, resource}
 _refresh_tokens: dict[str, dict] = {}        # refresh_token_value -> {pool_id, client_id, username, scope}
+_revoked_tokens: set = set()                 # refresh tokens and origin_jti values revoked
+_signed_out_tokens: set = set()              # the origin_jti values of those a global sign-out ended
+# origin_jti -> {latest, rotated, rotated_at}: a rotating client's refresh-token family
+_refresh_token_families: dict[str, dict] = {}
+_refresh_token_families_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # In-memory state — Identity Pools (cognito-identity)
 # ---------------------------------------------------------------------------
 
-_identity_pools = AccountScopedDict()
+_identity_pools = AccountRegionScopedDict()
 # identity_pool_id -> {
 #   IdentityPoolId, IdentityPoolName, AllowUnauthenticatedIdentities,
 #   SupportedLoginProviders, DeveloperProviderName,
 #   OpenIdConnectProviderARNs, CognitoIdentityProviders,
 #   SamlProviderARNs, IdentityPoolTags,
 #   _roles: {authenticated: arn, unauthenticated: arn},
+#   _principal_tags: {provider_name -> {UseDefaults, PrincipalTags}},
 #   _identities: {identity_id -> identity_dict},
 # }
 
-_identity_tags = AccountScopedDict()   # identity_pool_id -> {key: value}
+_identity_tags = AccountRegionScopedDict()   # identity_pool_id -> {key: value}
 
 # ---------------------------------------------------------------------------
 # In-memory state — OAuth2 authorization codes
@@ -264,8 +580,80 @@ _identity_tags = AccountScopedDict()   # identity_pool_id -> {key: value}
 _auth_codes = {}   # code -> {pool_id, client_id, username, redirect_uri, scopes, state, created_at}
 _AUTH_CODE_TTL = 300  # 5 minutes
 
+# Managed-login (Hosted UI) NEW_PASSWORD_REQUIRED sessions. Plain dict for the
+# same reason as `_auth_codes` above — no SigV4 on /login, so AccountScopedDict
+# would add no isolation; the unguessable token is the isolation boundary.
+_pending_new_password = {}   # token -> {pool_id, client_id, username, redirect_uri,
+                              #           scope, state, response_type, nonce,
+                              #           code_challenge, code_challenge_method, expires_at}
+_NEW_PASSWORD_SESSION_TTL = 300  # 5 minutes
+
+# Choice-based sign-in (Hosted UI, ALLOW_USER_AUTH) sessions. Plain dict for the
+# same reason as `_pending_new_password` above — no SigV4 on /login.
+_pending_user_auth = {}   # token -> {pool_id, client_id, username, redirect_uri, scope,
+                          #           state, response_type, nonce, code_challenge,
+                          #           code_challenge_method, available_challenges, expires_at}
+_USER_AUTH_SESSION_TTL = 300  # 5 minutes
+
+# Hosted UI MFA sessions after a password: a TOTP or SMS challenge, or TOTP
+# enrolment where the pool requires MFA. Plain dict for the same reason as above.
+# They last the client's AuthSessionValidity, as AWS's `cognito` cookie does.
+_pending_hosted_mfa = {}  # token -> {oauth fields, pool_id, username, kind: "verify"|"sms"|"setup",
+                          #           secret, failures, expires_at}
+
+# ---------------------------------------------------------------------------
+# In-memory state — CUSTOM_AUTH Challenge Sessions
+# ---------------------------------------------------------------------------
+
+# Keep challenge sessions account-scoped: signed AdminInitiateAuth can mint a
+# session in any region, while unsigned RespondToAuthChallenge redeems the
+# opaque token without a SigV4 region. The session's pool_id pins downstream
+# regional pool access in the worker context.
+_challenge_sessions = AccountScopedDict()
+# token (base64-encoded session token, opaque to client) -> {
+#   'pool_id': str,
+#   'client_id': str,
+#   'username': str,
+#   'created_at': float (epoch seconds),
+#   'expires_at': float (epoch seconds),
+#   'challenges': [
+#     {
+#       'challengeName': 'CUSTOM_CHALLENGE',
+#       'challengeResult': bool | None,   # None = pending (not yet verified)
+#       'challengeMetadata': str | None,  # 'MAGIC_LINK', 'SMS_OTP', etc.
+#       'publicChallengeParameters': dict,
+#       'privateChallengeParameters': dict,
+#       'timestamp': float,
+#     },
+#     ...
+#   ],
+#   'last_challenge_metadata': str | None,
+# }
+
+_CHALLENGE_SESSION_TTL = 3600  # fallback only — see _create_challenge_session for TTL from client config
+_MAX_CHALLENGE_ATTEMPTS = 3    # AWS parity — terminate CUSTOM_AUTH after 3 answered rounds
+
 
 # ── Persistence ────────────────────────────────────────────
+
+_REGION_PREFIX_RE = re.compile(r"^[a-z]+(-[a-z]+)+-\d+$")
+
+
+def _region_from_pool_id(pool_id: str) -> str:
+    if isinstance(pool_id, str) and "_" in pool_id:
+        candidate = pool_id.rsplit("_", 1)[0]
+        if _REGION_PREFIX_RE.match(candidate):
+            return candidate
+    return get_region()
+
+
+def _region_from_identity_id(identity_id: str) -> str:
+    if isinstance(identity_id, str) and ":" in identity_id:
+        candidate = identity_id.split(":", 1)[0]
+        if _REGION_PREFIX_RE.match(candidate):
+            return candidate
+    return get_region()
+
 
 def get_state():
     return {
@@ -275,30 +663,88 @@ def get_state():
         "identity_tags": copy.deepcopy(_identity_tags),
         "authorization_codes": copy.deepcopy(_authorization_codes),
         "refresh_tokens": copy.deepcopy(_refresh_tokens),
+        "revoked_tokens": list(_revoked_tokens),
+        "signed_out_tokens": list(_signed_out_tokens),
+        "refresh_token_families": copy.deepcopy(_refresh_token_families),
         "auth_codes": copy.deepcopy(_auth_codes),
+        "challenge_sessions": copy.deepcopy(_challenge_sessions),
     }
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     if data:
-        _user_pools.update(data.get("user_pools", {}))
-        _pool_domain_map.update(data.get("pool_domain_map", {}))
-        _identity_pools.update(data.get("identity_pools", {}))
-        _identity_tags.update(data.get("identity_tags", {}))
+        _restore_regional_store(
+            _user_pools,
+            data.get("user_pools", {}),
+            lambda pool_id, _pool: _region_from_pool_id(pool_id),
+        )
+        # Older state stored 60 for an unset validity; 60 hours exceeds AWS's one-day cap.
+        for pool in _user_pools.all_values():
+            for client in (pool.get("_clients") or {}).values():
+                units = client.get("TokenValidityUnits") or {}
+                for kind in ("AccessToken", "IdToken"):
+                    if client.get(f"{kind}Validity") == 60 and not units.get(kind):
+                        client[f"{kind}Validity"] = None
+
+        _restore_regional_store(
+            _pool_domain_map,
+            data.get("pool_domain_map", {}),
+            lambda _domain, pool_id: _region_from_pool_id(pool_id),
+        )
+        _restore_regional_store(
+            _identity_pools,
+            data.get("identity_pools", {}),
+            lambda pool_id, _pool: _region_from_identity_id(pool_id),
+        )
+        _restore_regional_store(
+            _identity_tags,
+            data.get("identity_tags", {}),
+            lambda pool_id, _tags: _region_from_identity_id(pool_id),
+        )
         _authorization_codes.update(data.get("authorization_codes", {}))
         _refresh_tokens.update(data.get("refresh_tokens", {}))
+        _revoked_tokens.update(data.get("revoked_tokens", []))
+        _signed_out_tokens.update(data.get("signed_out_tokens", []))
+        _refresh_token_families.update(data.get("refresh_token_families", {}))
         _auth_codes.update(data.get("auth_codes", {}))
+        _challenge_sessions.update(data.get("challenge_sessions", {}))
 
 
-try:
-    _restored = load_state("cognito")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
+def _ensure_schema_attributes(pool: dict) -> dict:
+    """Backfill a pool restored from a pre-SchemaAttributes snapshot.
+
+    Older snapshots stored the CreateUserPool request's `Schema` list verbatim
+    and carried no `SchemaAttributes`; rebuilding from it on first use keeps a
+    restored pool describing itself the way a freshly created one does, without
+    rewriting records that a caller never touches.
+    """
+    if not pool.get("SchemaAttributes"):
+        pool["SchemaAttributes"] = _build_schema_attributes(pool.pop("Schema", None))
+    return pool
+
+
+def _restore_regional_store(store, restored, region_for_item):
+    """Restore a Cognito store, self-placing legacy records from their IDs."""
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return
+
+    if isinstance(restored, AccountScopedDict):
+        items = restored._data.items()
+    elif isinstance(restored, dict):
+        account_id = get_account_id()
+        items = (((account_id, key), value) for key, value in restored.items())
+    else:
+        return
+
+    for (account_id, key), value in items:
+        store.set_scoped(account_id, region_for_item(key, value), key, value)
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -310,12 +756,25 @@ def _now_epoch() -> float:
 
 
 def _pool_arn(pool_id: str) -> str:
-    return f"arn:aws:cognito-idp:{get_region()}:{get_account_id()}:userpool/{pool_id}"
+    return f"arn:aws:cognito-idp:{_pool_region(pool_id)}:{get_account_id()}:userpool/{pool_id}"
 
 
 def _pool_id() -> str:
     suffix = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(26))
     return f"{get_region()}_{suffix[:9]}"
+
+
+def _pool_region(pool_id: str) -> str:
+    """Return the region encoded in a pool_id (format ``{region}_{suffix}``).
+
+    Falls back to get_region() for empty or non-standard IDs so callers
+    never have to special-case the edge cases. The regex accepts both
+    3-segment commercial regions (e.g. ``us-east-1``, ``eu-central-1``) and
+    4-segment GovCloud / ISO regions (e.g. ``us-gov-east-1``, ``us-iso-west-1``,
+    ``eu-isoe-west-1``) — Cognito is available in GovCloud, so the parser must
+    not silently fall through and reproduce the original `iss` bug there.
+    """
+    return _region_from_pool_id(pool_id)
 
 
 def _client_id() -> str:
@@ -334,28 +793,156 @@ def _identity_id(pool_id: str) -> str:
     return f"{get_region()}:{new_uuid()}"
 
 
+class _InvalidCognitoIdentityArn(ValueError):
+    pass
+
+
+class _InvalidCognitoIdpArn(ValueError):
+    pass
+
+
+def _user_pool_id_from_arn(resource_arn: str) -> str | None:
+    try:
+        spec = parse_arn(resource_arn)
+    except ArnParseError as exc:
+        raise _InvalidCognitoIdpArn("Invalid Cognito IDP resource ARN.") from exc
+    if spec.service != "cognito-idp":
+        raise _InvalidCognitoIdpArn("Invalid Cognito IDP resource ARN.")
+    if spec.region != get_region() or spec.account_id != get_account_id():
+        return None
+    prefix = "userpool/"
+    if not spec.resource.startswith(prefix):
+        raise _InvalidCognitoIdpArn("Invalid Cognito IDP resource ARN.")
+    pool_id = spec.resource[len(prefix):]
+    if not pool_id:
+        raise _InvalidCognitoIdpArn("Invalid Cognito IDP resource ARN.")
+    return pool_id
+
+
+def _identity_pool_id_from_arn(resource_arn: str) -> str | None:
+    try:
+        spec = parse_arn(resource_arn)
+    except ArnParseError as exc:
+        raise _InvalidCognitoIdentityArn("Invalid Cognito Identity resource ARN.") from exc
+    if spec.service != "cognito-identity":
+        raise _InvalidCognitoIdentityArn("Invalid Cognito Identity resource ARN.")
+    if spec.region != get_region() or spec.account_id != get_account_id():
+        return None
+    prefix = "identitypool/"
+    if not spec.resource.startswith(prefix):
+        raise _InvalidCognitoIdentityArn("Invalid Cognito Identity resource ARN.")
+    pool_id = spec.resource[len(prefix):]
+    if not pool_id:
+        raise _InvalidCognitoIdentityArn("Invalid Cognito Identity resource ARN.")
+    return pool_id
+
+
+_VALIDITY_UNIT_SECONDS = {"seconds": 1, "minutes": 60, "hours": 3600, "days": 86400}
+
+
+def _token_validity(pool_id: str, client_id: str, token_type: str) -> int:
+    """Seconds a token of this app client is valid, by its settings or the AWS default."""
+    client = ((_user_pools.get(pool_id) or {}).get("_clients") or {}).get(client_id) or {}
+    kind, value, unit = {"id": ("IdToken", 1, "hours"), "refresh": ("RefreshToken", 30, "days")}.get(
+        token_type, ("AccessToken", 1, "hours"))
+    value = client.get(f"{kind}Validity") or value
+    unit = (client.get("TokenValidityUnits") or {}).get(kind) or unit
+    return int(value) * _VALIDITY_UNIT_SECONDS.get(unit, 3600)
+
+
+_API_TOKEN_SCOPE = "aws.cognito.signin.user.admin"
+_STANDARD_OAUTH_SCOPES = ("openid", "email", "phone", "profile", _API_TOKEN_SCOPE)
+
+
+def _aws_scope_order(scopes: list[str], presized: bool = True) -> list[str]:
+    """Scopes in the iteration order of a Java HashSet built from them, the order AWS lists them in."""
+    # The token's set is sized for the scopes up front, the trigger event's grows as they are added
+    limit = len(scopes) / 0.75
+    if presized:
+        limit = int(limit) + 1
+    size = 16
+    while size < limit:
+        size *= 2
+
+    def bucket(scope):
+        h = 0
+        for ch in scope:
+            h = (31 * h + ord(ch)) & 0xFFFFFFFF
+        return (h ^ (h >> 16)) & (size - 1)
+
+    return sorted(scopes, key=bucket)
+
+
+def _granted_scopes(client: dict | None, requested: str | None, grant: str = "authorization_code") -> str | None:
+    """The scopes a token-endpoint grant carries: the requested ones the client allows, or all it allows."""
+    listed = (client or {}).get("AllowedOAuthScopes") or []
+    if not listed and not requested:
+        # Only user sign-ins inherit the user-pool API scope.
+        return "" if grant == "client_credentials" else None
+    # client_credentials grants only resource-server scopes
+    allowed = sorted(s for s in listed if "/" in s or grant != "client_credentials")
+    wanted = requested.split() if requested else allowed
+    if listed:
+        wanted = [s for s in wanted if s in allowed]
+    return " ".join(dict.fromkeys(wanted))
+
+
+def _id_token_granted(scope: str | None) -> bool:
+    """Whether a grant gets an ID token: API sign-ins always, OAuth grants only with openid."""
+    return scope is None or "openid" in scope.split()
+
+
+def _client_credentials_scope_error(pool: dict, client: dict, requested: str | None):
+    """invalid_scope for a non-custom scope or no defined one, invalid_grant for one or a flow the client lacks."""
+    allowed = client.get("AllowedOAuthScopes") or []
+    wanted = requested.split() if requested else [s for s in allowed if "/" in s]
+    defined = {
+        f"{identifier}/{scope['ScopeName']}"
+        for identifier, server in (pool.get("_resource_servers") or {}).items()
+        for scope in server.get("Scopes", [])
+    }
+    if "client_credentials" not in (client.get("AllowedOAuthFlows") or []):
+        # Unknown scopes fail first; known ones get invalid_grant without the flow
+        known = [scope for scope in wanted if scope in defined or scope in _STANDARD_OAUTH_SCOPES]
+        unknown = any("/" not in scope and scope not in _STANDARD_OAUTH_SCOPES for scope in wanted)
+        error = "invalid_scope" if unknown or not known else "invalid_grant"
+    # An undefined resource server scope is dropped when a defined one is requested
+    elif (requested and not wanted) or any("/" not in scope for scope in wanted):
+        error = "invalid_scope"
+    elif any(scope in defined and scope not in allowed for scope in wanted):
+        error = "invalid_grant"
+    elif wanted and not defined.intersection(wanted):
+        error = "invalid_scope"
+    else:
+        return None
+    return 400, {"Content-Type": "application/json"}, json.dumps({"error": error}).encode()
+
+
 def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "access",
                  username: str = "", user_attrs: dict | None = None,
                  groups: list[str] | None = None,
                  nonce: str = "",
-                 trigger_source: str = "TokenGeneration_Authentication") -> str:
+                 trigger_source: str = "TokenGeneration_Authentication",
+                 client_metadata: dict | None = None, origin_jti: str = "",
+                 scope: str | None = None, expires_at: int | None = None, audience: str = "") -> str:
     """Return a JWT signed with the RSA key when cryptography is available.
 
     For ``access`` and ``id`` tokens, runs the user pool's PreTokenGeneration
     Lambda trigger (V2_0 — both tokens; V1_0 — id token only) before signing.
-    Refresh tokens are opaque in AWS and skip the trigger.
+    Refresh tokens are opaque in AWS and skip the trigger. ``scope`` is the
+    grant's scopes; None for API sign-ins. ``audience`` is the resource the
+    sign-in was bound to (RFC 8707): the access token's ``aud``, kept in the
+    refresh token for the tokens it mints.
     """
-    header = base64.urlsafe_b64encode(
-        json.dumps({"alg": "RS256", "kid": "ministack-key-1"}).encode()
-    ).rstrip(b"=").decode()
+    granted = _API_TOKEN_SCOPE if scope is None else scope
     now = int(time.time())
-    origin_jti = new_uuid()
+    origin_jti = origin_jti or new_uuid()
     claims = {
         "sub": sub,
-        "iss": f"https://cognito-idp.{get_region()}.amazonaws.com/{pool_id}",
+        "iss": f"https://cognito-idp.{_pool_region(pool_id)}.amazonaws.com/{pool_id}",
         "token_use": token_type,
         "iat": now,
-        "exp": now + 3600,
+        "exp": expires_at or now + _token_validity(pool_id, client_id, token_type),
         "jti": new_uuid(),
     }
     if token_type == "id":
@@ -378,6 +965,22 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
             for k, v in user_attrs.items():
                 if k == "sub":
                     continue
+                if k == "identities":
+                    # "Your user's ID token contains all of their associated
+                    # providers in the identities claim" — as an array, while
+                    # the user attribute itself carries JSON text. The claim
+                    # carries primary and dateCreated as strings.
+                    try:
+                        parsed = json.loads(v)
+                    except (TypeError, ValueError):
+                        claims[k] = v
+                        continue
+                    claims[k] = [_identity_claim(i) for i in parsed] if isinstance(parsed, list) else parsed
+                    continue
+                if k in ("email_verified", "phone_number_verified"):
+                    # AWS carries the standard verified flags as JSON booleans in the ID token
+                    claims[k] = v == "true"
+                    continue
                 claims[k] = v
             if "email" in user_attrs:
                 claims.setdefault("email_verified", True)
@@ -385,7 +988,9 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
         claims["client_id"] = client_id
         claims["auth_time"] = now
         claims["origin_jti"] = origin_jti
-        claims["scope"] = "aws.cognito.signin.user.admin"
+        if audience:
+            claims["aud"] = audience
+        claims["scope"] = " ".join(_aws_scope_order(granted.split()))
         if username:
             claims["username"] = username
         if groups:
@@ -393,6 +998,11 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
     else:
         # RefreshToken — opaque in real AWS, but we use a JWT stub for simplicity
         claims["client_id"] = client_id
+        claims["origin_jti"] = origin_jti
+        if scope is not None:
+            claims["scope"] = scope
+        if audience:
+            claims["aud"] = audience
 
     if token_type in ("access", "id"):
         claims = _apply_pretoken_trigger(
@@ -404,26 +1014,91 @@ def _fake_token(sub: str, pool_id: str, client_id: str, token_type: str = "acces
             username=username,
             user_attrs=user_attrs or {},
             groups=groups or [],
+            client_metadata=client_metadata,
+            scope=granted,
         )
+    return _signed_jwt(claims, pool_id, "id" if token_type == "id" else "access")
 
+
+def _identity_claim(identity):
+    """An identities entry as the ID token carries it, with primary and dateCreated as strings."""
+    if not isinstance(identity, dict):
+        return identity
+    out = dict(identity)
+    if "primary" in out:
+        out["primary"] = str(out["primary"]).lower()
+    if out.get("dateCreated") is not None:
+        out["dateCreated"] = str(out["dateCreated"])
+    return out
+
+
+def _signed_jwt(claims: dict, pool_id: str = "", use: str = "") -> str:
+    """A JWT over *claims*, signed with the pool's `use` key, else the shared key, when cryptography is available."""
+    key, jwk = _pool_signing_key(pool_id, use) if pool_id else (None, None)
+    if key is None:
+        key, jwk = _RSA_PRIVATE_KEY, _JWKS_KEY
+    header = base64.urlsafe_b64encode(
+        json.dumps({"alg": "RS256", "kid": jwk["kid"]}).encode()
+    ).rstrip(b"=").decode()
     payload = base64.urlsafe_b64encode(
         json.dumps(claims).encode()
     ).rstrip(b"=").decode()
     signing_input = f"{header}.{payload}".encode()
-    if _RSA_PRIVATE_KEY is not None:
+    if key is not None:
         from cryptography.hazmat.primitives import hashes
         from cryptography.hazmat.primitives.asymmetric import padding
-        sig_bytes = _RSA_PRIVATE_KEY.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
+        sig_bytes = key.sign(signing_input, padding.PKCS1v15(), hashes.SHA256())
         sig = base64.urlsafe_b64encode(sig_bytes).rstrip(b"=").decode()
     else:
         sig = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
     return f"{header}.{payload}.{sig}"
 
 
+class _PreTokenRejected(Exception):
+    """Raised when a PreTokenGeneration Lambda runs and returns an error."""
+
+
+class _PreTokenUnavailable(Exception):
+    """Raised when a PreTokenGeneration Lambda cannot be invoked."""
+
+
+def _pretoken_error_code(exc) -> str:
+    return ("UserLambdaValidationException" if isinstance(exc, _PreTokenRejected)
+            else "UnexpectedLambdaException")
+
+
+def _pretoken_error(exc):
+    return error_response_json(_pretoken_error_code(exc), str(exc), 400)
+
+
+def _pretoken_oauth2_error(exc):
+    # The token endpoint passes Cognito's internal service exception through
+    # as the "error" text instead of an OAuth error code
+    error = (f"{exc} (Service: AWSCognitoIdentityProviderInternalService; Status Code: 400; "
+             f"Error Code: {_pretoken_error_code(exc)}; Request ID: {new_uuid()}; Proxy: null)")
+    return 400, {"Content-Type": "application/json;charset=UTF-8"}, json.dumps({"error": error}).encode()
+
+
+def _lambda_error_message(body) -> str:
+    """The ``errorMessage`` of a Lambda error result, else the body as text."""
+    if isinstance(body, (bytes, bytearray)):
+        body = body.decode("utf-8", "replace")
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except (TypeError, ValueError):
+            return body
+    if isinstance(body, dict) and body.get("errorMessage") is not None:
+        return str(body["errorMessage"])
+    return str(body)
+
+
 def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
                              trigger_source: str, client_id: str,
                              username: str, user_attrs: dict,
-                             groups: list[str]) -> dict:
+                             groups: list[str],
+                             client_metadata: dict | None = None,
+                             scope: str = _API_TOKEN_SCOPE) -> dict:
     """Invoke the user pool's PreTokenGeneration Lambda and apply its overrides.
 
     Honours both V1_0 (``LambdaConfig.PreTokenGeneration`` — id token only,
@@ -431,9 +1106,9 @@ def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
     (``LambdaConfig.PreTokenGenerationConfig`` — id + access tokens,
     ``claimsAndScopeOverrideDetails`` shape).
 
-    By default a Lambda failure is logged and ignored — the unmodified token
-    is still issued. Set ``MINISTACK_COGNITO_PRETOKEN_STRICT=1`` to fail-closed
-    (raise to the caller) the way real AWS does.
+    A Lambda that returns an error raises ``_PreTokenRejected`` (AWS's
+    ``UserLambdaValidationException``); one that cannot be invoked raises
+    ``_PreTokenUnavailable`` (``UnexpectedLambdaException``).
     """
     pool = _user_pools.get(pool_id)
     if not pool:
@@ -452,6 +1127,9 @@ def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
     # V1_0 only fires for id tokens.
     if not use_v2 and token_type != "id":
         return claims
+    # Client credentials grants only fire V3_0.
+    if trigger_source == "TokenGeneration_ClientCredentials" and v2_version != "V3_0":
+        return claims
 
     event = _build_pretoken_event(
         pool_id=pool_id,
@@ -461,32 +1139,36 @@ def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
         groups=groups,
         trigger_source=trigger_source,
         version=v2_version if use_v2 else "V1_0",
+        client_metadata=client_metadata,
+        scope=scope,
     )
 
-    strict = os.environ.get("MINISTACK_COGNITO_PRETOKEN_STRICT", "").lower() in ("1", "true", "yes")
+    trigger_name = f"PreTokenGeneration{v2_version}" if use_v2 else "PreTokenGeneration"
     try:
         # Lazy import to avoid a circular dependency between cognito and lambda_svc.
         from ministack.services import lambda_svc
-        name, qualifier = lambda_svc._resolve_name_and_qualifier(arn)
-        record, alias = lambda_svc._get_func_record_for_qualifier(name, qualifier)
-        if record is None:
-            raise RuntimeError(f"PreTokenGeneration Lambda not found: {arn}")
-        result = lambda_svc._execute_function(record, event)
+        record, config, _name = lambda_svc._get_func_record_for_ref(arn)
+        if record is None or config is None:
+            # AWS reports a missing function as the invoke being denied
+            raise _PreTokenUnavailable(
+                f"{trigger_name} invocation failed due to error AccessDeniedException.")
+        exec_record = lambda_svc._execution_record_for_config(record, config)
+        result = lambda_svc._execute_function_with_config_scope(exec_record, event)
     except Exception as e:
         logger.warning("PreTokenGeneration Lambda invocation failed for pool %s: %s",
                        pool_id, e)
-        if strict:
+        if isinstance(e, _PreTokenUnavailable):
             raise
-        return claims
+        raise _PreTokenUnavailable(
+            f"{trigger_name} invocation failed due to error {type(e).__name__}.") from e
 
     if isinstance(result, dict) and result.get("error"):
-        logger.warning("PreTokenGeneration Lambda returned an error for pool %s: %s",
-                       pool_id, result.get("body"))
-        if strict:
-            raise RuntimeError(f"PreTokenGeneration error: {result.get('body')}")
-        return claims
+        reason = _lambda_error_message(result.get("body"))
+        logger.info("PreTokenGeneration Lambda rejected the token for pool %s: %s",
+                    pool_id, reason)
+        raise _PreTokenRejected(f"{trigger_name} failed with error {reason}.")
     payload = result.get("body") if isinstance(result, dict) else result
-    response = _extract_pretoken_response(payload)
+    response = _extract_trigger_response(payload)
     if not response:
         return claims
 
@@ -527,7 +1209,9 @@ def _apply_pretoken_trigger(pool_id: str, claims: dict, token_type: str,
 
 def _build_pretoken_event(pool_id: str, client_id: str, username: str,
                            user_attrs: dict, groups: list[str],
-                           trigger_source: str, version: str) -> dict:
+                           trigger_source: str, version: str,
+                           client_metadata: dict | None = None,
+                           scope: str = _API_TOKEN_SCOPE) -> dict:
     """Construct the event payload AWS sends to a PreTokenGeneration Lambda.
 
     Shape from the Cognito Developer Guide
@@ -542,8 +1226,11 @@ def _build_pretoken_event(pool_id: str, client_id: str, username: str,
             "preferredRole": None,
         },
     }
+    # AWS leaves clientMetadata out when the request sent none.
+    if client_metadata:
+        request_block["clientMetadata"] = client_metadata
     if version.startswith("V2") or version.startswith("V3"):
-        request_block["scopes"] = ["aws.cognito.signin.user.admin"]
+        request_block["scopes"] = _aws_scope_order(scope.split(), presized=False)
 
     response_block = (
         {"claimsAndScopeOverrideDetails": None}
@@ -552,13 +1239,14 @@ def _build_pretoken_event(pool_id: str, client_id: str, username: str,
     )
 
     return {
-        "version": "1",
+        # The trigger's major version: "1", "2" or "3"
+        "version": version.split("_")[0].lstrip("V"),
         "triggerSource": trigger_source,
-        "region": get_region(),
+        "region": _pool_region(pool_id),
         "userPoolId": pool_id,
-        "userName": username or "",
+        "userName": "ClientCredentials" if trigger_source == "TokenGeneration_ClientCredentials" else username or "",
         "callerContext": {
-            "awsSdkVersion": "ministack",
+            "awsSdkVersion": "aws-sdk-unknown-unknown",
             "clientId": client_id or "",
         },
         "request": request_block,
@@ -566,12 +1254,13 @@ def _build_pretoken_event(pool_id: str, client_id: str, username: str,
     }
 
 
-def _extract_pretoken_response(payload) -> dict | None:
-    """Pull the ``response`` block from a Lambda invocation result.
+def _extract_trigger_response(payload) -> dict | None:
+    """Pull the ``response`` block from a Lambda trigger invocation result.
 
-    Lambdas return the full event echoed back with their overrides written
-    into ``response.claimsAndScopeOverrideDetails`` (V2/V3) or
-    ``response.claimsOverrideDetails`` (V1). Accept already-parsed dicts,
+    Cognito Lambda triggers return the full event echoed back with their
+    overrides written into the ``response`` block (e.g.
+    ``response.claimsAndScopeOverrideDetails`` for PreTokenGeneration V2/V3,
+    ``response.autoConfirmUser`` for PreSignUp). Accept already-parsed dicts,
     JSON strings, and bytes.
     """
     if payload is None:
@@ -589,6 +1278,263 @@ def _extract_pretoken_response(payload) -> dict | None:
     if not isinstance(payload, dict):
         return None
     return payload.get("response") if isinstance(payload.get("response"), dict) else payload
+
+
+class _PreSignUpRejected(Exception):
+    """Raised when a PreSignUp Lambda trigger rejects a federated sign-up."""
+
+
+def _apply_presignup_trigger(pool_id: str, client_id: str, username: str,
+                              user_attrs: dict,
+                              trigger_source: str = "PreSignUp_ExternalProvider") -> dict:
+    """Invoke the user pool's PreSignUp Lambda before persisting a federated user.
+
+    Emulates AWS's ``PreSignUp_ExternalProvider`` trigger, which fires
+    immediately before Cognito persists a user provisioned through IdP
+    federation. Unlike ``_apply_pretoken_trigger``, this is fail-closed even
+    when the Lambda cannot be invoked: on real AWS a Lambda that throws blocks
+    the sign-up outright (``UserLambdaValidationException``), so any
+    invocation failure or Lambda-reported error raises ``_PreSignUpRejected``
+    instead of being swallowed.
+
+    Returns the trigger's ``autoConfirmUser``/``autoVerifyEmail``/
+    ``autoVerifyPhone`` overrides (all ``False`` if the pool has no
+    ``LambdaConfig.PreSignUp`` configured, which is a no-op).
+    """
+    defaults = {"autoConfirmUser": False, "autoVerifyEmail": False, "autoVerifyPhone": False}
+    pool = _user_pools.get(pool_id)
+    if not pool:
+        return defaults
+    cfg = pool.get("LambdaConfig") or {}
+    arn = cfg.get("PreSignUp")
+    if not arn:
+        return defaults
+
+    event = _build_presignup_event(
+        pool_id=pool_id, client_id=client_id, username=username,
+        user_attrs=user_attrs, trigger_source=trigger_source,
+    )
+
+    try:
+        # Lazy import to avoid a circular dependency between cognito and lambda_svc.
+        from ministack.services import lambda_svc
+        record, config, _name = lambda_svc._get_func_record_for_ref(arn)
+        if record is None or config is None:
+            raise RuntimeError(f"PreSignUp Lambda not found: {arn}")
+        exec_record = lambda_svc._execution_record_for_config(record, config)
+        result = lambda_svc._execute_function_with_config_scope(exec_record, event)
+    except Exception as e:
+        logger.warning("PreSignUp Lambda invocation failed for pool %s: %s", pool_id, e)
+        raise _PreSignUpRejected(str(e)) from e
+
+    if isinstance(result, dict) and result.get("error"):
+        reason = _lambda_error_message(result.get("body"))
+        logger.info("PreSignUp Lambda rejected sign-up for pool %s user %s: %s",
+                    pool_id, username, reason)
+        # AWS's format for every trigger error: "[trigger] failed with error [error text]".
+        raise _PreSignUpRejected(f"PreSignUp failed with error {reason}.")
+
+    payload = result.get("body") if isinstance(result, dict) else result
+    response = _extract_trigger_response(payload) or {}
+    return {
+        "autoConfirmUser": bool(response.get("autoConfirmUser")),
+        "autoVerifyEmail": bool(response.get("autoVerifyEmail")),
+        "autoVerifyPhone": bool(response.get("autoVerifyPhone")),
+    }
+
+
+# Token claims Cognito owns; an IdP claim of the same name only becomes a user
+# attribute when AttributeMapping maps it explicitly.
+_FEDERATION_RESERVED_CLAIMS = frozenset(
+    ("iss", "aud", "exp", "iat", "nbf", "jti", "azp", "auth_time"))
+
+
+_FEDERATION_FLAT_SAFE = frozenset(string.ascii_letters + string.digits + ".-*_ ")
+
+
+def _federation_claim_value(value):
+    """A mapped OIDC claim as Cognito stores it (captured from AWS), None for a null claim."""
+    def text(v):
+        return v if isinstance(v, str) else json.dumps(v, separators=(",", ":"), ensure_ascii=False)
+
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        return text(value)
+    parts = [text(v) for v in value]
+    if all(_FEDERATION_FLAT_SAFE.issuperset(p) for p in parts):
+        return json.dumps(value, separators=(",", ":"), ensure_ascii=False)
+    return "[" + ", ".join(
+        "".join(c if c in _FEDERATION_FLAT_SAFE else "".join(f"%{b:02X}" for b in c.encode("utf-8", "surrogatepass"))
+                for c in p)
+        for p in parts) + "]"
+
+
+def _drop_unmapped_reserved_claims(claims: dict, attr_mapping: dict) -> dict:
+    """Registered token claims from InboundFederation output count only when mapped."""
+    mapped = set(attr_mapping.values())
+    return {k: v for k, v in claims.items()
+            if k not in _FEDERATION_RESERVED_CLAIMS or k in mapped}
+
+
+class _InboundFederationRejected(Exception):
+    """Raised when an InboundFederation Lambda trigger fails the federated sign-in."""
+
+
+def _apply_inbound_federation_trigger(pool_id: str, client_id: str, username: str,
+                                       provider_name: str, provider_type: str,
+                                       attributes: dict) -> dict:
+    """The InboundFederation Lambda's userAttributesToMap, ``{}`` when unconfigured; a failure raises."""
+    pool = _user_pools.get(pool_id)
+    cfg = ((pool or {}).get("LambdaConfig") or {}).get("InboundFederation")
+    arn = cfg.get("LambdaArn") if isinstance(cfg, dict) else None
+    if not arn:
+        return {}
+
+    event = {
+        "version": "1",
+        "triggerSource": "InboundFederation_ExternalProvider",
+        "region": _pool_region(pool_id),
+        "userPoolId": pool_id,
+        "userName": username or "",
+        "callerContext": {"awsSdkVersion": "aws-sdk-unknown-unknown", "clientId": client_id or ""},
+        "request": {
+            "providerName": provider_name,
+            "providerType": provider_type,
+            "attributes": attributes,
+        },
+        "response": {"userAttributesToMap": {}},
+    }
+
+    try:
+        # Lazy import to avoid a circular dependency between cognito and lambda_svc.
+        from ministack.services import lambda_svc
+        record, config, _name = lambda_svc._get_func_record_for_ref(arn)
+        if record is None or config is None:
+            raise RuntimeError(f"InboundFederation Lambda not found: {arn}")
+        exec_record = lambda_svc._execution_record_for_config(record, config)
+        result = lambda_svc._execute_function_with_config_scope(exec_record, event)
+    except Exception as e:
+        logger.warning("InboundFederation Lambda invocation failed for pool %s: %s", pool_id, e)
+        raise _InboundFederationRejected(str(e)) from e
+
+    if isinstance(result, dict) and result.get("error"):
+        reason = result.get("body") or "InboundFederation Lambda rejected the request."
+        logger.info("InboundFederation Lambda rejected sign-in for pool %s user %s: %s",
+                    pool_id, username, reason)
+        raise _InboundFederationRejected(str(reason))
+
+    payload = result.get("body") if isinstance(result, dict) else result
+    to_map = (_extract_trigger_response(payload) or {}).get("userAttributesToMap")
+    if not isinstance(to_map, dict):
+        return {}
+    return {str(k): str(v) for k, v in to_map.items()
+            if isinstance(v, (str, int, float, bool))}
+
+
+def _build_presignup_event(pool_id: str, client_id: str, username: str,
+                            user_attrs: dict, trigger_source: str) -> dict:
+    """Construct the event payload AWS sends to a PreSignUp Lambda.
+
+    Shape from the Cognito Developer Guide
+    (https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-lambda-pre-sign-up.html).
+    ``validationData`` is always empty for federated sign-in — it only carries
+    data supplied via ``ClientMetadata`` on the native ``SignUp`` API.
+    """
+    return {
+        "version": "1",
+        "triggerSource": trigger_source,
+        "region": _pool_region(pool_id),
+        "userPoolId": pool_id,
+        "userName": username or "",
+        "callerContext": {
+            "awsSdkVersion": "aws-sdk-unknown-unknown",
+            "clientId": client_id or "",
+        },
+        "request": {
+            "userAttributes": {k: v for k, v in (user_attrs or {}).items()
+                               if isinstance(v, (str, int, float, bool))},
+            "validationData": {},
+        },
+        "response": {
+            "autoConfirmUser": False,
+            "autoVerifyEmail": False,
+            "autoVerifyPhone": False,
+        },
+    }
+
+
+def _token_claims(token) -> dict:
+    """The unverified claims of a JWT, or {} when it is not one."""
+    try:
+        claims = _decode_id_token_unverified(token)
+    except (ValueError, AttributeError):
+        return {}
+    return claims if isinstance(claims, dict) else {}
+
+
+def _signature_valid(token: str) -> bool:
+    """Whether a JWT is signed with the key its issuer signs with: its user pool's, else the shared one."""
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+    pool_id = str(_token_claims(token).get("iss", "")).rsplit("/", 1)[-1]
+    if _get_pool_unscoped(pool_id) is not None:
+        head = token.split(".", 1)[0]
+        try:
+            kid = json.loads(base64.urlsafe_b64decode(head + "=" * (-len(head) % 4))).get("kid")
+        except (ValueError, AttributeError):
+            return False
+        keys = [k for k, jwk in (_pool_signing_key(pool_id, use) for use in _POOL_KEY_USES)
+                if k is not None and jwk["kid"] == kid]
+        if not keys:
+            return False
+        key = keys[0]
+    else:
+        key = _RSA_PRIVATE_KEY
+    signing_input, _, sig = token.rpartition(".")
+    try:
+        key.public_key().verify(
+            base64.urlsafe_b64decode(sig + "=" * (-len(sig) % 4)), signing_input.encode(),
+            padding.PKCS1v15(), hashes.SHA256())
+    except (InvalidSignature, ValueError):
+        return False
+    return True
+
+
+def _token_owner(claims: dict):
+    """The user named by a token's iss and username, False if the pool lacks it, None without either."""
+    pool = _user_pools.get(str(claims.get("iss", "")).rsplit("/", 1)[-1])
+    if not pool or not claims.get("username"):
+        return None
+    return pool["_users"].get(claims["username"]) or False
+
+
+def _access_token_error(data: dict):
+    """The error for an AccessToken AWS would not accept, or None."""
+    token = data.get("AccessToken")
+    if not token or not isinstance(token, str):
+        return None
+    claims = _token_claims(token)
+    if token.count(".") != 2 or not claims:
+        message = "Invalid Access Token"
+    elif claims.get("token_use") != "access":
+        message = "Invalid Access Token"
+    elif _RSA_PRIVATE_KEY is not None and not _signature_valid(token):
+        message = "Could not verify signature for Access Token"
+    elif not isinstance(claims.get("exp"), (int, float)) or time.time() >= claims["exp"]:
+        message = "Access Token has expired"
+    elif (user := _token_owner(claims)) is False:
+        return error_response_json("UserNotFoundException", "User does not exist.", 400)
+    elif user and not user.get("Enabled", True):
+        message = "User is disabled."
+    elif claims.get("origin_jti") in _revoked_tokens:
+        message = "Access Token has been revoked"
+    elif _API_TOKEN_SCOPE not in str(claims.get("scope", _API_TOKEN_SCOPE)).split():
+        message = "Access Token does not have required scopes"
+    else:
+        return None
+    return error_response_json("NotAuthorizedException", message, 400)
 
 
 def _user_from_token(token: str, pool: dict):
@@ -633,27 +1579,134 @@ def _resolve_user(pool: dict, username: str):
 
     # AliasAttributes (email, phone_number, preferred_username) and
     # UsernameAttributes (email, phone_number) let users sign in / be looked
-    # up via those attribute values. Real Cognito requires email/phone aliases
-    # to be verified (email_verified/phone_number_verified == "true") before
-    # the alias resolves; preferred_username has no verification requirement.
-    alias_attrs = set(pool.get("AliasAttributes") or []) | set(
-        pool.get("UsernameAttributes") or []
-    )
+    # up via those attribute values. Real Cognito requires email/phone
+    # AliasAttributes to be verified (email_verified/phone_number_verified ==
+    # "true") before the alias resolves; preferred_username has no
+    # verification requirement. UsernameAttributes is different: it's the
+    # pool's actual sign-in identifier (AdminCreateUser stores the given
+    # value there without auto-verifying it), so it resolves unverified too.
+    username_attrs = set(pool.get("UsernameAttributes") or [])
+    alias_only_attrs = set(pool.get("AliasAttributes") or []) - username_attrs
+    alias_attrs = username_attrs | alias_only_attrs
     if alias_attrs:
         for u in pool["_users"].values():
             attrs = _attr_list_to_dict(u.get("Attributes", []))
             for alias in alias_attrs:
                 if attrs.get(alias) != username:
                     continue
-                if alias in ("email", "phone_number"):
+                if alias in alias_only_attrs and alias in ("email", "phone_number"):
                     if str(attrs.get(f"{alias}_verified", "")).lower() != "true":
                         continue
                 return u, None
 
     return None, error_response_json(
         "UserNotFoundException",
-        f"User {username} does not exist.", 400,
+        "User does not exist.", 400,
     )
+
+
+def _hides_user_existence(pool: dict, client_id: str) -> bool:
+    """
+    Whether this app client must not reveal that a user is unknown.
+
+    With PreventUserExistenceErrors=ENABLED, real Cognito makes an unknown
+    username indistinguishable from a wrong password across the flows it names:
+    USER_PASSWORD_AUTH, USER_SRP_AUTH and ADMIN_USER_PASSWORD_AUTH answer
+    NotAuthorizedException, ForgotPassword and ResendConfirmationCode answer a
+    normal CodeDeliveryDetails, and ConfirmForgotPassword and ConfirmSignUp answer
+    CodeMismatchException.
+
+    The setting is a property of the app client, so it covers the admin
+    *authentication* flow as well — AWS lists ADMIN_USER_PASSWORD_AUTH
+    explicitly. It does not cover the directory operations: AdminGetUser and
+    friends keep reporting UserNotFoundException.
+
+    Two flows are deliberately untouched, as AWS handles them by other means:
+    CUSTOM_AUTH, where Cognito instead invokes the challenge Lambda with
+    UserNotFound=true, and the USER_AUTH choice-based flow, which the setting
+    does not affect.
+    """
+    client = (pool.get("_clients") or {}).get(client_id) or {}
+    return client.get("PreventUserExistenceErrors", "LEGACY") == "ENABLED"
+
+
+def _hidden_user_error(pool: dict, client_id: str, err):
+    """
+    `err` unless this client hides user existence, in which case the generic
+    auth failure that a wrong password also produces.
+
+    Used by every branch of the auth flows AWS names for the setting —
+    USER_PASSWORD_AUTH, USER_SRP_AUTH and ADMIN_USER_PASSWORD_AUTH — including
+    the RespondToAuthChallenge steps that continue them, because that is where
+    an SRP sign-in resolves the user: masking only InitiateAuth would leave the
+    browser flow leaking.
+    """
+    if _hides_user_existence(pool, client_id):
+        return error_response_json(
+            "NotAuthorizedException", "Incorrect username or password.", 400,
+        )
+    return err
+
+
+def _client_user_not_found():
+    """The UserNotFoundException of the sign-up confirmation and password recovery calls."""
+    return error_response_json("UserNotFoundException", "Username/client id combination not found.", 400)
+
+
+def _masked_destination(address: str) -> str:
+    """
+    Mask a delivery destination the way Cognito reports it: j***@e***.
+
+    Applied to BOTH the real and the unknown-user path, which is what makes the
+    two indistinguishable: returning the full address for a real user and a mask
+    for an unknown one would just move the enumeration oracle into this field.
+    AWS masks it in either case, and drops the domain suffix as well.
+
+    For a user who does not exist there is no stored address, so an address-shaped
+    username is masked instead; AWS documents ForgotPassword's simulated destination
+    as "determined by the input username format" (_unknown_user_delivery).
+    """
+    if not address or "@" not in address:
+        return "****"
+    local, _, domain = address.partition("@")
+    return f"{local[:1]}***@{domain[:1]}***"
+
+
+def _masked_phone(number: str) -> str:
+    """A phone number as Cognito's CodeDeliveryDetails shows it: +********0202."""
+    return "+" + "*" * max(0, len(number) - 5) + number[-4:]
+
+
+def _code_delivery(attribute: str, value: str) -> dict:
+    if attribute == "phone_number":
+        return {"Destination": _masked_phone(value), "DeliveryMedium": "SMS", "AttributeName": "phone_number"}
+    return {"Destination": _masked_destination(value), "DeliveryMedium": "EMAIL", "AttributeName": "email"}
+
+
+def _sign_up_code_attribute(pool, attrs):
+    """Where a sign-up's code goes: the phone number when the pool verifies it and the user has one, else the email."""
+    verified = pool.get("AutoVerifiedAttributes") or []
+    for attribute in ("phone_number", "email"):
+        if attribute in verified and attrs.get(attribute):
+            return attribute
+    return None
+
+
+def _unknown_user_delivery(username: str, attribute: str) -> dict:
+    """The made-up CodeDeliveryDetails a client that hides user existence answers for an unknown user.
+
+    The shape follows the username: an address is masked as itself. For any other username AWS
+    invents a destination, an SMS one for ForgotPassword and an email one for ResendConfirmationCode;
+    MiniStack derives it from the username so it is stable.
+    """
+    if "@" in (username or ""):
+        return _code_delivery("email", username)
+    digest = hashlib.sha256(username.encode()).hexdigest()
+    if attribute == "phone_number":
+        return {"Destination": "+*******" + str(int(digest[:8], 16))[-4:].zfill(4),
+                "DeliveryMedium": "SMS", "AttributeName": "phone_number"}
+    letter = "abcdefghijklmnopqrstuvwxyz"[int(digest[:2], 16) % 26]
+    return {"Destination": f"{(username or 'x')[:1].lower()}***@{letter}***", "DeliveryMedium": "EMAIL", "AttributeName": "email"}
 
 
 def _user_out(user: dict) -> dict:
@@ -684,30 +1737,761 @@ def _merge_attributes(existing: list, updates: list) -> list:
 
 
 # ---------------------------------------------------------------------------
+# CUSTOM_AUTH Challenge Session Helpers (Phase 2)
+# ---------------------------------------------------------------------------
+
+def _create_challenge_session(pool_id: str, client_id: str, username: str) -> tuple:
+    """Create a new challenge session and return (token, session).
+    
+    Args:
+        pool_id: User pool ID
+        client_id: Client/App ID
+        username: Authenticated username
+        
+    Returns:
+        (token: str, session: dict)
+    """
+    token = base64.b64encode(secrets.token_bytes(32)).decode()
+    now = time.time()
+    
+    # Compute TTL from client's AuthSessionValidity (in minutes), falling back to _CHALLENGE_SESSION_TTL
+    pool = _user_pools.get(pool_id)
+    client = (pool or {}).get("_clients", {}).get(client_id, {})
+    ttl = client.get("AuthSessionValidity", 3) * 60  # AuthSessionValidity is in minutes
+    
+    session = {
+        "pool_id": pool_id,
+        "client_id": client_id,
+        "username": username,
+        "created_at": now,
+        "expires_at": now + ttl,
+        "challenges": [],
+        "last_challenge_metadata": None,
+    }
+    _challenge_sessions[token] = session
+    return (token, session)
+
+
+def _get_challenge_session(token: str) -> tuple:
+    """Retrieve a challenge session from storage.
+    
+    Args:
+        token: Session token (base64-encoded)
+        
+    Returns:
+        (session: dict | None, error_str: str | None)
+    """
+    session = _challenge_sessions.get(token)
+    if session is None:
+        return (None, "InvalidParameterException: Session does not exist")
+    
+    if time.time() > session["expires_at"]:
+        del _challenge_sessions[token]
+        return (None, "NotAuthorizedException: Session has expired")
+    
+    return (session, None)
+
+
+def _append_challenge_to_session(session: dict, challenge_name: str,
+                                 challenge_result: bool | None,
+                                 challenge_metadata: str | None,
+                                 public_params: dict | None,
+                                 private_params: dict | None) -> None:
+    """Append a challenge record to a session's challenge history.
+    
+    Args:
+        session: The session dict
+        challenge_name: Challenge name (e.g., 'CUSTOM_CHALLENGE')
+        challenge_result: None (pending), True (correct), or False (incorrect)
+        challenge_metadata: Metadata string (e.g., 'MAGIC_LINK')
+        public_params: Public challenge parameters dict
+        private_params: Private challenge parameters dict
+    """
+    session["challenges"].append({
+        "challengeName": challenge_name,
+        "challengeResult": challenge_result,
+        "challengeMetadata": challenge_metadata,
+        "publicChallengeParameters": public_params or {},
+        "privateChallengeParameters": private_params or {},
+        "timestamp": time.time(),
+    })
+    session["last_challenge_metadata"] = challenge_metadata
+
+
+def _update_pending_challenge_result(session: dict, challenge_result: bool | None) -> None:
+    """Record a VerifyAuthChallenge result on the round it belongs to.
+
+    AWS records ONE ChallengeResult per CUSTOM_AUTH round, carrying BOTH the
+    metadata (set by CreateAuthChallenge) and the result (from
+    VerifyAuthChallengeResponse). Update the pending round's result in place
+    rather than appending a second, metadata-less entry that would split the
+    round across two session records — a consumer reading challengeMetadata and
+    challengeResult from the same element could then never identify the step.
+
+    Falls back to appending only when there is no pending round (empty or
+    malformed history), preserving the prior behaviour for that edge case.
+    """
+    challenges = session["challenges"]
+    if challenges and challenges[-1].get("challengeResult") is None:
+        challenges[-1]["challengeResult"] = challenge_result
+    else:
+        _append_challenge_to_session(session, "CUSTOM_CHALLENGE", challenge_result,
+                                     None, {}, {})
+
+
+def _build_session_list(session: dict) -> list:
+    """Build the session list for Lambda events (challenge history).
+    
+    Args:
+        session: The session dict
+        
+    Returns:
+        List of challenge records (challengeName, challengeMetadata, challengeResult)
+    """
+    return [
+        {
+            "challengeName": c["challengeName"],
+            "challengeMetadata": c["challengeMetadata"],
+            "challengeResult": c["challengeResult"],
+        }
+        for c in session["challenges"]
+    ]
+
+
+# ---------------------------------------------------------------------------
+# CUSTOM_AUTH Lambda Trigger Event Builders (Phase 3)
+# ---------------------------------------------------------------------------
+
+def _build_define_auth_challenge_event(pool_id: str, client_id: str, username: str,
+                                       user_attrs: dict, session: dict,
+                                       client_metadata: dict | None = None) -> dict:
+    """Build DefineAuthChallenge Lambda event.
+    
+    Called at both InitiateAuth and RespondToAuthChallenge to determine
+    the next step in the authentication flow.
+    """
+    return {
+        "version": "1",
+        "triggerSource": "DefineAuthChallenge_Authentication",
+        "region": _pool_region(pool_id),
+        "userPoolId": pool_id,
+        "userName": username,
+        "callerContext": {
+            "awsSdkVersion": "aws-sdk-unknown-unknown",
+            "clientId": client_id,
+        },
+        "request": {
+            "userAttributes": user_attrs or {},
+            "session": _build_session_list(session),
+            "userNotFound": False,
+            "clientMetadata": client_metadata or {},
+        },
+        "response": {
+            "challengeName": None,
+            "issueTokens": False,
+            "failAuthentication": False,
+        },
+    }
+
+
+def _build_create_auth_challenge_event(pool_id: str, client_id: str, username: str,
+                                       user_attrs: dict, session: dict,
+                                       client_metadata: dict) -> dict:
+    """Build CreateAuthChallenge Lambda event.
+    
+    Called to generate the challenge (e.g., magic link, SMS OTP) that is sent
+    to the user.
+    """
+    return {
+        "version": "1",
+        "triggerSource": "CreateAuthChallenge_Authentication",
+        "region": _pool_region(pool_id),
+        "userPoolId": pool_id,
+        "userName": username,
+        "callerContext": {
+            "awsSdkVersion": "aws-sdk-unknown-unknown",
+            "clientId": client_id,
+        },
+        "request": {
+            "userAttributes": user_attrs or {},
+            "challengeName": "CUSTOM_CHALLENGE",
+            "session": _build_session_list(session),
+            "userNotFound": False,
+            "clientMetadata": client_metadata or {},
+        },
+        "response": {
+            "publicChallengeParameters": None,
+            "privateChallengeParameters": None,
+            "challengeMetadata": None,
+        },
+    }
+
+
+def _build_verify_auth_challenge_event(pool_id: str, client_id: str, username: str,
+                                       user_attrs: dict, session: dict,
+                                       challenge_answer: str,
+                                       client_metadata: dict) -> dict:
+    """Build VerifyAuthChallengeResponse Lambda event.
+    
+    Called to verify the challenge response (e.g., validate the magic link token
+    or SMS OTP).
+    """
+    last = session["challenges"][-1] if session["challenges"] else {}
+    return {
+        "version": "1",
+        "triggerSource": "VerifyAuthChallengeResponse_Authentication",
+        "region": _pool_region(pool_id),
+        "userPoolId": pool_id,
+        "userName": username,
+        "callerContext": {
+            "awsSdkVersion": "aws-sdk-unknown-unknown",
+            "clientId": client_id,
+        },
+        "request": {
+            "userAttributes": user_attrs or {},
+            "challengeName": "CUSTOM_CHALLENGE",
+            "session": _build_session_list(session),
+            "userNotFound": False,
+            "challengeAnswer": challenge_answer,
+            "publicChallengeParameters": last.get("publicChallengeParameters", {}),
+            "privateChallengeParameters": last.get("privateChallengeParameters", {}),
+            "clientMetadata": client_metadata or {},
+        },
+        "response": {
+            "answerCorrect": None,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# CUSTOM_AUTH Lambda Invocation Wrappers (Phase 4)
+# ---------------------------------------------------------------------------
+
+
+
+
+# ---------------------------------------------------------------------------
+# SRP password verifier (USER_SRP_AUTH and CUSTOM_WITH_SRP)
+# ---------------------------------------------------------------------------
+
+# The 3072-bit prime of RFC 5054 (Appendix A) with generator 2, the group Cognito and its client SDKs
+# use; the RFC itself lists generator 5 for this prime.
+_SRP_N = int(
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DD"
+    "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED"
+    "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F"
+    "83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B"
+    "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA0510"
+    "15728E5A8AAAC42DAD33170D04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7"
+    "ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200C"
+    "BBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFCE0FD108E4B82D120A93AD2CAFFFFFFFFFFFFFFFF",
+    16,
+)
+_SRP_G = 2
+_SRP_A_RE = re.compile(r"^[0-9a-fA-F]+$")
+_SRP_WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_SRP_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+# EEE MMM d HH:mm:ss z yyyy in English, parsed the way AWS does (measured): the weekday and
+# month names in any case, one or two digits for the day, and UTC or GMT as the zone. The zone
+# is the one part AWS reads case-sensitively, so `utc` is a format error where `wed` is not.
+_SRP_TIMESTAMP_RE = re.compile(
+    r"^((?i:Mon|Tue|Wed|Thu|Fri|Sat|Sun)) ((?i:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)) "
+    r"(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) (UTC|GMT) (\d{4})$"
+)
+
+
+def _srp_pad(n: int) -> bytes:
+    """Big-endian bytes with a leading zero byte when the high bit is set, as the SDKs pad."""
+    return n.to_bytes(n.bit_length() // 8 + 1, "big")
+
+
+def _srp_hash(*parts: bytes) -> int:
+    return int.from_bytes(hashlib.sha256(b"".join(parts)).digest(), "big")
+
+
+_SRP_K = _srp_hash(_srp_pad(_SRP_N), _srp_pad(_SRP_G))
+
+
+def _srp_verifier(pool_id: str, user_id: str, password: str, salt_hex: str) -> int:
+    """v = g^x with x = H(salt | H(poolName + userId + ":" + password))."""
+    pool_name = pool_id.split("_", 1)[-1]
+    inner = hashlib.sha256(f"{pool_name}{user_id}:{password}".encode()).digest()
+    return pow(_SRP_G, _srp_hash(_srp_pad(int(salt_hex, 16)), inner), _SRP_N)
+
+
+def _srp_salt(seed: str) -> str:
+    """A per-user salt derived from a stable seed, so it survives restarts like the user does.
+
+    The first byte is never zero: the JavaScript SDK pads the salt as an
+    integer and pycognito as the hex string, and the two only agree when no
+    leading zero byte can be dropped.
+    """
+    digest = hashlib.sha256(f"cognito-srp-salt:{seed}".encode()).digest()
+    while digest[0] == 0:
+        digest = hashlib.sha256(digest).digest()
+    return digest[:16].hex()
+
+
+def _srp_challenge(pool_id: str, user: dict | None, user_id: str, srp_a: str,
+                   secret_block: str) -> tuple:
+    """PASSWORD_VERIFIER ChallengeParameters plus the state the response is checked against.
+
+    An unknown user (PreventUserExistenceErrors=ENABLED) gets a salt derived from
+    the name it was asked for and a verifier nobody can answer.
+    """
+    if user is not None:
+        seed = _attr_list_to_dict(user.get("Attributes", [])).get("sub") or user["Username"]
+        salt = _srp_salt(seed)
+        v = _srp_verifier(pool_id, user_id, user.get("_password") or "", salt)
+    else:
+        salt = _srp_salt(f"{pool_id}:{user_id}")
+        v = pow(_SRP_G, secrets.randbelow(_SRP_N - 2) + 1, _SRP_N)
+    b = secrets.randbelow(_SRP_N - 2) + 1
+    big_b = (_SRP_K * v + pow(_SRP_G, b, _SRP_N)) % _SRP_N
+    params = {
+        "SALT": salt,
+        "SECRET_BLOCK": secret_block,
+        "SRP_B": format(big_b, "x"),
+        "USERNAME": user_id,
+        "USER_ID_FOR_SRP": user_id,
+    }
+    state = {"srp_a": srp_a, "srp_b": format(big_b, "x"), "b": format(b, "x"),
+             "salt": salt, "secret_block": secret_block}
+    return params, state
+
+
+def _srp_canonical_timestamp(timestamp: str) -> str | None:
+    """The timestamp the proof is signed over, or None when it does not parse.
+
+    The format check is lenient, the signature is not: it is computed over the
+    canonical form (weekday derived from the date, unpadded day, UTC), so a
+    padded day or a wrong weekday parses and then fails the proof.
+    """
+    match = _SRP_TIMESTAMP_RE.match(timestamp)
+    if not match:
+        return None
+    _, month, day, hour, minute, second, _zone, year = match.groups()
+    month = month.capitalize()
+    try:
+        moment = datetime(int(year), _SRP_MONTHS.index(month) + 1, int(day),
+                          int(hour), int(minute), int(second))
+    except ValueError:
+        return None
+    return (f"{_SRP_WEEKDAYS[moment.weekday()]} {month} {moment.day} "
+            f"{moment:%H:%M:%S} UTC {moment.year}")
+
+
+def _srp_response_format_error(responses: dict):
+    """The request validation PASSWORD_VERIFIER applies before it looks at the proof.
+
+    The keys are checked in the order AWS names them (measured): an empty
+    response set is its own message, then USERNAME, TIMESTAMP, the signature
+    and the secret block.
+    """
+    if not responses:
+        return error_response_json("InvalidParameterException",
+                                   "Missing required parameter challenge responses.", 400)
+    for key in ("USERNAME", "TIMESTAMP", "PASSWORD_CLAIM_SIGNATURE", "PASSWORD_CLAIM_SECRET_BLOCK"):
+        if not responses.get(key):
+            return error_response_json("InvalidParameterException",
+                                       f"Missing required parameter {key}", 400)
+    if _srp_canonical_timestamp(responses["TIMESTAMP"]) is None:
+        return error_response_json("InvalidParameterException",
+                                   "TIMESTAMP format should be EEE MMM d HH:mm:ss z yyyy in english.", 400)
+    try:
+        base64.b64decode(responses["PASSWORD_CLAIM_SIGNATURE"], validate=True)
+    except (ValueError, base64.binascii.Error):
+        return error_response_json("InvalidParameterException",
+                                   "Invalid PASSWORD_CLAIM_SIGNATURE format. Must be a Base64 string.", 400)
+    return None
+
+
+def _srp_proof_valid(pool_id: str, user: dict, state: dict, responses: dict) -> bool:
+    """Recompute the client's PASSWORD_CLAIM_SIGNATURE from the stored password."""
+    secret_block = responses["PASSWORD_CLAIM_SECRET_BLOCK"]
+    if not hmac.compare_digest(secret_block.encode(), state["secret_block"].encode()):
+        return False
+    try:
+        big_a = int(state["srp_a"], 16)
+    except (TypeError, ValueError):
+        # CUSTOM_AUTH stores SRP_A as the client sent it; a value that is not
+        # hex cannot pass the proof.
+        return False
+    if big_a % _SRP_N == 0:
+        return False
+    big_b = int(state["srp_b"], 16)
+    u = _srp_hash(_srp_pad(big_a), _srp_pad(big_b))
+    if u == 0:
+        return False
+    user_id = user["Username"]
+    v = _srp_verifier(pool_id, user_id, user.get("_password") or "", state["salt"])
+    s = pow(big_a * pow(v, u, _SRP_N), int(state["b"], 16), _SRP_N)
+    prk = hmac.new(_srp_pad(u), _srp_pad(s), hashlib.sha256).digest()
+    key = hmac.new(prk, b"Caldera Derived Key\x01", hashlib.sha256).digest()[:16]
+    message = (pool_id.split("_", 1)[-1] + user_id).encode() + base64.b64decode(secret_block) \
+        + _srp_canonical_timestamp(responses["TIMESTAMP"]).encode()
+    expected = hmac.new(key, message, hashlib.sha256).digest()
+    return hmac.compare_digest(expected, base64.b64decode(responses["PASSWORD_CLAIM_SIGNATURE"]))
+
+
+def _awaits_password_proof(session: dict) -> bool:
+    """A USER_SRP_AUTH challenge, or a CUSTOM_WITH_SRP round still owing PASSWORD_VERIFIER."""
+    return session.get("auth_flow") == "USER_SRP_AUTH" or bool(session.get("pending_builtin_challenge"))
+
+
+def _return_custom_auth_password_verifier(token: str, session: dict, user: dict):
+    """Return Cognito-owned PASSWORD_VERIFIER for CUSTOM_AUTH (CUSTOM_WITH_SRP)."""
+    params, session["srp"] = _srp_challenge(
+        session["pool_id"], user, user["Username"], session.get("srp_a", ""),
+        base64.b64encode(secrets.token_bytes(32)).decode(),
+    )
+    session["pending_builtin_challenge"] = "PASSWORD_VERIFIER"
+    return json_response({
+        "ChallengeName": "PASSWORD_VERIFIER",
+        "Session": token,
+        "ChallengeParameters": params,
+    })
+
+
+def _continue_custom_auth_after_define(
+    token: str,
+    session: dict,
+    user: dict,
+    user_attrs: dict,
+    client_metadata: dict,
+    define_result,
+):
+    """Shared post-DefineAuth routing for CUSTOM_AUTH Initiate/Respond."""
+    if define_result is None:
+        # No DefineAuth Lambda — fall through to CreateAuthChallenge (prior behavior).
+        define_resp = {"challengeName": "CUSTOM_CHALLENGE"}
+    else:
+        define_resp = (define_result.get("response") or {})
+
+    if define_resp.get("failAuthentication"):
+        del _challenge_sessions[token]
+        return error_response_json("NotAuthorizedException",
+                "Incorrect username or password", 400)
+    if define_resp.get("issueTokens"):
+        del _challenge_sessions[token]
+        return json_response({"AuthenticationResult": _build_auth_result(
+            session["pool_id"], session["client_id"], user,
+            client_metadata=client_metadata,
+        )})
+
+    next_challenge = define_resp.get("challengeName")
+    if not next_challenge:
+        del _challenge_sessions[token]
+        return error_response_json("InvalidLambdaResponseException",
+            "DefineAuthChallenge returned unexpected response — not issuing tokens, "
+            "not failing auth, and no challengeName set", 400)
+
+    # Cognito-owned SRP challenges — do not invoke CreateAuthChallenge.
+    if next_challenge in ("PASSWORD_VERIFIER", "SRP_A"):
+        return _return_custom_auth_password_verifier(token, session, user)
+
+    if next_challenge != "CUSTOM_CHALLENGE":
+        del _challenge_sessions[token]
+        return error_response_json("InvalidLambdaResponseException",
+                "DefineAuthChallenge response invalid", 400)
+
+    answered_count = sum(1 for c in session["challenges"]
+                        if c.get("challengeResult") is not None)
+    if answered_count >= _MAX_CHALLENGE_ATTEMPTS:
+        del _challenge_sessions[token]
+        return error_response_json("NotAuthorizedException",
+                "Max authentication attempts exceeded", 400)
+
+    create_result, err = _invoke_create_auth_challenge_trigger(
+        session["pool_id"], session["client_id"], session["username"],
+        user_attrs, session, client_metadata
+    )
+    if err:
+        return err
+
+    if create_result is not None:
+        public_params = (create_result.get("response", {}) or {}).get("publicChallengeParameters") or {}
+        private_params = (create_result.get("response", {}) or {}).get("privateChallengeParameters") or {}
+        challenge_metadata = (create_result.get("response", {}) or {}).get("challengeMetadata")
+    else:
+        public_params = {"challenge": "PROVIDE_AUTH_PARAMETERS"}
+        private_params = {"challenge": "PROVIDE_AUTH_PARAMETERS"}
+        challenge_metadata = None
+
+    _append_challenge_to_session(session, "CUSTOM_CHALLENGE", None, challenge_metadata,
+                                public_params, private_params)
+    return json_response({
+        "ChallengeName": "CUSTOM_CHALLENGE",
+        "Session": token,
+        "ChallengeParameters": public_params,
+    })
+
+
+def _invoke_define_auth_challenge_trigger(pool_id: str, client_id: str, username: str,
+                                          user_attrs: dict, session: dict,
+                                          client_metadata: dict | None = None) -> tuple:
+    """Invoke DefineAuthChallenge Lambda trigger.
+    
+    Returns:
+        (payload_dict | None, error_response | None)
+    """
+    pool = _user_pools.get(pool_id)
+    if pool is None:
+        return (None, None)
+    
+    arn = (pool.get("LambdaConfig") or {}).get("DefineAuthChallenge")
+    if not arn:
+        return (None, None)
+    
+    event = _build_define_auth_challenge_event(
+        pool_id, client_id, username, user_attrs, session, client_metadata
+    )
+    
+    try:
+        from ministack.services import lambda_svc
+        name, qualifier = lambda_svc._resolve_name_and_qualifier(arn)
+        record, _ = lambda_svc._get_func_record_for_qualifier(name, qualifier)
+        if record is None:
+            return (None, error_response_json("InvalidLambdaResponseException",
+                    f"DefineAuthChallenge Lambda not found: {arn}", 400))
+        result = lambda_svc._execute_function(record, event)
+    except Exception as e:
+        return (None, error_response_json("InvalidLambdaResponseException",
+                f"DefineAuthChallenge invocation failed: {str(e)}", 400))
+    
+    if result.get("error"):
+        return (None, error_response_json("InvalidLambdaResponseException",
+                f"DefineAuthChallenge returned error: {str(result.get('body', ''))}", 400))
+    
+    body = result.get("body")
+    if body is None:
+        return (None, error_response_json("InvalidLambdaResponseException",
+                "DefineAuthChallenge returned null body", 400))
+    
+    if isinstance(body, (str, bytes)):
+        try:
+            body = json.loads(body)
+        except (ValueError, TypeError):
+            return (None, error_response_json("InvalidLambdaResponseException",
+                    "DefineAuthChallenge returned invalid JSON", 400))
+    
+    if not isinstance(body, dict):
+        return (None, error_response_json("InvalidLambdaResponseException",
+                "DefineAuthChallenge returned unexpected body type", 400))
+    
+    return (body, None)
+
+
+def _invoke_create_auth_challenge_trigger(pool_id: str, client_id: str, username: str,
+                                          user_attrs: dict, session: dict,
+                                          client_metadata: dict) -> tuple:
+    """Invoke CreateAuthChallenge Lambda trigger.
+    
+    Returns:
+        (payload_dict | None, error_response | None)
+    """
+    pool = _user_pools.get(pool_id)
+    if pool is None:
+        return (None, None)
+    
+    arn = (pool.get("LambdaConfig") or {}).get("CreateAuthChallenge")
+    if not arn:
+        return (None, None)
+    
+    event = _build_create_auth_challenge_event(pool_id, client_id, username,
+                                               user_attrs, session, client_metadata)
+    
+    try:
+        from ministack.services import lambda_svc
+        name, qualifier = lambda_svc._resolve_name_and_qualifier(arn)
+        record, _ = lambda_svc._get_func_record_for_qualifier(name, qualifier)
+        if record is None:
+            return (None, error_response_json("InvalidLambdaResponseException",
+                    f"CreateAuthChallenge Lambda not found: {arn}", 400))
+        result = lambda_svc._execute_function(record, event)
+    except Exception as e:
+        return (None, error_response_json("InvalidLambdaResponseException",
+                f"CreateAuthChallenge invocation failed: {str(e)}", 400))
+    
+    if result.get("error"):
+        return (None, error_response_json("InvalidLambdaResponseException",
+                f"CreateAuthChallenge returned error: {str(result.get('body', ''))}", 400))
+    
+    body = result.get("body")
+    if body is None:
+        return (None, error_response_json("InvalidLambdaResponseException",
+                "CreateAuthChallenge returned null body", 400))
+    
+    if isinstance(body, (str, bytes)):
+        try:
+            body = json.loads(body)
+        except (ValueError, TypeError):
+            return (None, error_response_json("InvalidLambdaResponseException",
+                    "CreateAuthChallenge returned invalid JSON", 400))
+    
+    if not isinstance(body, dict):
+        return (None, error_response_json("InvalidLambdaResponseException",
+                "CreateAuthChallenge returned unexpected body type", 400))
+    
+    return (body, None)
+
+
+def _invoke_verify_auth_challenge_trigger(pool_id: str, client_id: str, username: str,
+                                          user_attrs: dict, session: dict,
+                                          challenge_answer: str,
+                                          client_metadata: dict) -> tuple:
+    """Invoke VerifyAuthChallengeResponse Lambda trigger.
+    
+    Returns:
+        (payload_dict | None, error_response | None)
+    """
+    pool = _user_pools.get(pool_id)
+    if pool is None:
+        return (None, None)
+    
+    arn = (pool.get("LambdaConfig") or {}).get("VerifyAuthChallengeResponse")
+    if not arn:
+        return (None, None)
+    
+    event = _build_verify_auth_challenge_event(pool_id, client_id, username,
+                                               user_attrs, session,
+                                               challenge_answer, client_metadata)
+    
+    try:
+        from ministack.services import lambda_svc
+        name, qualifier = lambda_svc._resolve_name_and_qualifier(arn)
+        record, _ = lambda_svc._get_func_record_for_qualifier(name, qualifier)
+        if record is None:
+            return (None, error_response_json("InvalidLambdaResponseException",
+                    f"VerifyAuthChallengeResponse Lambda not found: {arn}", 400))
+        result = lambda_svc._execute_function(record, event)
+    except Exception as e:
+        return (None, error_response_json("InvalidLambdaResponseException",
+                f"VerifyAuthChallengeResponse invocation failed: {str(e)}", 400))
+    
+    if result.get("error"):
+        return (None, error_response_json("InvalidLambdaResponseException",
+                f"VerifyAuthChallengeResponse returned error: {str(result.get('body', ''))}", 400))
+    
+    body = result.get("body")
+    if body is None:
+        return (None, error_response_json("InvalidLambdaResponseException",
+                "VerifyAuthChallengeResponse returned null body", 400))
+    
+    if isinstance(body, (str, bytes)):
+        try:
+            body = json.loads(body)
+        except (ValueError, TypeError):
+            return (None, error_response_json("InvalidLambdaResponseException",
+                    "VerifyAuthChallengeResponse returned invalid JSON", 400))
+    
+    if not isinstance(body, dict):
+        return (None, error_response_json("InvalidLambdaResponseException",
+                "VerifyAuthChallengeResponse returned unexpected body type", 400))
+    
+    return (body, None)
+
+
+# ---------------------------------------------------------------------------
 # SAML / OAuth2 helpers
 # ---------------------------------------------------------------------------
 
-def _acs_url() -> str:
-    """Assertion Consumer Service URL for SAML responses."""
-    return f"http://{_MINISTACK_HOST}:{_MINISTACK_PORT}/saml2/idpresponse"
+def _pool_domain_base_url(pool: dict) -> str:
+    """Public base URL of the user pool's Cognito domain, or "" when it has none.
+
+    A custom domain (one created with `CustomDomainConfig`) is served on its own
+    FQDN; a prefix domain expands to the regional Cognito host. This is how AWS
+    builds the federation endpoints — from the configured domain, not from the
+    request headers.
+
+    Both forms are `https://`, as on AWS. MiniStack does not itself terminate TLS
+    for them: a custom domain is expected to be fronted by whatever terminates it
+    externally (nginx, an ALB, CloudFront) and proxied back to the gateway, which
+    is exactly the topology the domain exists to describe. The certificate named
+    in `CustomDomainConfig.CertificateArn` is recorded, never served.
+    """
+    if pool.get("CustomDomain"):
+        return f"https://{pool['CustomDomain']}"
+    if pool.get("Domain"):
+        return f"https://{pool['Domain']}.auth.{_pool_region(pool.get('Id', ''))}.amazoncognito.com"
+    return ""
 
 
-def _oidc_callback_url() -> str:
+def _acs_url(pool: dict) -> str:
+    """Assertion Consumer Service URL for SAML responses.
+
+    AWS serves this at `https://{user pool domain}/saml2/idpresponse`. A pool with
+    no domain configured falls back to the local gateway, which is all a
+    non-federated setup ever needs.
+    """
+    base = _pool_domain_base_url(pool) or f"http://{_MINISTACK_HOST}:{_MINISTACK_PORT}"
+    return f"{base}/saml2/idpresponse"
+
+
+def _oidc_callback_url(pool: dict) -> str:
     """OIDC callback URL — external OIDC IdPs redirect back here with `code`+`state`."""
-    return f"http://{_MINISTACK_HOST}:{_MINISTACK_PORT}/oauth2/idpresponse"
+    base = _pool_domain_base_url(pool) or f"http://{_MINISTACK_HOST}:{_MINISTACK_PORT}"
+    return f"{base}/oauth2/idpresponse"
 
 
-def _build_saml_authn_request(pool_id: str, destination: str) -> str:
+# ProviderDetails key -> OpenID Provider metadata key for the same endpoint.
+_OIDC_DISCOVERED_ENDPOINTS = {"authorize_url": "authorization_endpoint", "token_url": "token_endpoint"}
+
+
+def _oidc_endpoint(details: dict, key: str) -> str:
+    """An external OIDC IdP endpoint: the ProviderDetails value, else the one its issuer's discovery document advertises; "" if neither.
+
+    AWS takes `authorize_url` / `token_url` only for an IdP whose endpoints it
+    can't discover from `oidc_issuer`, so an issuer such as Google's, whose
+    endpoints are not `{issuer}/authorize` and `{issuer}/token`, works with
+    `oidc_issuer` alone. The document must name the configured issuer
+    (OpenID Connect Discovery 1.0, section 4.3).
+    """
+    import urllib.request
+
+    if details.get(key):
+        return details[key]
+    issuer = details.get("oidc_issuer", "")
+    if not issuer:
+        return ""
+    try:
+        with urllib.request.urlopen(f"{issuer.rstrip('/')}/.well-known/openid-configuration", timeout=10) as resp:
+            metadata = json.loads(resp.read().decode("utf-8"))
+    except (OSError, ValueError) as exc:
+        logger.warning("Cognito: OIDC discovery for %s failed: %s", issuer, exc)
+        return ""
+    if not isinstance(metadata, dict) or metadata.get("issuer") != issuer:
+        logger.warning("Cognito: OIDC discovery document of %s names another issuer", issuer)
+        return ""
+    url = metadata.get(_OIDC_DISCOVERED_ENDPOINTS[key])
+    return url if isinstance(url, str) else ""
+
+
+def _saml_sso_url_from_metadata(metadata_xml: str) -> str:
+    """The IdP's HTTP-Redirect SingleSignOnService Location, the binding Cognito sends AuthnRequests on; "" if none."""
+    if not metadata_xml:
+        return ""
+    try:
+        root = safe_xml_parse(metadata_xml.strip())
+    except Exception:
+        return ""
+    for el in root.iter("{urn:oasis:names:tc:SAML:2.0:metadata}SingleSignOnService"):
+        if el.get("Binding") == "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect" and el.get("Location"):
+            return el.get("Location")
+    return ""
+
+
+def _build_saml_authn_request(pool: dict, destination: str) -> str:
     """Build a minimal SAML AuthnRequest, deflate + base64-encode for HTTP-Redirect binding."""
     req = Element("{urn:oasis:names:tc:SAML:2.0:protocol}AuthnRequest")
     req.set("ID", "_" + new_uuid())
     req.set("Version", "2.0")
     req.set("IssueInstant", datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
-    req.set("AssertionConsumerServiceURL", _acs_url())
+    req.set("AssertionConsumerServiceURL", _acs_url(pool))
     req.set("Destination", destination)
     req.set("ProtocolBinding", "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST")
     issuer = SubElement(req, "{urn:oasis:names:tc:SAML:2.0:assertion}Issuer")
-    issuer.text = f"urn:amazon:cognito:sp:{pool_id}"
+    issuer.text = f"urn:amazon:cognito:sp:{pool.get('Id', '')}"
     xml_bytes = xml_tostring(req, encoding="unicode").encode("utf-8")
     # Raw deflate (strip zlib header/checksum) per SAML HTTP-Redirect binding
     deflated = zlib.compress(xml_bytes)[2:-4]
@@ -738,15 +2522,16 @@ def _all_pools():
     normal account-scoped iteration would miss pools created under a specific
     account.  Yields (pool_id, pool_dict) pairs.
     """
-    # _user_pools._data stores {(account_id, pool_id): pool_dict}
-    for (_, pid), pool in _user_pools._data.items():
+    for (_account_id, _region, pid), pool in _user_pools.all_items():
         yield pid, pool
 
 
 def _get_pool_unscoped(pool_id: str):
-    """Look up a pool by ID across ALL accounts."""
-    for pid, pool in _all_pools():
+    """Look up a pool globally and pin its owning scope for downstream work."""
+    for (account_id, region, pid), pool in _user_pools.all_items():
         if pid == pool_id:
+            set_request_account_id(account_id)
+            set_request_region(region)
             return pool
     return None
 
@@ -758,19 +2543,30 @@ def _find_pool_by_client_id(client_id: str):
     browsers without AWS credentials, so the normal account-scoped lookup
     would miss pools created under a specific account.
     """
-    for pid, pool in _all_pools():
+    for (account_id, region, pid), pool in _user_pools.all_items():
         client = pool["_clients"].get(client_id)
         if client is not None:
+            set_request_account_id(account_id)
+            set_request_region(region)
             return pid, pool, client
     return None, None, None
 
 
 def _cleanup_expired_relay_codes():
-    """Remove SAML/OIDC relay auth codes older than _AUTH_CODE_TTL."""
+    """Remove SAML/OIDC relay auth codes older than _AUTH_CODE_TTL.
+
+    `/saml2/idpresponse` and `/oauth2/idpresponse` run reentrantly, so this can
+    run on multiple threads at once while another thread concurrently inserts
+    or pops from `_auth_codes` — iterating the live dict view would raise
+    "dictionary changed size during iteration". Snapshot with `list(...)`
+    first, and `pop(..., None)` rather than `del` since a key collected into
+    `expired` may already have been consumed by another thread by the time
+    this one gets to remove it.
+    """
     now = time.time()
-    expired = [k for k, v in _auth_codes.items() if now - v.get("created_at", 0) > _AUTH_CODE_TTL]
+    expired = [k for k, v in list(_auth_codes.items()) if now - v.get("created_at", 0) > _AUTH_CODE_TTL]
     for k in expired:
-        del _auth_codes[k]
+        _auth_codes.pop(k, None)
 
 
 def _authenticate_client(headers: dict, form: dict):
@@ -780,7 +2576,12 @@ def _authenticate_client(headers: dict, form: dict):
         try:
             decoded = base64.b64decode(auth.split(" ", 1)[1]).decode("utf-8")
             cid, csec = decoded.split(":", 1)
-            return cid, csec
+            # RFC 6749 §2.3.1: the client id and secret are
+            # application/x-www-form-urlencoded before base64, so a secret
+            # containing "/" or "+" arrives as %2F/%2B and must be decoded to
+            # match the stored value. The client_secret_post path already gets
+            # this via parse_qs.
+            return unquote(cid), unquote(csec)
         except Exception:
             pass
     return form.get("client_id", ""), form.get("client_secret", "")
@@ -791,19 +2592,43 @@ def _generate_auth_code() -> str:
 
 
 def _cleanup_expired_codes():
+    """Remove expired managed-login authorization codes.
+
+    `/oauth2/token` runs reentrantly, so this can run on multiple threads at
+    once while `_issue_auth_code_redirect` (from `/login`, on the event loop)
+    or another `/oauth2/token` call concurrently inserts or pops from
+    `_authorization_codes` — iterating the live dict view would raise
+    "dictionary changed size during iteration". Snapshot with `list(...)`
+    first, and `pop(..., None)` rather than `del` since a key collected into
+    `expired` may already have been consumed by another thread by the time
+    this one gets to remove it.
+    """
     now = time.time()
-    expired = [code for code, entry in _authorization_codes.items() if entry["expires_at"] < now]
+    expired = [code for code, entry in list(_authorization_codes.items()) if entry["expires_at"] < now]
     for code in expired:
-        del _authorization_codes[code]
+        _authorization_codes.pop(code, None)
 
 
 def _verify_pkce(code_verifier: str, code_challenge: str, method: str) -> bool:
-    if method == "S256":
-        digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
-        computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
-        return computed == code_challenge
-    # plain
-    return code_verifier == code_challenge
+    # Cognito supports only S256.
+    if method != "S256":
+        return False
+    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+    computed = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return computed == code_challenge
+
+
+def _pkce_error_redirect(redirect_uri: str, code_challenge: str, code_challenge_method: str, state: str):
+    """The invalid_request redirect for PKCE parameters Cognito refuses, or None."""
+    if not (code_challenge or code_challenge_method):
+        return None
+    if code_challenge and code_challenge_method == "S256":
+        return None
+    sep = "&" if "?" in redirect_uri else "?"
+    location = f"{redirect_uri}{sep}error=invalid_request"
+    if state:
+        location += f"&state={quote(state)}"
+    return 302, {"Location": location, "Cache-Control": "no-store"}, b""
 
 
 def _qp(query_params: dict, key: str, default: str = "") -> str:
@@ -823,12 +2648,18 @@ async def handle_request(method, path, headers, body, query_params):
     # Path-based endpoints (form-encoded or no body — must run before JSON parse)
     if path.startswith("/oauth2/authorize"):
         return handle_oauth2_authorize(method, path, headers, query_params)
+    # These three routes can invoke PreSignUp/PreTokenGeneration Lambda triggers,
+    # which may call back into ministack over HTTP — run_reentrant gives that
+    # callback its own thread instead of queuing behind this request's thread.
     if path.startswith("/saml2/idpresponse"):
-        return _saml2_idp_response(body, query_params)
+        return await run_reentrant(_saml2_idp_response, body, query_params,
+                                   thread_name="ministack-cognito-trigger")
     if path.startswith("/oauth2/idpresponse"):
-        return _oauth2_idp_response(method, body, query_params)
+        return await run_reentrant(_oauth2_idp_response, method, body, query_params,
+                                   thread_name="ministack-cognito-trigger")
     if path.startswith("/oauth2/token"):
-        return _oauth2_token({}, query_params, body, headers)
+        return await run_reentrant(_run_oauth2_token, {}, query_params, body, headers,
+                                   thread_name="ministack-cognito-trigger")
 
     try:
         data = json.loads(body) if body else {}
@@ -837,11 +2668,11 @@ async def handle_request(method, path, headers, body, query_params):
 
     if target.startswith("AWSCognitoIdentityService."):
         action = target.split(".")[-1]
-        return _dispatch_identity(action, data)
+        return await _dispatch_identity(action, data)
 
     if target.startswith("AWSCognitoIdentityProviderService."):
         action = target.split(".")[-1]
-        return _dispatch_idp(action, data)
+        return await _dispatch_idp(action, data)
 
     return error_response_json("InvalidAction", f"Unknown Cognito target: {target}", 400)
 
@@ -850,7 +2681,236 @@ async def handle_request(method, path, headers, body, query_params):
 # IDP dispatcher
 # ---------------------------------------------------------------------------
 
-def _dispatch_idp(action: str, data: dict):
+_UNSIGNED_IDP_ACTIONS = {
+    "AssociateSoftwareToken",
+    "ChangePassword",
+    "ConfirmForgotPassword",
+    "ConfirmSignUp",
+    "DeleteUser",
+    "ForgotPassword",
+    "GetTokensFromRefreshToken",
+    "GetUser",
+    "GetUserAttributeVerificationCode",
+    "GlobalSignOut",
+    "InitiateAuth",
+    "ResendConfirmationCode",
+    "RespondToAuthChallenge",
+    "RevokeToken",
+    "SetUserMFAPreference",
+    "SignUp",
+    "UpdateAuthEventFeedback",
+    "UpdateUserAttributes",
+    "VerifySoftwareToken",
+    "VerifyUserAttribute",
+}
+
+_UNSIGNED_IDENTITY_ACTIONS = {
+    "GetCredentialsForIdentity",
+    "GetId",
+    "GetOpenIdToken",
+    "UnlinkIdentity",
+}
+
+
+def _pool_id_from_token(token: str) -> str:
+    if not isinstance(token, str) or not token:
+        return ""
+    try:
+        claims = _decode_id_token_unverified(token)
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return ""
+    if not isinstance(claims, dict):
+        return ""
+    issuer = claims.get("iss", "")
+    if not isinstance(issuer, str):
+        return ""
+    return issuer.rsplit("/", 1)[-1] if "/" in issuer else ""
+
+
+def _pool_scope_for_client(client_id: str):
+    """Find a client owner within the ambient account without widening tenants."""
+    if not client_id:
+        return None
+    account_id = get_account_id()
+    request_region = get_region()
+    matches = []
+    for (owner_account, region, pool_id), pool in _user_pools.all_items():
+        if owner_account != account_id or client_id not in pool.get("_clients", {}):
+            continue
+        if region == request_region:
+            return pool_id, region
+        matches.append((pool_id, region))
+    return matches[0] if len(matches) == 1 else None
+
+
+def _pin_unsigned_idp_scope(data: dict) -> None:
+    pool_id = data.get("UserPoolId", "")
+
+    if not pool_id:
+        session = _challenge_sessions.get(data.get("Session", ""))
+        if session:
+            pool_id = session.get("pool_id", "")
+
+    if not pool_id:
+        for field in ("AccessToken", "RefreshToken", "Token"):
+            token = data.get(field, "")
+            if not isinstance(token, str) or not token:
+                continue
+            pool_id = _pool_id_from_token(token)
+            if not pool_id:
+                pool_id = (_refresh_tokens.get(token) or {}).get("pool_id", "")
+            if pool_id:
+                break
+
+    if pool_id:
+        set_request_region(_pool_region(pool_id))
+        return
+
+    client_scope = _pool_scope_for_client(data.get("ClientId", ""))
+    if client_scope:
+        _pool_id, region = client_scope
+        set_request_region(region)
+
+
+_SECRET_HASH_PARAMETERS = {
+    "SignUp": "",
+    "ConfirmSignUp": "",
+    "ResendConfirmationCode": "",
+    "ForgotPassword": "",
+    "ConfirmForgotPassword": "",
+    "InitiateAuth": "AuthParameters",
+    "AdminInitiateAuth": "AuthParameters",
+    "RespondToAuthChallenge": "ChallengeResponses",
+    "AdminRespondToAuthChallenge": "ChallengeResponses",
+}
+
+
+def _validate_client_secret_hash(action: str, data: dict):
+    """Authenticate confidential app clients before user changes or triggers.
+
+    Enforced under AUTH=true.
+    Refresh authentication uses the token owner's username (or sub for a
+    UsernameAttributes pool), rather than the alias used at initial sign-in.
+    """
+    parameter = _SECRET_HASH_PARAMETERS.get(action)
+    if parameter is None:
+        return None
+    cid = data.get("ClientId")
+    if action.startswith("Admin"):
+        pool = _user_pools.get(data.get("UserPoolId"))
+    else:
+        pool, _pid = _pool_for_client(cid)
+    client = (pool or {}).get("_clients", {}).get(cid)
+    if not client:
+        # Let the operation retain its own missing-pool/client errors.
+        return None
+
+    params = data.get(parameter, {}) if parameter else data
+    if parameter == "ChallengeResponses":
+        session = _challenge_sessions.get(data.get("Session"))
+        if session and (session["client_id"] != cid or session["pool_id"] != pool["Id"]):
+            return error_response_json("NotAuthorizedException", "Invalid session for the user.", 400)
+
+    username = params.get("USERNAME" if parameter else "Username")
+    refreshing = parameter == "AuthParameters" and data.get("AuthFlow") in ("REFRESH_TOKEN_AUTH", "REFRESH_TOKEN")
+    if refreshing and not client.get("ClientSecret") and _rotation_grace(pool, cid) is not None:
+        # A public client that rotates refresh tokens is refused the flow ahead of its token.
+        return None
+    if refreshing:
+        # AWS rejects invalid refresh tokens before examining their secret hash.
+        user, error = _refresh_auth_user(pool, pool["Id"], cid, params.get("REFRESH_TOKEN", ""))
+        if error:
+            return error
+        username = (
+            _attr_list_to_dict(user.get("Attributes", [])).get("sub")
+            if pool.get("UsernameAttributes") else user["Username"]
+        )
+
+    supplied = params.get("SECRET_HASH" if parameter else "SecretHash")
+    if not client.get("ClientSecret"):
+        # AWS ignores an extra hash on refresh and challenge responses, but
+        # rejects it on initial authentication and the self-service APIs.
+        if refreshing or parameter == "ChallengeResponses":
+            return None
+        if supplied:
+            return error_response_json(
+                "InvalidParameterException",
+                f"App client {cid} is not configured for secret but secret hash was received", 400,
+            )
+        return None
+    if not supplied:
+        return error_response_json(
+            "NotAuthorizedException",
+            f"Client {cid} is configured with secret but SECRET_HASH was not received", 400,
+        )
+    if isinstance(username, str) and isinstance(supplied, str) and supplied.isascii():
+        try:
+            expected = base64.b64encode(hmac.new(
+                client["ClientSecret"].encode("utf-8"),
+                (username + cid).encode("utf-8"), hashlib.sha256,
+            ).digest())
+        except UnicodeEncodeError:
+            pass
+        else:
+            if hmac.compare_digest(expected, supplied.encode("ascii")):
+                return None
+    return error_response_json(
+        "NotAuthorizedException", f"Unable to verify secret hash for client {cid}", 400,
+    )
+
+
+# AuthFlow -> (the ExplicitAuthFlows entries that enable it, the refusal without one)
+_PASSWORD_AUTH_FLOWS = {
+    "USER_PASSWORD_AUTH": ({"ALLOW_USER_PASSWORD_AUTH", "USER_PASSWORD_AUTH"},
+                           "USER_PASSWORD_AUTH flow not enabled for this client"),
+    "ADMIN_USER_PASSWORD_AUTH": ({"ALLOW_ADMIN_USER_PASSWORD_AUTH", "ADMIN_NO_SRP_AUTH"},
+                                 "Auth flow not enabled for this client"),
+    "ADMIN_NO_SRP_AUTH": ({"ALLOW_ADMIN_USER_PASSWORD_AUTH", "ADMIN_NO_SRP_AUTH"},
+                          "Auth flow not enabled for this client"),
+}
+
+
+def _auth_flow_error(action: str, data: dict):
+    """InvalidParameterException for a password flow the app client's ExplicitAuthFlows leaves out, or None."""
+    flow = data.get("AuthFlow")
+    if (not isinstance(flow, str) or not action.endswith("InitiateAuth")
+            or action.startswith("Admin") != flow.startswith("ADMIN_")):
+        return None
+    enabling = _PASSWORD_AUTH_FLOWS.get(flow)
+    if not enabling:
+        return None
+    cid = data.get("ClientId")
+    pool = _user_pools.get(data.get("UserPoolId")) if action.startswith("Admin") else _pool_for_client(cid)[0]
+    flows = set(((pool or {}).get("_clients", {}).get(cid) or {}).get("ExplicitAuthFlows") or [])
+    if flows and not flows & enabling[0]:
+        return error_response_json("InvalidParameterException", enabling[1], 400)
+    return None
+
+
+def _run_idp_handler(handler, action: str, data: dict):
+    if action in _UNSIGNED_IDP_ACTIONS:
+        _pin_unsigned_idp_scope(data)
+    from ministack.app import AUTH
+    error = (_validate_client_secret_hash(action, data) or _auth_flow_error(action, data)
+             or _access_token_error(data) or _confirmation_code_error(action, data)) if AUTH else None
+    if error:
+        return error
+    try:
+        return handler(data)
+    except (_PreTokenRejected, _PreTokenUnavailable) as e:
+        return _pretoken_error(e)
+    except _PostAuthenticationInvalid as e:
+        return error_response_json("InvalidLambdaResponseException", str(e), 400)
+
+
+def _run_identity_handler(handler, action: str, data: dict):
+    if action in _UNSIGNED_IDENTITY_ACTIONS:
+        identity_id = data.get("IdentityPoolId") or data.get("IdentityId")
+        if identity_id:
+            set_request_region(_region_from_identity_id(identity_id))
+    return handler(data)
+
+async def _dispatch_idp(action: str, data: dict):
     handlers = {
         # User Pool CRUD
         "CreateUserPool": _create_user_pool,
@@ -858,12 +2918,27 @@ def _dispatch_idp(action: str, data: dict):
         "DescribeUserPool": _describe_user_pool,
         "ListUserPools": _list_user_pools,
         "UpdateUserPool": _update_user_pool,
+        "AddCustomAttributes": _add_custom_attributes,
         # User Pool Client CRUD
         "CreateUserPoolClient": _create_user_pool_client,
         "DeleteUserPoolClient": _delete_user_pool_client,
         "DescribeUserPoolClient": _describe_user_pool_client,
         "ListUserPoolClients": _list_user_pool_clients,
         "UpdateUserPoolClient": _update_user_pool_client,
+        "GetUICustomization": _get_ui_customization,
+        "SetUICustomization": _set_ui_customization,
+        # Managed login branding
+        "CreateManagedLoginBranding": _create_managed_login_branding,
+        "DescribeManagedLoginBranding": _describe_managed_login_branding,
+        "DescribeManagedLoginBrandingByClient": _describe_managed_login_branding_by_client,
+        "UpdateManagedLoginBranding": _update_managed_login_branding,
+        "DeleteManagedLoginBranding": _delete_managed_login_branding,
+        # Resource Servers
+        "CreateResourceServer": _create_resource_server,
+        "UpdateResourceServer": _update_resource_server,
+        "DescribeResourceServer": _describe_resource_server,
+        "DeleteResourceServer": _delete_resource_server,
+        "ListResourceServers": _list_resource_servers,
         # User management
         "AdminCreateUser": _admin_create_user,
         "AdminDeleteUser": _admin_delete_user,
@@ -878,12 +2953,15 @@ def _dispatch_idp(action: str, data: dict):
         "AdminUserGlobalSignOut": _admin_user_global_sign_out,
         "AdminListGroupsForUser": _admin_list_groups_for_user,
         "AdminListUserAuthEvents": _admin_list_user_auth_events,
+        "AdminUpdateAuthEventFeedback": _admin_update_auth_event_feedback,
+        "UpdateAuthEventFeedback": _update_auth_event_feedback,
         "AdminAddUserToGroup": _admin_add_user_to_group,
         "AdminRemoveUserFromGroup": _admin_remove_user_from_group,
         # Auth flows
         "AdminInitiateAuth": _admin_initiate_auth,
         "AdminRespondToAuthChallenge": _admin_respond_to_auth_challenge,
         "InitiateAuth": _initiate_auth,
+        "GetTokensFromRefreshToken": _get_tokens_from_refresh_token,
         "RespondToAuthChallenge": _respond_to_auth_challenge,
         "GlobalSignOut": _global_sign_out,
         "RevokeToken": _revoke_token,
@@ -896,6 +2974,8 @@ def _dispatch_idp(action: str, data: dict):
         "ChangePassword": _change_password,
         "GetUser": _get_user,
         "UpdateUserAttributes": _update_user_attributes,
+        "GetUserAttributeVerificationCode": _get_user_attribute_verification_code,
+        "VerifyUserAttribute": _verify_user_attribute,
         "DeleteUser": _delete_user,
         # Groups
         "CreateGroup": _create_group,
@@ -907,6 +2987,7 @@ def _dispatch_idp(action: str, data: dict):
         "CreateUserPoolDomain": _create_user_pool_domain,
         "DeleteUserPoolDomain": _delete_user_pool_domain,
         "DescribeUserPoolDomain": _describe_user_pool_domain,
+        "UpdateUserPoolDomain": _update_user_pool_domain,
         # Identity Providers
         "CreateIdentityProvider": _create_identity_provider,
         "DescribeIdentityProvider": _describe_identity_provider,
@@ -914,6 +2995,8 @@ def _dispatch_idp(action: str, data: dict):
         "DeleteIdentityProvider": _delete_identity_provider,
         "ListIdentityProviders": _list_identity_providers,
         "GetIdentityProviderByIdentifier": _get_identity_provider_by_identifier,
+        "AdminLinkProviderForUser": _admin_link_provider_for_user,
+        "AdminDisableProviderForUser": _admin_disable_provider_for_user,
         # MFA
         "GetUserPoolMfaConfig": _get_user_pool_mfa_config,
         "SetUserPoolMfaConfig": _set_user_pool_mfa_config,
@@ -929,14 +3012,19 @@ def _dispatch_idp(action: str, data: dict):
     handler = handlers.get(action)
     if not handler:
         return error_response_json("InvalidAction", f"Unknown Cognito IDP action: {action}", 400)
-    return handler(data)
+    # Run the sync handler in a worker thread so trigger Lambdas (which call
+    # back into ministack over HTTP) don't deadlock against a blocked event
+    # loop. The Lambda response path needs the loop free to accept new
+    # requests while _execute_function is running.
+    return await run_reentrant(_run_idp_handler, handler, action, data,
+                               thread_name="ministack-cognito-trigger")
 
 
 # ---------------------------------------------------------------------------
 # Identity Pool dispatcher
 # ---------------------------------------------------------------------------
 
-def _dispatch_identity(action: str, data: dict):
+async def _dispatch_identity(action: str, data: dict):
     handlers = {
         "CreateIdentityPool": _create_identity_pool,
         "DeleteIdentityPool": _delete_identity_pool,
@@ -948,6 +3036,8 @@ def _dispatch_identity(action: str, data: dict):
         "GetOpenIdToken": _get_open_id_token,
         "SetIdentityPoolRoles": _set_identity_pool_roles,
         "GetIdentityPoolRoles": _get_identity_pool_roles,
+        "SetPrincipalTagAttributeMap": _set_principal_tag_attribute_map,
+        "GetPrincipalTagAttributeMap": _get_principal_tag_attribute_map,
         "ListIdentities": _list_identities,
         "DescribeIdentity": _describe_identity,
         "MergeDeveloperIdentities": _merge_developer_identities,
@@ -960,17 +3050,120 @@ def _dispatch_identity(action: str, data: dict):
     handler = handlers.get(action)
     if not handler:
         return error_response_json("InvalidAction", f"Unknown Cognito Identity action: {action}", 400)
-    return handler(data)
+    return await run_reentrant(_run_identity_handler, handler, action, data,
+                               thread_name="ministack-cognito-trigger")
 
 
 # ===========================================================================
 # USER POOL CRUD
 # ===========================================================================
 
+_USER_POOL_TIERS = ("ESSENTIALS", "LITE", "PLUS")
+
+
+def _threat_protection_on(add_ons) -> bool:
+    return (add_ons or {}).get("AdvancedSecurityMode", "OFF") != "OFF"
+
+
+def _user_pool_tier(pool: dict) -> str:
+    """The pool's feature plan, defaulting as CreateUserPool does when the request omits it."""
+    tier = pool.get("UserPoolTier")
+    if tier is None:
+        tier = "PLUS" if _threat_protection_on(pool.get("UserPoolAddOns")) else "ESSENTIALS"
+    return tier
+
+
+def _user_pool_tier_error(tier, add_ons, policies, current=None):
+    """Refuse an unknown tier or a feature it lacks (threat protection on ESSENTIALS, password history on LITE)."""
+    if tier not in _USER_POOL_TIERS:
+        return error_response_json(
+            "InvalidParameterException",
+            f"1 validation error detected: Value '{tier}' at 'userPoolTier' failed to satisfy constraint: "
+            f"Member must satisfy enum value set: [{', '.join(_USER_POOL_TIERS)}]", 400)
+    if tier == "ESSENTIALS" and _threat_protection_on(add_ons):
+        feature = "Threat Protection"
+    elif tier == "LITE" and ((policies or {}).get("PasswordPolicy") or {}).get("PasswordHistorySize"):
+        feature = "Password History"
+    else:
+        return None
+    # A plan change the pool's features rule out has its own error code.
+    code = "TierChangeNotAllowedException" if current not in (None, tier) else "FeatureUnavailableInTierException"
+    return error_response_json(
+        code, f"The following features need to be disabled for the {tier} pricing tier configured: {feature}", 400)
+
+
+def _custom_sender_key_error(lambda_config):
+    """The error AWS answers for a custom sender trigger without a usable KMSKeyID, or None."""
+    lambda_config = lambda_config or {}
+    if not (lambda_config.get("CustomEmailSender") or lambda_config.get("CustomSMSSender")):
+        return None
+    key_id = lambda_config.get("KMSKeyID")
+    if not key_id:
+        return error_response_json(
+            "InvalidParameterException", "KMSKeyId parameter is required when Custom SMS/Email Lambda trigger is used.", 400)
+    if not _KMS_KEY_ARN_RE.fullmatch(key_id):
+        return error_response_json("InvalidParameterException", (
+            f"1 validation error detected: Value '{key_id}' at 'lambdaConfig.kMSKeyID' failed to satisfy constraint: "
+            f"Member must satisfy regular expression pattern: {_KMS_KEY_ARN_RE.pattern}"), 400)
+    if ":alias/" in key_id:
+        return error_response_json("InvalidParameterException", (
+            "Encountered error when CreateGrant was attempted on the input KMS key - "
+            "Key Aliases are not supported for this operation."), 400)
+    from ministack.services import kms as kms_mod
+    key = kms_mod._resolve_key(key_id)
+    if not key:
+        return error_response_json("InvalidParameterException", (
+            f"Encountered error when CreateGrant was attempted on the input KMS key - Key '{key_id}' does not exist"), 400)
+    if key.get("KeyState") == "PendingDeletion":
+        return error_response_json("InvalidParameterException", (
+            f"Encountered error when CreateGrant was attempted on the input KMS key - {key_id} is pending deletion."), 400)
+    return None
+
+
+_KMS_KEY_ARN_RE = re.compile(
+    r"arn:[\w+=/,.@-]+:[\w+=/,.@-]+:([\w+=/,.@-]*)?:[0-9]+:[\w+=/,.@-]+(:[\w+=/,.@-]+)?(:[\w+=/,.@-]+)?")
+_TEMPORARY_PASSWORD_RE = re.compile(r"^[\S]+.*[\S]+$")
+
+
+def _sms_configuration_error(auto_verified, sms_configuration):
+    if "phone_number" in (auto_verified or []) and not sms_configuration:
+        return error_response_json(
+            "InvalidParameterException", "SMS configuration is required when phone_number is selected for auto verification", 400)
+    return None
+
+
+def _update_settings_error(auto_verified, update_settings):
+    kept = (update_settings or {}).get("AttributesRequireVerificationBeforeUpdate") or []
+    if not set(kept) <= set(auto_verified or []):
+        return error_response_json("InvalidParameterException",
+                                   "All attributes in AttributesRequireVerificationBeforeUpdate must exist in AutoVerifiedAttributes", 400)
+    return None
+
+
 def _create_user_pool(data):
     name = data.get("PoolName")
     if not name:
         return error_response_json("InvalidParameterException", "PoolName is required.", 400)
+    err = (_custom_sender_key_error(data.get("LambdaConfig"))
+           or _sms_configuration_error(data.get("AutoVerifiedAttributes"), data.get("SmsConfiguration"))
+           or _update_settings_error(data.get("AutoVerifiedAttributes"), data.get("UserAttributeUpdateSettings")))
+    if err:
+        return err
+
+    # "You can't require that users provide a value for the attribute" — a
+    # custom (or developer-only) schema entry with Required=true is a pool
+    # real Cognito refuses to create.
+    for raw in data.get("Schema") or []:
+        if (isinstance(raw, dict) and raw.get("Required")
+                and _schema_attribute_name(raw).startswith(
+                    (_ATTRIBUTE_CUSTOM_PREFIX, _ATTRIBUTE_DEV_PREFIX))):
+            return error_response_json(
+                "InvalidParameterException",
+                "Required custom attributes are not supported.", 400)
+    tier = _user_pool_tier(data)
+    err = _user_pool_tier_error(tier, data.get("UserPoolAddOns"), data.get("Policies"))
+    if err:
+        return err
 
     pid = _pool_id()
     now = _now_epoch()
@@ -990,7 +3183,7 @@ def _create_user_pool(data):
                 "TemporaryPasswordValidityDays": 7,
             }
         }),
-        "Schema": data.get("Schema", []),
+        "SchemaAttributes": _build_schema_attributes(data.get("Schema")),
         "AutoVerifiedAttributes": data.get("AutoVerifiedAttributes", []),
         "AliasAttributes": data.get("AliasAttributes", []),
         "UsernameAttributes": data.get("UsernameAttributes", []),
@@ -1000,7 +3193,7 @@ def _create_user_pool(data):
         "SmsAuthenticationMessage": data.get("SmsAuthenticationMessage", ""),
         "MfaConfiguration": data.get("MfaConfiguration", "OFF"),
         "EstimatedNumberOfUsers": 0,
-        "EmailConfiguration": data.get("EmailConfiguration", {}),
+        "EmailConfiguration": _email_configuration_out(data.get("EmailConfiguration", {})),
         "SmsConfiguration": data.get("SmsConfiguration", {}),
         "UserPoolTags": data.get("UserPoolTags", {}),
         "AdminCreateUserConfig": data.get("AdminCreateUserConfig", {
@@ -1010,11 +3203,14 @@ def _create_user_pool(data):
         "AccountRecoverySetting": data.get("AccountRecoverySetting", {}),
         "DeletionProtection": data.get("DeletionProtection", "INACTIVE"),
         "LambdaConfig": data.get("LambdaConfig", {}),
+        "UserPoolTier": tier,
         "Domain": None,
+        "CustomDomain": None,
         "_clients": {},
         "_users": {},
         "_groups": {},
         "_identity_providers": {},
+        "_resource_servers": {},
     }
     if data.get("DeviceConfiguration"):
         pool["DeviceConfiguration"] = data["DeviceConfiguration"]
@@ -1024,6 +3220,8 @@ def _create_user_pool(data):
         pool["UserPoolAddOns"] = data["UserPoolAddOns"]
     if data.get("VerificationMessageTemplate"):
         pool["VerificationMessageTemplate"] = data["VerificationMessageTemplate"]
+    if data.get("UserAttributeUpdateSettings"):
+        pool["UserAttributeUpdateSettings"] = data["UserAttributeUpdateSettings"]
     _user_pools[pid] = pool
     logger.info("Cognito: CreateUserPool %s (%s)", name, pid)
     return json_response({"UserPool": _pool_out(pool)})
@@ -1034,9 +3232,11 @@ def _delete_user_pool(data):
     pool, err = _resolve_pool(pid)
     if err:
         return err
-    if pool.get("Domain"):
-        _pool_domain_map.pop(pool["Domain"], None)
+    for configured in (pool.get("Domain"), pool.get("CustomDomain")):
+        if configured:
+            _pool_domain_map.pop(configured, None)
     del _user_pools[pid]
+    _drop_pool_keys(pid)
     return json_response({})
 
 
@@ -1071,6 +3271,22 @@ def _update_user_pool(data):
     pool, err = _resolve_pool(pid)
     if err:
         return err
+    if "LambdaConfig" in data:
+        err = _custom_sender_key_error(data["LambdaConfig"])
+        if err:
+            return err
+    err = _sms_configuration_error(data.get("AutoVerifiedAttributes"), data.get("SmsConfiguration")) or _update_settings_error(
+        # Measured: an omitted AutoVerifiedAttributes counts as none, an omitted setting as the stored one.
+        data.get("AutoVerifiedAttributes", []),
+        data.get("UserAttributeUpdateSettings", pool.get("UserAttributeUpdateSettings")))
+    if err:
+        return err
+    # An omitted tier keeps the pool's plan; omitted add-ons stay out of the check, AWS resets them.
+    current = _user_pool_tier(pool)
+    err = _user_pool_tier_error(data.get("UserPoolTier", current), data.get("UserPoolAddOns"),
+                                data.get("Policies", pool.get("Policies")), current)
+    if err:
+        return err
     updatable = {
         "Policies", "AutoVerifiedAttributes", "SmsVerificationMessage",
         "EmailVerificationMessage", "EmailVerificationSubject",
@@ -1078,27 +3294,151 @@ def _update_user_pool(data):
         "EmailConfiguration", "SmsConfiguration", "UserPoolTags",
         "AdminCreateUserConfig", "UserPoolAddOns", "VerificationMessageTemplate",
         "AccountRecoverySetting", "LambdaConfig",
+        "UserAttributeUpdateSettings", "UserPoolTier",
+        # Deletion protection is switched off through UpdateUserPool before a
+        # protected pool can be deleted (per the DeletionProtection property
+        # on the CloudFormation resource reference).
+        "DeletionProtection",
     }
     for k in updatable:
         if k in data:
             pool[k] = data[k]
+    if data.get("PoolName"):
+        pool["Name"] = data["PoolName"]
+    if "EmailConfiguration" in data:
+        pool["EmailConfiguration"] = _email_configuration_out(data["EmailConfiguration"])
     pool["LastModifiedDate"] = _now_epoch()
     return json_response({})
 
 
+def _add_custom_attributes(data):
+    # https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_AddCustomAttributes.html
+    # Adds to the pool schema only: 1-25 attributes per call, each stored under
+    # its `custom:` (or `dev:`) prefix, and custom attributes can never be
+    # removed or redefined afterwards.
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return err
+    custom_attributes = data.get("CustomAttributes")
+    if not isinstance(custom_attributes, list) or not custom_attributes:
+        return error_response_json(
+            "InvalidParameterException",
+            "1 validation error detected: Value null at 'customAttributes' failed to "
+            "satisfy constraint: Member must not be null", 400)
+    if len(custom_attributes) > 25:
+        return error_response_json(
+            "InvalidParameterException",
+            "1 validation error detected: Value at 'customAttributes' failed to satisfy "
+            "constraint: Member must have length less than or equal to 25", 400)
+
+    existing = {a["Name"] for a in _ensure_schema_attributes(pool)["SchemaAttributes"]}
+    additions = []
+    for raw in custom_attributes:
+        if not isinstance(raw, dict) or not (raw.get("Name") or "").strip():
+            return error_response_json(
+                "InvalidParameterException", "Invalid attribute name.", 400)
+        attr = _normalize_schema_attribute(raw)
+        if not attr["Name"].startswith((_ATTRIBUTE_CUSTOM_PREFIX, _ATTRIBUTE_DEV_PREFIX)):
+            # A standard attribute name is not a custom attribute; AWS refuses
+            # rather than silently redefining the standard schema entry.
+            return error_response_json(
+                "InvalidParameterException",
+                f"{attr['Name']} is a standard attribute and cannot be added as a "
+                "custom attribute.", 400)
+        if attr["Name"] in existing:
+            return error_response_json(
+                "InvalidParameterException",
+                f"{attr['Name']}: Attribute already exists in the schema.", 400)
+        if attr.get("Required"):
+            return error_response_json(
+                "InvalidParameterException",
+                "Required custom attributes are not supported.", 400)
+        existing.add(attr["Name"])
+        additions.append(attr)
+
+    if _custom_attribute_count(pool) + len(additions) > _MAX_CUSTOM_ATTRIBUTES:
+        return error_response_json(
+            "InvalidParameterException",
+            f"user pool can have up to {_MAX_CUSTOM_ATTRIBUTES} custom attributes.", 400)
+
+    pool["SchemaAttributes"].extend(additions)
+    pool["LastModifiedDate"] = _now_epoch()
+    logger.info("Cognito: AddCustomAttributes %s (%s)",
+                ", ".join(a["Name"] for a in additions), pid)
+    return json_response({})
+
+
+def _email_configuration_out(email_configuration) -> dict:
+    # AWS reports EmailSendingAccount even when the request omitted it: an
+    # unspecified account means Cognito's built-in mailer.
+    # https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_EmailConfigurationType.html
+    config = dict(email_configuration or {})
+    # Cognito reports its default mailer even when no explicit email options
+    # were supplied. This also normalizes pools created by older MiniStack
+    # versions whose persisted EmailConfiguration was empty.
+    config.setdefault("EmailSendingAccount", "COGNITO_DEFAULT")
+    return config
+
+
 def _pool_out(pool: dict) -> dict:
-    return {k: v for k, v in pool.items() if not k.startswith("_")}
+    _ensure_schema_attributes(pool)
+    output = {k: v for k, v in pool.items() if not k.startswith("_")}
+    output["UserPoolTier"] = _user_pool_tier(pool)
+    if "EmailConfiguration" in output:
+        output["EmailConfiguration"] = _email_configuration_out(
+            output["EmailConfiguration"]
+        )
+    return output
 
 
 # ===========================================================================
 # USER POOL CLIENT CRUD
 # ===========================================================================
 
+def _refresh_token_rotation(rotation, explicit_auth_flows):
+    """The client's stored RefreshTokenRotation and the error AWS answers for it, one of them None."""
+    grace = rotation.get("RetryGracePeriodSeconds", 0)
+    if isinstance(grace, bool):
+        return None, error_response_json(
+            "SerializationException", f"{str(grace).upper()}_VALUE can not be converted to an Integer", 400)
+    if isinstance(grace, str):
+        return None, error_response_json("SerializationException", "STRING_VALUE can not be converted to an Integer", 400)
+    if isinstance(grace, float):
+        grace = int(grace)
+    feature = rotation.get("Feature")
+    errors = []
+    if feature is None:
+        errors.append("Value null at 'refreshTokenRotation.feature' failed to satisfy constraint: Member must not be null")
+    elif feature not in ("ENABLED", "DISABLED"):
+        errors.append(f"Value '{feature}' at 'refreshTokenRotation.feature' failed to satisfy constraint: "
+                      "Member must satisfy enum value set: [ENABLED, DISABLED]")
+    if isinstance(grace, int) and grace > 60:
+        errors.append(f"Value '{grace}' at 'refreshTokenRotation.retryGracePeriodSeconds' "
+                      "failed to satisfy constraint: Member must have value less than or equal to 60")
+    elif isinstance(grace, int) and grace < 0:
+        errors.append(f"Value '{grace}' at 'refreshTokenRotation.retryGracePeriodSeconds' "
+                      "failed to satisfy constraint: Member must have value greater than or equal to 0")
+    if errors:
+        count = f"{len(errors)} validation error{'s' if len(errors) > 1 else ''} detected: "
+        return None, error_response_json("InvalidParameterException", count + "; ".join(errors), 400)
+    if feature == "ENABLED" and "ALLOW_REFRESH_TOKEN_AUTH" in (explicit_auth_flows or []):
+        return None, error_response_json("InvalidParameterException", (
+            "ALLOW_REFRESH_TOKEN_AUTH is not a permitted ExplicitAuthFlow when refresh token rotation is enabled."), 400)
+    # A disabled rotation keeps no grace period.
+    return {"Feature": feature, "RetryGracePeriodSeconds": int(grace or 0) if feature == "ENABLED" else 0}, None
+
+
 def _create_user_pool_client(data):
     pid = data.get("UserPoolId")
     pool, err = _resolve_pool(pid)
     if err:
         return err
+    rotation = None
+    if data.get("RefreshTokenRotation") is not None:
+        rotation, err = _refresh_token_rotation(data["RefreshTokenRotation"], data.get("ExplicitAuthFlows"))
+        if err:
+            return err
 
     cid = _client_id()
     now = _now_epoch()
@@ -1111,8 +3451,8 @@ def _create_user_pool_client(data):
         "CreationDate": now,
         "LastModifiedDate": now,
         "RefreshTokenValidity": data.get("RefreshTokenValidity", 30),
-        "AccessTokenValidity": data.get("AccessTokenValidity", 60),
-        "IdTokenValidity": data.get("IdTokenValidity", 60),
+        "AccessTokenValidity": data.get("AccessTokenValidity"),
+        "IdTokenValidity": data.get("IdTokenValidity"),
         "TokenValidityUnits": data.get("TokenValidityUnits", {}),
         "ReadAttributes": data.get("ReadAttributes", []),
         "WriteAttributes": data.get("WriteAttributes", []),
@@ -1125,10 +3465,11 @@ def _create_user_pool_client(data):
         "AllowedOAuthScopes": data.get("AllowedOAuthScopes", []),
         "AllowedOAuthFlowsUserPoolClient": data.get("AllowedOAuthFlowsUserPoolClient", False),
         "AnalyticsConfiguration": data.get("AnalyticsConfiguration"),
-        "PreventUserExistenceErrors": data.get("PreventUserExistenceErrors", "ENABLED"),
+        "PreventUserExistenceErrors": data.get("PreventUserExistenceErrors", "LEGACY"),
         "EnableTokenRevocation": data.get("EnableTokenRevocation", True),
         "EnablePropagateAdditionalUserContextData": data.get("EnablePropagateAdditionalUserContextData", False),
         "AuthSessionValidity": data.get("AuthSessionValidity", 3),
+        "RefreshTokenRotation": rotation,
     }
     pool["_clients"][cid] = client
     out = {k: v for k, v in client.items() if v is not None}
@@ -1197,6 +3538,13 @@ def _update_user_pool_client(data):
         "AnalyticsConfiguration", "PreventUserExistenceErrors", "EnableTokenRevocation",
         "EnablePropagateAdditionalUserContextData", "AuthSessionValidity",
     }
+    # Left out of an update, rotation stays as it was, as on AWS.
+    rotation = data["RefreshTokenRotation"] if data.get("RefreshTokenRotation") is not None else client.get("RefreshTokenRotation")
+    if rotation is not None:
+        rotation, err = _refresh_token_rotation(rotation, data.get("ExplicitAuthFlows", client.get("ExplicitAuthFlows")))
+        if err:
+            return err
+        client["RefreshTokenRotation"] = rotation
     for k in updatable:
         if k in data:
             client[k] = data[k]
@@ -1204,13 +3552,688 @@ def _update_user_pool_client(data):
     return json_response({"UserPoolClient": {k: v for k, v in client.items() if v is not None}})
 
 
-def _validate_password(pool, password):
-    """Validate password against the pool's PasswordPolicy. Returns error response or None."""
+def _ui_customization_target(data):
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return None, None, err
+    cid = data.get("ClientId") or "ALL"
+    if cid != "ALL" and cid not in pool["_clients"]:
+        return None, None, error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
+    return pool, cid, None
+
+
+def _set_ui_customization(data):
+    pool, cid, err = _ui_customization_target(data)
+    if err:
+        return err
+    if not (pool.get("Domain") or pool.get("CustomDomain")):
+        return error_response_json(
+            "InvalidParameterException", "There has to be an existing domain associated with this user pool", 400)
+    # ImageFile is accepted but not stored: ministack does not serve the classic hosted UI assets.
+    now = _now_epoch()
+    ui = pool.setdefault("_ui_customizations", {})
+    ui[cid] = {
+        "UserPoolId": pool["Id"], "ClientId": cid, "CSS": data.get("CSS", ""), "CSSVersion": str(int(now * 1000)),
+        "CreationDate": ui.get(cid, {}).get("CreationDate", now), "LastModifiedDate": now,
+    }
+    return json_response({"UICustomization": ui[cid]})
+
+
+def _get_ui_customization(data):
+    pool, cid, err = _ui_customization_target(data)
+    if err:
+        return err
+    ui = pool.get("_ui_customizations", {})
+    return json_response({"UICustomization": ui.get(cid) or ui.get("ALL") or {}})
+
+
+# ---------------------------------------------------------------------------
+# Managed login branding
+# ---------------------------------------------------------------------------
+# One branding per app client, kept on the pool, so it outlives the client it
+# was made for, as on AWS. The checks run in the order AWS ran them in
+# eu-west-2 on 2026-11-04. The hosted UI ministack serves is its own and
+# does not render a branding.
+
+# The managed login style AWS answers for a branding that uses Cognito's values.
+# DescribeManagedLoginBranding with ReturnMergedResources returns these settings
+# with a branding's own merged over them. Captured from
+# DescribeManagedLoginBranding in eu-west-2 on 2026-11-04.
+DEFAULT_SETTINGS = {'components': {'secondaryButton': {'lightMode': {'hover': {'backgroundColor': 'f2f8fdff',
+                                                            'borderColor': '033160ff',
+                                                            'textColor': '033160ff'},
+                                                  'defaults': {'backgroundColor': 'ffffffff',
+                                                               'borderColor': '0972d3ff',
+                                                               'textColor': '0972d3ff'},
+                                                  'active': {'backgroundColor': 'd3e7f9ff',
+                                                             'borderColor': '033160ff',
+                                                             'textColor': '033160ff'}},
+                                    'darkMode': {'hover': {'backgroundColor': '192534ff',
+                                                           'borderColor': '89bdeeff',
+                                                           'textColor': '89bdeeff'},
+                                                 'defaults': {'backgroundColor': '0f1b2aff',
+                                                              'borderColor': '539fe5ff',
+                                                              'textColor': '539fe5ff'},
+                                                 'active': {'backgroundColor': '354150ff',
+                                                            'borderColor': '89bdeeff',
+                                                            'textColor': '89bdeeff'}}},
+                'form': {'lightMode': {'backgroundColor': 'ffffffff', 'borderColor': 'c6c6cdff'},
+                         'borderRadius': 8.0,
+                         'backgroundImage': {'enabled': False},
+                         'logo': {'location': 'CENTER',
+                                  'position': 'TOP',
+                                  'enabled': False,
+                                  'formInclusion': 'IN'},
+                         'darkMode': {'backgroundColor': '0f1b2aff', 'borderColor': '424650ff'}},
+                'alert': {'lightMode': {'error': {'backgroundColor': 'fff7f7ff',
+                                                  'borderColor': 'd91515ff'}},
+                          'borderRadius': 12.0,
+                          'darkMode': {'error': {'backgroundColor': '1a0000ff',
+                                                 'borderColor': 'eb6f6fff'}}},
+                'favicon': {'enabledTypes': ['ICO', 'SVG']},
+                'pageBackground': {'image': {'enabled': True},
+                                   'lightMode': {'color': 'ffffffff'},
+                                   'darkMode': {'color': '0f1b2aff'}},
+                'pageText': {'lightMode': {'bodyColor': '414d5cff',
+                                           'headingColor': '000716ff',
+                                           'descriptionColor': '414d5cff'},
+                             'darkMode': {'bodyColor': 'b6bec9ff',
+                                          'headingColor': 'd1d5dbff',
+                                          'descriptionColor': 'b6bec9ff'}},
+                'phoneNumberSelector': {'displayType': 'TEXT'},
+                'primaryButton': {'lightMode': {'hover': {'backgroundColor': '033160ff',
+                                                          'textColor': 'ffffffff'},
+                                                'defaults': {'backgroundColor': '0972d3ff',
+                                                             'textColor': 'ffffffff'},
+                                                'active': {'backgroundColor': '033160ff',
+                                                           'textColor': 'ffffffff'},
+                                                'disabled': {'backgroundColor': 'ffffffff',
+                                                             'borderColor': 'ffffffff'}},
+                                  'darkMode': {'hover': {'backgroundColor': '89bdeeff',
+                                                         'textColor': '000716ff'},
+                                               'defaults': {'backgroundColor': '539fe5ff',
+                                                            'textColor': '000716ff'},
+                                               'active': {'backgroundColor': '539fe5ff',
+                                                          'textColor': '000716ff'},
+                                               'disabled': {'backgroundColor': 'ffffffff',
+                                                            'borderColor': 'ffffffff'}}},
+                'pageFooter': {'lightMode': {'borderColor': 'd5dbdbff',
+                                             'background': {'color': 'fafafaff'}},
+                               'backgroundImage': {'enabled': False},
+                               'logo': {'location': 'START', 'enabled': False},
+                               'darkMode': {'borderColor': '424650ff',
+                                            'background': {'color': '0f141aff'}}},
+                'pageHeader': {'lightMode': {'borderColor': 'd5dbdbff',
+                                             'background': {'color': 'fafafaff'}},
+                               'backgroundImage': {'enabled': False},
+                               'logo': {'location': 'START', 'enabled': False},
+                               'darkMode': {'borderColor': '424650ff',
+                                            'background': {'color': '0f141aff'}}},
+                'idpButton': {'standard': {'lightMode': {'hover': {'backgroundColor': 'f2f8fdff',
+                                                                   'borderColor': '033160ff',
+                                                                   'textColor': '033160ff'},
+                                                         'defaults': {'backgroundColor': 'ffffffff',
+                                                                      'borderColor': '424650ff',
+                                                                      'textColor': '424650ff'},
+                                                         'active': {'backgroundColor': 'd3e7f9ff',
+                                                                    'borderColor': '033160ff',
+                                                                    'textColor': '033160ff'}},
+                                           'darkMode': {'hover': {'backgroundColor': '192534ff',
+                                                                  'borderColor': '89bdeeff',
+                                                                  'textColor': '89bdeeff'},
+                                                        'defaults': {'backgroundColor': '0f1b2aff',
+                                                                     'borderColor': 'c6c6cdff',
+                                                                     'textColor': 'c6c6cdff'},
+                                                        'active': {'backgroundColor': '354150ff',
+                                                                   'borderColor': '89bdeeff',
+                                                                   'textColor': '89bdeeff'}}},
+                              'custom': {}}},
+ 'componentClasses': {'dropDown': {'lightMode': {'hover': {'itemBackgroundColor': 'f4f4f4ff',
+                                                           'itemBorderColor': '7d8998ff',
+                                                           'itemTextColor': '000716ff'},
+                                                 'defaults': {'itemBackgroundColor': 'ffffffff'},
+                                                 'match': {'itemBackgroundColor': '414d5cff',
+                                                           'itemTextColor': '0972d3ff'}},
+                                   'borderRadius': 8.0,
+                                   'darkMode': {'hover': {'itemBackgroundColor': '081120ff',
+                                                          'itemBorderColor': '5f6b7aff',
+                                                          'itemTextColor': 'e9ebedff'},
+                                                'defaults': {'itemBackgroundColor': '192534ff'},
+                                                'match': {'itemBackgroundColor': 'd1d5dbff',
+                                                          'itemTextColor': '89bdeeff'}}},
+                      'input': {'lightMode': {'defaults': {'backgroundColor': 'ffffffff',
+                                                           'borderColor': '7d8998ff'},
+                                              'placeholderColor': '5f6b7aff'},
+                                'borderRadius': 8.0,
+                                'darkMode': {'defaults': {'backgroundColor': '0f1b2aff',
+                                                          'borderColor': '5f6b7aff'},
+                                             'placeholderColor': '8d99a8ff'}},
+                      'inputDescription': {'lightMode': {'textColor': '5f6b7aff'},
+                                           'darkMode': {'textColor': '8d99a8ff'}},
+                      'buttons': {'borderRadius': 8.0},
+                      'optionControls': {'lightMode': {'defaults': {'backgroundColor': 'ffffffff',
+                                                                    'borderColor': '7d8998ff'},
+                                                       'selected': {'backgroundColor': '0972d3ff',
+                                                                    'foregroundColor': 'ffffffff'}},
+                                         'darkMode': {'defaults': {'backgroundColor': '0f1b2aff',
+                                                                   'borderColor': '7d8998ff'},
+                                                      'selected': {'backgroundColor': '539fe5ff',
+                                                                   'foregroundColor': '000716ff'}}},
+                      'statusIndicator': {'lightMode': {'success': {'backgroundColor': 'f2fcf3ff',
+                                                                    'borderColor': '037f0cff',
+                                                                    'indicatorColor': '037f0cff'},
+                                                        'pending': {'indicatorColor': 'AAAAAAAA'},
+                                                        'warning': {'backgroundColor': 'fffce9ff',
+                                                                    'borderColor': '8d6605ff',
+                                                                    'indicatorColor': '8d6605ff'},
+                                                        'error': {'backgroundColor': 'fff7f7ff',
+                                                                  'borderColor': 'd91515ff',
+                                                                  'indicatorColor': 'd91515ff'}},
+                                          'darkMode': {'success': {'backgroundColor': '001a02ff',
+                                                                   'borderColor': '29ad32ff',
+                                                                   'indicatorColor': '29ad32ff'},
+                                                       'pending': {'indicatorColor': 'AAAAAAAA'},
+                                                       'warning': {'backgroundColor': '1d1906ff',
+                                                                   'borderColor': 'e0ca57ff',
+                                                                   'indicatorColor': 'e0ca57ff'},
+                                                       'error': {'backgroundColor': '1a0000ff',
+                                                                 'borderColor': 'eb6f6fff',
+                                                                 'indicatorColor': 'eb6f6fff'}}},
+                      'divider': {'lightMode': {'borderColor': 'ebebf0ff'},
+                                  'darkMode': {'borderColor': '232b37ff'}},
+                      'idpButtons': {'icons': {'enabled': True}},
+                      'focusState': {'lightMode': {'borderColor': '0972d3ff'},
+                                     'darkMode': {'borderColor': '539fe5ff'}},
+                      'inputLabel': {'lightMode': {'textColor': '000716ff'},
+                                     'darkMode': {'textColor': 'd1d5dbff'}},
+                      'link': {'lightMode': {'hover': {'textColor': '033160ff'},
+                                             'defaults': {'textColor': '0972d3ff'}},
+                               'darkMode': {'hover': {'textColor': '89bdeeff'},
+                                            'defaults': {'textColor': '539fe5ff'}}}},
+ 'categories': {'form': {'sessionTimerDisplay': 'NONE',
+                         'instructions': {'enabled': False},
+                         'languageSelector': {'enabled': False},
+                         'displayGraphics': True,
+                         'location': {'horizontal': 'CENTER', 'vertical': 'CENTER'}},
+                'auth': {'federation': {'interfaceStyle': 'BUTTON_LIST', 'order': []},
+                         'authMethodOrder': [[{'display': 'BUTTON', 'type': 'FEDERATED'},
+                                              {'display': 'INPUT', 'type': 'USERNAME_PASSWORD'}]]},
+                'global': {'colorSchemeMode': 'LIGHT',
+                           'pageFooter': {'enabled': False},
+                           'pageHeader': {'enabled': False},
+                           'spacingDensity': 'REGULAR'},
+                'signUp': {'acceptanceElements': [{'enforcement': 'NONE', 'textKey': 'en'}]}}}
+
+_BRANDING_CATEGORIES = (
+    "PAGE_FOOTER_BACKGROUND", "SMS_GRAPHIC", "PASSWORD_GRAPHIC", "EMAIL_GRAPHIC", "FORM_LOGO",
+    "FORM_BACKGROUND", "FAVICON_ICO", "PAGE_HEADER_LOGO", "PAGE_HEADER_BACKGROUND",
+    "AUTH_APP_GRAPHIC", "PASSKEY_GRAPHIC", "FAVICON_SVG", "IDP_BUTTON_ICON", "PAGE_BACKGROUND",
+    "PAGE_FOOTER_LOGO",
+)
+_BRANDING_COLOR_MODES = ("DARK", "LIGHT", "DYNAMIC")
+_BRANDING_EXTENSIONS = ("SVG", "JPEG", "PNG", "ICO", "WEBP")
+_BRANDING_FAVICON_EXTENSIONS = {"FAVICON_ICO": "ICO", "FAVICON_SVG": "SVG"}
+_BRANDING_ID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[4][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$")
+_BRANDING_VALUES_ERROR = "useCognitoProvidedValues or settings should be specified (but not both)"
+_BRANDING_NOT_FOUND = "ManagedLoginBranding does not exist."
+
+
+def _branding_invalid(message):
+    return error_response_json("InvalidParameterException", message, 400)
+
+
+def _branding_serialization_error(value, structure=False):
+    """The deserialization error AWS's JSON protocol answers for a member of the wrong JSON type."""
+    if isinstance(value, list):
+        message = "Start of list found where not expected"
+    elif structure:
+        message = "Expected null"
+    elif isinstance(value, bool):
+        message = f"{'TRUE' if value else 'FALSE'}_VALUE can not be converted to a String"
+    elif isinstance(value, (int, float)):
+        message = "NUMBER_VALUE can not be converted to a String"
+    else:
+        message = "Start of structure or map found where not expected."
+    return error_response_json("SerializationException", message, 400, message_key="Message")
+
+
+def _branding_shape_error(data, assets):
+    for key in ("UserPoolId", "ClientId", "ManagedLoginBrandingId"):
+        if data.get(key) is not None and not isinstance(data[key], str):
+            return _branding_serialization_error(data[key])
+    if not isinstance(assets, list):
+        return _branding_serialization_error(assets, structure=not isinstance(assets, dict))
+    for asset in assets:
+        if not isinstance(asset, dict):
+            return _branding_serialization_error(asset, structure=True)
+    return None
+
+
+def _branding_asset_repr(asset):
+    """An asset as AWS's validator prints it in a list-length error (a Java object dump)."""
+    try:
+        size = len(base64.b64decode(asset.get("Bytes") or "", validate=False))
+    except (ValueError, TypeError):
+        size = 0
+    rid = asset.get("ResourceId")
+    return (f"AssetType(category={asset.get('Category')}, colorMode={asset.get('ColorMode')}, "
+            f"extension={asset.get('Extension')}, bytes=java.nio.HeapByteBuffer[pos=0 lim={size} cap={size}], "
+            f"resourceId={'null' if rid is None else rid})")
+
+
+def _branding_request_error(data, requires_id=False):
+    """AWS's request validation, which answers ahead of every other check: the
+    id's pattern, then each asset's extension, color mode and category."""
+    bid = data.get("ManagedLoginBrandingId")
+    if requires_id and bid is None:
+        return _branding_invalid("1 validation error detected: Value null at 'managedLoginBrandingId' failed to "
+                                 "satisfy constraint: Member must not be null")
+    if bid is not None and not (isinstance(bid, str) and _BRANDING_ID_RE.match(bid)):
+        return _branding_invalid(
+            f"1 validation error detected: Value '{bid}' at 'managedLoginBrandingId' failed to satisfy constraint: "
+            f"Member must satisfy regular expression pattern: {_BRANDING_ID_RE.pattern}")
+    assets = data.get("Assets") or []
+    invalid = _branding_shape_error(data, assets)
+    if invalid:
+        return invalid
+    problems = []
+    if len(assets) > 40:
+        listed = ", ".join(_branding_asset_repr(a) for a in assets)
+        problems.append(f"Value '[{listed}]' at 'assets' failed to satisfy constraint: "
+                        "Member must have length less than or equal to 40")
+    for i, asset in enumerate(assets, start=1):
+        rid = asset.get("ResourceId")
+        if rid is not None and not re.fullmatch(r"[\w\- ]+", str(rid)):
+            problems.append(f"Value '{rid}' at 'assets.{i}.member.resourceId' failed to satisfy constraint: "
+                            "Member must satisfy regular expression pattern: ^[\\w\\- ]+$")
+        for member, key, allowed in (("extension", "Extension", _BRANDING_EXTENSIONS),
+                                     ("colorMode", "ColorMode", _BRANDING_COLOR_MODES),
+                                     ("category", "Category", _BRANDING_CATEGORIES)):
+            if asset.get(key) not in allowed:
+                problems.append(f"Value '{asset.get(key)}' at 'assets.{i}.member.{member}' failed to satisfy "
+                                f"constraint: Member must satisfy enum value set: [{', '.join(allowed)}]")
+    if problems:
+        count = f"{len(problems)} validation error{'s' if len(problems) > 1 else ''} detected"
+        return _branding_invalid(f"{count}: {'; '.join(problems)}")
+    return None
+
+
+def _branding_values_error(data):
+    """AWS needs exactly one of UseCognitoProvidedValues=true and Settings."""
+    if (data.get("UseCognitoProvidedValues") is True) == (data.get("Settings") is not None):
+        return _branding_invalid(_BRANDING_VALUES_ERROR)
+    return None
+
+
+def _branding_asset_key(asset):
+    return asset.get("Category"), asset.get("ColorMode"), asset.get("ResourceId")
+
+
+def _branding_assets_error(pool, assets):
+    keys = [_branding_asset_key(a) for a in assets]
+    repeated = sorted({k for k in keys if keys.count(k) > 1}, key=keys.index)
+    if repeated:
+        names = ", ".join(f"{mode.lower()}-{category.lower()}" + (f"-{rid}" if rid else "")
+                          for category, mode, rid in repeated)
+        return _branding_invalid(f"Multiple instances of assets: [{names}]")
+    problems = []
+    for asset in assets:
+        category, rid = asset["Category"], asset.get("ResourceId")
+        if category in _BRANDING_FAVICON_EXTENSIONS and asset.get("Extension") != _BRANDING_FAVICON_EXTENSIONS[category]:
+            reason = f"{category} extension type must be one of [{_BRANDING_FAVICON_EXTENSIONS[category]}]."
+        elif rid and category != "IDP_BUTTON_ICON":
+            reason = f"Resource Id is not supported for asset category '{category}'"
+        elif rid and rid not in pool.get("_identity_providers", {}):
+            reason = f"Resource Id '{rid}' for asset category '{category}' not found"
+        else:
+            continue
+        rid_part = f", resourceId: {rid}" if rid else ""
+        problems.append(f"{{category: {category}, extension: {asset.get('Extension')}, colorMode: {asset['ColorMode']}"
+                        f"{rid_part}, errorMessage: \"{reason}\"}}")
+    if problems:
+        return _branding_invalid(f"Invalid assets provided. Validation errors: [{','.join(problems)}]")
+    return None
+
+
+def _branding_settings_error(settings):
+    """A property Cognito's own settings lack is refused, and so is a value of another JSON type.
+
+    AWS validates the settings against a schema it does not publish; Cognito's
+    default settings carry the same properties and types, so they stand in
+    for it here. An empty object there, such as idpButton.custom, is a map
+    whose values must be objects, and what goes inside them is not checked.
+    Lists are checked as lists, not item by item."""
+    def first_problem(own, default, path):
+        if isinstance(default, dict) and not default:
+            if not isinstance(own, dict):
+                return path, "InvalidDataType"
+            bad = next((k for k, v in own.items() if not isinstance(v, dict)), None)
+            return (f"{path}.{bad}", "InvalidDataType") if bad is not None else None
+        if isinstance(default, dict):
+            if not isinstance(own, dict):
+                return path, "InvalidDataType"
+            for key, value in own.items():
+                if key not in default:
+                    return f"{path}.{key}", "UnknownProperty"
+                found = first_problem(value, default[key], f"{path}.{key}")
+                if found:
+                    return found
+            return None
+        if isinstance(default, bool) or isinstance(own, bool):
+            same = isinstance(own, bool) and isinstance(default, bool)
+        elif isinstance(default, (int, float)):
+            same = isinstance(own, (int, float))
+        else:
+            same = isinstance(own, type(default))
+        return None if same else (path, "InvalidDataType")
+
+    found = first_problem(settings, DEFAULT_SETTINGS, "$")
+    if found:
+        return _branding_invalid(
+            f"Invalid settings provided. Validation errors: [{{property: {found[0]}, errorType: {found[1]}}}]")
+    return None
+
+
+def _branding_numbers(settings, defaults):
+    """Settings with each whole number a float where Cognito's own is one: AWS answers 4 as 4.0."""
+    if isinstance(settings, dict) and isinstance(defaults, dict):
+        return {k: _branding_numbers(v, defaults.get(k)) for k, v in settings.items()}
+    if (isinstance(settings, int) and not isinstance(settings, bool)
+            and isinstance(defaults, float)):
+        return float(settings)
+    return settings
+
+
+def _branding_assets(assets):
+    return [{k: a[k] for k in ("Category", "ColorMode", "Extension", "Bytes", "ResourceId") if k in a}
+            for a in assets or []]
+
+
+def _merge_branding_settings(defaults, own):
+    """A branding's settings over Cognito's, object by object; a list replaces the default list."""
+    if not isinstance(defaults, dict) or not isinstance(own, dict):
+        return copy.deepcopy(own)
+    merged = copy.deepcopy(defaults)
+    for key, value in own.items():
+        merged[key] = _merge_branding_settings(defaults.get(key), value)
+    return merged
+
+
+def _branding_out(branding, merged=False):
+    out = {
+        "ManagedLoginBrandingId": branding["ManagedLoginBrandingId"],
+        "UserPoolId": branding["UserPoolId"],
+        "UseCognitoProvidedValues": branding["UseCognitoProvidedValues"],
+    }
+    if merged:
+        # AWS also merges its own default artwork into Assets; that artwork is not
+        # redistributed here, so only the settings are merged.
+        out["Settings"] = _merge_branding_settings(DEFAULT_SETTINGS, branding.get("Settings") or {})
+    elif not branding["UseCognitoProvidedValues"]:
+        out["Settings"] = copy.deepcopy(branding["Settings"])
+    out["Assets"] = copy.deepcopy(branding["Assets"])
+    out["CreationDate"] = branding["CreationDate"]
+    out["LastModifiedDate"] = branding["LastModifiedDate"]
+    return {"ManagedLoginBranding": out}
+
+
+def _branding_client_pool(data):
+    """The pool of a call naming a client, or the error AWS answers: it names the pool when that is missing."""
+    pid, cid = data.get("UserPoolId"), data.get("ClientId")
+    for value in (pid, cid):
+        if value is not None and not isinstance(value, str):
+            return None, _branding_serialization_error(value)
+    pool = _user_pools.get(pid)
+    if not pool:
+        return None, error_response_json(
+            "ResourceNotFoundException", f"User pool client {cid} does not exist in user pool {pid}.", 400)
+    if cid not in pool["_clients"]:
+        return None, error_response_json("ResourceNotFoundException", f"User pool client {cid} does not exist.", 400)
+    return pool, None
+
+
+def _branding_pool(data):
+    """_resolve_pool, with the message the calls naming a branding answer, which has no full stop."""
+    if not data.get("UserPoolId"):
+        return None, _branding_invalid("UserPoolId must not be null")
+    pid = data["UserPoolId"]
+    pool = _user_pools.get(pid)
+    if not pool:
+        return None, error_response_json("ResourceNotFoundException", f"User pool {pid} does not exist", 400)
+    return pool, None
+
+
+def _create_managed_login_branding(data):
+    err = _branding_request_error(data)
+    if err:
+        return err
+    pool, err = _branding_client_pool(data)
+    if err:
+        return err
+    assets = _branding_assets(data.get("Assets"))
+    err = (_branding_values_error(data) or _branding_assets_error(pool, assets)
+           or (data.get("Settings") is not None and _branding_settings_error(data["Settings"])))
+    if err:
+        return err
+    cid = data["ClientId"]
+    brandings = pool.setdefault("_managed_login_brandings", {})
+    if any(b["ClientId"] == cid for b in brandings.values()):
+        return error_response_json("ManagedLoginBrandingExistsException",
+                                   f"A ManagedLoginBranding already exists for client {cid}", 400)
+    now = _now_epoch()
+    ucpv = data.get("UseCognitoProvidedValues") is True
+    branding = {
+        "ManagedLoginBrandingId": new_uuid(),
+        "UserPoolId": pool["Id"],
+        "ClientId": cid,
+        "UseCognitoProvidedValues": ucpv,
+        "Settings": None if ucpv else _branding_numbers(copy.deepcopy(data["Settings"]), DEFAULT_SETTINGS),
+        "Assets": assets,
+        "CreationDate": now,
+        "LastModifiedDate": now,
+    }
+    brandings[branding["ManagedLoginBrandingId"]] = branding
+    return json_response(_branding_out(branding))
+
+
+def _find_branding(data, update=False):
+    """The pool and branding a call names. An update's values, assets and settings are checked
+    ahead of the lookup, as AWS checks them."""
+    err = _branding_request_error(data, requires_id=True)
+    if err:
+        return None, None, err
+    pool, err = _branding_pool(data)
+    if err:
+        return None, None, err
+    if update:
+        err = (_branding_values_error(data) or _branding_assets_error(pool, _branding_assets(data.get("Assets")))
+               or (data.get("Settings") is not None and _branding_settings_error(data["Settings"])))
+        if err:
+            return None, None, err
+    branding = pool.get("_managed_login_brandings", {}).get(data["ManagedLoginBrandingId"])
+    if not branding:
+        return None, None, error_response_json("ResourceNotFoundException", _BRANDING_NOT_FOUND, 400)
+    return pool, branding, None
+
+
+def _describe_managed_login_branding(data):
+    _, branding, err = _find_branding(data)
+    if err:
+        return err
+    return json_response(_branding_out(branding, merged=data.get("ReturnMergedResources") is True))
+
+
+def _describe_managed_login_branding_by_client(data):
+    pool, err = _branding_client_pool(data)
+    if err:
+        return err
+    cid = data["ClientId"]
+    branding = next((b for b in pool.get("_managed_login_brandings", {}).values() if b["ClientId"] == cid), None)
+    if not branding:
+        return error_response_json("ResourceNotFoundException",
+                                   f"ManagedLoginBranding for client {cid} does not exist.", 400)
+    return json_response(_branding_out(branding, merged=data.get("ReturnMergedResources") is True))
+
+
+def _update_managed_login_branding(data):
+    _, branding, err = _find_branding(data, update=True)
+    if err:
+        return err
+    given = _branding_assets(data.get("Assets"))
+    # An asset replaces the one with its category, color mode and resource id and goes last; an update
+    # never removes one. AWS answers the others in an order of its own; they keep their order here.
+    assets = {_branding_asset_key(a): a for a in branding["Assets"]}
+    for asset in given:
+        assets.pop(_branding_asset_key(asset), None)
+        assets[_branding_asset_key(asset)] = asset
+    ucpv = data.get("UseCognitoProvidedValues") is True
+    branding["UseCognitoProvidedValues"] = ucpv
+    branding["Settings"] = None if ucpv else _branding_numbers(copy.deepcopy(data["Settings"]), DEFAULT_SETTINGS)
+    branding["Assets"] = list(assets.values())
+    branding["LastModifiedDate"] = _now_epoch()
+    return json_response(_branding_out(branding))
+
+
+def _delete_managed_login_branding(data):
+    pool, branding, err = _find_branding(data)
+    if err:
+        return err
+    del pool["_managed_login_brandings"][branding["ManagedLoginBrandingId"]]
+    return json_response({})
+
+
+# ---------------------------------------------------------------------------
+# Resource Servers
+# ---------------------------------------------------------------------------
+# Scoped to what CDK/Terraform actually exercise: CRUD + list, keyed by the
+# caller-supplied Identifier (not a separately generated id — that matches
+# real AWS, where Identifier is also the resource server's primary key
+# within a pool and is reused directly in OAuth scope strings as
+# "{Identifier}/{ScopeName}").
+
+def _resource_server_dict(pool_id, identifier, name, scopes):
+    return {
+        "UserPoolId": pool_id,
+        "Identifier": identifier,
+        "Name": name,
+        "Scopes": scopes,
+    }
+
+
+def _pool_resource_servers(pool):
+    # setdefault, not direct indexing — pools created before this field
+    # existed (or via a CFN provisioner that builds its own pool dict, e.g.
+    # _cognito_user_pool_create) may not have "_resource_servers" yet.
+    return pool.setdefault("_resource_servers", {})
+
+
+def _create_resource_server(data):
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return err
+    resource_servers = _pool_resource_servers(pool)
+
+    identifier = data.get("Identifier")
+    if not identifier:
+        return error_response_json(
+            "InvalidParameterException", "Identifier is required.", 400,
+        )
+    if identifier in resource_servers:
+        return error_response_json(
+            "InvalidParameterException",
+            f"Resource server {identifier} already exists.", 400,
+        )
+
+    server = _resource_server_dict(
+        pid, identifier, data.get("Name", identifier), data.get("Scopes", []),
+    )
+    resource_servers[identifier] = server
+    return json_response({"ResourceServer": server})
+
+
+def _update_resource_server(data):
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return err
+
+    identifier = data.get("Identifier")
+    server = _pool_resource_servers(pool).get(identifier)
+    if not server:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Resource server {identifier} does not exist.", 400,
+        )
+
+    if "Name" in data:
+        server["Name"] = data["Name"]
+    if "Scopes" in data:
+        server["Scopes"] = data["Scopes"]
+    return json_response({"ResourceServer": server})
+
+
+def _describe_resource_server(data):
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return err
+
+    identifier = data.get("Identifier")
+    server = _pool_resource_servers(pool).get(identifier)
+    if not server:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Resource server {identifier} does not exist.", 400,
+        )
+    return json_response({"ResourceServer": server})
+
+
+def _delete_resource_server(data):
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return err
+
+    identifier = data.get("Identifier")
+    resource_servers = _pool_resource_servers(pool)
+    if identifier not in resource_servers:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Resource server {identifier} does not exist.", 400,
+        )
+    del resource_servers[identifier]
+    return json_response({})
+
+
+def _list_resource_servers(data):
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return err
+
+    max_results = min(data.get("MaxResults", 50), 50)
+    next_token = data.get("NextToken")
+    servers = sorted(
+        _pool_resource_servers(pool).values(), key=lambda s: s["Identifier"],
+    )
+    start = int(next_token) if next_token else 0
+    page = servers[start:start + max_results]
+    resp = {"ResourceServers": page}
+    if start + max_results < len(servers):
+        resp["NextToken"] = str(start + max_results)
+    return json_response(resp)
+
+
+def _password_policy_errors(pool, password):
+    """Return a list of PasswordPolicy violation strings, or [] if compliant."""
     policy = pool.get("Policies", {}).get("PasswordPolicy", {})
     min_len = policy.get("MinimumLength", 8)
     errors = []
     if len(password) < min_len:
-        errors.append(f"Password must have length greater than or equal to {min_len}")
+        errors.append("Password not long enough")
     if policy.get("RequireUppercase", True) and not any(c.isupper() for c in password):
         errors.append("Password must have uppercase characters")
     if policy.get("RequireLowercase", True) and not any(c.islower() for c in password):
@@ -1219,12 +4242,15 @@ def _validate_password(pool, password):
         errors.append("Password must have numeric characters")
     if policy.get("RequireSymbols", True) and not any(c in "^$*.[]{}()?-\"!@#%&/\\,><':;|_~`+=" for c in password):
         errors.append("Password must have symbol characters")
+    return errors
+
+
+def _validate_password(pool, password, prefix="Password did not conform with policy"):
+    """The pool's PasswordPolicy answer for a password, or None. AWS names only the first rule it breaks,
+    and words the prefix differently per operation."""
+    errors = _password_policy_errors(pool, password)
     if errors:
-        return error_response_json(
-            "InvalidPasswordException",
-            "Password did not conform with policy: " + "; ".join(errors),
-            400,
-        )
+        return error_response_json("InvalidPasswordException", f"{prefix}: {errors[0]}", 400)
     return None
 
 
@@ -1247,6 +4273,8 @@ _DEFAULT_VERIFICATION_MESSAGE = "Your verification code is {####}."
 _DEFAULT_VERIFICATION_LINK_MESSAGE = (
     "Please click the link below to verify your email address. {##Verify Email##}"
 )
+_DEFAULT_EMAIL_OTP_SUBJECT = "Your sign-in code"
+_DEFAULT_EMAIL_OTP_MESSAGE = "Your sign-in code is {####}."
 
 
 def _cognito_email_enabled() -> bool:
@@ -1275,6 +4303,17 @@ def _expand_template(template: str, username: str, code: str) -> str:
     if not template:
         return ""
     return template.replace("{username}", username or "").replace("{####}", code or "")
+
+
+def _template_username(pool: dict, username: str, attr_dict: dict) -> str:
+    """Value substituted for `{username}`. In a UsernameAttributes pool the
+    stored Username is an internal UUID, but the user-facing username is the
+    email / phone number they registered with."""
+    username_attrs = pool.get("UsernameAttributes") or []
+    for attr in ("email", "phone_number"):
+        if attr in username_attrs and (attr_dict or {}).get(attr):
+            return attr_dict[attr]
+    return username
 
 
 def _resolve_invite_template(pool: dict) -> tuple:
@@ -1365,13 +4404,101 @@ def _wants_email_delivery(data: dict) -> bool:
     return "EMAIL" in [str(m).upper() for m in mediums]
 
 
-def _send_invitation_email(pool, username, temp_password, attr_dict):
+class _CustomMessageRejected(Exception):
+    """Raised when a CustomMessage Lambda trigger fails or reports an error."""
+
+
+class _CustomMessageInvalid(Exception):
+    """Raised when a CustomMessage Lambda returns a message AWS would refuse."""
+
+
+def _custom_message_error(exc):
+    code = ("InvalidLambdaResponseException" if isinstance(exc, _CustomMessageInvalid)
+            else "UserLambdaValidationException")
+    return error_response_json(code, str(exc), 400)
+
+
+def _apply_custom_message_trigger(pool: dict, trigger_source: str, username: str,
+                                  user_attrs: dict, client_metadata=None,
+                                  username_parameter: str = "{username}") -> dict:
+    """Invoke the pool's CustomMessage Lambda and return its ``response`` block.
+
+    Fail-closed like AWS, where a CustomMessage Lambda that throws fails the
+    calling API with ``UserLambdaValidationException``. Returns ``{}`` when the
+    pool has no ``LambdaConfig.CustomMessage``.
+    """
+    arn = (pool.get("LambdaConfig") or {}).get("CustomMessage")
+    if not arn:
+        return {}
+    pool_id = pool.get("Id", "")
+    event = {
+        "version": "1",
+        "triggerSource": trigger_source,
+        "region": _pool_region(pool_id),
+        "userPoolId": pool_id,
+        "userName": username or "",
+        "callerContext": {
+            "awsSdkVersion": "aws-sdk-unknown-unknown",
+            "clientId": "CLIENT_ID_NOT_APPLICABLE",
+        },
+        "request": {
+            "userAttributes": {k: v for k, v in (user_attrs or {}).items()
+                               if isinstance(v, (str, int, float, bool))},
+            "codeParameter": "{####}",
+            "usernameParameter": username_parameter,
+            "clientMetadata": dict(client_metadata or {}),
+        },
+        "response": {"smsMessage": None, "emailMessage": None, "emailSubject": None},
+    }
+    try:
+        # Lazy import to avoid a circular dependency between cognito and lambda_svc.
+        from ministack.services import lambda_svc
+        record, config, _name = lambda_svc._get_func_record_for_ref(arn)
+        if record is None or config is None:
+            raise RuntimeError(f"CustomMessage Lambda not found: {arn}")
+        exec_record = lambda_svc._execution_record_for_config(record, config)
+        result = lambda_svc._execute_function_with_config_scope(exec_record, event)
+    except Exception as e:
+        logger.warning("CustomMessage Lambda invocation failed for pool %s: %s", pool_id, e)
+        raise _CustomMessageRejected(str(e)) from e
+
+    if isinstance(result, dict) and result.get("error"):
+        raise _CustomMessageRejected(f"CustomMessage failed with error {_lambda_error_message(result.get('body'))}.")
+    payload = result.get("body") if isinstance(result, dict) else result
+    return _extract_trigger_response(payload) or {}
+
+
+def _render_invitation_message(pool, username, temp_password, attr_dict,
+                               client_metadata=None) -> tuple:
+    """Return the (subject, body) of an invitation email.
+
+    A CustomMessage Lambda's ``emailSubject`` / ``emailMessage`` replace the
+    pool's InviteMessageTemplate; either one left out falls back to the template.
+    Raises ``_CustomMessageRejected`` when the Lambda fails, and
+    ``_CustomMessageInvalid`` when its ``emailMessage`` lacks the ``{username}``
+    or ``{####}`` placeholder that AWS requires for AdminCreateUser messages.
+    """
+    subject_tpl, body_tpl, _ = _resolve_invite_template(pool)
+    custom = _apply_custom_message_trigger(
+        pool, "CustomMessage_AdminCreateUser", username, attr_dict, client_metadata,
+    )
+    custom_body = custom.get("emailMessage")
+    if custom_body and not ("{####}" in custom_body and "{username}" in custom_body):
+        raise _CustomMessageInvalid(
+            "CustomMessage emailMessage must contain both {username} and {####}.")
+    subject_tpl = custom.get("emailSubject") or subject_tpl
+    body_tpl = custom_body or body_tpl
+    display = _template_username(pool, username, attr_dict)
+    return (_expand_template(subject_tpl, display, temp_password),
+            _expand_template(body_tpl, display, temp_password))
+
+
+def _deliver_invitation_email(pool, username, attr_dict, subject, body, sender=None):
     email = (attr_dict or {}).get("email")
     if not email:
         return None
-    subject_tpl, body_tpl, _ = _resolve_invite_template(pool)
-    subject = _expand_template(subject_tpl, username, temp_password)
-    body = _expand_template(body_tpl, username, temp_password)
+    if sender and _send_to_custom_email_sender(pool, attr_dict, **sender):
+        return None
     return _deliver_cognito_email(
         pool, email, subject, body,
         type_name="CognitoInvitationMessage",
@@ -1379,18 +4506,22 @@ def _send_invitation_email(pool, username, temp_password, attr_dict):
     )
 
 
-def _send_verification_email(pool, username, attr_dict, code, attribute_name="email"):
+def _send_verification_email(pool, username, attr_dict, code, attribute_name="email", sender=None, by_link=None):
     email = (attr_dict or {}).get("email")
     if not email:
         return None
+    if sender and _send_to_custom_email_sender(pool, attr_dict, code=code, **sender):
+        return None
     # CONFIRM_WITH_LINK means body uses {##...##} link placeholder; we still
     # interpolate {####} as the verification code for compatibility.
-    by_link = (pool.get("VerificationMessageTemplate") or {}).get(
-        "DefaultEmailOption"
-    ) == "CONFIRM_WITH_LINK"
+    if by_link is None:
+        by_link = (pool.get("VerificationMessageTemplate") or {}).get(
+            "DefaultEmailOption"
+        ) == "CONFIRM_WITH_LINK"
     subject_tpl, body_tpl = _resolve_verification_template(pool, by_link=by_link)
-    subject = _expand_template(subject_tpl, username, code)
-    body = _expand_template(body_tpl, username, code)
+    display = _template_username(pool, username, attr_dict)
+    subject = _expand_template(subject_tpl, display, code)
+    body = _expand_template(body_tpl, display, code)
     return _deliver_cognito_email(
         pool, email, subject, body,
         type_name="CognitoVerificationMessage",
@@ -1398,9 +4529,247 @@ def _send_verification_email(pool, username, attr_dict, code, attribute_name="em
     )
 
 
+def _send_email_otp(pool, username, attr_dict, code, sender=None):
+    """Send the EMAIL_OTP first-factor sign-in code. AWS has no template
+    configuration API for this message, so it always uses the built-in text."""
+    if sender and _send_to_custom_email_sender(pool, attr_dict, code=code, **sender):
+        return None
+    return _deliver_cognito_email(
+        pool, attr_dict["email"],
+        _DEFAULT_EMAIL_OTP_SUBJECT,
+        _expand_template(
+            _DEFAULT_EMAIL_OTP_MESSAGE,
+            _template_username(pool, username, attr_dict),
+            code,
+        ),
+        type_name="CognitoEmailOtpMessage",
+        extra={"Username": username},
+    )
+
+
+_CLIENT_ID_NOT_APPLICABLE = "CLIENT_ID_NOT_APPLICABLE"
+
+
+def _html_encoded_code(code) -> str:
+    """The code as Cognito hands it to a custom sender: A&<>"'1a arrives as A&amp;&lt;&gt;&quot;&#39;1a."""
+    return html_mod.escape(str(code), quote=True).replace("&#x27;", "&#39;")
+
+
+class _CustomEmailSenderUnavailable(Exception):
+    """The pool's custom email sender can't be reached: its KMS key or its Lambda."""
+
+
+# ---------------------------------------------------------------------------
+# AWS Encryption SDK messages, as Cognito writes them for a custom sender trigger
+# ---------------------------------------------------------------------------
+# Cognito hands a custom email sender the code (or temporary password) as an
+# Encryption SDK ciphertext: a version 1 message with algorithm suite 0x0378
+# (AES-256-GCM, HKDF-SHA384, ECDSA P-384), one aws-kms encrypted data key for the
+# pool's KMSKeyID, an encryption context of userpool-id and the signing key's
+# aws-crypto-public-key, and the whole plaintext in one final frame of a 4096-byte
+# framed body. A sender decrypts it with any Encryption SDK and a KMS keyring for
+# that key, so the data key here comes from ministack's own KMS, whose Decrypt
+# then opens it.
+# Spec: https://github.com/awslabs/aws-encryption-sdk-specification
+
+_ESDK_SUITE_ID = 0x0378
+_ESDK_VERSION = 0x01
+_ESDK_TYPE_CUSTOMER_AED = 0x80
+_ESDK_CONTENT_FRAMED = 0x02
+_ESDK_IV_LENGTH = 12
+_ESDK_TAG_LENGTH = 16
+_ESDK_FRAME_LENGTH = 4096
+_ESDK_FINAL_FRAME = 0xFFFFFFFF
+_ESDK_FINAL_FRAME_AAD = b"AWSKMSEncryptionClient Final Frame"
+_ESDK_PUBLIC_KEY_CONTEXT_KEY = "aws-crypto-public-key"
+# The DER signature of a P-384 key varies in length. Cognito's are always 103 bytes,
+# so a signature is made again until one is.
+_ESDK_SIGNATURE_LENGTH = 103
+
+
+def _esdk_u16(value: int) -> bytes:
+    return struct.pack(">H", value)
+
+
+def _esdk_field(value: bytes) -> bytes:
+    return _esdk_u16(len(value)) + value
+
+
+def _esdk_serialize_context(context: dict) -> bytes:
+    if not context:
+        return b""
+    pairs = sorted((k.encode(), v.encode()) for k, v in context.items())
+    return _esdk_u16(len(pairs)) + b"".join(_esdk_field(k) + _esdk_field(v) for k, v in pairs)
+
+
+def _esdk_frame_iv(sequence: int) -> bytes:
+    return b"\x00" * (_ESDK_IV_LENGTH - 4) + struct.pack(">I", sequence)
+
+
+def _esdk_signing_key():
+    """A fresh P-384 key and its compressed public point, base64 encoded, for the encryption context."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    private_key = ec.generate_private_key(ec.SECP384R1())
+    public = private_key.public_key().public_bytes(
+        serialization.Encoding.X962, serialization.PublicFormat.CompressedPoint)
+    return private_key, base64.b64encode(public).decode()
+
+
+def _esdk_encrypt(plaintext: bytes, data_key: bytes, encrypted_data_key: bytes, key_arn: str,
+            context: dict, private_key) -> bytes:
+    """Build the message. ``context`` must already carry ``aws-crypto-public-key``
+    for ``private_key``, because KMS bound ``encrypted_data_key`` to the whole context."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+    if _ESDK_PUBLIC_KEY_CONTEXT_KEY not in context:
+        raise ValueError("the encryption context needs the signing key's public point")
+    if len(plaintext) > _ESDK_FRAME_LENGTH:
+        raise ValueError("a custom sender's code fits one frame")
+
+    message_id = os.urandom(16)
+    aad = _esdk_serialize_context(context)
+    header = (
+        bytes([_ESDK_VERSION, _ESDK_TYPE_CUSTOMER_AED]) + _esdk_u16(_ESDK_SUITE_ID) + message_id
+        + _esdk_field(aad)
+        + _esdk_u16(1) + _esdk_field(b"aws-kms") + _esdk_field(key_arn.encode()) + _esdk_field(encrypted_data_key)
+        + bytes([_ESDK_CONTENT_FRAMED]) + b"\x00\x00\x00\x00"
+        + bytes([_ESDK_IV_LENGTH]) + struct.pack(">I", _ESDK_FRAME_LENGTH)
+    )
+
+    key = HKDF(algorithm=hashes.SHA384(), length=32, salt=None,
+               info=_esdk_u16(_ESDK_SUITE_ID) + message_id).derive(data_key)
+    aes = AESGCM(key)
+    header_iv = b"\x00" * _ESDK_IV_LENGTH
+    header_auth = header_iv + aes.encrypt(header_iv, b"", header)
+
+    sequence = 1
+    frame_iv = _esdk_frame_iv(sequence)
+    frame_aad = message_id + _ESDK_FINAL_FRAME_AAD + struct.pack(">I", sequence) + struct.pack(">Q", len(plaintext))
+    sealed = aes.encrypt(frame_iv, plaintext, frame_aad)
+    content, tag = sealed[:-_ESDK_TAG_LENGTH], sealed[-_ESDK_TAG_LENGTH:]
+    body = (struct.pack(">I", _ESDK_FINAL_FRAME) + struct.pack(">I", sequence) + frame_iv
+            + struct.pack(">I", len(content)) + content + tag)
+
+    signed = header + header_auth + body
+    for _ in range(64):
+        signature = private_key.sign(signed, ec.ECDSA(hashes.SHA384()))
+        if len(signature) == _ESDK_SIGNATURE_LENGTH:
+            return signed + _esdk_field(signature)
+    raise RuntimeError("could not produce a fixed-length ECDSA signature")
+
+
+def _send_to_custom_email_sender(pool, attr_dict, trigger, user_name, user_status, code,
+                                 client_id=None, client_metadata=None) -> bool:
+    """Hand the email to the pool's custom email sender, if it has one, in place of Cognito's own.
+
+    As on AWS the Lambda is invoked asynchronously, retried on failure, and
+    never fails the call that sent the email. ``code`` reaches it as an AWS
+    Encryption SDK message under the pool's ``KMSKeyID``, which the Lambda
+    decrypts through KMS. Returns False when the pool has no custom email
+    sender, so the caller sends the email itself.
+    """
+    lambda_config = pool.get("LambdaConfig") or {}
+    arn = (lambda_config.get("CustomEmailSender") or {}).get("LambdaArn")
+    if not arn:
+        return False
+    pool_id = pool.get("Id", "")
+    try:
+        from ministack.services import kms as kms_mod
+        from ministack.services import lambda_svc
+
+        private_key, public_key = _esdk_signing_key()
+        context = {"userpool-id": pool_id, "aws-crypto-public-key": public_key}
+        key, data_key, encrypted_data_key = kms_mod._generate_data_key_common(
+            {"KeyId": lambda_config.get("KMSKeyID", ""), "EncryptionContext": context})
+        if key is None:
+            raise _CustomEmailSenderUnavailable(
+                f"KMS key {lambda_config.get('KMSKeyID')!r} cannot encrypt the code: {encrypted_data_key[2]!r}")
+        message = _esdk_encrypt(_html_encoded_code(code).encode(), data_key,
+                                encrypted_data_key, key["Arn"], context, private_key)
+        record, config, _name = lambda_svc._get_func_record_for_ref(arn)
+        if record is None or config is None:
+            raise _CustomEmailSenderUnavailable(f"CustomEmailSender Lambda not found: {arn}")
+        attributes = {k: v for k, v in (attr_dict or {}).items() if isinstance(v, str)}
+        attributes["cognito:user_status"] = user_status
+        event = {
+            "version": "1",
+            "triggerSource": f"CustomEmailSender_{trigger}",
+            "region": _pool_region(pool_id),
+            "userPoolId": pool_id,
+            "userName": user_name,
+            "callerContext": {"awsSdkVersion": "aws-sdk-unknown-unknown", "clientId": client_id},
+            "request": {
+                "type": "customEmailSenderRequestV1",
+                "code": base64.b64encode(message).decode(),
+                "clientMetadata": dict(client_metadata) if client_metadata else None,
+                "userAttributes": attributes,
+            },
+        }
+        lambda_svc.invoke_async_with_retry(lambda_svc._execution_record_for_config(record, config), event)
+    except _CustomEmailSenderUnavailable as e:
+        logger.warning("Cognito: CustomEmailSender_%s for pool %s was not sent: %s", trigger, pool_id, e)
+    except ImportError:
+        logger.warning("Cognito: CustomEmailSender_%s for pool %s was not sent: encrypting its code needs the "
+                       "cryptography package (pip install ministack[full])", trigger, pool_id)
+    except Exception:
+        logger.exception("Cognito: CustomEmailSender_%s for pool %s was not sent", trigger, pool_id)
+    return True
+
+
 # ===========================================================================
 # USER MANAGEMENT
 # ===========================================================================
+
+_USERNAME_EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+")
+_USERNAME_PHONE_RE = re.compile(r"\+[0-9]{3,18}")
+
+
+def _username_alias_attribute(pool: dict, username: str):
+    """Return which UsernameAttributes alias ("email"/"phone_number") the
+    given Username value should be registered as, or None if the pool
+    doesn't use UsernameAttributes. Real Cognito never uses the caller-
+    supplied value as the actual Username in this mode: the Username is the
+    user's sub and the supplied value is stored as the alias attribute.
+    """
+    username_attrs = set(pool.get("UsernameAttributes") or [])
+    if "email" in username_attrs and "phone_number" in username_attrs:
+        return "phone_number" if _USERNAME_PHONE_RE.fullmatch(username) else "email"
+    if "email" in username_attrs:
+        return "email"
+    if "phone_number" in username_attrs:
+        return "phone_number"
+    return None
+
+
+def _new_user_error(pool: dict, username: str, attr_dict: dict):
+    """InvalidParameterException for a Username or attributes AdminCreateUser and SignUp refuse, else None."""
+    username_attrs = set(pool.get("UsernameAttributes") or [])
+    message = None
+    if username_attrs and not (
+        "email" in username_attrs and _USERNAME_EMAIL_RE.fullmatch(username)
+        or "phone_number" in username_attrs and _USERNAME_PHONE_RE.fullmatch(username)
+    ):
+        if username_attrs == {"email"}:
+            message = "Username should be an email."
+        elif username_attrs == {"phone_number"}:
+            message = "Username should be a phone number."
+        else:
+            message = "Username should be either an email or a phone number."
+    elif "sub" in attr_dict:
+        message = "Cannot modify the non-mutable attribute sub"
+    elif username_attrs:
+        alias_attr = _username_alias_attribute(pool, username)
+        if attr_dict.get(alias_attr) and attr_dict[alias_attr] != username:
+            label = "email" if alias_attr == "email" else "phone number"
+            message = (f"User {label} should be empty or same as username, "
+                       f"since username attribute is {alias_attr}.")
+    return error_response_json("InvalidParameterException", message, 400) if message else None
+
 
 def _admin_create_user(data):
     pid = data.get("UserPoolId")
@@ -1411,18 +4780,50 @@ def _admin_create_user(data):
     username = data.get("Username")
     if not username:
         return error_response_json("InvalidParameterException", "Username is required.", 400)
+    username_err = _new_user_error(pool, username, _attr_list_to_dict(data.get("UserAttributes", [])))
+    if username_err:
+        return username_err
 
+    if "TemporaryPassword" in data and not _TEMPORARY_PASSWORD_RE.fullmatch(str(data["TemporaryPassword"])):
+        return error_response_json("InvalidParameterException", (
+            "1 validation error detected: Value at 'temporaryPassword' failed to satisfy constraint: "
+            f"Member must satisfy regular expression pattern: {_TEMPORARY_PASSWORD_RE.pattern}"), 400)
+    alias_attr = _username_alias_attribute(pool, username)
     message_action = (data.get("MessageAction") or "").upper()
-    existing = pool["_users"].get(username)
+    if alias_attr:
+        existing, _ = _resolve_user(pool, username)
+    else:
+        existing = pool["_users"].get(username)
     if message_action == "RESEND":
         if not existing:
             return error_response_json(
                 "UserNotFoundException", "User does not exist.", 400,
             )
-        existing["UserLastModifiedDate"] = _now_epoch()
+        if existing.get("UserStatus") != "FORCE_CHANGE_PASSWORD":
+            return error_response_json(
+                "UnsupportedUserStateException",
+                f"Resend not possible. {existing['Username']} status is not FORCE_CHANGE_PASSWORD", 400)
+        # A resent invitation carries a new temporary password, and the old one stops working.
+        temp_password = data.get("TemporaryPassword") or _generate_temp_password(pool)
+        pw_err = _validate_password(pool, temp_password, "Password does not conform to policy")
+        if pw_err:
+            return pw_err
         attr_dict = _attr_list_to_dict(existing.get("Attributes", []))
-        if _wants_email_delivery(data):
-            _send_invitation_email(pool, username, existing.get("_password", ""), attr_dict)
+        invitation = None
+        if _wants_email_delivery(data) and attr_dict.get("email"):
+            try:
+                invitation = _render_invitation_message(
+                    pool, existing["Username"], temp_password, attr_dict, data.get("ClientMetadata"),
+                )
+            except (_CustomMessageRejected, _CustomMessageInvalid) as e:
+                return _custom_message_error(e)
+        existing["_password"] = temp_password
+        existing["UserLastModifiedDate"] = _now_epoch()
+        if invitation:
+            _deliver_invitation_email(pool, existing["Username"], attr_dict, *invitation, sender={
+                "trigger": "AdminCreateUser", "user_name": username, "user_status": existing.get("UserStatus"),
+                "code": temp_password, "client_id": _CLIENT_ID_NOT_APPLICABLE,
+                "client_metadata": data.get("ClientMetadata")})
         return json_response({"User": _user_out(existing)})
 
     if existing:
@@ -1432,8 +4833,8 @@ def _admin_create_user(data):
         )
 
     now = _now_epoch()
-    temp_password = data.get("TemporaryPassword") or _generate_temp_password()
-    pw_err = _validate_password(pool, temp_password)
+    temp_password = data.get("TemporaryPassword") or _generate_temp_password(pool)
+    pw_err = _validate_password(pool, temp_password, "Password did not conform with password policy")
     if pw_err:
         return pw_err
     attrs = data.get("UserAttributes", [])
@@ -1441,10 +4842,26 @@ def _admin_create_user(data):
     attr_dict = _attr_list_to_dict(attrs)
     if "sub" not in attr_dict:
         attr_dict["sub"] = new_uuid()
+    if alias_attr:
+        attr_dict.setdefault(alias_attr, username)
+        real_username = attr_dict["sub"]
+    else:
+        real_username = username
     attrs = _dict_to_attr_list(attr_dict)
 
+    # Rendered before the user is persisted: a failing CustomMessage Lambda
+    # fails the call without leaving the user behind, as on AWS.
+    invitation = None
+    if message_action != "SUPPRESS" and _wants_email_delivery(data) and attr_dict.get("email"):
+        try:
+            invitation = _render_invitation_message(
+                pool, real_username, temp_password, attr_dict, data.get("ClientMetadata"),
+            )
+        except (_CustomMessageRejected, _CustomMessageInvalid) as e:
+            return _custom_message_error(e)
+
     user = {
-        "Username": username,
+        "Username": real_username,
         "Attributes": attrs,
         "UserCreateDate": now,
         "UserLastModifiedDate": now,
@@ -1455,12 +4872,15 @@ def _admin_create_user(data):
         "_groups": [],
         "_tokens": [],
     }
-    pool["_users"][username] = user
+    pool["_users"][real_username] = user
     pool["EstimatedNumberOfUsers"] = len(pool["_users"])
-    logger.info("Cognito: AdminCreateUser %s in pool %s", username, pid)
+    logger.info("Cognito: AdminCreateUser %s in pool %s", real_username, pid)
 
-    if message_action != "SUPPRESS" and _wants_email_delivery(data):
-        _send_invitation_email(pool, username, temp_password, attr_dict)
+    if invitation:
+        _deliver_invitation_email(pool, real_username, attr_dict, *invitation, sender={
+            "trigger": "AdminCreateUser", "user_name": username, "user_status": user["UserStatus"],
+            "code": temp_password, "client_id": _CLIENT_ID_NOT_APPLICABLE,
+            "client_metadata": data.get("ClientMetadata")})
 
     return json_response({"User": _user_out(user)})
 
@@ -1474,8 +4894,14 @@ def _admin_delete_user(data):
     user, err = _resolve_user(pool, username)
     if err:
         return err
-    del pool["_users"][username]
+    # Delete by the resolved Username. In a UsernameAttributes pool the caller
+    # can pass an alias (email), which is not the "_users" key.
+    del pool["_users"][user["Username"]]
     pool["EstimatedNumberOfUsers"] = len(pool["_users"])
+    # A deleted user's refresh tokens end with it: a new user of the same name inherits none of them.
+    for token in [t for t, e in _refresh_tokens.items()
+                  if e.get("username") == user["Username"] and e.get("pool_id") == pid]:
+        del _refresh_tokens[token]
     return json_response({})
 
 
@@ -1534,7 +4960,7 @@ def _admin_set_user_password(data):
     if err:
         return err
     new_pw = data.get("Password", "")
-    pw_err = _validate_password(pool, new_pw)
+    pw_err = _validate_password(pool, new_pw, "Password does not conform to policy")
     if pw_err:
         return pw_err
     user["_password"] = new_pw
@@ -1556,10 +4982,9 @@ def _admin_update_user_attributes(data):
     user, err = _resolve_user(pool, username)
     if err:
         return err
-    user["Attributes"] = _merge_attributes(
-        user.get("Attributes", []),
-        data.get("UserAttributes", []),
-    )
+    _sent, err = _apply_attribute_update(pool, user, data.get("UserAttributes", []), None, data.get("ClientMetadata"))
+    if err:
+        return err
     user["UserLastModifiedDate"] = _now_epoch()
     return json_response({})
 
@@ -1589,6 +5014,13 @@ def _admin_disable_user(data):
         return err
     user["Enabled"] = False
     user["UserLastModifiedDate"] = _now_epoch()
+    from ministack.app import AUTH
+    if AUTH:
+        # Every session ends: its tokens stay revoked after AdminEnableUser.
+        _sign_out_sessions(user)
+        for tok in [t for t, e in _refresh_tokens.items()
+                    if e.get("username") == user["Username"] and e.get("pool_id") == pid]:
+            del _refresh_tokens[tok]
     return json_response({})
 
 
@@ -1606,6 +5038,20 @@ def _admin_enable_user(data):
     return json_response({})
 
 
+def _reset_code_attribute(user):
+    """Where a password reset's code goes: the verified email, else the verified phone number."""
+    attrs = _attr_list_to_dict(user.get("Attributes", []))
+    for attribute in ("email", "phone_number"):
+        if attrs.get(attribute) and str(attrs.get(f"{attribute}_verified", "")).lower() == "true":
+            return attribute, attrs[attribute]
+    return None, None
+
+
+def _cannot_reset_password():
+    return error_response_json("InvalidParameterException", (
+        "Cannot reset password for the user as there is no registered/verified email or phone_number"), 400)
+
+
 def _admin_reset_user_password(data):
     pid = data.get("UserPoolId")
     pool, err = _resolve_pool(pid)
@@ -1615,12 +5061,19 @@ def _admin_reset_user_password(data):
     user, err = _resolve_user(pool, username)
     if err:
         return err
+    attribute, _destination = _reset_code_attribute(user)
+    if not attribute:
+        return _cannot_reset_password()
+    status_before_reset = user.get("UserStatus")
     user["UserStatus"] = "RESET_REQUIRED"
     user["UserLastModifiedDate"] = _now_epoch()
     code = "654321"
     user["_reset_code"] = code
-    attrs = _attr_list_to_dict(user.get("Attributes", []))
-    _send_verification_email(pool, username, attrs, code, attribute_name="password")
+    if attribute == "email":
+        attrs = _attr_list_to_dict(user.get("Attributes", []))
+        _send_verification_email(pool, username, attrs, code, attribute_name="password", sender={
+            "trigger": "ForgotPassword", "user_name": user["Username"], "user_status": status_before_reset,
+            "client_metadata": data.get("ClientMetadata")})
     return json_response({})
 
 
@@ -1636,21 +5089,27 @@ def _resend_confirmation_code(data):
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
 
-    user = pool["_users"].get(username)
+    if not (pool.get("AutoVerifiedAttributes") or []):
+        return error_response_json("NotAuthorizedException", "Cannot resend codes. Auto verification not turned on.", 400)
+    user, _err = _resolve_user(pool, username)
     if not user:
-        return error_response_json("UserNotFoundException", "User does not exist.", 400)
-
+        if _hides_user_existence(pool, cid):
+            return json_response({"CodeDeliveryDetails": _unknown_user_delivery(username, "email")})
+        return _client_user_not_found()
+    if user.get("UserStatus") == "CONFIRMED" and not _hides_user_existence(pool, cid):
+        return error_response_json("InvalidParameterException", "User is already confirmed.", 400)
+    attrs = _attr_list_to_dict(user.get("Attributes", []))
+    attribute = _sign_up_code_attribute(pool, attrs)
+    if not attribute:
+        return error_response_json("InvalidParameterException", "Cannot send code to either phone_number or email", 400)
     code = user.get("_confirmation_code") or "123456"
     user["_confirmation_code"] = code
-    attrs = _attr_list_to_dict(user.get("Attributes", []))
-    _send_verification_email(pool, username, attrs, code)
-    return json_response({
-        "CodeDeliveryDetails": {
-            "Destination": attrs.get("email", ""),
-            "DeliveryMedium": "EMAIL",
-            "AttributeName": "email",
-        }
-    })
+    user["_confirmation_attribute"] = attribute
+    if attribute == "email":
+        _send_verification_email(pool, username, attrs, code, sender={
+            "trigger": "ResendCode", "user_name": user["Username"], "user_status": user.get("UserStatus"),
+            "client_id": cid, "client_metadata": data.get("ClientMetadata")})
+    return json_response({"CodeDeliveryDetails": _code_delivery(attribute, attrs[attribute])})
 
 
 def _admin_user_global_sign_out(data):
@@ -1662,7 +5121,14 @@ def _admin_user_global_sign_out(data):
     user, err = _resolve_user(pool, username)
     if err:
         return err
-    user["_tokens"] = []
+    # Invalidate every token issued before now (checked by REFRESH_TOKEN_AUTH)
+    # and drop the user's OAuth-flow refresh tokens.
+    user["_signout_at"] = _now_epoch()
+    _sign_out_sessions(user)
+    uname = user.get("Username", username)
+    for tok in [t for t, e in _refresh_tokens.items()
+                if e.get("username") == uname and e.get("pool_id") == pid]:
+        del _refresh_tokens[tok]
     return json_response({})
 
 
@@ -1682,16 +5148,174 @@ def _admin_list_groups_for_user(data):
     return json_response({"Groups": [_group_out(g) for g in groups]})
 
 
+_AUTH_EVENTS_MAX_RESULTS = 60
+_AUTH_EVENT_ID_RE = re.compile(r"[\w+-]+")
+
+
+def _auth_events_add_on_error(pool: dict):
+    """UserPoolAddOnNotEnabledException for a pool without threat protection, else None."""
+    if _threat_protection_on(pool.get("UserPoolAddOns")):
+        return None
+    return error_response_json(
+        "UserPoolAddOnNotEnabledException",
+        "This is an add on feature. Please update AdvancedSecurityMode"
+        " for your user pool to access this API.",
+        400,
+    )
+
+
+def _record_auth_event(pool: dict, user: dict, data: dict, event_type: str, response: str,
+                       challenges: tuple = (), session: str | None = None) -> None:
+    """Log an auth event with the verdict AWS gives a low-risk request, when the pool logs events."""
+    if not _threat_protection_on(pool.get("UserPoolAddOns")):
+        return
+    event = {
+        "EventId": new_uuid(),
+        "EventType": event_type,
+        "CreationDate": round(_now_epoch(), 3),
+        "EventResponse": response,
+        "EventRisk": {"RiskDecision": "NoRisk", "CompromisedCredentialsDetected": False},
+        "ChallengeResponses": [{"ChallengeName": name, "ChallengeResponse": result}
+                               for name, result in challenges],
+        # The admin flows' ContextData names the user's address; "null" is what AWS
+        # reports for a place it cannot locate, and nothing here locates one.
+        "EventContextData": {
+            "IpAddress": (data.get("ContextData") or {}).get("IpAddress") or get_request_client_ip(),
+            "City": "null",
+            "Country": "null",
+        },
+    }
+    if session:
+        # The challenge session that will answer this InProgress sign-in.
+        event["_session"] = session
+    user.setdefault("_auth_events", []).append(event)
+
+
+def _finish_auth_event(user: dict, session: str | None, challenge: str, passed: bool) -> None:
+    """Close the sign-in event the answered challenge session left InProgress, with its result."""
+    for event in reversed(user.get("_auth_events", [])):
+        if session and event.get("_session") == session:
+            del event["_session"]
+            event["EventResponse"] = "Pass" if passed else "Fail"
+            event["ChallengeResponses"].append(
+                {"ChallengeName": challenge, "ChallengeResponse": "Success" if passed else "Failure"})
+            return
+
+
+_JSON_INTEGER_ERRORS = {
+    str: "STRING_VALUE can not be converted to an Integer",
+    list: "Start of list found where not expected",
+    dict: "Start of structure or map found where not expected.",
+}
+
+
 def _admin_list_user_auth_events(data):
+    """List a user's auth events newest first; pools without threat protection are refused first."""
+    raw = data.get("MaxResults")
+    if isinstance(raw, bool):
+        return error_response_json("SerializationException",
+                                   f"{str(raw).upper()}_VALUE can not be converted to an Integer", 400,
+                                   message_key="Message")
+    if type(raw) in _JSON_INTEGER_ERRORS:
+        return error_response_json("SerializationException", _JSON_INTEGER_ERRORS[type(raw)], 400,
+                                   message_key="Message")
+    max_results = int(raw or 0)
+    if not 0 <= max_results <= _AUTH_EVENTS_MAX_RESULTS:
+        bound = ("greater than or equal to 0" if max_results < 0
+                 else f"less than or equal to {_AUTH_EVENTS_MAX_RESULTS}")
+        return error_response_json(
+            "InvalidParameterException",
+            f"1 validation error detected: Value '{max_results}' at 'maxResults' failed to satisfy"
+            f" constraint: Member must have value {bound}",
+            400,
+        )
+    max_results = max_results or _AUTH_EVENTS_MAX_RESULTS
     pid = data.get("UserPoolId")
     pool, err = _resolve_pool(pid)
     if err:
         return err
-    username = data.get("Username")
-    _, err = _resolve_user(pool, username)
+    err = _auth_events_add_on_error(pool)
     if err:
         return err
-    return json_response({"AuthEvents": []})
+    username = data.get("Username")
+    user, _ = _resolve_user(pool, username)
+    if user is None:
+        # Real AWS answers this op with the plain message, without the name.
+        return error_response_json(
+            "UserNotFoundException", "User does not exist.", 400,
+        )
+    events = user.get("_auth_events", [])[::-1]
+    # The token names the last event listed, as AWS's does: <EventId>#<CreationDate>.
+    after = (data.get("NextToken") or "").split("#", 1)[0]
+    start = next((i + 1 for i, event in enumerate(events) if event["EventId"] == after), 0)
+    page = [{k: v for k, v in event.items() if not k.startswith("_")}
+            for event in events[start:start + max_results]]
+    resp = {"AuthEvents": page}
+    if start + max_results < len(events):
+        last = page[-1]
+        stamp = datetime.fromtimestamp(last["CreationDate"], timezone.utc).isoformat(timespec="milliseconds")
+        resp["NextToken"] = f"{last['EventId']}#{stamp.replace('+00:00', 'Z')}"
+    return json_response(resp)
+
+
+def _auth_event_feedback_error(data: dict):
+    """The input validation AWS applies to EventId and FeedbackValue."""
+    value = data.get("FeedbackValue")
+    if value not in ("Invalid", "Valid"):
+        return error_response_json(
+            "InvalidParameterException",
+            f"1 validation error detected: Value '{value}' at 'feedbackValue' failed to satisfy"
+            " constraint: Member must satisfy enum value set: [Invalid, Valid]",
+            400,
+        )
+    event_id = data.get("EventId") or ""
+    if not _AUTH_EVENT_ID_RE.fullmatch(event_id):
+        return error_response_json(
+            "InvalidParameterException",
+            f"1 validation error detected: Value '{event_id}' at 'eventId' failed to satisfy"
+            " constraint: Member must satisfy regular expression pattern: [\\w+-]+",
+            400,
+        )
+    return None
+
+
+def _admin_update_auth_event_feedback(data):
+    """Record the admin's Valid or Invalid verdict on one of a user's auth events."""
+    err = _auth_event_feedback_error(data)
+    if err:
+        return err
+    pool, err = _resolve_pool(data.get("UserPoolId"))
+    if err:
+        return err
+    err = _auth_events_add_on_error(pool)
+    if err:
+        return err
+    user, _ = _resolve_user(pool, data.get("Username"))
+    if user is None:
+        return error_response_json("NotAuthorizedException", "Incorrect username or password.", 400)
+    event = next((e for e in user.get("_auth_events", []) if e["EventId"] == data["EventId"]), None)
+    if event is None:
+        return error_response_json("InvalidParameterException", "EventId is invalid", 400)
+    event["EventFeedback"] = {
+        "FeedbackValue": data["FeedbackValue"],
+        "Provider": "Admin",
+        "FeedbackDate": round(_now_epoch(), 3),
+    }
+    return json_response({})
+
+
+def _update_auth_event_feedback(data):
+    """User feedback by a notification email's token; no notification is sent here, so no token is valid."""
+    err = _auth_event_feedback_error(data)
+    if err:
+        return err
+    pool, err = _resolve_pool(data.get("UserPoolId"))
+    if err:
+        return err
+    err = _auth_events_add_on_error(pool)
+    if err:
+        return err
+    return error_response_json("NotAuthorizedException", "Invalid session provided", 400)
 
 
 def _admin_add_user_to_group(data):
@@ -1708,7 +5332,7 @@ def _admin_add_user_to_group(data):
         return error_response_json("ResourceNotFoundException", f"Group {group_name} not found.", 400)
     if group_name not in user.get("_groups", []):
         user.setdefault("_groups", []).append(group_name)
-        pool["_groups"][group_name].setdefault("_members", []).append(username)
+        pool["_groups"][group_name].setdefault("_members", []).append(user["Username"])
     return json_response({})
 
 
@@ -1726,8 +5350,8 @@ def _admin_remove_user_from_group(data):
         user["_groups"].remove(group_name)
     if group_name in pool["_groups"]:
         members = pool["_groups"][group_name].get("_members", [])
-        if username in members:
-            members.remove(username)
+        if user["Username"] in members:
+            members.remove(user["Username"])
     return json_response({})
 
 
@@ -1740,14 +5364,20 @@ def _mfa_challenge_for_user(pool: dict, user: dict, pid: str, username: str) -> 
     mfa_config = pool.get("MfaConfiguration", "OFF")
     if mfa_config == "OFF":
         return None
-    preferred = user.get("_preferred_mfa", "")
     enabled_mfa = user.get("_mfa_enabled", [])
+    # A TOTP enrolled on the hosted page signs in with a code too, though it sets no MFA preference.
+    has_totp = "SOFTWARE_TOKEN_MFA" in enabled_mfa or bool(user.get("_totp_hosted") and user.get("_totp_secret"))
     # OPTIONAL: only challenge if user has TOTP set up
-    if mfa_config == "OPTIONAL" and "SOFTWARE_TOKEN_MFA" not in enabled_mfa:
+    if mfa_config == "OPTIONAL" and not has_totp:
         return None
-    # ON: challenge if TOTP is set up; if not set up yet, skip (let them enroll)
-    if mfa_config == "ON" and "SOFTWARE_TOKEN_MFA" not in enabled_mfa:
-        return None
+    # ON without a factor yet: AWS answers MFA_SETUP where TOTP can be set up; other cases still sign in.
+    if mfa_config == "ON" and not has_totp:
+        if not (pool.get("SoftwareTokenMfaConfiguration") or {}).get("Enabled"):
+            return None
+        session = base64.b64encode(secrets.token_bytes(32)).decode()
+        _mfa_setup_users[session] = (pid, user["Username"])
+        return {"ChallengeName": "MFA_SETUP", "Session": session,
+                "ChallengeParameters": {"MFAS_CAN_SETUP": '["SOFTWARE_TOKEN_MFA"]'}}
     session = base64.b64encode(secrets.token_bytes(32)).decode()
     return {
         "ChallengeName": "SOFTWARE_TOKEN_MFA",
@@ -1759,20 +5389,214 @@ def _mfa_challenge_for_user(pool: dict, user: dict, pid: str, username: str) -> 
     }
 
 
-def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = "") -> dict:
+class _PostAuthenticationInvalid(Exception):
+    """Raised when a PostAuthentication Lambda does not return the event."""
+
+
+def _apply_postauth_trigger(pool_id: str, client_id: str, user: dict, client_metadata: dict | None,
+                            new_device_used: bool = False):
+    """Invoke the pool's PostAuthentication Lambda after a sign-in, before tokens are issued."""
+    pool = _user_pools.get(pool_id)
+    arn = ((pool or {}).get("LambdaConfig") or {}).get("PostAuthentication")
+    if not arn:
+        return
+    attrs = {k: v for k, v in _attr_list_to_dict(user.get("Attributes", [])).items()
+             if isinstance(v, (str, int, float, bool))}
+    attrs["cognito:user_status"] = user.get("UserStatus", "CONFIRMED")
+    request = {"userAttributes": attrs, "newDeviceUsed": new_device_used}
+    # AWS leaves out InitiateAuth's ClientMetadata; only challenge responses pass it.
+    if client_metadata:
+        request["clientMetadata"] = client_metadata
+    event = {
+        "version": "1",
+        "triggerSource": "PostAuthentication_Authentication",
+        "region": _pool_region(pool_id),
+        "userPoolId": pool_id,
+        "userName": user.get("Username", ""),
+        "callerContext": {"awsSdkVersion": "aws-sdk-unknown-unknown", "clientId": client_id or ""},
+        "request": request,
+        "response": {},
+    }
+    try:
+        # Lazy import to avoid a circular dependency between cognito and lambda_svc.
+        from ministack.services import lambda_svc
+        record, config, _name = lambda_svc._get_func_record_for_ref(arn)
+        if record is None or config is None:
+            raise _PreTokenUnavailable("PostAuthentication invocation failed due to error AccessDeniedException.")
+        exec_record = lambda_svc._execution_record_for_config(record, config)
+        result = lambda_svc._execute_function_with_config_scope(exec_record, event)
+    except Exception as e:
+        logger.warning("PostAuthentication Lambda invocation failed for pool %s: %s", pool_id, e)
+        if isinstance(e, _PreTokenUnavailable):
+            raise
+        raise _PreTokenUnavailable(
+            f"PostAuthentication invocation failed due to error {type(e).__name__}.") from e
+    if isinstance(result, dict) and result.get("error"):
+        raise _PreTokenRejected(f"PostAuthentication failed with error {_lambda_error_message(result.get('body'))}.")
+    payload = result.get("body") if isinstance(result, dict) else result
+    if isinstance(payload, (bytes, bytearray)):
+        payload = payload.decode("utf-8", "replace")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except ValueError:
+            raise _PostAuthenticationInvalid("Unrecognizable lambda output")
+    if payload is None:
+        raise _PostAuthenticationInvalid("Invalid lambda function output : Invalid JSON")
+    if not isinstance(payload, dict):
+        raise _PostAuthenticationInvalid("Unrecognizable lambda output")
+
+
+def _build_auth_result(pool_id: str, client_id: str, user: dict, nonce: str = "",
+                        trigger_source: str = "TokenGeneration_Authentication",
+                        client_metadata: dict | None = None, origin_jti: str = "",
+                        scope: str | None = None, audience: str = "") -> dict:
+    if trigger_source in ("TokenGeneration_Authentication", "TokenGeneration_NewPasswordChallenge"):
+        _apply_postauth_trigger(pool_id, client_id, user, client_metadata,
+                                new_device_used=trigger_source == "TokenGeneration_NewPasswordChallenge")
+    if not origin_jti:
+        origin_jti = new_uuid()
+        user.setdefault("_origin_jtis", []).append(origin_jti)
     attrs = _attr_list_to_dict(user.get("Attributes", []))
     sub = attrs.get("sub", user["Username"])
     username = user.get("Username", "")
     groups = user.get("_groups", [])
     return {
         "AccessToken": _fake_token(sub, pool_id, client_id, "access", username=username,
-                                    user_attrs=attrs, groups=groups),
+                                    user_attrs=attrs, groups=groups,
+                                    trigger_source=trigger_source,
+                                    client_metadata=client_metadata, origin_jti=origin_jti, scope=scope,
+                                    audience=audience),
         "IdToken": _fake_token(sub, pool_id, client_id, "id", username=username,
-                               user_attrs=attrs, groups=groups, nonce=nonce),
-        "RefreshToken": _fake_token(sub, pool_id, client_id, "refresh"),
+                               user_attrs=attrs, groups=groups, nonce=nonce,
+                               trigger_source=trigger_source,
+                               client_metadata=client_metadata, origin_jti=origin_jti, scope=scope),
+        "RefreshToken": _fake_token(sub, pool_id, client_id, "refresh", origin_jti=origin_jti, scope=scope,
+                                    audience=audience),
         "TokenType": "Bearer",
-        "ExpiresIn": 3600,
+        "ExpiresIn": _token_validity(pool_id, client_id, "access"),
     }
+
+
+def _password_auth_result(pool: dict, pid: str, cid: str, user: dict, username: str,
+                          client_metadata: dict | None = None, data: dict | None = None):
+    """What a verified password answers: NEW_PASSWORD_REQUIRED, an MFA challenge or tokens."""
+    mfa_challenge = None
+    if user.get("UserStatus") != "FORCE_CHANGE_PASSWORD":
+        mfa_challenge = _mfa_challenge_for_user(pool, user, pid, username)
+    _record_auth_event(pool, user, data or {}, "SignIn", "InProgress" if mfa_challenge else "Pass",
+                       (("Password", "Success"),), (mfa_challenge or {}).get("Session"))
+    if user.get("UserStatus") == "FORCE_CHANGE_PASSWORD":
+        _apply_postauth_trigger(pid, cid, user, client_metadata)
+        session = base64.b64encode(secrets.token_bytes(32)).decode()
+        return json_response({
+            "ChallengeName": "NEW_PASSWORD_REQUIRED",
+            "Session": session,
+            "ChallengeParameters": {
+                "USER_ID_FOR_SRP": username,
+                "requiredAttributes": "[]",
+                "userAttributes": json.dumps(_attr_list_to_dict(user.get("Attributes", []))),
+            },
+        })
+    if mfa_challenge:
+        return json_response(mfa_challenge)
+    return json_response({"AuthenticationResult": _build_auth_result(
+        pid, cid, user, client_metadata=client_metadata)})
+
+
+def _initiate_user_srp_auth(pool: dict, pid: str, cid: str, auth_params: dict):
+    """USER_SRP_AUTH for InitiateAuth and AdminInitiateAuth: a real PASSWORD_VERIFIER.
+
+    AWS returns no Session here; the SECRET_BLOCK the client echoes back is the
+    handle to the pending challenge, valid for AuthSessionValidity.
+    """
+    flows = pool["_clients"].get(cid, {}).get("ExplicitAuthFlows") or []
+    # An empty or legacy-only ExplicitAuthFlows keeps SRP enabled.
+    if any(f.startswith("ALLOW_") for f in flows) and "ALLOW_USER_SRP_AUTH" not in flows:
+        return error_response_json("InvalidParameterException",
+                                   "USER_SRP_AUTH is not enabled for the client.", 400)
+    srp_a = auth_params.get("SRP_A")
+    if not srp_a:
+        return error_response_json("InvalidParameterException", "Missing required parameter SRP_A", 400)
+    if not _SRP_A_RE.match(srp_a):
+        return error_response_json(
+            "InvalidParameterException",
+            f"1 validation error detected: Value '{srp_a}' at 'sRPA' failed to satisfy constraint: "
+            "Member must satisfy regular expression pattern: ^[0-9a-fA-F]+$", 400)
+    username = auth_params.get("USERNAME")
+    user, _err = _resolve_user(pool, username)
+    # Username and aliases sign in; unlike the directory operations, the sub does not.
+    if user is not None and user["Username"] != username \
+            and _attr_list_to_dict(user.get("Attributes", [])).get("sub") == username:
+        user = None
+    if user is None:
+        if not username or not _hides_user_existence(pool, cid):
+            return error_response_json("UserNotFoundException", "User does not exist.", 400)
+        user_id = username
+    else:
+        if not user.get("Enabled", True):
+            return error_response_json("NotAuthorizedException", "User is disabled.", 400)
+        if user.get("UserStatus") == "UNCONFIRMED":
+            return error_response_json("UserNotConfirmedException", "User is not confirmed.", 400)
+        user_id = user["Username"]
+    token, session = _create_challenge_session(pid, cid, user_id)
+    session["auth_flow"] = "USER_SRP_AUTH"
+    params, session["srp"] = _srp_challenge(pid, user, user_id, srp_a, token)
+    return json_response({"ChallengeName": "PASSWORD_VERIFIER", "ChallengeParameters": params})
+
+
+def _respond_to_password_verifier(data: dict, cid: str):
+    """PASSWORD_VERIFIER for RespondToAuthChallenge and its admin variant.
+
+    A CUSTOM_WITH_SRP round arrives with the CUSTOM_AUTH Session and continues
+    with DefineAuthChallenge; USER_SRP_AUTH is found by its SECRET_BLOCK.
+    """
+    responses = data.get("ChallengeResponses") or {}
+    err = _srp_response_format_error(responses)
+    if err:
+        return err
+    denied = error_response_json("NotAuthorizedException", "Incorrect username or password.", 400)
+    token = data.get("Session")
+    session = _get_challenge_session(token)[0] if token else None
+    custom = session is not None and session.get("pending_builtin_challenge") == "PASSWORD_VERIFIER"
+    if not custom:
+        token = responses.get("PASSWORD_CLAIM_SECRET_BLOCK") or ""
+        session = _get_challenge_session(token)[0]
+        if session is None or "srp" not in session or session.get("pending_builtin_challenge"):
+            return denied
+    if session["client_id"] != cid:
+        return denied
+    pool = _user_pools.get(session["pool_id"])
+    if not pool:
+        return error_response_json("ResourceNotFoundException",
+                                   f"Pool {session['pool_id']} not found.", 400)
+    user = _resolve_user(pool, session["username"])[0]
+    # A challenge answers any number of proofs until the session expires, as on AWS.
+    if user is None or not _srp_proof_valid(session["pool_id"], user, session["srp"], responses):
+        if user is not None and not custom:
+            _record_auth_event(pool, user, data, "SignIn", "Fail", (("Password", "Failure"),))
+        return denied
+    refused = _password_signin_refused(user)
+    if refused:
+        return refused
+    if user.get("UserStatus") == "RESET_REQUIRED":
+        return _password_reset_required()
+    client_metadata = data.get("ClientMetadata", {})
+    if not custom:
+        return _password_auth_result(pool, session["pool_id"], cid, user, user["Username"],
+                                     client_metadata, data)
+    _append_challenge_to_session(session, "PASSWORD_VERIFIER", True, None, {}, {})
+    session["pending_builtin_challenge"] = None
+    user_attrs = _attr_list_to_dict(user.get("Attributes", []))
+    define_result, err = _invoke_define_auth_challenge_trigger(
+        session["pool_id"], session["client_id"], session["username"],
+        user_attrs, session, client_metadata
+    )
+    if err:
+        return err
+    return _continue_custom_auth_after_define(
+        token, session, user, user_attrs, client_metadata, define_result
+    )
 
 
 def _admin_initiate_auth(data):
@@ -1792,44 +5616,109 @@ def _admin_initiate_auth(data):
         password = auth_params.get("PASSWORD")
         user, _err = _resolve_user(pool, username)
         if _err:
-            return _err
+            return _hidden_user_error(pool, cid, _err)
         if not user.get("Enabled", True):
             return error_response_json("NotAuthorizedException", "User is disabled.", 400)
+        # Answered before the password is looked at, right or wrong; a disabled
+        # user is refused as disabled first (measured).
+        if user.get("UserStatus") == "UNCONFIRMED":
+            return error_response_json("UserNotConfirmedException", "User is not confirmed.", 400)
+        refused = _password_signin_refused(user)
+        if refused:
+            return refused
         if user.get("_password") and user["_password"] != password:
+            _record_auth_event(pool, user, data, "SignIn", "Fail", (("Password", "Failure"),))
             return error_response_json("NotAuthorizedException", "Incorrect username or password.", 400)
-        if user.get("UserStatus") == "FORCE_CHANGE_PASSWORD":
-            session = base64.b64encode(secrets.token_bytes(32)).decode()
-            return json_response({
-                "ChallengeName": "NEW_PASSWORD_REQUIRED",
-                "Session": session,
-                "ChallengeParameters": {
-                    "USER_ID_FOR_SRP": username,
-                    "requiredAttributes": "[]",
-                    "userAttributes": json.dumps(_attr_list_to_dict(user.get("Attributes", []))),
-                },
-            })
-        mfa_challenge = _mfa_challenge_for_user(pool, user, pid, username)
-        if mfa_challenge:
-            return json_response(mfa_challenge)
-        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+        # Only a correct password learns that a reset is required.
+        if user.get("UserStatus") == "RESET_REQUIRED":
+            return _password_reset_required()
+        return _password_auth_result(pool, pid, cid, user, username, data=data)
+
+    if auth_flow == "USER_SRP_AUTH":
+        return _initiate_user_srp_auth(pool, pid, cid, auth_params)
 
     if auth_flow in ("REFRESH_TOKEN_AUTH", "REFRESH_TOKEN"):
+        if _rotation_grace(pool, cid) is not None:
+            return _rotation_unsupported()
         refresh_token = auth_params.get("REFRESH_TOKEN", "")
-        if not refresh_token:
-            return error_response_json("NotAuthorizedException", "Refresh token is missing.", 400)
-        # Decode stub token to find the correct user by sub
-        user = _user_from_token(refresh_token, pool)
-        if not user:
-            # Fall back to first user if token can't be decoded (e.g. externally issued token)
-            users = list(pool["_users"].values())
-            if not users:
-                return error_response_json("NotAuthorizedException", "No users in pool.", 400)
-            user = users[0]
-        result = _build_auth_result(pid, cid, user)
-        result.pop("RefreshToken", None)  # AWS doesn't return a new refresh token here
+        result, err = _refresh_auth_result(pool, pid, cid, refresh_token)
+        if err:
+            return err
         return json_response({"AuthenticationResult": result})
 
+    if auth_flow == "CUSTOM_AUTH":
+        # Validate ExplicitAuthFlows
+        client = pool["_clients"].get(cid, {})
+        flows = client.get("ExplicitAuthFlows", [])
+        if any(f.startswith("ALLOW_") for f in flows) and "ALLOW_CUSTOM_AUTH" not in flows:
+            return error_response_json("InvalidParameterException",
+                    "CUSTOM_AUTH is not enabled for the client.", 400)
+
+        # Get username
+        username = auth_params.get("USERNAME")
+        if not username:
+            return error_response_json("InvalidParameterException",
+                    "USERNAME is required.", 400)
+
+        # Validate user
+        user, err = _resolve_user(pool, username)
+        if err:
+            return err
+        if not user.get("Enabled", True):
+            return error_response_json("NotAuthorizedException",
+                    "User is disabled.", 400)
+
+        # Extract ClientMetadata (top-level field, NOT inside AuthParameters)
+        client_metadata = data.get("ClientMetadata", {})
+
+        # Build user_attrs dict
+        user_attrs = _attr_list_to_dict(user.get("Attributes", []))
+
+        # Create session
+        token, session = _create_challenge_session(pid, cid, username)
+
+        # AWS CUSTOM_WITH_SRP: client sends SRP_A on InitiateAuth; Cognito records
+        # SRP_A success before DefineAuthChallenge so DefineAuth can return
+        # PASSWORD_VERIFIER (built-in), then later CUSTOM_CHALLENGE for MFA.
+        if auth_params.get("SRP_A") or auth_params.get("CHALLENGE_NAME") == "SRP_A":
+            _append_challenge_to_session(session, "SRP_A", True, None, {}, {})
+            session["srp_a"] = auth_params.get("SRP_A") or ""
+
+        # Invoke DefineAuthChallenge first
+        define_result, err = _invoke_define_auth_challenge_trigger(
+            pid, cid, username, user_attrs, session, client_metadata
+        )
+        if err:
+            del _challenge_sessions[token]
+            return err
+
+        return _continue_custom_auth_after_define(
+            token, session, user, user_attrs, client_metadata, define_result
+        )
+
     return error_response_json("InvalidParameterException", f"Unsupported AuthFlow: {auth_flow}", 400)
+
+
+def _software_token_code_refused(user, responses):
+    """A SOFTWARE_TOKEN_MFA code that does not match; a user who never enrolled TOTP has no code that does."""
+    totp_secret = user.get("_totp_secret")
+    if not totp_secret:
+        return "SOFTWARE_TOKEN_MFA" not in (user.get("_mfa_enabled") or [])
+    return not _totp_matches(totp_secret, responses.get("SOFTWARE_TOKEN_MFA_CODE", ""))
+
+
+def _mfa_setup_response(pool, pid, cid, data, responses):
+    """MFA_SETUP answered with VerifySoftwareToken's session: AWS then asks for a SOFTWARE_TOKEN_MFA code. A user
+    who has not enrolled yet gets MFA_SETUP again."""
+    _mfa_setup_users.pop(responses.get("SESSION") or data.get("Session") or "", None)
+    user, _err = _resolve_user(pool, responses.get("USERNAME"))
+    if _err:
+        return _hidden_user_error(pool, cid, _err)
+    challenge = _mfa_challenge_for_user(pool, user, pid, user["Username"])
+    if challenge is None:
+        return json_response({"AuthenticationResult": _build_auth_result(
+            pid, cid, user, client_metadata=data.get("ClientMetadata", {}))})
+    return json_response(challenge)
 
 
 def _admin_respond_to_auth_challenge(data):
@@ -1838,46 +5727,284 @@ def _admin_respond_to_auth_challenge(data):
     pool, err = _resolve_pool(pid)
     if err:
         return err
+    if cid not in pool["_clients"]:
+        return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
 
     challenge_name = data.get("ChallengeName", "")
     responses = data.get("ChallengeResponses", {})
 
+    if challenge_name == "CUSTOM_CHALLENGE":
+        # Extract parameters
+        token = data.get("Session")
+        challenge_answer = responses.get("ANSWER", "")
+        client_metadata = data.get("ClientMetadata", {})
+
+        # Validate session; one awaiting a password proof is not a custom challenge.
+        session, err = _get_challenge_session(token)
+        if not err and _awaits_password_proof(session):
+            err = "InvalidParameterException: Session does not exist"
+        if err:
+            # Parse the error from the helper
+            if "Session does not exist" in err:
+                return error_response_json("InvalidParameterException",
+                        "Session does not exist", 400)
+            elif "expired" in err.lower():
+                return error_response_json("NotAuthorizedException",
+                        "Session has expired", 400)
+            return error_response_json("InvalidParameterException", err, 400)
+
+        # Re-resolve pool and user
+        pool = _user_pools.get(session["pool_id"])
+        if not pool:
+            return error_response_json("ResourceNotFoundException",
+                    f"Pool {session['pool_id']} not found.", 400)
+        
+        user, err = _resolve_user(pool, session["username"])
+        if err:
+            del _challenge_sessions[token]
+            return err
+
+        user_attrs = _attr_list_to_dict(user.get("Attributes", []))
+
+        # Invoke VerifyAuthChallenge
+        verify_result, err = _invoke_verify_auth_challenge_trigger(
+            session["pool_id"], session["client_id"], session["username"],
+            user_attrs, session, challenge_answer, client_metadata
+        )
+        if err:
+            return err
+
+        # Determine answer_correct
+        if verify_result is not None:
+            answer_correct = bool((verify_result.get("response", {}) or {}).get("answerCorrect", False))
+        else:
+            # No Lambda configured — auto-fail (caller must provide answer)
+            answer_correct = False
+
+        # Record the verify result on the pending round — AWS keeps ONE merged
+        # ChallengeResult per round (metadata + result), not two split entries.
+        _update_pending_challenge_result(session, answer_correct)
+
+        # Invoke DefineAuthChallenge (evaluates full session history)
+        define_result, err = _invoke_define_auth_challenge_trigger(
+            session["pool_id"], session["client_id"], session["username"],
+            user_attrs, session, client_metadata
+        )
+        if err:
+            return err
+
+        return _continue_custom_auth_after_define(
+            token, session, user, user_attrs, client_metadata, define_result
+        )
+
+    if challenge_name == "PASSWORD_VERIFIER":
+        return _respond_to_password_verifier(data, cid)
+
     if challenge_name == "NEW_PASSWORD_REQUIRED":
         username = responses.get("USERNAME")
         new_password = responses.get("NEW_PASSWORD")
+        client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
-            return _err
+            return _hidden_user_error(pool, cid, _err)
+        refused = _password_signin_refused(user)
+        if refused:
+            return refused
         if new_password:
             user["_password"] = new_password
         user["UserStatus"] = "CONFIRMED"
         user["UserLastModifiedDate"] = _now_epoch()
-        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+        _record_auth_event(pool, user, data, "PasswordChange", "Pass")
+        return json_response({"AuthenticationResult": _build_auth_result(
+            pid, cid, user, trigger_source="TokenGeneration_NewPasswordChallenge",
+            client_metadata=client_metadata)})
 
     if challenge_name == "SMS_MFA":
         username = responses.get("USERNAME")
+        client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
-            return _err
-        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+            return _hidden_user_error(pool, cid, _err)
+        return json_response({"AuthenticationResult": _build_auth_result(
+            pid, cid, user, client_metadata=client_metadata)})
 
     if challenge_name == "SOFTWARE_TOKEN_MFA":
         username = responses.get("USERNAME")
+        client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
-            return _err
-        # Accept any TOTP code in emulator — no real TOTP validation
-        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+            return _hidden_user_error(pool, cid, _err)
+        # The code is checked against the secret VerifySoftwareToken enrolled.
+        # A user enrolled before secrets were stored has nothing to check
+        # against; that legacy state keeps the old accept-any behaviour until
+        # re-enrolment.
+        if _software_token_code_refused(user, responses):
+            _finish_auth_event(user, data.get("Session"), "Mfa", False)
+            return error_response_json(
+                "CodeMismatchException", "Invalid code received for user", 400)
+        _finish_auth_event(user, data.get("Session"), "Mfa", True)
+        return json_response({"AuthenticationResult": _build_auth_result(
+            pid, cid, user, client_metadata=client_metadata)})
 
     if challenge_name == "MFA_SETUP":
-        # Triggered when pool MFA=ON but user hasn't enrolled yet
-        username = responses.get("USERNAME")
-        user, _err = _resolve_user(pool, username)
-        if _err:
-            return _err
-        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+        return _mfa_setup_response(pool, pid, cid, data, responses)
 
     return error_response_json("InvalidParameterException", f"Unsupported challenge: {challenge_name}", 400)
+
+
+def _pool_for_client(cid):
+    """Return (pool, pool_id) for the client id, or (None, None)."""
+    for p_id, p in _user_pools.items():
+        if cid in p["_clients"]:
+            return p, p_id
+    return None, None
+
+
+def _rotation_grace(pool, cid):
+    """The retry grace period of a client that rotates refresh tokens, else None."""
+    rotation = ((pool or {}).get("_clients", {}).get(cid) or {}).get("RefreshTokenRotation") or {}
+    return int(rotation.get("RetryGracePeriodSeconds", 0)) if rotation.get("Feature") == "ENABLED" else None
+
+
+def _next_refresh_token(pid, cid, grace, refresh_token, claims):
+    """A rotating client's next refresh token, or None for a reused one.
+
+    Only the newest token of a sign-in's family refreshes. The token it
+    replaced may be retried for ``grace`` seconds after it was first used,
+    each retry minting a newer token in turn; any other reuse is refused
+    without revoking the family. A new token keeps the family's original
+    expiry: rotation never extends a session, as on AWS.
+    """
+    origin = claims.get("origin_jti") or refresh_token
+    minted = _fake_token(claims.get("sub", ""), pid, cid, "refresh",
+                         origin_jti=claims.get("origin_jti", ""), scope=claims.get("scope"),
+                         expires_at=claims.get("exp"), audience=claims.get("aud", ""))
+    with _refresh_token_families_lock:
+        family = _refresh_token_families.setdefault(
+            origin, {"latest": refresh_token, "rotated": None, "rotated_at": 0})
+        now = _now_epoch()
+        if refresh_token == family["latest"]:
+            family["rotated"], family["rotated_at"] = refresh_token, now
+        elif refresh_token != family["rotated"] or now - family["rotated_at"] >= grace:
+            return None
+        family["latest"] = minted
+    return minted
+
+
+def _rotated_out(refresh_token, origin):
+    """A token a newer one replaced while its client rotated, which stays refused once rotation is off."""
+    family = _refresh_token_families.get(origin or refresh_token)
+    return bool(family) and refresh_token != family["latest"]
+
+
+def _rotation_unsupported():
+    return error_response_json("UnsupportedOperationException", "This API does not support refresh token rotation", 400)
+
+
+def _refresh_token_reused():
+    return error_response_json("RefreshTokenReuseException", "Refresh token reuse detected", 400)
+
+
+def _refresh_auth_user(pool, pid, cid, refresh_token):
+    """Resolve a refresh-token owner without issuing tokens or invoking triggers."""
+    if not refresh_token:
+        return None, error_response_json("NotAuthorizedException", "Refresh token is missing.", 400)
+    try:
+        claims = _decode_id_token_unverified(refresh_token)
+    except (ValueError, AttributeError):
+        claims = None
+    if (not isinstance(claims, dict) or claims.get("token_use") != "refresh"
+            or str(claims.get("iss", "")).rsplit("/", 1)[-1] != pid):
+        return None, error_response_json("NotAuthorizedException", "Invalid Refresh Token", 400)
+    from ministack.app import AUTH
+    if AUTH and _RSA_PRIVATE_KEY is not None and not _signature_valid(refresh_token):
+        return None, error_response_json("NotAuthorizedException", "Invalid Refresh Token", 400)
+    if claims.get("client_id") != cid:
+        return None, error_response_json("NotAuthorizedException",
+                                         "Refresh Token has different Client", 400)
+    exp = claims.get("exp")
+    if isinstance(exp, (int, float)) and time.time() >= exp:
+        return None, error_response_json("NotAuthorizedException", "Refresh Token has expired", 400)
+    user = _user_from_token(refresh_token, pool)
+    if not user:
+        return None, error_response_json("NotAuthorizedException",
+                                         "The user has been deleted for the associated refresh token", 400)
+    if AUTH and not user.get("Enabled", True):
+        return None, error_response_json("NotAuthorizedException", "User is disabled.", 400)
+    origin = claims.get("origin_jti")
+    if _rotation_grace(pool, cid) is not None:
+        # Revoking any token of a rotating family revokes it all, and AWS names no reason;
+        # a global sign-out still answers "has been revoked".
+        if refresh_token in _revoked_tokens or (origin in _revoked_tokens and origin not in _signed_out_tokens):
+            return None, error_response_json("NotAuthorizedException", "", 400)
+        if origin in _signed_out_tokens or _refresh_token_revoked(refresh_token, user):
+            return None, error_response_json("NotAuthorizedException", "Refresh Token has been revoked", 400)
+    elif (_refresh_token_revoked(refresh_token, user) or (AUTH and isinstance(origin, str) and origin in _revoked_tokens)
+          or _rotated_out(refresh_token, origin)):
+        return None, error_response_json("NotAuthorizedException",
+                                         "Refresh Token has been revoked", 400)
+    return user, None
+
+
+def _refresh_auth_result(pool, pid, cid, refresh_token, reused=_refresh_token_reused):
+    """Shared REFRESH_TOKEN_AUTH core. Returns (auth_result_dict, error_response);
+    exactly one is non-None. Used by InitiateAuth's REFRESH_TOKEN_AUTH branch and
+    by GetTokensFromRefreshToken so both mint tokens identically. A rotating
+    client gets a new refresh token too, and ``reused()`` for a reused one."""
+    user, err = _refresh_auth_user(pool, pid, cid, refresh_token)
+    if err:
+        return None, err
+    claims = _token_claims(refresh_token)
+    result = _build_auth_result(pid, cid, user, trigger_source="TokenGeneration_RefreshTokens",
+                                origin_jti=claims.get("origin_jti", ""),
+                                scope=claims.get("scope"), audience=claims.get("aud", ""))
+    grace = _rotation_grace(pool, cid)
+    rotated = None
+    if grace is not None:
+        # Rotated only once the tokens exist, so a failing PreTokenGeneration trigger leaves the family as it was.
+        rotated = _next_refresh_token(pid, cid, grace, refresh_token, claims)
+        if rotated is None:
+            return None, reused()
+    if rotated:
+        result["RefreshToken"] = rotated
+    else:
+        result.pop("RefreshToken", None)  # AWS doesn't return a new refresh token here
+    return result, None
+
+
+def _get_tokens_from_refresh_token(data):
+    """GetTokensFromRefreshToken — the only session-refresh path aws-amplify
+    v6.15+ uses (added by AWS in 2025 alongside refresh token rotation). Accepts
+    a top-level ``RefreshToken``/``ClientId`` and reuses the REFRESH_TOKEN_AUTH
+    core, returning the same ``AuthenticationResult`` shape: with a new
+    RefreshToken for a client that rotates them, and without one otherwise."""
+    cid = data.get("ClientId")
+    refresh_token = data.get("RefreshToken")
+    if not cid:
+        return error_response_json("InvalidParameterException",
+                                   "Missing required parameter ClientId", 400)
+    if not refresh_token:
+        return error_response_json("InvalidParameterException",
+                                   "Missing required parameter RefreshToken", 400)
+    pool, pid = _pool_for_client(cid)
+    if not pool:
+        return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
+    from ministack.app import AUTH
+    secret = pool["_clients"][cid].get("ClientSecret")
+    if AUTH and secret:
+        # The token is checked before the secret.
+        _user, err = _refresh_auth_user(pool, pid, cid, refresh_token)
+        if err:
+            return err
+    if AUTH and secret and not data.get("ClientSecret"):
+        return error_response_json("NotAuthorizedException",
+                                   f"Client {cid} is configured for secret but secret was not received", 400)
+    if AUTH and secret and data.get("ClientSecret") != secret:
+        return error_response_json("NotAuthorizedException", f"Unable to verify secret hash for client {cid}", 400)
+    result, err = _refresh_auth_result(pool, pid, cid, refresh_token)
+    if err:
+        return err
+    return json_response({"AuthenticationResult": result})
 
 
 def _initiate_auth(data):
@@ -1902,55 +6029,84 @@ def _initiate_auth(data):
         password = auth_params.get("PASSWORD")
         user, _err = _resolve_user(pool, username)
         if _err:
-            return _err
+            return _hidden_user_error(pool, cid, _err)
         if not user.get("Enabled", True):
             return error_response_json("NotAuthorizedException", "User is disabled.", 400)
+        # Answered before the password is looked at, right or wrong; a disabled
+        # user is refused as disabled first (measured).
+        if user.get("UserStatus") == "UNCONFIRMED":
+            return error_response_json("UserNotConfirmedException", "User is not confirmed.", 400)
+        refused = _password_signin_refused(user)
+        if refused:
+            return refused
         if user.get("_password") and user["_password"] != password:
+            _record_auth_event(pool, user, data, "SignIn", "Fail", (("Password", "Failure"),))
             return error_response_json("NotAuthorizedException", "Incorrect username or password.", 400)
-        if user.get("UserStatus") == "FORCE_CHANGE_PASSWORD":
-            session = base64.b64encode(secrets.token_bytes(32)).decode()
-            return json_response({
-                "ChallengeName": "NEW_PASSWORD_REQUIRED",
-                "Session": session,
-                "ChallengeParameters": {
-                    "USER_ID_FOR_SRP": username,
-                    "requiredAttributes": "[]",
-                    "userAttributes": json.dumps(_attr_list_to_dict(user.get("Attributes", []))),
-                },
-            })
-        mfa_challenge = _mfa_challenge_for_user(pool, user, pid, username)
-        if mfa_challenge:
-            return json_response(mfa_challenge)
-        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+        # Only a correct password learns that a reset is required.
+        if user.get("UserStatus") == "RESET_REQUIRED":
+            return _password_reset_required()
+        return _password_auth_result(pool, pid, cid, user, username, data=data)
 
     if auth_flow in ("REFRESH_TOKEN_AUTH", "REFRESH_TOKEN"):
-        refresh_token = auth_params.get("REFRESH_TOKEN", "")
-        if not refresh_token:
-            return error_response_json("NotAuthorizedException", "Refresh token is missing.", 400)
-        # Decode stub token to find the correct user by sub
-        user = _user_from_token(refresh_token, pool)
-        if not user:
-            users = list(pool["_users"].values())
-            if not users:
-                return error_response_json("NotAuthorizedException", "No users in pool.", 400)
-            user = users[0]
-        result = _build_auth_result(pid, cid, user)
-        result.pop("RefreshToken", None)  # AWS doesn't return a new refresh token here
+        if _rotation_grace(pool, cid) is not None:
+            return _rotation_unsupported()
+        result, err = _refresh_auth_result(pool, pid, cid, auth_params.get("REFRESH_TOKEN", ""))
+        if err:
+            return err
         return json_response({"AuthenticationResult": result})
 
-    # USER_SRP_AUTH — return SRP challenge stub
     if auth_flow == "USER_SRP_AUTH":
-        username = auth_params.get("USERNAME", "")
-        return json_response({
-            "ChallengeName": "PASSWORD_VERIFIER",
-            "Session": base64.b64encode(secrets.token_bytes(32)).decode(),
-            "ChallengeParameters": {
-                "USER_ID_FOR_SRP": username,
-                "SRP_B": base64.b64encode(secrets.token_bytes(128)).hex(),
-                "SALT": base64.b64encode(secrets.token_bytes(16)).hex(),
-                "SECRET_BLOCK": base64.b64encode(secrets.token_bytes(32)).decode(),
-            },
-        })
+        return _initiate_user_srp_auth(pool, pid, cid, auth_params)
+
+    if auth_flow == "CUSTOM_AUTH":
+        # Validate ExplicitAuthFlows
+        client = pool["_clients"].get(cid, {})
+        flows = client.get("ExplicitAuthFlows", [])
+        if any(f.startswith("ALLOW_") for f in flows) and "ALLOW_CUSTOM_AUTH" not in flows:
+            return error_response_json("InvalidParameterException",
+                    "CUSTOM_AUTH is not enabled for the client.", 400)
+
+        # Get username
+        username = auth_params.get("USERNAME")
+        if not username:
+            return error_response_json("InvalidParameterException",
+                    "USERNAME is required.", 400)
+
+        # Validate user
+        user, err = _resolve_user(pool, username)
+        if err:
+            return err
+        if not user.get("Enabled", True):
+            return error_response_json("NotAuthorizedException",
+                    "User is disabled.", 400)
+
+        # Extract ClientMetadata (top-level field, NOT inside AuthParameters)
+        client_metadata = data.get("ClientMetadata", {})
+
+        # Build user_attrs dict
+        user_attrs = _attr_list_to_dict(user.get("Attributes", []))
+
+        # Create session
+        token, session = _create_challenge_session(pid, cid, username)
+
+        # AWS CUSTOM_WITH_SRP: client sends SRP_A on InitiateAuth; Cognito records
+        # SRP_A success before DefineAuthChallenge so DefineAuth can return
+        # PASSWORD_VERIFIER (built-in), then later CUSTOM_CHALLENGE for MFA.
+        if auth_params.get("SRP_A") or auth_params.get("CHALLENGE_NAME") == "SRP_A":
+            _append_challenge_to_session(session, "SRP_A", True, None, {}, {})
+            session["srp_a"] = auth_params.get("SRP_A") or ""
+
+        # Invoke DefineAuthChallenge first
+        define_result, err = _invoke_define_auth_challenge_trigger(
+            pid, cid, username, user_attrs, session, client_metadata
+        )
+        if err:
+            del _challenge_sessions[token]
+            return err
+
+        return _continue_custom_auth_after_define(
+            token, session, user, user_attrs, client_metadata, define_result
+        )
 
     return error_response_json("InvalidParameterException", f"Unsupported AuthFlow: {auth_flow}", 400)
 
@@ -1970,35 +6126,173 @@ def _respond_to_auth_challenge(data):
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
 
-    if challenge_name in ("NEW_PASSWORD_REQUIRED", "PASSWORD_VERIFIER"):
+    if challenge_name == "CUSTOM_CHALLENGE":
+        # Extract parameters
+        token = data.get("Session")
+        challenge_answer = responses.get("ANSWER", "")
+        client_metadata = data.get("ClientMetadata", {})
+
+        # Validate session; one awaiting a password proof is not a custom challenge.
+        session, err = _get_challenge_session(token)
+        if not err and _awaits_password_proof(session):
+            err = "InvalidParameterException: Session does not exist"
+        if err:
+            # Parse the error from the helper
+            if "Session does not exist" in err:
+                return error_response_json("InvalidParameterException",
+                        "Session does not exist", 400)
+            elif "expired" in err.lower():
+                return error_response_json("NotAuthorizedException",
+                        "Session has expired", 400)
+            return error_response_json("InvalidParameterException", err, 400)
+
+        # Re-resolve pool and user
+        pool = _user_pools.get(session["pool_id"])
+        if not pool:
+            return error_response_json("ResourceNotFoundException",
+                    f"Pool {session['pool_id']} not found.", 400)
+        
+        user, err = _resolve_user(pool, session["username"])
+        if err:
+            del _challenge_sessions[token]
+            return err
+
+        user_attrs = _attr_list_to_dict(user.get("Attributes", []))
+
+        # Invoke VerifyAuthChallenge
+        verify_result, err = _invoke_verify_auth_challenge_trigger(
+            session["pool_id"], session["client_id"], session["username"],
+            user_attrs, session, challenge_answer, client_metadata
+        )
+        if err:
+            return err
+
+        # Determine answer_correct
+        if verify_result is not None:
+            answer_correct = bool((verify_result.get("response", {}) or {}).get("answerCorrect", False))
+        else:
+            # No Lambda configured — auto-fail (caller must provide answer)
+            answer_correct = False
+
+        # Record the verify result on the pending round — AWS keeps ONE merged
+        # ChallengeResult per round (metadata + result), not two split entries.
+        _update_pending_challenge_result(session, answer_correct)
+
+        # Invoke DefineAuthChallenge (evaluates full session history)
+        define_result, err = _invoke_define_auth_challenge_trigger(
+            session["pool_id"], session["client_id"], session["username"],
+            user_attrs, session, client_metadata
+        )
+        if err:
+            return err
+
+        return _continue_custom_auth_after_define(
+            token, session, user, user_attrs, client_metadata, define_result
+        )
+
+    if challenge_name == "PASSWORD_VERIFIER":
+        return _respond_to_password_verifier(data, cid)
+
+    if challenge_name == "NEW_PASSWORD_REQUIRED":
         username = responses.get("USERNAME")
         new_password = responses.get("NEW_PASSWORD") or responses.get("PASSWORD")
+        client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
-            return _err
+            return _hidden_user_error(pool, cid, _err)
+        refused = _password_signin_refused(user)
+        if refused:
+            return refused
         if new_password:
             user["_password"] = new_password
         user["UserStatus"] = "CONFIRMED"
         user["UserLastModifiedDate"] = _now_epoch()
-        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+        _record_auth_event(pool, user, data, "PasswordChange", "Pass")
+        return json_response({"AuthenticationResult": _build_auth_result(
+            pid, cid, user, trigger_source="TokenGeneration_NewPasswordChallenge",
+            client_metadata=client_metadata)})
 
-    if challenge_name in ("SOFTWARE_TOKEN_MFA", "MFA_SETUP"):
+    if challenge_name == "MFA_SETUP":
+        return _mfa_setup_response(pool, pid, cid, data, responses)
+
+    if challenge_name == "SOFTWARE_TOKEN_MFA":
         username = responses.get("USERNAME")
+        client_metadata = data.get("ClientMetadata", {})
         user, _err = _resolve_user(pool, username)
         if _err:
-            return _err
-        # Accept any TOTP code in emulator
-        return json_response({"AuthenticationResult": _build_auth_result(pid, cid, user)})
+            return _hidden_user_error(pool, cid, _err)
+        # The code is checked against the enrolled secret (legacy pre-secret
+        # enrolments keep accept-any until re-enrolment).
+        if _software_token_code_refused(user, responses):
+            _finish_auth_event(user, data.get("Session"), "Mfa", False)
+            return error_response_json(
+                "CodeMismatchException", "Invalid code received for user", 400)
+        _finish_auth_event(user, data.get("Session"), "Mfa", True)
+        return json_response({"AuthenticationResult": _build_auth_result(
+            pid, cid, user, client_metadata=client_metadata)})
 
     return error_response_json("InvalidParameterException", f"Unsupported challenge: {challenge_name}", 400)
 
 
+def _sign_out_sessions(user: dict) -> None:
+    ended = user.pop("_origin_jtis", [])
+    _revoked_tokens.update(ended)
+    _signed_out_tokens.update(ended)
+
+
+def _refresh_token_revoked(refresh_token: str, user: dict | None) -> bool:
+    """True if a refresh token has been revoked (RevokeToken) or invalidated by a
+    GlobalSignOut that happened after the token was issued."""
+    if refresh_token in _revoked_tokens:
+        return True
+    signout_at = (user or {}).get("_signout_at", 0)
+    if signout_at:
+        try:
+            payload = json.loads(
+                base64.urlsafe_b64decode(refresh_token.split(".")[1] + "=="))
+            if int(payload.get("iat", 0)) < int(signout_at):
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def _global_sign_out(data):
-    # Access token is opaque to us — accept and succeed
+    # AWS invalidates every token issued to the user before the sign-out. Mark
+    # the user with a sign-out timestamp (checked by REFRESH_TOKEN_AUTH) and drop
+    # any OAuth-flow refresh tokens so /oauth2/token can't mint new ones either.
+    access_token = data.get("AccessToken", "")
+    try:
+        payload = json.loads(
+            base64.urlsafe_b64decode(access_token.split(".")[1] + "=="))
+    except Exception:
+        return json_response({})
+    username = payload.get("username", "")
+    iss = payload.get("iss", "")
+    pool_id = iss.rsplit("/", 1)[-1] if iss else ""
+    pool = _user_pools.get(pool_id)
+    if pool and username:
+        user = pool["_users"].get(username)
+        if user:
+            user["_signout_at"] = _now_epoch()
+            _sign_out_sessions(user)
+    if username and pool_id:
+        for tok in [t for t, e in _refresh_tokens.items()
+                    if e.get("username") == username and e.get("pool_id") == pool_id]:
+            del _refresh_tokens[tok]
     return json_response({})
 
 
 def _revoke_token(data):
+    # AWS revokes the supplied refresh token (and tokens derived from it). Record
+    # it as revoked (checked by REFRESH_TOKEN_AUTH) and drop the OAuth-flow entry.
+    token = data.get("Token", "")
+    if token:
+        _revoked_tokens.add(token)
+        _refresh_tokens.pop(token, None)
+        claims = _token_claims(token)
+        if claims.get("token_use") == "refresh" and claims.get("origin_jti"):
+            _revoked_tokens.add(claims["origin_jti"])
     return json_response({})
 
 
@@ -2020,7 +6314,12 @@ def _sign_up(data):
             break
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {cid} not found.", 400)
-    if username in pool["_users"]:
+    username_err = _new_user_error(pool, username or "", _attr_list_to_dict(data.get("UserAttributes", [])))
+    if username_err:
+        return username_err
+    alias_attr = _username_alias_attribute(pool, username)
+    existing = _resolve_user(pool, username)[0] if alias_attr else pool["_users"].get(username)
+    if existing:
         return error_response_json("UsernameExistsException", "User already exists.", 400)
 
     pw_err = _validate_password(pool, password)
@@ -2032,12 +6331,37 @@ def _sign_up(data):
     attr_dict = _attr_list_to_dict(attrs)
     if "sub" not in attr_dict:
         attr_dict["sub"] = new_uuid()
+    if alias_attr:
+        # As in AdminCreateUser: the email/phone becomes the alias, the sub the Username.
+        attr_dict.setdefault(alias_attr, username)
+        username = attr_dict["sub"]
     attrs = _dict_to_attr_list(attr_dict)
 
-    # SignUp always creates UNCONFIRMED — ConfirmSignUp (or AdminConfirmSignUp) confirms the account.
-    # AutoVerifiedAttributes only auto-verifies those attributes (e.g. email), not the account itself.
-    # Auto-confirming accounts requires a pre-signup Lambda trigger, which we don't emulate.
+    # SignUp creates UNCONFIRMED unless the pool's PreSignUp Lambda trigger
+    # auto-confirms — invoked before the user is persisted, fail-closed, as on
+    # AWS (a rejecting or failing trigger blocks the sign-up with
+    # UserLambdaValidationException).
     status = "UNCONFIRMED"
+    try:
+        presignup = _apply_presignup_trigger(
+            pid, cid, username, dict(attr_dict),
+            trigger_source="PreSignUp_SignUp",
+        )
+    except _PreSignUpRejected as e:
+        logger.info("Cognito: PreSignUp Lambda rejected sign-up for %s: %s", username, e)
+        return error_response_json("UserLambdaValidationException", str(e), 400)
+    if presignup["autoConfirmUser"]:
+        status = "CONFIRMED"
+    if presignup["autoVerifyEmail"] and "email" in attr_dict:
+        attr_dict["email_verified"] = "true"
+    if presignup["autoVerifyPhone"] and "phone_number" in attr_dict:
+        attr_dict["phone_number_verified"] = "true"
+    # Only a pool that verifies the address sends the sign-up a code; the email is unverified either way.
+    code_attribute = _sign_up_code_attribute(pool, attr_dict)
+    for verifiable in ("email", "phone_number"):
+        if verifiable in attr_dict:
+            attr_dict.setdefault(f"{verifiable}_verified", "false")
+    attrs = _dict_to_attr_list(attr_dict)
 
     user = {
         "Username": username,
@@ -2050,7 +6374,6 @@ def _sign_up(data):
         "_password": password,
         "_groups": [],
         "_tokens": [],
-        "_confirmation_code": "123456",
     }
     pool["_users"][username] = user
     pool["EstimatedNumberOfUsers"] = len(pool["_users"])
@@ -2059,20 +6382,56 @@ def _sign_up(data):
         "UserConfirmed": status == "CONFIRMED",
         "UserSub": attr_dict["sub"],
     }
-    if "email" in attr_dict:
-        resp["CodeDeliveryDetails"] = {
-            "Destination": attr_dict["email"],
-            "DeliveryMedium": "EMAIL",
-            "AttributeName": "email",
-        }
-        _send_verification_email(pool, username, attr_dict, user["_confirmation_code"])
+    if code_attribute and status != "CONFIRMED":
+        # An auto-confirmed user has nothing to verify — no code is delivered.
+        user["_confirmation_code"] = "123456"
+        user["_confirmation_attribute"] = code_attribute
+        resp["CodeDeliveryDetails"] = _code_delivery(code_attribute, attr_dict[code_attribute])
+        if code_attribute == "email":
+            _send_verification_email(pool, username, attr_dict, user["_confirmation_code"], sender={
+                "trigger": "SignUp", "user_name": username, "user_status": status,
+                "client_id": cid, "client_metadata": data.get("ClientMetadata")})
     return json_response(resp)
+
+
+def _code_error(issued, code):
+    """ExpiredCodeException when no code was issued, CodeMismatchException for another code, else None."""
+    if not issued:
+        return error_response_json(
+            "ExpiredCodeException", "Invalid code provided, please request a code again.", 400)
+    if code != issued:
+        return error_response_json(
+            "CodeMismatchException", "Invalid verification code provided, please try again.", 400)
+    return None
+
+
+def _confirmation_code_error(action: str, data: dict):
+    """The error for a ConfirmSignUp, ConfirmForgotPassword or VerifyUserAttribute the issued code does not allow, or None."""
+    if action == "VerifyUserAttribute":
+        user, _pool = _user_pool_for_access_token(data.get("AccessToken", ""))
+        attr = data.get("AttributeName")
+        if (not user or attr not in _VERIFIABLE_ATTRIBUTES
+                or not (_attr_list_to_dict(user.get("Attributes", [])).get(attr)
+                        or (user.get("_pending_attributes") or {}).get(attr))):
+            return None
+        return _code_error((user.get("_attribute_codes") or {}).get(attr), data.get("Code"))
+    if action not in ("ConfirmSignUp", "ConfirmForgotPassword"):
+        return None
+    pool, _pid = _pool_for_client(data.get("ClientId"))
+    user = _resolve_user(pool, data.get("Username"))[0] if pool else None
+    if not user:
+        return None
+    if action == "ConfirmForgotPassword":
+        return _code_error(user.get("_reset_code"), data.get("ConfirmationCode"))
+    if user.get("UserStatus") != "UNCONFIRMED":
+        return error_response_json(
+            "NotAuthorizedException", f"User cannot be confirmed. Current status is {user.get('UserStatus')}", 400)
+    return _code_error(user.get("_confirmation_code"), data.get("ConfirmationCode"))
 
 
 def _confirm_sign_up(data):
     cid = data.get("ClientId")
     username = data.get("Username")
-    code = data.get("ConfirmationCode", "")
 
     pool = None
     for p in _user_pools.values():
@@ -2084,9 +6443,19 @@ def _confirm_sign_up(data):
 
     user, err = _resolve_user(pool, username)
     if err:
-        return err
+        if _hides_user_existence(pool, cid):
+            return error_response_json(
+                "CodeMismatchException",
+                "Invalid verification code provided, please try again.", 400,
+            )
+        return _client_user_not_found()
 
-    # Accept any code in emulation
+    # Codes are checked under AUTH=true (_confirmation_code_error).
+    user.pop("_confirmation_code", None)
+    attribute = user.pop("_confirmation_attribute", None)
+    if attribute:
+        # Confirming with the code verifies the address it went to.
+        user["Attributes"] = _merge_attributes(user.get("Attributes", []), [{"Name": f"{attribute}_verified", "Value": "true"}])
     user["UserStatus"] = "CONFIRMED"
     user["UserLastModifiedDate"] = _now_epoch()
     return json_response({})
@@ -2106,19 +6475,24 @@ def _forgot_password(data):
 
     user, _err = _resolve_user(pool, username)
     if _err:
-        return _err
+        if _hides_user_existence(pool, cid) and not (pool.get("AutoVerifiedAttributes") or []):
+            return _cannot_reset_password()
+        if _hides_user_existence(pool, cid):
+            # Answer as though a code had been sent; nothing is delivered and no state changes.
+            return json_response({"CodeDeliveryDetails": _unknown_user_delivery(username, "phone_number")})
+        return _client_user_not_found()
 
+    attribute, destination = _reset_code_attribute(user)
+    if not attribute:
+        return _cannot_reset_password()
     code = "654321"
     user["_reset_code"] = code
-    attrs = _attr_list_to_dict(user.get("Attributes", []))
-    _send_verification_email(pool, username, attrs, code, attribute_name="password")
-    return json_response({
-        "CodeDeliveryDetails": {
-            "Destination": attrs.get("email", ""),
-            "DeliveryMedium": "EMAIL",
-            "AttributeName": "email",
-        }
-    })
+    if attribute == "email":
+        attrs = _attr_list_to_dict(user.get("Attributes", []))
+        _send_verification_email(pool, username, attrs, code, attribute_name="password", sender={
+            "trigger": "ForgotPassword", "user_name": user["Username"], "user_status": user.get("UserStatus"),
+            "client_id": cid, "client_metadata": data.get("ClientMetadata")})
+    return json_response({"CodeDeliveryDetails": _code_delivery(attribute, destination)})
 
 
 def _confirm_forgot_password(data):
@@ -2136,16 +6510,35 @@ def _confirm_forgot_password(data):
 
     user, _err = _resolve_user(pool, username)
     if _err:
-        return _err
+        if _hides_user_existence(pool, cid):
+            # An unknown username looks like a bad code, which is what a caller
+            # would see for a real user given the wrong code.
+            return error_response_json(
+                "CodeMismatchException",
+                "Invalid verification code provided, please try again.", 400,
+            )
+        return _client_user_not_found()
 
-    # Accept any confirmation code in emulation (real AWS validates against issued code)
+    # Codes are checked under AUTH=true (_confirmation_code_error).
     pw_err = _validate_password(pool, new_password)
     if pw_err:
         return pw_err
+    user.pop("_reset_code", None)
     user["_password"] = new_password
     user["UserStatus"] = "CONFIRMED"
     user["UserLastModifiedDate"] = _now_epoch()
     return json_response({})
+
+
+def _user_pool_for_access_token(access_token):
+    """Resolve (user, pool) from an access token across the pools in scope."""
+    if not access_token:
+        return None, None
+    for pool in _user_pools.values():
+        user = _user_from_token(access_token, pool)
+        if user:
+            return user, pool
+    return None, None
 
 
 def _change_password(data):
@@ -2153,63 +6546,221 @@ def _change_password(data):
     if not access_token:
         return error_response_json("NotAuthorizedException", "Access token is missing.", 400)
     proposed = data.get("ProposedPassword", "")
-    # Decode token to find user and update password
-    for pool in _user_pools.values():
-        user = _user_from_token(access_token, pool)
-        if user:
-            pw_err = _validate_password(pool, proposed)
-            if pw_err:
-                return pw_err
-            user["_password"] = proposed
-            user["UserLastModifiedDate"] = _now_epoch()
-            return json_response({})
-    return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+    user, pool = _user_pool_for_access_token(access_token)
+    if not user:
+        return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+    # PreviousPassword is required when the user has a password
+    # and is checked before ProposedPassword's policy (measured).
+    # AWS names the missing parameter "OldPassword" in its message.
+    if user.get("_password"):
+        previous = data.get("PreviousPassword")
+        if not previous:
+            return error_response_json("InvalidParameterException", "Missing required parameter OldPassword", 400)
+        if previous != user["_password"]:
+            return error_response_json("NotAuthorizedException", "Incorrect username or password.", 400)
+    pw_err = _validate_password(pool, proposed)
+    if pw_err:
+        return pw_err
+    user["_password"] = proposed
+    user["UserLastModifiedDate"] = _now_epoch()
+    _record_auth_event(pool, user, data, "PasswordChange", "Pass")
+    return json_response({})
 
 
 def _get_user(data):
     access_token = data.get("AccessToken", "")
     if not access_token:
         return error_response_json("NotAuthorizedException", "Access token is missing.", 400)
-    for pool in _user_pools.values():
-        user = _user_from_token(access_token, pool)
-        if user:
-            out = _user_out(user)
-            # GetUser uses UserAttributes, not Attributes (per AWS API shape)
-            out["UserAttributes"] = out.pop("Attributes", [])
-            out["UserMFASettingList"] = user.get("_mfa_enabled", [])
-            out["PreferredMfaSetting"] = user.get("_preferred_mfa", "")
-            return json_response(out)
-    return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+    user, _pool = _user_pool_for_access_token(access_token)
+    if not user:
+        return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+    out = _user_out(user)
+    # GetUser uses UserAttributes, not Attributes (per AWS API shape)
+    out["UserAttributes"] = out.pop("Attributes", [])
+    out["UserMFASettingList"] = user.get("_mfa_enabled", [])
+    out["PreferredMfaSetting"] = user.get("_preferred_mfa", "")
+    return json_response(out)
 
 
 def _update_user_attributes(data):
     access_token = data.get("AccessToken", "")
     if not access_token:
         return error_response_json("NotAuthorizedException", "Access token is missing.", 400)
-    for pool in _user_pools.values():
-        user = _user_from_token(access_token, pool)
-        if user:
-            user["Attributes"] = _merge_attributes(
-                user.get("Attributes", []),
-                data.get("UserAttributes", []),
-            )
-            user["UserLastModifiedDate"] = _now_epoch()
-            return json_response({"CodeDeliveryDetailsList": []})
-    return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+    user, pool = _user_pool_for_access_token(access_token)
+    if not user:
+        return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+    updates = data.get("UserAttributes", [])
+    verified = next((u["Name"] for u in updates if u.get("Name") in ("email_verified", "phone_number_verified")), None)
+    if verified:
+        return error_response_json("InvalidParameterException", f"Cannot modify the non-mutable attribute {verified}", 400)
+    sent, err = _apply_attribute_update(pool, user, updates,
+                                        _token_claims(access_token).get("client_id"), data.get("ClientMetadata"))
+    if err:
+        return err
+    user["UserLastModifiedDate"] = _now_epoch()
+    if not sent:
+        return json_response({})
+    return json_response({"CodeDeliveryDetailsList": [_code_delivery(attribute, value) for attribute, value in sent]})
+
+
+_VERIFIABLE_ATTRIBUTES = ("email", "phone_number")
+_ATTRIBUTE_VERIFICATION_CODE = "123456"
+
+
+def _alias_key(pool, value):
+    if (pool.get("UsernameConfiguration") or {}).get("CaseSensitive") is False:
+        return value.lower()
+    return value
+
+
+def _alias_taken(pool, user, attribute, value):
+    """Another user in a pool that signs in by this attribute already holds the value, verified or not."""
+    if attribute not in (pool.get("UsernameAttributes") or []):
+        return False
+    wanted = _alias_key(pool, value)
+    return any(other is not user and _alias_key(pool, _attr_list_to_dict(other.get("Attributes", [])).get(attribute) or "") == wanted
+               for other in pool["_users"].values())
+
+
+def _alias_exists(attribute):
+    return error_response_json("AliasExistsException", f"An account with the given {attribute} already exists.", 400)
+
+
+def _is_true(value):
+    return str(value or "").lower() == "true"
+
+
+def _take_email_alias(pool, user, email):
+    """In a pool with an email alias, the address a user has just verified stops being verified for anyone else."""
+    if "email" not in (pool.get("AliasAttributes") or []):
+        return
+    for other in pool["_users"].values():
+        attrs = _attr_list_to_dict(other.get("Attributes", []))
+        if other is not user and attrs.get("email") == email and _is_true(attrs.get("email_verified")):
+            other["Attributes"] = _merge_attributes(other["Attributes"], [{"Name": "email_verified", "Value": "false"}])
+
+
+def _apply_attribute_update(pool, user, updates, client_id, client_metadata):
+    """Merge an attribute update. Returns ((attribute, value) for each code sent; an error).
+
+    A changed email or phone number is unverified until verified, unless an
+    admin's update sets it verified, and a pool that auto-verifies it sends the
+    new value a code, which replaces any earlier one. An attribute in
+    AttributesRequireVerificationBeforeUpdate keeps its old value, which still
+    signs in, until the new one is verified. The pending value and its code
+    outlive a later change back and an admin's verified update; a later change
+    replaces them. The other attributes apply at once.
+    """
+    current = _attr_list_to_dict(user.get("Attributes", []))
+    given = _attr_list_to_dict(updates)
+    kept = set((pool.get("UserAttributeUpdateSettings") or {}).get("AttributesRequireVerificationBeforeUpdate") or [])
+    marked = {a for a in _VERIFIABLE_ATTRIBUTES if _is_true(given.get(f"{a}_verified"))}
+    changed = [a for a in _VERIFIABLE_ATTRIBUTES if given.get(a) and given[a] != current.get(a)]
+    held = {a for a in changed if a in kept and a not in marked}
+    taken = next((a for a in changed if a not in held and _alias_taken(pool, user, a, given[a])), None)
+    if taken:
+        return None, _alias_exists(taken)
+    merged = [u for u in updates if u.get("Name") not in held]
+    merged += [{"Name": f"{a}_verified", "Value": "false"} for a in changed if a not in held and a not in marked]
+    user["Attributes"] = _merge_attributes(user.get("Attributes", []), merged)
+    if "email" in marked:
+        _take_email_alias(pool, user, _attr_list_to_dict(user["Attributes"]).get("email"))
+    pending = user.setdefault("_pending_attributes", {})
+    codes = user.setdefault("_attribute_codes", {})
+    code_for = user.setdefault("_attribute_code_for", {})
+    sent = []
+    for attribute in changed:
+        if attribute in held:
+            pending[attribute] = given[attribute]
+        elif attribute in kept:
+            continue
+        codes.pop(attribute, None)
+        if attribute in marked or attribute not in (pool.get("AutoVerifiedAttributes") or []):
+            continue
+        codes[attribute] = _ATTRIBUTE_VERIFICATION_CODE
+        code_for[attribute] = given[attribute]
+        sent.append((attribute, given[attribute]))
+        if attribute == "email":
+            # The code goes to the new address; a pending one leaves email_verified as it was.
+            attrs = {**_attr_list_to_dict(user["Attributes"]), "email": given["email"]}
+            _send_verification_email(pool, user["Username"], attrs, _ATTRIBUTE_VERIFICATION_CODE, by_link=False, sender={
+                "trigger": "UpdateUserAttribute", "user_name": user["Username"], "user_status": user.get("UserStatus"),
+                "client_id": client_id, "client_metadata": client_metadata})
+    return sent, None
+
+
+def _get_user_attribute_verification_code(data):
+    access_token = data.get("AccessToken", "")
+    if not access_token:
+        return error_response_json("NotAuthorizedException", "Access token is missing.", 400)
+    user, pool = _user_pool_for_access_token(access_token)
+    if not user:
+        return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+    attr = data.get("AttributeName")
+    if attr not in _VERIFIABLE_ATTRIBUTES:
+        return error_response_json(
+            "InvalidParameterException", "Invalid attribute name. Only phone_number and email can be verified.", 400)
+    attrs = _attr_list_to_dict(user.get("Attributes", []))
+    if not attrs.get(attr):
+        message = ("User does not have a valid registered phone number" if attr == "phone_number"
+                   else "User does not have a valid registered email")
+        return error_response_json("InvalidParameterException", message, 400)
+    if attr == "phone_number" and not pool.get("SmsConfiguration"):
+        return error_response_json("InvalidParameterException", (
+            "Invalid phone number provided/Unable to send the message. User pool does not have SMS configuration "
+            "to send messages."), 400)
+    # A code requested while a change is pending is for the current value, and replaces the pending one's.
+    user.setdefault("_attribute_codes", {})[attr] = _ATTRIBUTE_VERIFICATION_CODE
+    user.setdefault("_attribute_code_for", {})[attr] = attrs[attr]
+    if attr == "email":
+        _send_verification_email(pool, user["Username"], attrs, _ATTRIBUTE_VERIFICATION_CODE, by_link=False, sender={
+            "trigger": "VerifyUserAttribute", "user_name": user["Username"], "user_status": user.get("UserStatus"),
+            "client_id": _token_claims(access_token).get("client_id"), "client_metadata": data.get("ClientMetadata")})
+    return json_response({"CodeDeliveryDetails": _code_delivery(attr, attrs[attr])})
+
+
+def _verify_user_attribute(data):
+    """Mark the attribute verified, and move a pending value to the one its code went to.
+    The code itself is checked only with AUTH=true, as for ConfirmSignUp."""
+    access_token = data.get("AccessToken", "")
+    if not access_token:
+        return error_response_json("NotAuthorizedException", "Access token is missing.", 400)
+    user, pool = _user_pool_for_access_token(access_token)
+    if not user:
+        return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+    attr = data.get("AttributeName")
+    if attr not in _VERIFIABLE_ATTRIBUTES:
+        return error_response_json(
+            "InvalidParameterException", "Invalid attribute name. Only phone_number and email can be verified.", 400)
+    pending = (user.get("_pending_attributes") or {}).get(attr)
+    if not (_attr_list_to_dict(user.get("Attributes", [])).get(attr) or pending):
+        return error_response_json(
+            "InvalidParameterException", f"Unable to verify attribute: {attr} no value set to verify", 400)
+    moving = pending and (user.get("_attribute_code_for") or {}).get(attr) == pending
+    if moving and _alias_taken(pool, user, attr, pending):
+        return _alias_exists(attr)
+    (user.get("_attribute_codes") or {}).pop(attr, None)
+    updates = [{"Name": f"{attr}_verified", "Value": "true"}]
+    if moving:
+        updates.append({"Name": attr, "Value": user["_pending_attributes"].pop(attr)})
+    user["Attributes"] = _merge_attributes(user.get("Attributes", []), updates)
+    if attr == "email":
+        _take_email_alias(pool, user, _attr_list_to_dict(user["Attributes"]).get("email"))
+    user["UserLastModifiedDate"] = _now_epoch()
+    return json_response({})
 
 
 def _delete_user(data):
     access_token = data.get("AccessToken", "")
     if not access_token:
         return error_response_json("NotAuthorizedException", "Access token is missing.", 400)
-    for pool in _user_pools.values():
-        user = _user_from_token(access_token, pool)
-        if user:
-            username = user["Username"]
-            del pool["_users"][username]
-            pool["EstimatedNumberOfUsers"] = len(pool["_users"])
-            return json_response({})
-    return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+    user, pool = _user_pool_for_access_token(access_token)
+    if not user:
+        return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+    username = user["Username"]
+    del pool["_users"][username]
+    pool["EstimatedNumberOfUsers"] = len(pool["_users"])
+    return json_response({})
 
 
 # ===========================================================================
@@ -2226,12 +6777,19 @@ def _create_group(data):
         return error_response_json("InvalidParameterException", "GroupName is required.", 400)
     if name in pool["_groups"]:
         return error_response_json("GroupExistsException", f"Group {name} already exists.", 400)
+    _cog_role_arn = data.get("RoleArn", "")
+    if _cog_role_arn:
+        from ministack.core.iam_evaluator import validate_role_arn
+        _cog_role_err = validate_role_arn(_cog_role_arn)
+        if _cog_role_err:
+            return error_response_json("InvalidParameterException", _cog_role_err, 400)
+
     now = _now_epoch()
     group = {
         "GroupName": name,
         "UserPoolId": pid,
         "Description": data.get("Description", ""),
-        "RoleArn": data.get("RoleArn", ""),
+        "RoleArn": _cog_role_arn,
         "Precedence": data.get("Precedence", 0),
         "CreationDate": now,
         "LastModifiedDate": now,
@@ -2315,6 +6873,16 @@ def _list_users_in_group(data):
 # DOMAIN
 # ===========================================================================
 
+def _cloudfront_domain(domain: str) -> str:
+    """Deterministic CloudFront distribution domain fronting a custom domain."""
+    return f"d{hashlib.sha256(domain.encode()).hexdigest()[:13]}.cloudfront.net"
+
+
+def _managed_login_version(requested, current):
+    """The domain's managed login version: a value other than 1 or 2 keeps the current one."""
+    return requested if requested in (1, 2) else current
+
+
 def _create_user_pool_domain(data):
     pid = data.get("UserPoolId")
     pool, err = _resolve_pool(pid)
@@ -2325,9 +6893,84 @@ def _create_user_pool_domain(data):
         return error_response_json("InvalidParameterException", "Domain is required.", 400)
     if domain in _pool_domain_map:
         return error_response_json("InvalidParameterException", f"Domain {domain} already exists.", 400)
-    pool["Domain"] = domain
+    # CustomDomainConfig is what separates the two kinds of domain: supplied means
+    # `Domain` is a full FQDN served as-is, omitted means it is a bare prefix AWS
+    # expands to {prefix}.auth.{region}.amazoncognito.com. A pool may hold one of
+    # each, so they are stored in separate fields.
+    custom_config = data.get("CustomDomainConfig")
+    if custom_config is None and pool.get("Domain"):
+        return error_response_json(
+            "InvalidParameterException", "User pool already has a domain configured.", 400)
+    if custom_config is not None:
+        if not isinstance(custom_config, dict) or not custom_config.get("CertificateArn"):
+            return error_response_json(
+                "InvalidParameterException",
+                "CustomDomainConfig must specify a CertificateArn.", 400)
+        pool["CustomDomain"] = domain
+        pool["_custom_domain_config"] = custom_config
+        cloudfront = _cloudfront_domain(domain)
+    else:
+        pool["Domain"] = domain
+        # A prefix (Amazon Cognito) domain has no CloudFront alias target to
+        # CNAME to, so AWS returns a null CloudFrontDomain for it — omit it.
+        cloudfront = None
     _pool_domain_map[domain] = pid
-    return json_response({"CloudFrontDomain": f"{domain}.auth.{get_region()}.amazoncognito.com"})
+    version = _managed_login_version(data.get("ManagedLoginVersion"), 1)
+    pool.setdefault("_managed_login_versions", {})[domain] = version
+    resp = {"ManagedLoginVersion": version}
+    if cloudfront:
+        resp["CloudFrontDomain"] = cloudfront
+    return json_response(resp)
+
+
+def _update_user_pool_domain(data):
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return err
+    domain = data.get("Domain")
+    owner = _pool_domain_map.get(domain)
+    if owner is None:
+        return error_response_json("ResourceNotFoundException", "User pool domain was not found.", 400)
+    if owner != pid:
+        return error_response_json(
+            "InvalidParameterException", "The domain is not configured for this user pool.", 400)
+    is_custom = pool.get("CustomDomain") == domain
+    custom_config = data.get("CustomDomainConfig")
+    if is_custom and custom_config is None:
+        return error_response_json(
+            "InvalidParameterException", "Cannot convert custom domain to prefix domain.", 400)
+    if custom_config is not None:
+        if not is_custom:
+            return error_response_json(
+                "InvalidParameterException", "Cannot convert prefix domain to custom domain.", 400)
+        if not isinstance(custom_config, dict) or not custom_config.get("CertificateArn"):
+            return error_response_json(
+                "InvalidParameterException",
+                "CustomDomainConfig must specify a CertificateArn.", 400)
+    versions = pool.setdefault("_managed_login_versions", {})
+    version = _managed_login_version(data.get("ManagedLoginVersion"), versions.get(domain, 1))
+    routing = data.get("Routing")
+    if routing:
+        if version != 2:
+            return error_response_json(
+                "InvalidParameterException", "Routing field is not supported for Hosted UI (classic)", 400)
+        # Failover routes to a replica region, and no user pool here has one.
+        region = (routing.get("Failover") or {}).get("SecondaryRegion")
+        if region == _pool_region(pid):
+            return error_response_json(
+                "InvalidParameterException",
+                "Routing field can only be configured when replica status is one of: "
+                "ACTIVE, CREATING, INACTIVE. Current status: null", 400)
+        return error_response_json(
+            "InvalidParameterException", f"Region {region} is not active for the user pool", 400)
+    versions[domain] = version
+    resp = {"ManagedLoginVersion": version}
+    if is_custom:
+        if custom_config is not None:
+            pool["_custom_domain_config"] = custom_config
+        resp["CloudFrontDomain"] = _cloudfront_domain(domain)
+    return json_response(resp)
 
 
 def _delete_user_pool_domain(data):
@@ -2337,7 +6980,12 @@ def _delete_user_pool_domain(data):
         return err
     domain = data.get("Domain")
     _pool_domain_map.pop(domain, None)
-    pool["Domain"] = None
+    pool.get("_managed_login_versions", {}).pop(domain, None)
+    if domain and pool.get("CustomDomain") == domain:
+        pool["CustomDomain"] = None
+        pool.pop("_custom_domain_config", None)
+    elif domain and pool.get("Domain") == domain:
+        pool["Domain"] = None
     return json_response({})
 
 
@@ -2347,16 +6995,21 @@ def _describe_user_pool_domain(data):
     if not pid:
         return json_response({"DomainDescription": {}})
     pool = _user_pools.get(pid, {})
+    is_custom = pool.get("CustomDomain") == domain
     return json_response({
         "DomainDescription": {
             "UserPoolId": pid,
             "AWSAccountId": get_account_id(),
             "Domain": domain,
             "S3Bucket": "",
-            "CloudFrontDistribution": f"{domain}.auth.{get_region()}.amazoncognito.com",
+            # Only a custom domain has a CloudFront alias target; a prefix
+            # domain has none (same as its null CloudFrontDomain on create).
+            "CloudFrontDistribution": (_cloudfront_domain(domain) if is_custom
+                                       else ""),
             "Version": "1",
             "Status": "ACTIVE",
-            "CustomDomainConfig": {},
+            "CustomDomainConfig": pool.get("_custom_domain_config", {}) if is_custom else {},
+            "ManagedLoginVersion": pool.get("_managed_login_versions", {}).get(domain, 1),
         }
     })
 
@@ -2406,6 +7059,7 @@ def _create_identity_provider(data):
         "LastModifiedDate": now,
     }
     providers[provider_name] = provider
+    _provider_group(pool, pid, provider_name)
     logger.info("Cognito: CreateIdentityProvider %s in pool %s", provider_name, pid)
     return json_response({"IdentityProvider": provider})
 
@@ -2516,16 +7170,352 @@ def _get_identity_provider_by_identifier(data):
 # MFA CONFIG
 # ===========================================================================
 
-def _get_user_pool_mfa_config(data):
+# ---------------------------------------------------------------------------
+# Linking federated users to an existing profile (#1499)
+#
+# "When a federated user signs in to your user pool for the first time, Amazon
+# Cognito looks for a local profile that you have linked to their identity. If
+# no linked profile exists, your user pool creates a new profile." Links are
+# created ahead of that first sign-in, typically from a PreSignUp trigger.
+# ---------------------------------------------------------------------------
+
+# "You can link up to five federated users to each user profile."
+_PROVIDER_LINK_MAX_PER_USER = 5
+# "You can link users to each IdP from up to five IdP attribute claims."
+_PROVIDER_LINK_MAX_ATTRIBUTES_PER_IDP = 5
+# ProviderName values Cognito recognises without a SAML/OIDC configuration.
+_SOCIAL_PROVIDER_TYPES = {
+    "Facebook": "Facebook",
+    "Google": "Google",
+    "LoginWithAmazon": "LoginWithAmazon",
+    "SignInWithApple": "SignInWithApple",
+}
+
+
+def _provider_links(pool: dict) -> dict:
+    """{(provider, attribute_name, attribute_value): destination username}."""
+    return pool.setdefault("_provider_links", {})
+
+
+def _provider_link_key(provider_name, attribute_name, attribute_value):
+    return "\x00".join((provider_name, attribute_name or "", attribute_value))
+
+
+def _provider_type_for(pool: dict, provider_name: str) -> str:
+    """Resolve the IdP's ProviderType, preferring the pool's own configuration."""
+    for provider in pool.get("_identity_providers", {}).values():
+        if provider.get("ProviderName") == provider_name:
+            return provider.get("ProviderType") or "OIDC"
+    return _SOCIAL_PROVIDER_TYPES.get(provider_name, "OIDC")
+
+
+def _user_identities(user: dict) -> list:
+    """The user's `identities` attribute, decoded. AWS stores it as JSON text."""
+    raw = _attr_list_to_dict(user.get("Attributes", [])).get("identities")
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _set_user_identities(user: dict, identities: list) -> None:
+    attrs = _attr_list_to_dict(user.get("Attributes", []))
+    if identities:
+        attrs["identities"] = json.dumps(identities)
+    else:
+        attrs.pop("identities", None)
+    user["Attributes"] = _dict_to_attr_list(attrs)
+
+
+def _provider_user_identifier(data, field):
+    """Validate a ProviderUserIdentifierType member. Returns (value, error)."""
+    raw = data.get(field)
+    if not isinstance(raw, dict):
+        return None, error_response_json(
+            "InvalidParameterException", f"{field} is required.", 400)
+    provider_name = (raw.get("ProviderName") or "").strip()
+    attribute_value = (raw.get("ProviderAttributeValue") or "").strip()
+    if not provider_name:
+        return None, error_response_json(
+            "InvalidParameterException",
+            f"{field}.ProviderName is required.", 400)
+    if not attribute_value:
+        return None, error_response_json(
+            "InvalidParameterException",
+            f"{field}.ProviderAttributeValue is required.", 400)
+    return {
+        "ProviderName": provider_name,
+        "ProviderAttributeName": (raw.get("ProviderAttributeName") or "").strip(),
+        "ProviderAttributeValue": attribute_value,
+    }, None
+
+
+def _federated_profile_username(provider_name, attribute_value):
+    """Auto-created federated profiles are named `{Provider name}_identifier`."""
+    return f"{provider_name}_{attribute_value}"
+
+
+def _provider_group(pool, pool_id, provider_name):
+    """The group `{user pool id}_{IdP name}` that holds the IdP's auto-created profiles."""
+    name = f"{pool_id}_{provider_name}"
+    group = pool["_groups"].get(name)
+    if group is None:
+        now = _now_epoch()
+        group = pool["_groups"][name] = {
+            "GroupName": name,
+            "UserPoolId": pool_id,
+            "CreationDate": now,
+            "LastModifiedDate": now,
+            "_members": [],
+        }
+    return group
+
+
+def _start_federated_profile(pool, pool_id, user, provider_name, user_id):
+    """Record a new IdP profile's own identity and add it to the IdP's group."""
+    _set_user_identities(user, [{
+        "userId": user_id,
+        "providerName": provider_name,
+        "providerType": _provider_type_for(pool, provider_name),
+        "issuer": None,
+        "primary": True,
+        "dateCreated": int(time.time() * 1000),
+    }])
+    group = _provider_group(pool, pool_id, provider_name)
+    group["_members"].append(user["Username"])
+    user["_groups"].append(group["GroupName"])
+
+
+def _admin_link_provider_for_user(data):
     pid = data.get("UserPoolId")
     pool, err = _resolve_pool(pid)
     if err:
         return err
-    return json_response({
-        "SmsMfaConfiguration": pool.get("SmsMfaConfiguration", {}),
-        "SoftwareTokenMfaConfiguration": pool.get("SoftwareTokenMfaConfiguration", {"Enabled": False}),
-        "MfaConfiguration": pool.get("MfaConfiguration", "OFF"),
+
+    destination, err = _provider_user_identifier(data, "DestinationUser")
+    if err:
+        return err
+    source, err = _provider_user_identifier(data, "SourceUser")
+    if err:
+        return err
+
+    # "This user must be a federated user (for example, a SAML or Facebook
+    # user), not another native user."
+    if source["ProviderName"] == "Cognito":
+        return error_response_json(
+            "InvalidParameterException",
+            "SourceUser must be a federated user, not a Cognito user.", 400)
+
+    # "For a native username + password user, the ProviderAttributeValue for
+    # the DestinationUser should be the username in the user pool. For a
+    # federated user, it should be the provider-specific user_id." The
+    # DestinationUser's ProviderAttributeName is ignored.
+    if destination["ProviderName"] == "Cognito":
+        destination_username = destination["ProviderAttributeValue"]
+    else:
+        destination_username = _federated_profile_username(
+            destination["ProviderName"], destination["ProviderAttributeValue"])
+    destination_user = pool["_users"].get(destination_username)
+    if not destination_user:
+        return error_response_json(
+            "UserNotFoundException", "User does not exist.", 400)
+
+    # "To link a federated user who has previously signed in, you must first
+    # delete their existing profile."
+    source_profile = _federated_profile_username(
+        source["ProviderName"], source["ProviderAttributeValue"])
+    if source_profile in pool["_users"]:
+        return error_response_json(
+            "AliasExistsException",
+            "This user already exists in the user pool. To link this "
+            "federated identity, delete the existing profile first.", 400)
+
+    links = _provider_links(pool)
+    key = _provider_link_key(
+        source["ProviderName"], source["ProviderAttributeName"],
+        source["ProviderAttributeValue"])
+    linked_to = links.get(key)
+    if linked_to == destination_username:
+        return json_response({})
+    if linked_to:
+        return error_response_json(
+            "AliasExistsException",
+            "This federated identity is already linked to another user "
+            "profile.", 400)
+
+    identities = _user_identities(destination_user)
+    if len(identities) >= _PROVIDER_LINK_MAX_PER_USER:
+        return error_response_json(
+            "LimitExceededException",
+            "You can link up to "
+            f"{_PROVIDER_LINK_MAX_PER_USER} federated users to each user "
+            "profile.", 400)
+    attribute_names = {
+        stored_key.split("\x00")[1]
+        for stored_key in links
+        if stored_key.split("\x00")[0] == source["ProviderName"]
+    }
+    if (source["ProviderAttributeName"] not in attribute_names
+            and len(attribute_names) >= _PROVIDER_LINK_MAX_ATTRIBUTES_PER_IDP):
+        return error_response_json(
+            "LimitExceededException",
+            "You can link users to each IdP from up to "
+            f"{_PROVIDER_LINK_MAX_ATTRIBUTES_PER_IDP} IdP attribute claims.",
+            400)
+
+    links[key] = destination_username
+    identities.append({
+        "userId": source["ProviderAttributeValue"],
+        "providerName": source["ProviderName"],
+        "providerType": _provider_type_for(pool, source["ProviderName"]),
+        # AWS carries the SAML entity issuer here and null for social IdPs. We
+        # never learn an entity id, so it stays null.
+        "issuer": None,
+        # A linked identity is never the profile's primary one.
+        "primary": False,
+        "dateCreated": int(time.time() * 1000),
     })
+    _set_user_identities(destination_user, identities)
+    destination_user["UserLastModifiedDate"] = _now_epoch()
+    logger.info("Cognito: linked %s user %s to %s in pool %s",
+                source["ProviderName"], source["ProviderAttributeValue"],
+                destination_username, pid)
+    return json_response({})
+
+
+def _password_reset_required():
+    return error_response_json("PasswordResetRequiredException", "Password reset required for the user", 400)
+
+
+def _password_signin_refused(user):
+    """The refusal a password sign-in draws for a provider-deactivated local user.
+
+    AdminDisableProviderForUser with ProviderName=Cognito: "they can't use
+    their password to sign in", while the profile itself stays (AdminGetUser,
+    tokens already issued, and non-password flows are untouched).
+    """
+    if user.get("_provider_disabled"):
+        return error_response_json(
+            "NotAuthorizedException", "Incorrect username or password.", 400)
+    return None
+
+
+def _admin_disable_provider_for_user(data):
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return err
+
+    user_identifier, err = _provider_user_identifier(data, "User")
+    if err:
+        return err
+
+    # "To deactivate a local user, set ProviderName to Cognito and the
+    # ProviderAttributeName to Cognito_Subject. The ProviderAttributeValue
+    # must be user's local username." The user keeps existing but can no
+    # longer sign in with their password.
+    if user_identifier["ProviderName"] == "Cognito":
+        user, err = _resolve_user(pool, user_identifier["ProviderAttributeValue"])
+        if err:
+            return err
+        user["_provider_disabled"] = True
+        user["UserLastModifiedDate"] = _now_epoch()
+        return json_response({})
+
+    links = _provider_links(pool)
+    key = _provider_link_key(
+        user_identifier["ProviderName"],
+        user_identifier["ProviderAttributeName"],
+        user_identifier["ProviderAttributeValue"])
+    destination_username = links.get(key)
+    if not destination_username:
+        return error_response_json(
+            "ResourceNotFoundException",
+            "The specified federated identity is not linked to a user "
+            "profile.", 400)
+
+    del links[key]
+    destination_user = pool["_users"].get(destination_username)
+    if destination_user:
+        identities = [
+            identity for identity in _user_identities(destination_user)
+            if not (identity.get("providerName") == user_identifier["ProviderName"]
+                    and identity.get("userId")
+                    == user_identifier["ProviderAttributeValue"])
+        ]
+        _set_user_identities(destination_user, identities)
+        destination_user["UserLastModifiedDate"] = _now_epoch()
+    return json_response({})
+
+
+def _merge_federated_attrs(user: dict, user_attrs: dict, now) -> str:
+    """Apply a federated sign-in's mapped attributes to an existing profile; return its sub."""
+    merged = _attr_list_to_dict(user.get("Attributes", []))
+    # `sub` is Cognito's own immutable identifier; a mapped IdP `sub` claim must not replace it.
+    merged.update({k: v for k, v in user_attrs.items() if k != "sub"})
+    user["Attributes"] = _dict_to_attr_list(merged)
+    user["UserLastModifiedDate"] = now
+    return merged.get("sub", new_uuid())
+
+
+def _linked_username_for_federation(pool, provider_name, name_id, user_attrs):
+    """Resolve a federated sign-in to a linked local profile, if one exists.
+
+    Cognito looks for the link before it would create a `{Provider}_id`
+    profile, so a linked user signs in to the profile they were linked to
+    rather than getting a second one.
+    """
+    links = _provider_links(pool)
+    if not links:
+        return None
+    # "When you set ProviderAttributeName to Cognito_Subject, Amazon Cognito
+    # will automatically parse the default unique identifier found in the
+    # subject from the IdP token."
+    candidates = [("Cognito_Subject", name_id), ("", name_id)]
+    # "For OIDC, the ProviderAttributeName can be any mapped value from a claim
+    # in the ID token" — match against the mapped attributes of this sign-in.
+    candidates.extend(
+        (attribute_name, value)
+        for attribute_name, value in (user_attrs or {}).items()
+        if isinstance(value, str)
+    )
+    for attribute_name, value in candidates:
+        username = links.get(
+            _provider_link_key(provider_name, attribute_name, value))
+        if username and username in pool["_users"]:
+            return username
+    return None
+
+
+
+def _get_user_pool_mfa_config(data):
+    # https://docs.aws.amazon.com/cognito-user-identity-pools/latest/APIReference/API_GetUserPoolMfaConfig.html
+    # A configuration that was never set is absent from the response rather than
+    # reported as a disabled block — clients diff the response against their
+    # desired state, so an invented SoftwareTokenMfaConfiguration reads as drift.
+    pid = data.get("UserPoolId")
+    pool, err = _resolve_pool(pid)
+    if err:
+        return err
+    resp = {"MfaConfiguration": pool.get("MfaConfiguration", "OFF")}
+    for key in ("SmsMfaConfiguration", "SoftwareTokenMfaConfiguration",
+                "EmailMfaConfiguration", "WebAuthnConfiguration"):
+        # `is not None`, not truthiness: a caller turning software-token MFA
+        # off sends an empty object — `enabled = false` serialises with the
+        # false field omitted — and that is a value it set, not a field it left
+        # unset. Dropping it makes the caller re-send the change on every run.
+        value = pool.get(key)
+        if value is None:
+            continue
+        if key == "SoftwareTokenMfaConfiguration":
+            value = {"Enabled": bool(value.get("Enabled", False))}
+        elif not value:
+            continue
+        resp[key] = value
+    return json_response(resp)
 
 
 def _admin_set_user_mfa_preference(data):
@@ -2546,12 +7536,11 @@ def _set_user_mfa_preference(data):
     access_token = data.get("AccessToken")
     if not access_token:
         return error_response_json("NotAuthorizedException", "Missing access token.", 400)
-    for pool in _user_pools.values():
-        user = _user_from_token(access_token, pool)
-        if user:
-            _apply_mfa_preference(user, data)
-            return json_response({})
-    return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+    user, _pool = _user_pool_for_access_token(access_token)
+    if not user:
+        return error_response_json("NotAuthorizedException", "Invalid access token.", 400)
+    _apply_mfa_preference(user, data)
+    return json_response({})
 
 
 def _apply_mfa_preference(user: dict, data: dict):
@@ -2567,6 +7556,7 @@ def _apply_mfa_preference(user: dict, data: dict):
             user["_preferred_mfa"] = "SOFTWARE_TOKEN_MFA"
     elif "Enabled" in totp_settings and not totp_settings["Enabled"]:
         enabled_mfa[:] = [m for m in enabled_mfa if m != "SOFTWARE_TOKEN_MFA"]
+        user.pop("_totp_hosted", None)
         if user.get("_preferred_mfa") == "SOFTWARE_TOKEN_MFA":
             user["_preferred_mfa"] = ""
 
@@ -2590,41 +7580,133 @@ def _set_user_pool_mfa_config(data):
         pool["SmsMfaConfiguration"] = data["SmsMfaConfiguration"]
     if "SoftwareTokenMfaConfiguration" in data:
         pool["SoftwareTokenMfaConfiguration"] = data["SoftwareTokenMfaConfiguration"]
+    if "EmailMfaConfiguration" in data:
+        pool["EmailMfaConfiguration"] = data["EmailMfaConfiguration"]
+    if "WebAuthnConfiguration" in data:
+        pool["WebAuthnConfiguration"] = data["WebAuthnConfiguration"]
     if "MfaConfiguration" in data:
         pool["MfaConfiguration"] = data["MfaConfiguration"]
     pool["LastModifiedDate"] = _now_epoch()
-    return json_response({
-        "SmsMfaConfiguration": pool.get("SmsMfaConfiguration", {}),
-        "SoftwareTokenMfaConfiguration": pool.get("SoftwareTokenMfaConfiguration", {}),
-        "MfaConfiguration": pool.get("MfaConfiguration", "OFF"),
-    })
+    resp = {"MfaConfiguration": pool.get("MfaConfiguration", "OFF")}
+    for key in ("SmsMfaConfiguration", "SoftwareTokenMfaConfiguration",
+                "EmailMfaConfiguration", "WebAuthnConfiguration"):
+        # `is not None`, not truthiness: a caller turning software-token MFA
+        # off sends an empty object — `enabled = false` serialises with the
+        # false field omitted — and that is a value it set, not a field it left
+        # unset. Dropping it makes the caller re-send the change on every run.
+        value = pool.get(key)
+        if value is None:
+            continue
+        if key == "SoftwareTokenMfaConfiguration":
+            value = {"Enabled": bool(value.get("Enabled", False))}
+        elif not value:
+            continue
+        resp[key] = value
+    return json_response(resp)
+
+
+# Session string (from AssociateSoftwareToken) -> pending TOTP secret, for the
+# MFA_SETUP flow where no access token exists yet. Ephemeral, keyed by an
+# unguessable random session — the same isolation argument as the OAuth code
+# stores above.
+_totp_session_secrets: dict[str, str] = {}
+# An MFA_SETUP challenge's session, and the AssociateSoftwareToken / VerifySoftwareToken sessions that carry it
+# on -> (pool id, username): the user enrolling before they have an access token.
+_mfa_setup_users: dict[str, tuple[str, str]] = {}
+
+
+def _mfa_setup_user(session):
+    owner = _mfa_setup_users.get(session or "")
+    pool = _get_pool_unscoped(owner[0]) if owner else None
+    return (_resolve_user(pool, owner[1])[0] if pool else None), owner
+
+
+def _totp_code(secret_b32: str, step_offset: int = 0) -> str:
+    """RFC 6238: HMAC-SHA1, 30-second step, 6 digits."""
+    return _totp_code_at(secret_b32, int(time.time() // 30) + step_offset)
+
+
+def _totp_code_at(secret_b32: str, counter: int) -> str:
+    key = base64.b32decode(secret_b32 + "=" * (-len(secret_b32) % 8), casefold=True)
+    mac = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = mac[-1] & 0x0F
+    return f"{(struct.unpack('>I', mac[offset:offset + 4])[0] & 0x7FFFFFFF) % 10**6:06d}"
+
+
+def _totp_matches(secret_b32: str, user_code) -> bool:
+    """Accept the current step plus one on either side, as authenticators drift."""
+    if not secret_b32 or not isinstance(user_code, str):
+        return False
+    try:
+        return any(hmac.compare_digest(_totp_code(secret_b32, off), user_code)
+                   for off in (-1, 0, 1))
+    except Exception:
+        return False
+
+
+def _user_for_access_token(access_token):
+    return _user_pool_for_access_token(access_token)[0]
 
 
 def _associate_software_token(data):
-    """Issue a stub TOTP secret. Works with both AccessToken and Session."""
+    """Issue a TOTP secret and remember it as pending for verification."""
     secret = base64.b32encode(secrets.token_bytes(20)).decode()
     session = base64.b64encode(secrets.token_bytes(32)).decode()
+    user = _user_for_access_token(data.get("AccessToken"))
+    if user is not None:
+        user["_totp_pending_secret"] = secret
+    owner = _mfa_setup_users.pop(data.get("Session") or "", None)
+    if owner:
+        _mfa_setup_users[session] = owner
+    _totp_session_secrets[session] = secret
     return json_response({"SecretCode": secret, "Session": session})
 
 
 def _verify_software_token(data):
-    """Accept any TOTP code. Mark the user as TOTP-enrolled so auth flow issues the challenge."""
+    """Verify the user's code against the pending secret (RFC 6238) and, on
+    success, promote it to the active TOTP secret and mark the user enrolled."""
     access_token = data.get("AccessToken")
-    user_code = data.get("UserCode", "")  # accepted regardless of value in emulator
-    friendly_name = data.get("FriendlyDeviceName", "TOTP device")
+    session = data.get("Session")
+    user_code = data.get("UserCode", "")
 
-    if access_token:
-        # Find the user by token across all pools
-        for pool in _user_pools.values():
-            user = _user_from_token(access_token, pool)
-            if user:
-                user.setdefault("_mfa_enabled", [])
-                if "SOFTWARE_TOKEN_MFA" not in user["_mfa_enabled"]:
-                    user["_mfa_enabled"].append("SOFTWARE_TOKEN_MFA")
-                user["_preferred_mfa"] = "SOFTWARE_TOKEN_MFA"
-                break
+    user = _user_for_access_token(access_token)
+    owner = None
+    if user is None and session:
+        user, owner = _mfa_setup_user(session)
+    secret = None
+    if owner:
+        secret = _totp_session_secrets.get(session)
+    elif user is not None:
+        secret = user.get("_totp_pending_secret") or user.get("_totp_secret")
+    if not secret and session:
+        secret = _totp_session_secrets.get(session)
+    if not secret:
+        # Nothing was associated: there is no secret to verify a code against.
+        return error_response_json(
+            "EnableSoftwareTokenMFAException",
+            "No software token MFA has been associated for verification.", 400)
+    if not _totp_matches(secret, user_code):
+        return error_response_json(
+            "EnableSoftwareTokenMFAException", "Code mismatch", 400)
 
-    return json_response({"Status": "SUCCESS"})
+    if user is not None:
+        user["_totp_secret"] = secret
+        user.pop("_totp_pending_secret", None)
+        user.pop("_totp_device_name", None)
+        user.setdefault("_mfa_enabled", [])
+        if "SOFTWARE_TOKEN_MFA" not in user["_mfa_enabled"]:
+            user["_mfa_enabled"].append("SOFTWARE_TOKEN_MFA")
+        user["_preferred_mfa"] = "SOFTWARE_TOKEN_MFA"
+    if session:
+        _totp_session_secrets.pop(session, None)
+
+    resp = {"Status": "SUCCESS"}
+    if session:
+        resp["Session"] = base64.b64encode(secrets.token_bytes(32)).decode()
+        if owner:
+            _mfa_setup_users.pop(session, None)
+            _mfa_setup_users[resp["Session"]] = owner
+    return json_response(resp)
 
 
 # ===========================================================================
@@ -2634,30 +7716,41 @@ def _verify_software_token(data):
 def _idp_tag_resource(data):
     arn = data.get("ResourceArn", "")
     tags = data.get("Tags", {})
-    # Find pool by ARN
-    for pool in _user_pools.values():
-        if pool["Arn"] == arn:
-            pool["UserPoolTags"].update(tags)
-            return json_response({})
+    try:
+        pid = _user_pool_id_from_arn(arn)
+    except _InvalidCognitoIdpArn as exc:
+        return error_response_json("InvalidParameterException", str(exc), 400)
+    pool = _user_pools.get(pid) if pid else None
+    if pool and pool.get("Arn") == arn:
+        pool["UserPoolTags"].update(tags)
+        return json_response({})
     return error_response_json("ResourceNotFoundException", f"Resource {arn} not found.", 400)
 
 
 def _idp_untag_resource(data):
     arn = data.get("ResourceArn", "")
     tag_keys = data.get("TagKeys", [])
-    for pool in _user_pools.values():
-        if pool["Arn"] == arn:
-            for k in tag_keys:
-                pool["UserPoolTags"].pop(k, None)
-            return json_response({})
+    try:
+        pid = _user_pool_id_from_arn(arn)
+    except _InvalidCognitoIdpArn as exc:
+        return error_response_json("InvalidParameterException", str(exc), 400)
+    pool = _user_pools.get(pid) if pid else None
+    if pool and pool.get("Arn") == arn:
+        for k in tag_keys:
+            pool["UserPoolTags"].pop(k, None)
+        return json_response({})
     return error_response_json("ResourceNotFoundException", f"Resource {arn} not found.", 400)
 
 
 def _idp_list_tags_for_resource(data):
     arn = data.get("ResourceArn", "")
-    for pool in _user_pools.values():
-        if pool["Arn"] == arn:
-            return json_response({"Tags": pool.get("UserPoolTags", {})})
+    try:
+        pid = _user_pool_id_from_arn(arn)
+    except _InvalidCognitoIdpArn as exc:
+        return error_response_json("InvalidParameterException", str(exc), 400)
+    pool = _user_pools.get(pid) if pid else None
+    if pool and pool.get("Arn") == arn:
+        return json_response({"Tags": pool.get("UserPoolTags", {})})
     return error_response_json("ResourceNotFoundException", f"Resource {arn} not found.", 400)
 
 
@@ -2670,19 +7763,47 @@ def _oauth2_error(error: str, description: str, status: int = 400):
     return status, {"Content-Type": "application/json"}, body
 
 
-def _login_page_html(client_id, redirect_uri, scope, state, response_type,
-                     code_challenge="", code_challenge_method="", nonce="",
-                     error_message=""):
-    esc = html_mod.escape
-    err_block = ""
-    if error_message:
-        err_block = f'<div class="error">{esc(error_message)}</div>'
+def _invalid_scope_redirect(client, redirect_uri: str, scope: str, state: str):
+    """The redirect back to the app for an authorize request with a scope the client does not allow, or None."""
+    allowed_scopes = client.get("AllowedOAuthScopes") or []
+    if not (redirect_uri and scope and allowed_scopes and any(s not in allowed_scopes for s in scope.split())):
+        return None
+    sep = "&" if "?" in redirect_uri else "?"
+    location = f"{redirect_uri}{sep}error=invalid_request&error_description=invalid_scope"
+    if state:
+        location += f"&state={quote(state)}"
+    return 302, {"Location": location, "Cache-Control": "no-store"}, b""
+
+
+def _use_choice_based_ui(client) -> bool:
+    """True when the client's ExplicitAuthFlows opts into USER_AUTH (choice-based
+    sign-in), which drives a multi-step Hosted UI instead of the single-page form."""
+    return "ALLOW_USER_AUTH" in client.get("ExplicitAuthFlows", [])
+
+
+_SUPPORTED_FIRST_AUTH_FACTORS = ("PASSWORD", "EMAIL_OTP")
+
+
+def _available_first_auth_factors(pool):
+    """Resolve the first-factor choices for choice-based sign-in from
+    Policies.SignInPolicy.AllowedFirstAuthFactors (default ["PASSWORD"])."""
+    factors = ((pool.get("Policies") or {}).get("SignInPolicy") or {}).get(
+        "AllowedFirstAuthFactors") or ["PASSWORD"]
+    factors = [f for f in factors if f in _SUPPORTED_FIRST_AUTH_FACTORS]
+    # AWS forbids OTP factors when MFA is required, restricting the choice to passwords.
+    if pool.get("MfaConfiguration") == "ON":
+        factors = [f for f in factors if f == "PASSWORD"]
+    return factors or ["PASSWORD"]
+
+
+def _page_shell(title, heading, body_html):
+    """Shared page chrome (CSS + card layout) for all Hosted UI login pages."""
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Sign in</title>
+<title>{title}</title>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
@@ -2695,7 +7816,7 @@ input[type=text],input[type=password]{{width:100%;padding:10px 12px;border:1px s
   border-radius:4px;font-size:14px;margin-bottom:16px;outline:none;transition:border-color .15s}}
 input[type=text]:focus,input[type=password]:focus{{border-color:#0073bb;box-shadow:0 0 0 2px rgba(0,115,187,.2)}}
 button{{width:100%;padding:10px;background:#0073bb;color:#fff;border:none;border-radius:4px;
-  font-size:16px;font-weight:500;cursor:pointer;transition:background .15s}}
+  font-size:16px;font-weight:500;cursor:pointer;transition:background .15s;margin-bottom:12px}}
 button:hover{{background:#005a94}}
 .error{{background:#fce8e6;color:#d13212;border:1px solid #d13212;border-radius:4px;
   padding:10px;margin-bottom:16px;font-size:13px;text-align:center}}
@@ -2704,8 +7825,22 @@ button:hover{{background:#005a94}}
 </head>
 <body>
 <div class="card">
-<h1>Sign in</h1>
-{err_block}
+<h1>{heading}</h1>
+{body_html}
+<div class="footer">Powered by ministack</div>
+</div>
+</body>
+</html>"""
+
+
+def _login_page_html(client_id, redirect_uri, scope, state, response_type,
+                     code_challenge="", code_challenge_method="", nonce="", resource="",
+                     error_message=""):
+    esc = html_mod.escape
+    err_block = ""
+    if error_message:
+        err_block = f'<div class="error">{esc(error_message)}</div>'
+    body = f"""{err_block}
 <form method="POST" action="/login">
 <input type="hidden" name="client_id" value="{esc(client_id)}">
 <input type="hidden" name="redirect_uri" value="{esc(redirect_uri)}">
@@ -2715,16 +7850,241 @@ button:hover{{background:#005a94}}
 <input type="hidden" name="code_challenge" value="{esc(code_challenge)}">
 <input type="hidden" name="code_challenge_method" value="{esc(code_challenge_method)}">
 <input type="hidden" name="nonce" value="{esc(nonce)}">
+<input type="hidden" name="resource" value="{esc(resource)}">
 <label for="username">Username</label>
 <input type="text" id="username" name="username" autocomplete="username" required autofocus>
 <label for="password">Password</label>
 <input type="password" id="password" name="password" autocomplete="current-password" required>
 <button type="submit">Sign in</button>
 </form>
-<div class="footer">Powered by ministack</div>
+{_forgot_password_link(client_id, redirect_uri, scope, state, response_type, code_challenge, code_challenge_method, nonce, resource)}"""
+    return _page_shell("Sign in", "Sign in", body)
+
+
+def _new_password_page_html(np_token, error_message=""):
+    esc = html_mod.escape
+    err_block = ""
+    if error_message:
+        err_block = f'<div class="error">{esc(error_message)}</div>'
+    body = f"""{err_block}
+<form method="POST" action="/login">
+<input type="hidden" name="np_token" value="{esc(np_token)}">
+<label for="new_password">New password</label>
+<input type="password" id="new_password" name="new_password" autocomplete="new-password" required autofocus>
+<label for="confirm_password">Confirm new password</label>
+<input type="password" id="confirm_password" name="confirm_password" autocomplete="new-password" required>
+<button type="submit">Update password</button>
+</form>"""
+    return _page_shell("Change password", "Set a new password", body)
+
+
+def _username_page_html(client_id, redirect_uri, scope, state, response_type,
+                        code_challenge="", code_challenge_method="", nonce="", resource="",
+                        error_message=""):
+    """Step 1 of choice-based sign-in (ALLOW_USER_AUTH): username only."""
+    esc = html_mod.escape
+    err_block = ""
+    if error_message:
+        err_block = f'<div class="error">{esc(error_message)}</div>'
+    body = f"""{err_block}
+<form method="POST" action="/login">
+<input type="hidden" name="auth_flow" value="USER_AUTH">
+<input type="hidden" name="client_id" value="{esc(client_id)}">
+<input type="hidden" name="redirect_uri" value="{esc(redirect_uri)}">
+<input type="hidden" name="scope" value="{esc(scope)}">
+<input type="hidden" name="state" value="{esc(state)}">
+<input type="hidden" name="response_type" value="{esc(response_type)}">
+<input type="hidden" name="code_challenge" value="{esc(code_challenge)}">
+<input type="hidden" name="code_challenge_method" value="{esc(code_challenge_method)}">
+<input type="hidden" name="nonce" value="{esc(nonce)}">
+<input type="hidden" name="resource" value="{esc(resource)}">
+<label for="username">Username</label>
+<input type="text" id="username" name="username" autocomplete="username" required autofocus>
+<button type="submit">Next</button>
+</form>"""
+    return _page_shell("Sign in", "Sign in", body)
+
+
+_CHALLENGE_LABELS = {
+    "PASSWORD": "Password",
+    "EMAIL_OTP": "Email code",
+}
+
+
+def _select_challenge_page_html(ua_token, available_challenges, error_message=""):
+    """Step 2 of choice-based sign-in: pick an authentication method."""
+    esc = html_mod.escape
+    err_block = ""
+    if error_message:
+        err_block = f'<div class="error">{esc(error_message)}</div>'
+    buttons = "\n".join(
+        f'<button type="submit" name="challenge" value="{esc(c)}">'
+        f'{esc(_CHALLENGE_LABELS.get(c, c))}</button>'
+        for c in available_challenges
+    )
+    body = f"""{err_block}
+<form method="POST" action="/login">
+<input type="hidden" name="ua_token" value="{esc(ua_token)}">
+{buttons}
+</form>"""
+    return _page_shell("Sign in", "Choose how to sign in", body)
+
+
+def _password_page_html(ua_token, username, error_message=""):
+    """Step 3 of choice-based sign-in: password entry."""
+    esc = html_mod.escape
+    err_block = ""
+    if error_message:
+        err_block = f'<div class="error">{esc(error_message)}</div>'
+    session = _pending_user_auth.get(ua_token) or {}
+    link = _forgot_password_link(*(session.get(k, "") for k in _HOSTED_OAUTH_FIELDS)) if session else ""
+    body = f"""{err_block}
+<form method="POST" action="/login">
+<input type="hidden" name="ua_token" value="{esc(ua_token)}">
+<label for="password">Password for {esc(username)}</label>
+<input type="password" id="password" name="password" autocomplete="current-password" required autofocus>
+<button type="submit">Sign in</button>
+</form>
+{link}"""
+    return _page_shell("Sign in", "Sign in", body)
+
+
+_HOSTED_OAUTH_FIELDS = ("client_id", "redirect_uri", "scope", "state", "response_type",
+                        "code_challenge", "code_challenge_method", "nonce", "resource")
+
+
+def _forgot_password_link(*oauth_values):
+    query = urlencode(dict(zip(_HOSTED_OAUTH_FIELDS, oauth_values)))
+    return f'<p style="text-align:center;font-size:14px"><a href="/forgotPassword?{html_mod.escape(query)}">Forgot your password?</a></p>'
+
+
+def _oauth_hidden_fields(oauth):
+    esc = html_mod.escape
+    return "\n".join(f'<input type="hidden" name="{k}" value="{esc(oauth.get(k, ""))}">' for k in _HOSTED_OAUTH_FIELDS)
+
+
+def _sign_in_url(oauth):
+    """ministack's sign-in page for the same OAuth request, where AWS's hosted UI has /login."""
+    return "/oauth2/authorize?" + urlencode({k: oauth[k] for k in _HOSTED_OAUTH_FIELDS if oauth.get(k)})
+
+
+def _sign_in_again(oauth):
+    return 302, {"Location": _sign_in_url(oauth), "Cache-Control": "no-store"}, b""
+
+
+def _html_page(html_body, status=200):
+    return status, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+
+
+def _hosted_error_page(error):
+    body = f"""<p style="text-align:center;font-size:14px;margin-bottom:16px">An error was encountered with the requested page.</p>
+<div class="error">{html_mod.escape(error)}</div>"""
+    return _html_page(_page_shell("Sign in", "Sign in", body), 400)
+
+
+def _forgot_password_page_html(oauth, by_email, error_message=""):
+    esc = html_mod.escape
+    err_block = f'<div class="error">{esc(error_message)}</div>' if error_message else ""
+    what = "Email" if by_email else "Username"
+    body = f"""{err_block}
+<form method="POST" action="/login">
+<input type="hidden" name="step" value="forgot_password">
+{_oauth_hidden_fields(oauth)}
+<label for="username">Enter your {what} below and we will send a message to reset your password</label>
+<input type="text" id="username" name="username" autocomplete="username" required autofocus>
+<button type="submit">Reset my password</button>
+</form>"""
+    return _page_shell("Forgot your password?", "Forgot your password?", body)
+
+
+def _confirm_forgot_password_page_html(oauth, username, destination, delivery_medium, error_message=""):
+    """The code-and-new-password page, whose sentence AWS builds from its hidden
+    destination and deliveryMedium fields; after a password mismatch AWS hands
+    those two back swapped, so the sentence reads "...by m***@e*** to EMAIL"."""
+    esc = html_mod.escape
+    err_block = f'<div class="error">{esc(error_message)}</div>' if error_message else ""
+    medium = "email" if delivery_medium == "EMAIL" else delivery_medium
+    sent = f"We have sent a password reset code by {medium} to {destination}. Enter it below to reset your password."
+    body = f"""{err_block}
+<form method="POST" action="/login">
+<input type="hidden" name="step" value="confirm_forgot_password">
+<input type="hidden" name="username" value="{esc(username)}">
+<input type="hidden" name="destination" value="{esc(destination)}">
+<input type="hidden" name="deliveryMedium" value="{esc(delivery_medium)}">
+{_oauth_hidden_fields(oauth)}
+<p style="font-size:14px;margin-bottom:16px">{esc(sent)}</p>
+<label for="code">Code</label>
+<input type="password" id="code" name="code" autocomplete="one-time-code" required autofocus>
+<label for="password">New Password</label>
+<input type="password" id="password" name="password" autocomplete="new-password" required>
+<label for="confirmPassword">Enter New Password Again</label>
+<input type="password" id="confirmPassword" name="confirmPassword" autocomplete="new-password" required>
+<button type="submit">Change Password</button>
+</form>"""
+    return _page_shell("Reset your password", "Reset your password", body)
+
+
+def _masked_phone(phone):
+    return "+" + "*" * max(len(phone) - 5, 0) + phone[-4:]
+
+
+def _mfa_page_html(mfa_token, session, prompt, error_message=""):
+    esc = html_mod.escape
+    err_block = f'<div class="error">{esc(error_message)}</div>' if error_message else ""
+    body = f"""<form method="POST" action="/login">
+<input type="hidden" name="mfa_token" value="{esc(mfa_token)}">
+{_oauth_hidden_fields(session)}
+<label for="authentication_code">{esc(prompt)}</label>
+{err_block}
+<input type="text" id="authentication_code" name="authentication_code" inputmode="numeric" autocomplete="one-time-code" required autofocus>
+<button type="submit">Sign in</button>
+</form>"""
+    return _page_shell("Sign in", "Sign in", body)
+
+
+def _mfa_setup_page_html(mfa_token, session, error_message=""):
+    esc = html_mod.escape
+    err_block = f'<div class="error">{esc(error_message)}</div>' if error_message else ""
+    body = f"""{err_block}
+<form method="POST" action="/login">
+<input type="hidden" name="mfa_token" value="{esc(mfa_token)}">
+{_oauth_hidden_fields(session)}
+<p style="font-size:14px;margin-bottom:4px">1</p>
+<p style="font-size:14px;margin-bottom:12px">Install an authenticator app on your mobile device.</p>
+<p style="font-size:14px;margin-bottom:4px">2</p>
+<p style="font-size:14px;margin-bottom:8px">Scan this QR code with your authenticator app. Alternatively, you can manually enter a secret key in your authenticator app.</p>
+<p style="font-size:14px;margin-bottom:12px"><a id="showSecretKey" href="#" onclick="document.getElementById('secretKeySection').hidden=false;this.hidden=true;document.getElementById('hideSecretKey').hidden=false;return false">Show secret key</a>
+<a id="hideSecretKey" href="#" hidden onclick="document.getElementById('secretKeySection').hidden=true;this.hidden=true;document.getElementById('showSecretKey').hidden=false;return false">Hide secret key</a></p>
+<div id="secretKeySection" hidden>
+<p style="font-size:14px;margin-bottom:4px">Secret key</p>
+<p id="secretKey" style="font-family:monospace;word-break:break-all;margin-bottom:16px">{esc(session["secret"])}</p>
 </div>
-</body>
-</html>"""
+<p style="font-size:14px;margin-bottom:4px">3</p>
+<label for="userCode">Enter a code from your authenticator app</label>
+<input type="text" id="userCode" name="userCode" inputmode="numeric" autocomplete="one-time-code" required autofocus>
+<label for="friendlyDeviceName">Enter a friendly device name - optional</label>
+<input type="text" id="friendlyDeviceName" name="friendlyDeviceName">
+<button type="submit">Sign in</button>
+</form>
+<p style="text-align:center;font-size:14px"><a href="{esc(_sign_in_url(session))}">Back</a></p>"""
+    return _page_shell("Set up authenticator app MFA", "Set up authenticator app MFA", body)
+
+
+def _email_otp_page_html(ua_token, error_message=""):
+    """Step 3 of choice-based sign-in: EMAIL_OTP code entry. The destination
+    email address is intentionally not shown, to avoid user enumeration."""
+    esc = html_mod.escape
+    err_block = ""
+    if error_message:
+        err_block = f'<div class="error">{esc(error_message)}</div>'
+    body = f"""{err_block}
+<form method="POST" action="/login">
+<input type="hidden" name="ua_token" value="{esc(ua_token)}">
+<label for="code">Enter the code we emailed you</label>
+<input type="text" id="code" name="code" inputmode="numeric" autocomplete="one-time-code" required autofocus>
+<button type="submit">Sign in</button>
+</form>"""
+    return _page_shell("Sign in", "Enter verification code", body)
 
 
 # -- /oauth2/authorize (GET) ------------------------------------------------
@@ -2737,6 +8097,7 @@ def _oauth2_authorize_federation(query_params):
     identity_provider = _qp(query_params, "identity_provider")
     state = _qp(query_params, "state")
     scope = _qp(query_params, "scope", "openid")
+    nonce = _qp(query_params, "nonce")
 
     if not client_id:
         return error_response_json("InvalidParameterException", "client_id is required.", 400)
@@ -2745,11 +8106,13 @@ def _oauth2_authorize_federation(query_params):
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Client {client_id} not found.", 400)
 
-    # Validate redirect_uri against CallbackURLs (skip if empty for dev convenience)
     callback_urls = client.get("CallbackURLs", [])
-    if callback_urls and redirect_uri not in callback_urls:
+    if redirect_uri not in callback_urls:
         return error_response_json("InvalidParameterException",
                                    f"redirect_uri {redirect_uri} is not in CallbackURLs.", 400)
+    invalid_scope = _invalid_scope_redirect(client, redirect_uri, _qp(query_params, "scope"), state)
+    if invalid_scope:
+        return invalid_scope
 
     if not identity_provider:
         return error_response_json("InvalidParameterException", "identity_provider is required.", 400)
@@ -2769,6 +8132,8 @@ def _oauth2_authorize_federation(query_params):
         "redirect_uri": redirect_uri,
         "state": state,
         "scope": scope,
+        # Echoed in the ID token issued to the app, not forwarded to the IdP.
+        "nonce": nonce,
         "provider_name": identity_provider,
         "created_at": time.time(),
     }
@@ -2777,28 +8142,32 @@ def _oauth2_authorize_federation(query_params):
     details = provider.get("ProviderDetails", {})
 
     if provider_type == "SAML":
-        # Resolve IdP SSO URL: IDPSSOEndpoint > MetadataURL
-        sso_url = details.get("IDPSSOEndpoint") or details.get("MetadataURL", "")
+        # Resolve IdP SSO URL: IDPSSOEndpoint > MetadataFile > MetadataURL.
+        # MetadataURL is used verbatim because MiniStack does not fetch remote metadata.
+        sso_url = (details.get("IDPSSOEndpoint")
+                   or _saml_sso_url_from_metadata(details.get("MetadataFile", ""))
+                   or details.get("MetadataURL", ""))
         if not sso_url:
-            return error_response_json("InvalidParameterException",
-                                       "SAML provider has no IDPSSOEndpoint or MetadataURL.", 400)
-        saml_request = _build_saml_authn_request(pool_id, sso_url)
+            return error_response_json(
+                "InvalidParameterException",
+                "SAML provider has no IDPSSOEndpoint, MetadataFile with an HTTP-Redirect SingleSignOnService, or MetadataURL.",
+                400)
+        saml_request = _build_saml_authn_request(pool, sso_url)
         redirect_url = sso_url + ("&" if "?" in sso_url else "?") + urlencode({
             "SAMLRequest": saml_request,
             "RelayState": relay_key,
         })
     elif provider_type == "OIDC":
         # OIDC authorize redirect
-        oidc_issuer = details.get("oidc_issuer", "")
-        authorize_url = details.get("authorize_url", f"{oidc_issuer}/authorize" if oidc_issuer else "")
+        authorize_url = _oidc_endpoint(details, "authorize_url")
         if not authorize_url:
             return error_response_json("InvalidParameterException",
-                                       "OIDC provider has no oidc_issuer or authorize_url.", 400)
+                                       "OIDC provider has no authorize_url and none was discovered from its oidc_issuer.", 400)
         oidc_client_id = details.get("client_id", "")
         redirect_url = authorize_url + ("&" if "?" in authorize_url else "?") + urlencode({
             "response_type": response_type or "code",
             "client_id": oidc_client_id,
-            "redirect_uri": _oidc_callback_url(),
+            "redirect_uri": _oidc_callback_url(pool),
             "scope": details.get("authorize_scopes", scope),
             "state": relay_key,
         })
@@ -2808,6 +8177,22 @@ def _oauth2_authorize_federation(query_params):
 
     logger.info("Cognito: OAuth2 authorize redirect to %s for provider %s", provider_type, identity_provider)
     return 302, {"Location": redirect_url, "Content-Type": "text/html"}, b""
+
+
+def _binds_resource(pool, headers):
+    """Managed login (version 2) binds an RFC 8707 resource to the sign-in; the classic hosted UI ignores it.
+
+    MiniStack serves every domain on one host, so the domain is the request's host when it names one of
+    the pool's (a custom domain exactly, a prefix domain as its first label), else any of them.
+    """
+    versions = {d.lower(): v for d, v in (pool.get("_managed_login_versions") or {}).items()}
+    host = next((v for k, v in (headers or {}).items() if k.lower() == "host"), "").split(":")[0].lower()
+    if host in versions:
+        return versions[host] == 2
+    label = host.split(".", 1)[0]
+    if label in versions:
+        return versions[label] == 2
+    return 2 in versions.values()
 
 
 def handle_oauth2_authorize(method, path, headers, query_params):
@@ -2847,13 +8232,26 @@ def handle_oauth2_authorize(method, path, headers, query_params):
         redirect_uri = client.get("DefaultRedirectURI", "")
     if not redirect_uri:
         return _oauth2_error("invalid_request", "redirect_uri is required.")
-    if callback_urls and redirect_uri not in callback_urls:
+    if redirect_uri not in callback_urls:
         return _oauth2_error("invalid_request", f"redirect_uri is not allowed: {redirect_uri}")
+    invalid_scope = _invalid_scope_redirect(client, redirect_uri, scope, state)
+    if invalid_scope:
+        return invalid_scope
+    pkce_error = _pkce_error_redirect(redirect_uri, code_challenge, code_challenge_method, state)
+    if pkce_error:
+        return pkce_error
 
-    html_body = _login_page_html(
-        client_id, redirect_uri, scope, state, response_type,
-        code_challenge, code_challenge_method, nonce,
-    )
+    resource = _qp(query_params, "resource") if _binds_resource(pool, headers) else ""
+    if _use_choice_based_ui(client):
+        html_body = _username_page_html(
+            client_id, redirect_uri, scope, state, response_type,
+            code_challenge, code_challenge_method, nonce, resource=resource,
+        )
+    else:
+        html_body = _login_page_html(
+            client_id, redirect_uri, scope, state, response_type,
+            code_challenge, code_challenge_method, nonce, resource=resource,
+        )
     return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
 
 
@@ -2874,12 +8272,25 @@ def _saml2_idp_response(body: bytes, query_params):
     relay_state = form.get("RelayState", "")
 
     if not saml_response_b64:
-        return error_response_json("InvalidParameterException", "SAMLResponse is required.", 400)
+        logger.warning("Cognito SAML callback: missing `SAMLResponse` form field")
+        return error_response_json("InvalidParameterException",
+                                   "SAML callback missing `SAMLResponse` form field.", 400)
 
     # Look up relay context
     relay = _auth_codes.pop(relay_state, None)
     if not relay or relay.get("type") != "relay":
-        return error_response_json("InvalidParameterException", "Invalid or expired RelayState.", 400)
+        logger.warning(
+            "Cognito SAML callback: no matching relay for RelayState=%s (expired after %ds, "
+            "already consumed, or never issued by /oauth2/authorize). "
+            "Re-start the federated login flow from /oauth2/authorize.",
+            relay_state, _AUTH_CODE_TTL,
+        )
+        return error_response_json(
+            "InvalidParameterException",
+            "SAML callback `RelayState` does not match any pending authorize flow "
+            "(expired, already consumed, or unknown).",
+            400,
+        )
 
     pool_id = relay["pool_id"]
     client_id = relay["client_id"]
@@ -2910,42 +8321,69 @@ def _saml2_idp_response(body: bytes, query_params):
     # Apply attribute mapping: IdP claim name → Cognito attribute name
     attr_mapping = provider.get("AttributeMapping", {})
     reverse_mapping = {v: k for k, v in attr_mapping.items()}  # IdP claim → Cognito attr
+    try:
+        to_map = _apply_inbound_federation_trigger(
+            pool_id, client_id, name_id, provider_name, "SAML",
+            {"samlResponse": saml_data["attributes"]})
+        idp_attrs = (_drop_unmapped_reserved_claims(to_map, attr_mapping) if to_map
+                     else dict(saml_data.get("attributes", {})))
+    except _InboundFederationRejected as e:
+        logger.info("Cognito: InboundFederation Lambda rejected SAML sign-in for %s: %s",
+                    name_id, e)
+        return error_response_json("UserLambdaValidationException", str(e), 400)
     user_attrs = {}
-    for idp_claim, value in saml_data.get("attributes", {}).items():
+    for idp_claim, value in idp_attrs.items():
         cognito_attr = reverse_mapping.get(idp_claim, idp_claim)
         user_attrs[cognito_attr] = value
 
-    # Create or update federated user
-    username = f"{provider_name}_{name_id}"
+    # Create or update federated user. A profile linked ahead of this first
+    # sign-in wins over minting a new `{Provider}_id` one (#1499).
+    username = (_linked_username_for_federation(pool, provider_name, name_id, user_attrs)
+                or f"{provider_name}_{name_id}")
     existing_user = pool["_users"].get(username)
     now = _now_epoch()
 
     if existing_user:
-        # Update attributes
-        existing_dict = _attr_list_to_dict(existing_user.get("Attributes", []))
-        existing_dict.update(user_attrs)
-        existing_user["Attributes"] = _dict_to_attr_list(existing_dict)
-        existing_user["UserLastModifiedDate"] = now
-        sub = existing_dict.get("sub", new_uuid())
+        sub = _merge_federated_attrs(existing_user, user_attrs, now)
     else:
         sub = new_uuid()
-        user_attrs["sub"] = sub
         if "email" not in user_attrs:
             user_attrs["email"] = name_id if "@" in name_id else ""
-        user = {
-            "Username": username,
-            "Attributes": _dict_to_attr_list(user_attrs),
-            "UserCreateDate": now,
-            "UserLastModifiedDate": now,
-            "Enabled": True,
-            "UserStatus": "EXTERNAL_PROVIDER",
-            "MFAOptions": [],
-            "_password": "",
-            "_groups": [],
-            "_tokens": [],
-        }
-        pool["_users"][username] = user
-        pool["EstimatedNumberOfUsers"] = len(pool["_users"])
+        try:
+            presignup = _apply_presignup_trigger(pool_id, client_id, username, user_attrs)
+        except _PreSignUpRejected as e:
+            logger.info("Cognito: PreSignUp Lambda rejected SAML federation sign-up for %s: %s",
+                        username, e)
+            return error_response_json("UserLambdaValidationException", str(e), 400)
+        # A PreSignUp link (AdminLinkProviderForUser) signs in as the linked profile.
+        linked_username = _linked_username_for_federation(
+            pool, provider_name, name_id, user_attrs)
+        if linked_username:
+            username = linked_username
+            if not user_attrs.get("email"):
+                user_attrs.pop("email", None)  # placeholder must not blank the profile's email
+            sub = _merge_federated_attrs(pool["_users"][username], user_attrs, now)
+        else:
+            if presignup["autoVerifyEmail"] and "email" in user_attrs:
+                user_attrs["email_verified"] = "true"
+            if presignup["autoVerifyPhone"] and "phone_number" in user_attrs:
+                user_attrs["phone_number_verified"] = "true"
+            user_attrs["sub"] = sub
+            user = {
+                "Username": username,
+                "Attributes": _dict_to_attr_list(user_attrs),
+                "UserCreateDate": now,
+                "UserLastModifiedDate": now,
+                "Enabled": True,
+                "UserStatus": "EXTERNAL_PROVIDER",
+                "MFAOptions": [],
+                "_password": "",
+                "_groups": [],
+                "_tokens": [],
+            }
+            pool["_users"][username] = user
+            pool["EstimatedNumberOfUsers"] = len(pool["_users"])
+            _start_federated_profile(pool, pool_id, user, provider_name, name_id)
 
     # Generate authorization code
     _cleanup_expired_relay_codes()
@@ -2958,6 +8396,7 @@ def _saml2_idp_response(body: bytes, query_params):
         "sub": sub,
         "redirect_uri": redirect_uri,
         "scopes": relay.get("scope", "openid"),
+        "nonce": relay.get("nonce", ""),
         "created_at": time.time(),
     }
 
@@ -3019,13 +8458,28 @@ def _oauth2_idp_response(method, body, query_params):
             pass
 
     if not code:
-        return error_response_json("InvalidParameterException", "code is required.", 400)
+        logger.warning("Cognito OIDC callback: missing `code` query param")
+        return error_response_json("InvalidParameterException",
+                                   "OIDC callback missing `code` query parameter.", 400)
     if not state:
-        return error_response_json("InvalidParameterException", "state is required.", 400)
+        logger.warning("Cognito OIDC callback: missing `state` query param")
+        return error_response_json("InvalidParameterException",
+                                   "OIDC callback missing `state` query parameter.", 400)
 
     relay = _auth_codes.pop(state, None)
     if not relay or relay.get("type") != "relay":
-        return error_response_json("InvalidParameterException", "Invalid or expired state.", 400)
+        logger.warning(
+            "Cognito OIDC callback: no matching relay for state=%s (expired after %ds, "
+            "already consumed, or never issued by /oauth2/authorize). "
+            "Re-start the federated login flow from /oauth2/authorize.",
+            state, _AUTH_CODE_TTL,
+        )
+        return error_response_json(
+            "InvalidParameterException",
+            "OIDC callback `state` does not match any pending authorize flow "
+            "(expired, already consumed, or unknown).",
+            400,
+        )
 
     pool_id = relay["pool_id"]
     client_id = relay["client_id"]
@@ -3043,11 +8497,10 @@ def _oauth2_idp_response(method, body, query_params):
                                    f"OIDC provider {provider_name} not found.", 400)
 
     details = provider.get("ProviderDetails", {})
-    oidc_issuer = details.get("oidc_issuer", "")
-    token_url = details.get("token_url") or (f"{oidc_issuer}/token" if oidc_issuer else "")
+    token_url = _oidc_endpoint(details, "token_url")
     if not token_url:
         return error_response_json("InvalidParameterException",
-                                   "OIDC provider has no token_url or oidc_issuer.", 400)
+                                   "OIDC provider has no token_url and none was discovered from its oidc_issuer.", 400)
 
     oidc_client_id = details.get("client_id", "")
     oidc_client_secret = details.get("client_secret", "")
@@ -3056,7 +8509,7 @@ def _oauth2_idp_response(method, body, query_params):
     token_body = urlencode({
         "grant_type": "authorization_code",
         "code": code,
-        "redirect_uri": _oidc_callback_url(),
+        "redirect_uri": _oidc_callback_url(pool),
         "client_id": oidc_client_id,
         "client_secret": oidc_client_secret,
     }).encode("ascii")
@@ -3102,14 +8555,30 @@ def _oauth2_idp_response(method, body, query_params):
     # as the SAML branch.
     attr_mapping = provider.get("AttributeMapping", {})
     reverse_mapping = {v: k for k, v in attr_mapping.items()}
+    try:
+        to_map = _apply_inbound_federation_trigger(
+            pool_id, client_id, claims.get('sub') or claims.get('email') or '',
+            provider_name, "OIDC", {"idToken": claims})
+    except _InboundFederationRejected as e:
+        logger.info("Cognito: InboundFederation Lambda rejected OIDC sign-in for %s: %s",
+                    claims.get("sub"), e)
+        return error_response_json("UserLambdaValidationException", str(e), 400)
+    if to_map:
+        idp_claims = _drop_unmapped_reserved_claims(to_map, attr_mapping)
+    else:
+        idp_claims = {}
+        for k, v in claims.items():
+            if k in _FEDERATION_RESERVED_CLAIMS:
+                continue
+            if k in reverse_mapping:
+                value = _federation_claim_value(v)
+            else:
+                value = str(v) if isinstance(v, (str, int, float, bool)) else None
+            if value is not None:
+                idp_claims[k] = value
     user_attrs = {}
-    for idp_claim, value in claims.items():
-        if idp_claim in ("iss", "aud", "exp", "iat", "nbf", "jti", "azp", "auth_time"):
-            continue
-        if not isinstance(value, (str, int, float, bool)):
-            continue
-        cognito_attr = reverse_mapping.get(idp_claim, idp_claim)
-        user_attrs[cognito_attr] = str(value)
+    for idp_claim, value in idp_claims.items():
+        user_attrs[reverse_mapping.get(idp_claim, idp_claim)] = value
 
     # Stable identifier: prefer `sub` from id_token, fall back to `email` or
     # a generated UUID so users can be re-found on subsequent logins.
@@ -3121,35 +8590,50 @@ def _oauth2_idp_response(method, body, query_params):
         return error_response_json("InvalidParameterException",
                                    "OIDC id_token has no `sub` or `email` claim.", 400)
 
-    username = f"{provider_name}_{name_id}"
+    username = (_linked_username_for_federation(pool, provider_name, name_id, user_attrs)
+                or f"{provider_name}_{name_id}")
     existing_user = pool["_users"].get(username)
     now = _now_epoch()
 
     if existing_user:
-        existing_dict = _attr_list_to_dict(existing_user.get("Attributes", []))
-        existing_dict.update(user_attrs)
-        existing_user["Attributes"] = _dict_to_attr_list(existing_dict)
-        existing_user["UserLastModifiedDate"] = now
-        sub = existing_dict.get("sub", new_uuid())
+        sub = _merge_federated_attrs(existing_user, user_attrs, now)
     else:
         sub = new_uuid()
-        user_attrs["sub"] = sub
         if "email" not in user_attrs and "@" in name_id:
             user_attrs["email"] = name_id
-        user = {
-            "Username": username,
-            "Attributes": _dict_to_attr_list(user_attrs),
-            "UserCreateDate": now,
-            "UserLastModifiedDate": now,
-            "Enabled": True,
-            "UserStatus": "EXTERNAL_PROVIDER",
-            "MFAOptions": [],
-            "_password": "",
-            "_groups": [],
-            "_tokens": [],
-        }
-        pool["_users"][username] = user
-        pool["EstimatedNumberOfUsers"] = len(pool["_users"])
+        try:
+            presignup = _apply_presignup_trigger(pool_id, client_id, username, user_attrs)
+        except _PreSignUpRejected as e:
+            logger.info("Cognito: PreSignUp Lambda rejected OIDC federation sign-up for %s: %s",
+                        username, e)
+            return error_response_json("UserLambdaValidationException", str(e), 400)
+        # A PreSignUp link (AdminLinkProviderForUser) signs in as the linked profile.
+        linked_username = _linked_username_for_federation(
+            pool, provider_name, name_id, user_attrs)
+        if linked_username:
+            username = linked_username
+            sub = _merge_federated_attrs(pool["_users"][username], user_attrs, now)
+        else:
+            if presignup["autoVerifyEmail"] and "email" in user_attrs:
+                user_attrs["email_verified"] = "true"
+            if presignup["autoVerifyPhone"] and "phone_number" in user_attrs:
+                user_attrs["phone_number_verified"] = "true"
+            user_attrs["sub"] = sub
+            user = {
+                "Username": username,
+                "Attributes": _dict_to_attr_list(user_attrs),
+                "UserCreateDate": now,
+                "UserLastModifiedDate": now,
+                "Enabled": True,
+                "UserStatus": "EXTERNAL_PROVIDER",
+                "MFAOptions": [],
+                "_password": "",
+                "_groups": [],
+                "_tokens": [],
+            }
+            pool["_users"][username] = user
+            pool["EstimatedNumberOfUsers"] = len(pool["_users"])
+            _start_federated_profile(pool, pool_id, user, provider_name, name_id)
 
     # Issue MiniStack auth code so the app's /oauth2/token call works.
     _cleanup_expired_relay_codes()
@@ -3162,6 +8646,7 @@ def _oauth2_idp_response(method, body, query_params):
         "sub": sub,
         "redirect_uri": redirect_uri,
         "scopes": relay.get("scope", "openid"),
+        "nonce": relay.get("nonce", ""),
         "created_at": time.time(),
         "_oidc_access_token": access_token,  # kept for /oauth2/userInfo passthrough
     }
@@ -3176,53 +8661,246 @@ def _oauth2_idp_response(method, body, query_params):
 
 # -- /login (POST) ----------------------------------------------------------
 
-def handle_login_submit(method, path, headers, body, query_params):
-    """POST /login — process the login form and redirect with auth code."""
-    form: dict = {}
-    if body:
-        try:
-            parsed = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
-            form = {k: v[0] for k, v in parsed.items()}
-        except Exception:
-            pass
+def _hosted_mfa_kind(pool, user):
+    """The page a hosted UI sign-in shows after the password: "verify" (TOTP),
+    "sms", "setup" (TOTP enrolment, only where the pool requires MFA and allows
+    TOTP), or None for the authorization code."""
+    mfa = pool.get("MfaConfiguration", "OFF")
+    if mfa == "OFF":
+        return None
+    enabled = user.get("_mfa_enabled") or []
+    totp = bool(user.get("_totp_secret")) and ("SOFTWARE_TOKEN_MFA" in enabled or user.get("_totp_hosted"))
+    sms = "SMS_MFA" in enabled
+    if totp and sms:
+        return "sms" if user.get("_preferred_mfa") == "SMS_MFA" else "verify"
+    if totp:
+        return "verify"
+    if sms:
+        return "sms"
+    if mfa != "ON":
+        return None
+    if (pool.get("SoftwareTokenMfaConfiguration") or {}).get("Enabled"):
+        return "setup"
+    if (_attr_list_to_dict(user.get("Attributes", [])).get("phone_number")
+            and (pool.get("SmsMfaConfiguration") or pool.get("SmsConfiguration"))):
+        return "sms"
+    # MFA is required and the user has no factor they can use or set up: AWS refuses the sign-in.
+    return "unavailable"
 
-    username = form.get("username", "")
-    password = form.get("password", "")
-    client_id = form.get("client_id", "")
-    redirect_uri = form.get("redirect_uri", "")
-    scope = form.get("scope", "")
-    state = form.get("state", "")
-    response_type = form.get("response_type", "code")
-    code_challenge = form.get("code_challenge", "")
-    code_challenge_method = form.get("code_challenge_method", "")
-    nonce = form.get("nonce", "")
 
-    pool_id, pool, client = _find_pool_by_client_id(client_id)
+def _hosted_mfa_prompt(session, user):
+    if session["kind"] == "sms":
+        phone = _attr_list_to_dict(user.get("Attributes", [])).get("phone_number", "")
+        return f"Enter the code that was sent by sms to {_masked_phone(phone)}."
+    return f"Please enter the code from {user.get('_totp_device_name') or 'your passcode app'}."
+
+
+def _finish_password_sign_in(pool, pool_id, user, oauth):
+    """After a hosted UI password: the MFA challenge or enrolment page, or the authorization code."""
+    kind = _hosted_mfa_kind(pool, user)
+    if kind == "unavailable":
+        return _hosted_error_page("MFA is required and no MFA method is available for this user.")
+    if kind:
+        now = time.time()
+        for stale in [t for t, s in _pending_hosted_mfa.items() if s["expires_at"] < now]:
+            _pending_hosted_mfa.pop(stale, None)
+        client = (pool.get("_clients") or {}).get(oauth.get("client_id"), {})
+        token = secrets.token_urlsafe(24)
+        session = _pending_hosted_mfa[token] = {
+            **{k: oauth.get(k, "") for k in _HOSTED_OAUTH_FIELDS}, "pool_id": pool_id,
+            "username": user["Username"], "kind": kind,
+            "secret": base64.b32encode(secrets.token_bytes(32)).decode().rstrip("=") if kind == "setup" else None,
+            "expires_at": now + client.get("AuthSessionValidity", 3) * 60,
+        }
+        if kind == "setup":
+            return _html_page(_mfa_setup_page_html(token, session))
+        return _html_page(_mfa_page_html(token, session, _hosted_mfa_prompt(session, user)))
+    return _issue_auth_code_redirect(
+        oauth["client_id"], pool_id, oauth["redirect_uri"], oauth["scope"], user["Username"],
+        oauth.get("nonce", ""), oauth.get("code_challenge", ""), oauth.get("code_challenge_method", ""),
+        oauth.get("state", ""), resource=oauth.get("resource", ""))
+
+
+def _totp_matching_step(secret_b32, user_code):
+    """The 30-second step whose code `user_code` is, within the drift `_totp_matches` allows, or None."""
+    if not secret_b32 or not isinstance(user_code, str):
+        return None
+    now_step = int(time.time() // 30)
+    try:
+        return next((step for step in (now_step - 1, now_step, now_step + 1)
+                     if hmac.compare_digest(_totp_code_at(secret_b32, step), user_code)), None)
+    except Exception:
+        return None
+
+
+# AWS's lockout for failed sign-in attempts, which it applies to MFA codes: after five failures the user is locked
+# for 2^(n-5) seconds, up to about 15 minutes. Attempts while locked don't count; a success, or 15 quiet minutes
+# after a lockout, resets it.
+_MFA_LOCKOUT_AFTER = 5
+_MFA_LOCKOUT_MAX_SECONDS = 900
+
+
+def _mfa_locked(user, now):
+    if (user.get("_mfa_failures", 0) >= _MFA_LOCKOUT_AFTER
+            and now - user.get("_mfa_last_failure", 0) >= _MFA_LOCKOUT_MAX_SECONDS):
+        _mfa_reset(user)
+    return now < user.get("_mfa_locked_until", 0)
+
+
+def _mfa_failed(user, now):
+    failures = user["_mfa_failures"] = user.get("_mfa_failures", 0) + 1
+    user["_mfa_last_failure"] = now
+    if failures >= _MFA_LOCKOUT_AFTER:
+        user["_mfa_locked_until"] = now + min(2 ** min(failures - _MFA_LOCKOUT_AFTER, 10), _MFA_LOCKOUT_MAX_SECONDS)
+
+
+def _mfa_reset(user):
+    for key in ("_mfa_failures", "_mfa_last_failure", "_mfa_locked_until"):
+        user.pop(key, None)
+
+
+def _handle_hosted_mfa_submit(mfa_token, form):
+    """The MFA challenge or enrolment page's submission. TOTP codes are checked
+    for real, as for the API; an SMS code is accepted as the API's SMS_MFA
+    challenge accepts it."""
+    session = _pending_hosted_mfa.get(mfa_token)
+    if not session or session["expires_at"] < time.time():
+        _pending_hosted_mfa.pop(mfa_token, None)
+        oauth = session or _extract_oauth_form_params(form)
+        if oauth.get("client_id"):
+            return _sign_in_again(oauth)
+        return _oauth2_error("invalid_request", "Session has expired. Please sign in again.")
+    pool = _get_pool_unscoped(session["pool_id"])
+    user = _resolve_user(pool, session["username"])[0] if pool else None
+    if not user:
+        _pending_hosted_mfa.pop(mfa_token, None)
+        return _oauth2_error("invalid_request", "Session has expired. Please sign in again.")
+    kind = session["kind"]
+
+    def again(message):
+        if kind == "setup":
+            return _html_page(_mfa_setup_page_html(mfa_token, session, message))
+        return _html_page(_mfa_page_html(mfa_token, session, _hosted_mfa_prompt(session, user), message))
+
+    status_error = _hosted_ui_user_status_error(user)
+    if status_error:
+        return again(status_error)
+    if kind == "setup":
+        if not _totp_matches(session["secret"], form.get("userCode", "").strip()):
+            return again("Invalid or expired code entered. Try again.")
+        user["_totp_secret"] = session["secret"]
+        user["_totp_hosted"] = True
+        user.pop("_totp_pending_secret", None)
+        device_name = form.get("friendlyDeviceName", "").strip()
+        if device_name:
+            user["_totp_device_name"] = device_name
+        else:
+            user.pop("_totp_device_name", None)
+    elif kind == "verify":
+        code = form.get("authentication_code", "").strip()
+        if not code:
+            return again("Missing required parameter SOFTWARE_TOKEN_MFA_CODE")
+        now = time.time()
+        if _mfa_locked(user, now):
+            return again("Too many invalid credentials attempts. User temporarily locked. "
+                         "Please try again after few seconds.")
+        step = _totp_matching_step(user.get("_totp_secret"), code)
+        if step is None:
+            _mfa_failed(user, now)
+            return again("The code entered is invalid, please try again.")
+        if step == user.get("_totp_used_step"):
+            return again("Your software token has already been used once.")
+        user["_totp_used_step"] = step
+        _mfa_reset(user)
+    del _pending_hosted_mfa[mfa_token]
+    return _issue_auth_code_redirect(
+        session["client_id"], session["pool_id"], session["redirect_uri"], session["scope"], user["Username"],
+        session["nonce"], session["code_challenge"], session["code_challenge_method"], session["state"],
+        resource=session.get("resource", ""))
+
+
+def handle_forgot_password_page(method, path, headers, query_params):
+    """GET /forgotPassword — the page the sign-in page's "Forgot your password?"
+    link opens. AWS sends a bad request to /error with a 302; it is rendered here."""
+    oauth = {k: _qp(query_params, k) for k in _HOSTED_OAUTH_FIELDS}
+    _pool_id, pool, client = _find_pool_by_client_id(oauth["client_id"])
     if not pool:
-        return _oauth2_error("invalid_client", f"Client {client_id} not found.")
+        return _oauth2_error("invalid_client", f"Client {oauth['client_id']} not found.")
+    if oauth["redirect_uri"] not in (client.get("CallbackURLs") or []):
+        return _hosted_error_page("redirect_mismatch")
+    if oauth["response_type"] != "code":
+        return _hosted_error_page("unauthorized_client")
+    return _html_page(_forgot_password_page_html(oauth, "email" in (pool.get("UsernameAttributes") or [])))
 
-    # Authenticate user
-    error_msg = ""
-    user, _err = _resolve_user(pool, username)
-    if _err:
-        user = None
-        error_msg = "Incorrect username or password."
-    elif not user.get("Enabled", True):
-        error_msg = "User is disabled."
-    elif user.get("UserStatus") not in ("CONFIRMED", "FORCE_CHANGE_PASSWORD"):
-        error_msg = "User is not confirmed."
-    elif user.get("_password") != password:
-        error_msg = "Incorrect username or password."
 
-    if error_msg:
-        html_body = _login_page_html(
-            client_id, redirect_uri, scope, state, response_type,
-            code_challenge, code_challenge_method, nonce,
-            error_message=error_msg,
-        )
-        return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+def _hosted_reset_refused(user):
+    """Whether the hosted UI refuses to send this user a reset code, as it does an unknown one."""
+    if user is None or not user.get("Enabled", True) or user.get("UserStatus") == "FORCE_CHANGE_PASSWORD":
+        return True
+    attrs = _attr_list_to_dict(user.get("Attributes", []))
+    return not attrs.get("email") or str(attrs.get("email_verified", "")).lower() != "true"
 
-    # Generate authorization code
+
+def _handle_forgot_password_submit(form):
+    oauth = _extract_oauth_form_params(form)
+    _pool_id, pool, _client = _find_pool_by_client_id(oauth["client_id"])
+    if not pool:
+        return _oauth2_error("invalid_client", f"Client {oauth['client_id']} not found.")
+    username = form.get("username", "")
+    if _hosted_reset_refused(_resolve_user(pool, username)[0]):
+        if not _hides_user_existence(pool, oauth["client_id"]):
+            return _html_page(_forgot_password_page_html(
+                oauth, "email" in (pool.get("UsernameAttributes") or []),
+                "Could not reset password for the account, please contact support or try again"))
+        destination = _masked_destination(username)
+    else:
+        _status, _, body = _forgot_password({"ClientId": oauth["client_id"], "Username": username})
+        destination = json.loads(body)["CodeDeliveryDetails"]["Destination"]
+    return _html_page(_confirm_forgot_password_page_html(oauth, username, destination, "EMAIL"))
+
+
+def _handle_confirm_forgot_password_submit(form):
+    """The confirm page's submission, refused in AWS's order: a password
+    mismatch, then the code (checked under AUTH=true only, as for the API),
+    then the password policy."""
+    oauth = _extract_oauth_form_params(form)
+    _pool_id, pool, _client = _find_pool_by_client_id(oauth["client_id"])
+    if not pool:
+        return _oauth2_error("invalid_client", f"Client {oauth['client_id']} not found.")
+    username, password, code = form.get("username", ""), form.get("password", ""), form.get("code", "").strip()
+    destination, medium = form.get("destination", ""), form.get("deliveryMedium", "")
+
+    def again(message, destination=destination, medium=medium):
+        return _html_page(_confirm_forgot_password_page_html(oauth, username, destination, medium, message))
+
+    if password != form.get("confirmPassword", ""):
+        return again("Password does not match the confirm password.", destination=medium, medium=destination)
+    invalid_code = "Invalid verification code provided, please try again."
+    from ministack.app import AUTH
+    if AUTH:
+        user = _resolve_user(pool, username)[0]
+        if user is None or _code_error(user.get("_reset_code"), code):
+            return again(invalid_code)
+    policy = _password_policy_errors(pool, password)
+    if policy:
+        reason = "Password not long enough" if policy[0].startswith("Password must have length") else policy[0]
+        return again(f"Password does not conform to policy: {reason}")
+    status, _, _body = _confirm_forgot_password(
+        {"ClientId": oauth["client_id"], "Username": username, "ConfirmationCode": code, "Password": password})
+    if status >= 400:
+        return again(invalid_code)
+    return _sign_in_again(oauth)
+
+
+def _issue_auth_code_redirect(client_id, pool_id, redirect_uri, scope, username, nonce,
+                               code_challenge, code_challenge_method, state, resource=""):
+    """Mint an authorization code and build the 302 redirect response for the Hosted UI."""
+    client = _find_pool_by_client_id(client_id)[2] or {}
+    if redirect_uri not in client.get("CallbackURLs", []):
+        return _oauth2_error("invalid_request", f"redirect_uri is not allowed: {redirect_uri}")
+    pkce_error = _pkce_error_redirect(redirect_uri, code_challenge, code_challenge_method, state)
+    if pkce_error:
+        return pkce_error
     code = _generate_auth_code()
     _authorization_codes[code] = {
         "client_id": client_id,
@@ -3233,10 +8911,10 @@ def handle_login_submit(method, path, headers, body, query_params):
         "nonce": nonce,
         "code_challenge": code_challenge,
         "code_challenge_method": code_challenge_method,
+        "resource": resource,
         "expires_at": time.time() + 300,
     }
 
-    # Redirect with code
     sep = "&" if "?" in redirect_uri else "?"
     location = f"{redirect_uri}{sep}code={quote(code)}"
     if state:
@@ -3245,7 +8923,359 @@ def handle_login_submit(method, path, headers, body, query_params):
     return 302, {"Location": location, "Cache-Control": "no-store"}, b""
 
 
+def _hosted_ui_user_status_error(user) -> str:
+    """Disabled/unconfirmed checks shared by every Hosted UI first-factor path
+    (PASSWORD and EMAIL_OTP alike), applied once a user has been resolved."""
+    if not user.get("Enabled", True):
+        return "User is disabled."
+    if user.get("UserStatus") not in ("CONFIRMED", "FORCE_CHANGE_PASSWORD"):
+        return "User is not confirmed."
+    return ""
+
+
+def _authenticate_hosted_ui_user(pool, username, password):
+    """Validate username/password for the Hosted UI login paths.
+
+    Returns (user, error_msg); error_msg is empty on success. "No such user"
+    and "wrong password" intentionally share the same error text so the
+    Hosted UI never reveals whether a username exists by that path alone;
+    the disabled/unconfirmed messages below do distinguish an existing
+    account from a nonexistent one, matching the pre-existing single-page
+    login behavior this helper was extracted from.
+    """
+    user, _err = _resolve_user(pool, username)
+    if _err:
+        return None, "Incorrect username or password."
+    status_error = _hosted_ui_user_status_error(user)
+    if status_error:
+        return None, status_error
+    if _password_signin_refused(user) is not None:
+        return None, "Incorrect username or password."
+    if user.get("_password") != password:
+        return None, "Incorrect username or password."
+    return user, ""
+
+
+def _extract_oauth_form_params(form: dict) -> dict:
+    """Pull the OAuth2 authorize-request fields that the Hosted UI carries as hidden
+    form fields across its login/username/challenge steps, with their defaults."""
+    return {
+        "client_id": form.get("client_id", ""),
+        "redirect_uri": form.get("redirect_uri", ""),
+        "scope": form.get("scope", ""),
+        "state": form.get("state", ""),
+        "response_type": form.get("response_type", "code"),
+        "code_challenge": form.get("code_challenge", ""),
+        "code_challenge_method": form.get("code_challenge_method", ""),
+        "nonce": form.get("nonce", ""),
+        "resource": form.get("resource", ""),
+    }
+
+
+def _start_new_password_session(pool_id, client_id, username, redirect_uri, scope, state,
+                                response_type, nonce, code_challenge, code_challenge_method, resource="") -> str:
+    """Create a `_pending_new_password` session for a FORCE_CHANGE_PASSWORD user reached
+    via either Hosted UI login path (single-page or choice-based), returning its token."""
+    np_token = secrets.token_urlsafe(24)
+    _pending_new_password[np_token] = {
+        "pool_id": pool_id,
+        "client_id": client_id,
+        "username": username,
+        "redirect_uri": redirect_uri,
+        "scope": scope,
+        "state": state,
+        "response_type": response_type,
+        "nonce": nonce,
+        "code_challenge": code_challenge,
+        "code_challenge_method": code_challenge_method,
+        "resource": resource,
+        "expires_at": time.time() + _NEW_PASSWORD_SESSION_TTL,
+    }
+    return np_token
+
+
+def handle_login_submit(method, path, headers, body, query_params):
+    """POST /login — process the login form and redirect with auth code."""
+    form: dict = {}
+    if body:
+        try:
+            parsed = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
+            form = {k: v[0] for k, v in parsed.items()}
+        except Exception:
+            pass
+
+    np_token = form.get("np_token", "")
+    if np_token:
+        return _handle_new_password_submit(np_token, form)
+    if form.get("resource") and not _binds_resource(_find_pool_by_client_id(form.get("client_id", ""))[1] or {}, headers):
+        form["resource"] = ""
+
+    if form.get("mfa_token"):
+        return _handle_hosted_mfa_submit(form["mfa_token"], form)
+    if form.get("step") == "forgot_password":
+        return _handle_forgot_password_submit(form)
+    if form.get("step") == "confirm_forgot_password":
+        return _handle_confirm_forgot_password_submit(form)
+
+    ua_token = form.get("ua_token", "")
+    if ua_token:
+        return _handle_user_auth_submit(ua_token, form)
+
+    if form.get("auth_flow") == "USER_AUTH":
+        return _handle_user_auth_start(form)
+
+    username = form.get("username", "")
+    password = form.get("password", "")
+    oauth = _extract_oauth_form_params(form)
+    client_id = oauth["client_id"]
+    redirect_uri = oauth["redirect_uri"]
+    scope = oauth["scope"]
+    state = oauth["state"]
+    response_type = oauth["response_type"]
+    code_challenge = oauth["code_challenge"]
+    code_challenge_method = oauth["code_challenge_method"]
+    nonce = oauth["nonce"]
+    resource = oauth["resource"]
+
+    pool_id, pool, client = _find_pool_by_client_id(client_id)
+    if not pool:
+        return _oauth2_error("invalid_client", f"Client {client_id} not found.")
+
+    user, error_msg = _authenticate_hosted_ui_user(pool, username, password)
+
+    if error_msg:
+        html_body = _login_page_html(
+            client_id, redirect_uri, scope, state, response_type,
+            code_challenge, code_challenge_method, nonce, resource=resource,
+            error_message=error_msg,
+        )
+        return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+
+    if user.get("UserStatus") == "FORCE_CHANGE_PASSWORD":
+        np_token = _start_new_password_session(
+            pool_id, client_id, user["Username"], redirect_uri, scope, state,
+            response_type, nonce, code_challenge, code_challenge_method, resource=resource,
+        )
+        html_body = _new_password_page_html(np_token)
+        return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+
+    return _finish_password_sign_in(pool, pool_id, user, oauth)
+
+
+_EMAIL_OTP_CODE = "123456"
+
+
+def _begin_user_auth_challenge(pool, ua_token, session, challenge):
+    """Confirm the chosen first factor for a pending choice-based sign-in
+    session and render its page. For EMAIL_OTP, this is also when the code
+    is generated and mailed; a missing user or email intentionally leaves
+    `otp_code` unset instead of erroring, so the page renders identically
+    either way and verification simply fails later (avoids user enumeration).
+    """
+    session["challenge"] = challenge
+    if challenge == "EMAIL_OTP":
+        user, _err = _resolve_user(pool, session["username"])
+        attr_dict = _attr_list_to_dict(user.get("Attributes", [])) if user else {}
+        if user and attr_dict.get("email"):
+            session["otp_code"] = _EMAIL_OTP_CODE
+            # AWS leaves the sign-in's ClientMetadata out of this event.
+            _send_email_otp(pool, session["username"], attr_dict, _EMAIL_OTP_CODE, sender={
+                "trigger": "Authentication", "user_name": user["Username"], "user_status": user.get("UserStatus"),
+                "client_id": session.get("client_id")})
+        return _email_otp_page_html(ua_token)
+    return _password_page_html(ua_token, session["username"])
+
+
+def _handle_user_auth_start(form):
+    """POST /login with `auth_flow=USER_AUTH` — step 1 of choice-based sign-in.
+
+    Only collects the username. Real Cognito's USER_AUTH flow returns
+    AvailableChallenges regardless of whether the username exists (to avoid
+    user enumeration), so no user lookup happens here.
+    """
+    username = form.get("username", "")
+    oauth = _extract_oauth_form_params(form)
+    client_id = oauth["client_id"]
+
+    pool_id, pool, client = _find_pool_by_client_id(client_id)
+    if not pool:
+        return _oauth2_error("invalid_client", f"Client {client_id} not found.")
+    if not _use_choice_based_ui(client):
+        return _oauth2_error("invalid_request", "USER_AUTH flow not allowed for this client.")
+
+    available_challenges = _available_first_auth_factors(pool)
+    ua_token = secrets.token_urlsafe(24)
+    session = {
+        "pool_id": pool_id,
+        "username": username,
+        "available_challenges": available_challenges,
+        "challenge": "",
+        "expires_at": time.time() + _USER_AUTH_SESSION_TTL,
+        **oauth,
+    }
+    _pending_user_auth[ua_token] = session
+
+    if len(available_challenges) == 1:
+        html_body = _begin_user_auth_challenge(pool, ua_token, session, available_challenges[0])
+    else:
+        html_body = _select_challenge_page_html(ua_token, available_challenges)
+    return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+
+
+def _handle_user_auth_submit(ua_token, form):
+    """POST /login with `ua_token` — steps 2/3 of choice-based sign-in: challenge
+    selection and challenge verification (PASSWORD or EMAIL_OTP)."""
+    session = _pending_user_auth.get(ua_token)
+    if not session or session["expires_at"] < time.time():
+        _pending_user_auth.pop(ua_token, None)
+        return _oauth2_error("invalid_request", "Session has expired. Please sign in again.")
+
+    pool = _get_pool_unscoped(session["pool_id"])
+    if not pool:
+        _pending_user_auth.pop(ua_token, None)
+        return error_response_json("ResourceNotFoundException",
+                                   f"User pool {session['pool_id']} not found.", 400)
+
+    challenge = session["challenge"]
+
+    if not challenge:
+        chosen = form.get("challenge", "")
+        if chosen not in session["available_challenges"]:
+            html_body = _select_challenge_page_html(
+                ua_token, session["available_challenges"],
+                error_message="Invalid authentication method.",
+            )
+            return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+        html_body = _begin_user_auth_challenge(pool, ua_token, session, chosen)
+        return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+
+    if challenge == "PASSWORD":
+        password = form.get("password", "")
+        user, error_msg = _authenticate_hosted_ui_user(pool, session["username"], password)
+        if error_msg:
+            html_body = _password_page_html(ua_token, session["username"], error_message=error_msg)
+            return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+    else:  # EMAIL_OTP
+        code = form.get("code", "")
+        otp_code = session.get("otp_code")
+        if not otp_code or code != otp_code:
+            html_body = _email_otp_page_html(ua_token, error_message="Incorrect code.")
+            return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+        user, _err = _resolve_user(pool, session["username"])
+        status_error = _hosted_ui_user_status_error(user) if user else "Incorrect code."
+        if status_error:
+            html_body = _email_otp_page_html(ua_token, error_message=status_error)
+            return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+
+    if user.get("UserStatus") == "FORCE_CHANGE_PASSWORD":
+        np_token = _start_new_password_session(
+            session["pool_id"], session["client_id"], user["Username"],
+            session["redirect_uri"], session["scope"], session["state"],
+            session["response_type"], session["nonce"],
+            session["code_challenge"], session["code_challenge_method"], resource=session.get("resource", ""),
+        )
+        _pending_user_auth.pop(ua_token, None)
+        html_body = _new_password_page_html(np_token)
+        return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+
+    _pending_user_auth.pop(ua_token, None)
+    if session.get("challenge") == "PASSWORD":
+        return _finish_password_sign_in(pool, session["pool_id"], user, session)
+    return _issue_auth_code_redirect(
+        session["client_id"], session["pool_id"], session["redirect_uri"], session["scope"],
+        user["Username"], session["nonce"], session["code_challenge"],
+        session["code_challenge_method"], session["state"], resource=session.get("resource", ""),
+    )
+
+
+def _handle_new_password_submit(np_token, form):
+    """POST /login with `np_token` — finalize a FORCE_CHANGE_PASSWORD flow started by the
+    Hosted UI login form."""
+    session = _pending_new_password.get(np_token)
+    if not session or session["expires_at"] < time.time():
+        _pending_new_password.pop(np_token, None)
+        return _oauth2_error("invalid_request", "Session has expired. Please sign in again.")
+
+    new_password = form.get("new_password", "")
+    confirm_password = form.get("confirm_password", "")
+
+    if new_password != confirm_password:
+        html_body = _new_password_page_html(np_token, error_message="Passwords do not match.")
+        return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+
+    pool = _get_pool_unscoped(session["pool_id"])
+    if not pool:
+        _pending_new_password.pop(np_token, None)
+        return error_response_json("ResourceNotFoundException",
+                                   f"User pool {session['pool_id']} not found.", 400)
+
+    policy_errors = _password_policy_errors(pool, new_password)
+    if policy_errors:
+        html_body = _new_password_page_html(
+            np_token,
+            error_message="Password did not conform with policy: " + "; ".join(policy_errors),
+        )
+        return 200, {"Content-Type": "text/html; charset=utf-8"}, html_body.encode("utf-8")
+
+    user, err = _resolve_user(pool, session["username"])
+    if err:
+        _pending_new_password.pop(np_token, None)
+        return err
+
+    user["_password"] = new_password
+    user["UserStatus"] = "CONFIRMED"
+    user["UserLastModifiedDate"] = _now_epoch()
+
+    del _pending_new_password[np_token]
+
+    return _finish_password_sign_in(pool, session["pool_id"], user, session)
+
+
 # -- /oauth2/token (POST) ---------------------------------------------------
+
+def _oauth2_refresh_token_reused():
+    """/oauth2/token's answer to a refresh token a rotating client refuses, or one rotation replaced: the bare error."""
+    return 400, {"Content-Type": "application/json"}, json.dumps({"error": "invalid_grant"}).encode()
+
+
+def _oauth2_refresh_api_issued_token(refresh_val: str, cid: str, csec: str):
+    """Refresh tokens minted by InitiateAuth / RespondToAuthChallenge never enter
+    ``_refresh_tokens`` (that registry only holds Hosted UI grants), yet AWS accepts
+    them at /oauth2/token. Validate them with the REFRESH_TOKEN_AUTH core, and the
+    client as the authorization_code branch does."""
+    try:
+        claims = _decode_id_token_unverified(refresh_val)
+    except ValueError:
+        claims = None
+    if not isinstance(claims, dict) or claims.get("token_use") != "refresh":
+        return _oauth2_error("invalid_grant", "Invalid refresh token.")
+    pid = str(claims.get("iss", "")).rsplit("/", 1)[-1]
+    pool = _get_pool_unscoped(pid)
+    if not pool:
+        return _oauth2_error("invalid_grant", "Invalid refresh token.")
+    client_id = cid or str(claims.get("client_id", ""))
+    _, _, client = _find_pool_by_client_id(client_id)
+    if not client or (client.get("ClientSecret") and csec != client["ClientSecret"]):
+        return _oauth2_error("invalid_client", "Invalid client credentials.")
+    result, err = _refresh_auth_result(pool, pid, client_id, refresh_val, reused=_oauth2_refresh_token_reused)
+    if err:
+        if err[2] == _oauth2_refresh_token_reused()[2]:
+            return err
+        if _rotation_grace(pool, client_id) is not None or _rotated_out(refresh_val, _token_claims(refresh_val).get("origin_jti")):
+            return _oauth2_refresh_token_reused()
+        return _oauth2_error("invalid_grant", "Invalid refresh token.")
+    resp = {
+        "access_token": result["AccessToken"],
+        "id_token": result["IdToken"],
+        "token_type": "Bearer",
+        "expires_in": 3600,
+    }
+    if result.get("RefreshToken"):
+        resp["refresh_token"] = result["RefreshToken"]
+    if not _id_token_granted(claims.get("scope")):
+        del resp["id_token"]
+    return 200, {"Content-Type": "application/json"}, json.dumps(resp).encode()
+
 
 def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | None = None):
     """/oauth2/token endpoint — supports authorization_code, refresh_token, client_credentials."""
@@ -3283,12 +9313,28 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             if entry.get("code_challenge"):
                 if not code_verifier:
                     return _oauth2_error("invalid_grant", "code_verifier is required.")
-                method = entry.get("code_challenge_method", "plain")
+                method = entry.get("code_challenge_method", "")
                 if not _verify_pkce(code_verifier, entry["code_challenge"], method):
                     return _oauth2_error("invalid_grant", "PKCE verification failed.")
 
-            # Consume code (one-time use)
-            del _authorization_codes[code]
+            # Validate client secret BEFORE consuming the code. AWS rejects bad
+            # client authentication without invalidating the single-use code, so
+            # a client that authenticates in two steps (HTTP Basic, then
+            # client_secret_post fallback — as Go/Vault does) can still succeed
+            # on the retry. Consuming the code first turned that retry into
+            # invalid_grant "Invalid or expired authorization code" (#932).
+            _, _, client = _find_pool_by_client_id(cid)
+            if client and client.get("ClientSecret") and csec != client["ClientSecret"]:
+                return _oauth2_error("invalid_client", "Invalid client credentials.")
+
+            # Consume code (one-time use). This handler runs off the loop
+            # (run_reentrant), so two concurrent requests for the same code
+            # can both reach this point after passing validation above — pop()
+            # is the atomic single-use gate; the loser must not proceed past it
+            # even though it already "validated" against the (about-to-be-stale)
+            # entry.
+            if _authorization_codes.pop(code, None) is not entry:
+                return _oauth2_error("invalid_grant", "Invalid or expired authorization code.")
 
             pool_id = entry["pool_id"]
             pool = _get_pool_unscoped(pool_id)
@@ -3298,13 +9344,18 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             user = pool["_users"].get(entry["username"])
             if not user:
                 return _oauth2_error("server_error", "User not found.")
+            from ministack.app import AUTH
+            if AUTH and not user.get("Enabled", True):
+                # A code issued before AdminDisableUser no longer signs the user in.
+                return _oauth2_error("invalid_grant", "User is disabled.")
 
-            # Validate client secret if client has one
-            _, _, client = _find_pool_by_client_id(cid)
-            if client and client.get("ClientSecret") and csec != client["ClientSecret"]:
-                return _oauth2_error("invalid_client", "Invalid client credentials.")
-
-            result = _build_auth_result(pool_id, cid, user, nonce=entry.get("nonce", ""))
+            resource = entry.get("resource", "")
+            if resource and resource not in _pool_resource_servers(pool):
+                # An unregistered resource fails the exchange, not the sign-in, and AWS gives no description.
+                return 400, {"Content-Type": "application/json"}, json.dumps({"error": "invalid_grant"}).encode()
+            scope = _granted_scopes(client, entry.get("scope"))
+            result = _build_auth_result(pool_id, cid, user, nonce=entry.get("nonce", ""),
+                                         trigger_source="TokenGeneration_HostedAuth", scope=scope, audience=resource)
             refresh_val = result["RefreshToken"]
             _refresh_tokens[refresh_val] = {
                 "pool_id": pool_id,
@@ -3318,8 +9369,10 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
                 "id_token": result["IdToken"],
                 "refresh_token": refresh_val,
                 "token_type": "Bearer",
-                "expires_in": 3600,
+                "expires_in": result["ExpiresIn"],
             }
+            if not _id_token_granted(scope):
+                del resp["id_token"]
             return 200, {"Content-Type": "application/json"}, json.dumps(resp).encode()
 
         # Try SAML/OIDC federation auth codes
@@ -3337,23 +9390,37 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
             effective_client_id = code_data["client_id"]
 
             user_attrs = {}
+            groups = []
+            origin_jti = new_uuid()
+            scope = _granted_scopes(_find_pool_by_client_id(effective_client_id)[2], code_data.get("scopes"))
             pool = _get_pool_unscoped(pool_id)
             if pool:
                 user = pool["_users"].get(username)
                 if user:
                     user_attrs = _attr_list_to_dict(user.get("Attributes", []))
+                    groups = user.get("_groups", [])
+                    user.setdefault("_origin_jtis", []).append(origin_jti)
 
-            access_token = _fake_token(sub, pool_id, effective_client_id, "access", username)
-            id_token = _fake_token(sub, pool_id, effective_client_id, "id", username, user_attrs=user_attrs)
-            refresh_token = secrets.token_urlsafe(48)
+            access_token = _fake_token(sub, pool_id, effective_client_id, "access", username,
+                                        user_attrs=user_attrs, groups=groups,
+                                        trigger_source="TokenGeneration_HostedAuth", origin_jti=origin_jti,
+                                        scope=scope)
+            id_token = _fake_token(sub, pool_id, effective_client_id, "id", username, user_attrs=user_attrs,
+                                    groups=groups, trigger_source="TokenGeneration_HostedAuth",
+                                    nonce=code_data.get("nonce", ""), origin_jti=origin_jti, scope=scope)
+            refresh_token = _fake_token(sub, pool_id, effective_client_id, "refresh", origin_jti=origin_jti,
+                                        scope=scope)
 
-            return json_response({
+            resp = {
                 "id_token": id_token,
                 "access_token": access_token,
                 "refresh_token": refresh_token,
                 "token_type": "Bearer",
-                "expires_in": 3600,
-            })
+                "expires_in": _token_validity(pool_id, effective_client_id, "access"),
+            }
+            if not _id_token_granted(scope):
+                del resp["id_token"]
+            return json_response(resp)
 
         return _oauth2_error("invalid_grant", "Invalid or expired authorization code.")
 
@@ -3362,7 +9429,7 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
         refresh_val = form.get("refresh_token", "")
         entry = _refresh_tokens.get(refresh_val)
         if not entry:
-            return _oauth2_error("invalid_grant", "Invalid refresh token.")
+            return _oauth2_refresh_api_issued_token(refresh_val, cid, csec)
 
         pool_id = entry["pool_id"]
         pool = _get_pool_unscoped(pool_id)
@@ -3371,6 +9438,15 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
         user = pool["_users"].get(entry["username"])
         if not user:
             return _oauth2_error("server_error", "User not found.")
+        from ministack.app import AUTH
+        registry_origin = _token_claims(refresh_val).get("origin_jti")
+        revoked = _refresh_token_revoked(refresh_val, user) or (
+            isinstance(registry_origin, str) and registry_origin in _revoked_tokens)
+        rotating = _rotation_grace(pool, cid or entry["client_id"]) is not None
+        if (revoked and rotating) or _rotated_out(refresh_val, registry_origin):
+            return _oauth2_refresh_token_reused()
+        if AUTH and (not user.get("Enabled", True) or revoked):
+            return _oauth2_refresh_token_reused() if rotating else _oauth2_error("invalid_grant", "Invalid refresh token.")
 
         # Validate client secret if client has one
         _, _, client = _find_pool_by_client_id(cid or entry["client_id"])
@@ -3381,12 +9457,33 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
         attrs = _attr_list_to_dict(user.get("Attributes", []))
         sub = attrs.get("sub", user["Username"])
         username = user.get("Username", "")
+        refresh_claims = _token_claims(refresh_val)
+        origin_jti = refresh_claims.get("origin_jti", "")
+        scope = refresh_claims.get("scope")
+        exp = refresh_claims.get("exp")
+        if isinstance(exp, (int, float)) and time.time() >= exp:
+            if _rotation_grace(pool, client_id) is not None:
+                return _oauth2_refresh_token_reused()
+            return _oauth2_error("invalid_grant", "Invalid refresh token.")
         resp = {
-            "access_token": _fake_token(sub, pool_id, client_id, "access", username=username),
-            "id_token": _fake_token(sub, pool_id, client_id, "id", username=username, user_attrs=attrs),
+            "access_token": _fake_token(sub, pool_id, client_id, "access", username=username,
+                                         trigger_source="TokenGeneration_RefreshTokens", origin_jti=origin_jti,
+                                         scope=scope, audience=refresh_claims.get("aud", "")),
+            "id_token": _fake_token(sub, pool_id, client_id, "id", username=username, user_attrs=attrs,
+                                     trigger_source="TokenGeneration_RefreshTokens", origin_jti=origin_jti,
+                                     scope=scope),
             "token_type": "Bearer",
-            "expires_in": 3600,
+            "expires_in": _token_validity(pool_id, client_id, "access"),
         }
+        grace = _rotation_grace(pool, client_id)
+        if grace is not None:
+            rotated = _next_refresh_token(pool_id, client_id, grace, refresh_val, refresh_claims)
+            if rotated is None:
+                return _oauth2_refresh_token_reused()
+            _refresh_tokens[rotated] = dict(entry)
+            resp["refresh_token"] = rotated
+        if not _id_token_granted(scope):
+            del resp["id_token"]
         return 200, {"Content-Type": "application/json"}, json.dumps(resp).encode()
 
     # ── client_credentials ──
@@ -3394,35 +9491,84 @@ def _oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | Non
         pool_id, pool, client = _find_pool_by_client_id(cid)
         if not pool or not client:
             return _oauth2_error("invalid_client", "Client not found.")
-        if not client.get("ClientSecret"):
-            return _oauth2_error("invalid_client", "client_credentials requires a confidential client.")
-        if csec != client["ClientSecret"]:
+        if csec != (client.get("ClientSecret") or ""):
             return _oauth2_error("invalid_client", "Invalid client credentials.")
 
-        access_token = _fake_token(cid, pool_id, cid, "access")
+        scope_error = _client_credentials_scope_error(pool, client, form.get("scope"))
+        if scope_error:
+            return scope_error
+        if not client.get("ClientSecret"):
+            return _oauth2_error("invalid_client", "client_credentials requires a confidential client.")
+
+        # M2M's own client-metadata channel — a JSON object, urlencoded, in
+        # the aws_client_metadata POST field (there's no ClientMetadata
+        # request field on this grant the way there is on
+        # Initiate/RespondToAuthChallenge). parse_qs already url-decoded the
+        # form, so this is the raw JSON string.
+        client_metadata = {}
+        raw_metadata = form.get("aws_client_metadata", "")
+        if raw_metadata:
+            try:
+                parsed_metadata = json.loads(raw_metadata)
+                if isinstance(parsed_metadata, dict):
+                    client_metadata = parsed_metadata
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        scope = _granted_scopes(client, form.get("scope"), "client_credentials")
+        access_token = _fake_token(cid, pool_id, cid, "access",
+                                    trigger_source="TokenGeneration_ClientCredentials",
+                                    client_metadata=client_metadata, scope=scope)
         resp = {
             "access_token": access_token,
             "token_type": "Bearer",
-            "expires_in": 3600,
+            "expires_in": _token_validity(pool_id, cid, "access"),
         }
         return 200, {"Content-Type": "application/json"}, json.dumps(resp).encode()
 
-    # ── fallback (legacy behaviour for unrecognised grant_type) ──
-    pool_id, pool, client = _find_pool_by_client_id(cid)
-    access_token = _fake_token(cid or new_uuid(), pool_id or "", cid or "", "access")
-    return json_response({
-        "access_token": access_token,
-        "token_type": "Bearer",
-        "expires_in": 3600,
-    })
+    return 400, {"Content-Type": "application/json"}, json.dumps({"error": "unsupported_grant_type"}).encode()
 
 
-def handle_oauth2_token(method, path, headers, body, query_params):
+def _run_oauth2_token(data, query_params, raw_body: bytes = b"", headers: dict | None = None):
+    try:
+        return _oauth2_token(data, query_params, raw_body, headers)
+    except (_PreTokenRejected, _PreTokenUnavailable) as e:
+        return _pretoken_oauth2_error(e)
+
+
+async def handle_oauth2_token(method, path, headers, body, query_params):
     """Public entry point called from app.py for POST /oauth2/token."""
-    return _oauth2_token({}, query_params, body, headers)
+    return await run_reentrant(_run_oauth2_token, {}, query_params, body, headers,
+                               thread_name="ministack-cognito-trigger")
 
 
 # -- /oauth2/userInfo (GET/POST) ---------------------------------------------
+
+def _userinfo_token_error(token: str):
+    """The error_description /oauth2/userInfo answers for a token AWS would not accept, or None."""
+    claims = _token_claims(token)
+    if token.count(".") != 2 or not claims:
+        return "Access token format is not valid"
+    if not isinstance(claims.get("client_id"), str):
+        return "Value of client_id in token claims must be a String"
+    if claims.get("token_use") != "access":
+        return "Access token format is not valid"
+    expired = "Access token is expired or user has globally signed out, disabled, or been deleted"
+    # _access_token_error's checks without the admin scope, which userInfo does not require.
+    if ((_RSA_PRIVATE_KEY is not None and not _signature_valid(token))
+            or not isinstance(claims.get("exp"), (int, float)) or time.time() >= claims["exp"]
+            or claims.get("origin_jti") in _revoked_tokens):
+        return expired
+    if not isinstance(claims.get("username"), str):
+        return "Value of username in token claims must be a String"
+    pool = _get_pool_unscoped(str(claims.get("iss", "")).rsplit("/", 1)[-1])
+    user = _user_from_token(token, pool) if pool else None
+    if not user or not user.get("Enabled", True):
+        return expired
+    if "openid" not in str(claims.get("scope", "")).split():
+        return "Access token does not contain the 'openid' scope"
+    return None
+
 
 def handle_oauth2_userinfo(method, path, headers, body, query_params):
     """GET or POST /oauth2/userInfo — return user claims from the access token."""
@@ -3432,6 +9578,16 @@ def handle_oauth2_userinfo(method, path, headers, body, query_params):
             json.dumps({"error": "invalid_token", "error_description": "Missing Bearer token."}).encode()
 
     token = auth.split(" ", 1)[1].strip()
+    from ministack.app import AUTH
+    error = _userinfo_token_error(token) if AUTH else None
+    if error:
+        iss = _token_claims(token).get("iss")
+        pool_id = iss.rsplit("/", 1)[-1] if isinstance(iss, str) else ""
+        # The pool's own issuer, never the text a token claims.
+        realm = (f"realm=https://cognito-idp.{pool_id.split('_', 1)[0]}.amazonaws.com/{pool_id}, "
+                 if pool_id and _get_pool_unscoped(pool_id) else "")
+        return 401, {"Content-Type": "application/json", "WWW-Authenticate": f"Bearer {realm}error=INVALID_TOKEN"}, \
+            json.dumps({"error": "invalid_token", "error_description": error}).encode()
     # Decode JWT payload
     try:
         parts = token.split(".")
@@ -3486,11 +9642,19 @@ def handle_oauth2_userinfo(method, path, headers, body, query_params):
     claims = {"sub": attrs.get("sub", user["Username"])}
     # Standard OIDC claims
     for key in ("email", "email_verified", "name", "family_name", "given_name",
-                "phone_number", "phone_number_verified", "preferred_username",
-                "nickname", "picture", "profile", "website", "gender",
-                "birthdate", "zoneinfo", "locale", "address", "updated_at"):
+                "middle_name", "phone_number", "phone_number_verified",
+                "preferred_username", "nickname", "picture", "profile", "website",
+                "gender", "birthdate", "zoneinfo", "locale", "address", "updated_at"):
         if key in attrs:
             claims[key] = attrs[key]
+    # Custom attributes. Real Cognito returns these for both `openid` and
+    # `openid profile`, bounded by the app client's read attributes.
+    for key, value in attrs.items():
+        if key.startswith("custom:") or key.startswith("dev:custom:"):
+            claims[key] = value
+    # AWS returns the plain `username` claim; `cognito:username` stays for
+    # callers already reading it here.
+    claims["username"] = user.get("Username", "")
     claims["cognito:username"] = user.get("Username", "")
     groups = user.get("_groups", [])
     if groups:
@@ -3543,6 +9707,7 @@ def _create_identity_pool(data):
         "SamlProviderARNs": data.get("SamlProviderARNs", []),
         "IdentityPoolTags": data.get("IdentityPoolTags", {}),
         "_roles": {},
+        "_principal_tags": {},
         "_identities": {},
     }
     _identity_pools[iid] = pool
@@ -3600,10 +9765,19 @@ def _update_identity_pool(data):
 
 
 def _get_id(data):
+    from ministack.app import AUTH
     iid = data.get("IdentityPoolId")
     pool = _identity_pools.get(iid)
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Identity pool {iid} not found.", 400)
+    logins = data.get("Logins") or {}
+    if AUTH:
+        error = _identity_logins_error(pool, None, logins)
+        if error:
+            return error
+    owner = _link_logins(pool, None, logins)
+    if owner:
+        return json_response({"IdentityId": owner})
     identity_id = _identity_id(iid)
     pool["_identities"][identity_id] = {
         "IdentityId": identity_id,
@@ -3614,30 +9788,245 @@ def _get_id(data):
     return json_response({"IdentityId": identity_id})
 
 
+def _identity_login_fields(logins: dict) -> tuple[list[str], list[str]]:
+    """The amr list and the API Gateway provider strings of an identity's logins."""
+    # The provider string is "<provider>,<provider>:CognitoSignIn:<sub>" per
+    # the mapping template reference, sub from the login's id token.
+    provider_parts = []
+    amr = ["authenticated"] if logins else ["unauthenticated"]
+    for provider_name, login_token in logins.items():
+        sub = ""
+        try:
+            payload = json.loads(base64.urlsafe_b64decode(
+                login_token.split(".")[1] + "=="))
+            sub = payload.get("sub", "")
+        except Exception:
+            pass
+        # amr carries the bare provider name (what trust policies match with
+        # ForAnyValue:StringLike per the Cognito RBAC doc) and, for a
+        # user-pool sign-in, the CognitoSignIn entry alongside it.
+        amr.append(provider_name)
+        if sub:
+            provider_parts.append(f"{provider_name},{provider_name}:CognitoSignIn:{sub}")
+            amr.append(f"{provider_name}:CognitoSignIn:{sub}")
+        else:
+            provider_parts.append(provider_name)
+    return amr, provider_parts
+
+
 def _get_credentials_for_identity(data):
+    """Vend identity-pool credentials AND register them as an STS session.
+
+    The AUTH=true evaluator resolves temporary keys through ``sts._sessions``;
+    unregistered vended keys were rejected as an invalid security token, so
+    our own GetCredentialsForIdentity output could never call an enforced API.
+    On AWS these credentials are the pool role assumed with the session name
+    ``CognitoIdentityCredentials`` — GetCallerIdentity reports
+    ``arn:aws:sts::<account>:assumed-role/<RoleName>/CognitoIdentityCredentials``.
+    """
+    from ministack.app import AUTH
     identity_id = data.get("IdentityId", new_uuid())
     now = int(time.time())
+    logins = data.get("Logins") or {}
+    pool = None
+    for _iid, candidate in _identity_pools.items():
+        if identity_id in candidate.get("_identities", {}):
+            pool = candidate
+            if AUTH:
+                error = _identity_logins_error(candidate, identity_id, logins)
+                if error:
+                    return error
+            identity_id = _link_logins(candidate, identity_id, logins)
+            if not logins:
+                logins = candidate["_identities"][identity_id].get("Logins") or {}
+            break
+
+    flavor = "authenticated" if logins else "unauthenticated"
+    role_arn = (pool or {}).get("_roles", {}).get(flavor, "")
+    # A pool with no SetIdentityPoolRoles keeps vending (lenient, matching the
+    # emulator's accept-all model) under a synthesized role name.
+    role_name = role_arn.rpartition("/")[2] if role_arn else "CognitoIdentityPoolRole"
+
+    access_key = f"ASIA{''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(16))}"
+    secret_key = base64.b64encode(secrets.token_bytes(30)).decode()
+    session_token = base64.b64encode(secrets.token_bytes(64)).decode()
+    role_id = "AROA" + new_uuid().replace("-", "")[:17].upper()
+
+    # The cognito* identity fields API Gateway reports for IAM-authorized
+    # calls, precomputed here where the login tokens are at hand.
+    amr, provider_parts = _identity_login_fields(logins)
+
+    from ministack.services import sts as sts_svc
+    sts_svc.register_session(access_key, {
+        "Arn": (f"arn:aws:sts::{get_account_id()}:assumed-role/"
+                f"{role_name}/CognitoIdentityCredentials"),
+        "UserId": f"{role_id}:CognitoIdentityCredentials",
+        "SecretAccessKey": secret_key,
+        "SessionToken": session_token,
+        "Expiration": now + 3600,
+        "AccountId": get_account_id(),
+        "PrincipalType": "AssumedRole",
+        "_identity_id": identity_id,
+        "_identity_pool_id": (pool or {}).get("IdentityPoolId", ""),
+        "_logins": logins,
+        "_cognito_auth_type": "authenticated" if logins else "unauthenticated",
+        "_cognito_auth_provider": ",".join(provider_parts) or None,
+        "_cognito_amr": amr,
+    })
+
     return json_response({
         "IdentityId": identity_id,
         "Credentials": {
-            "AccessKeyId": f"ASIA{''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(16))}",
-            "SecretKey": base64.b64encode(secrets.token_bytes(30)).decode(),
-            "SessionToken": base64.b64encode(secrets.token_bytes(64)).decode(),
+            "AccessKeyId": access_key,
+            "SecretKey": secret_key,
+            "SessionToken": session_token,
             "Expiration": now + 3600,
         },
     })
 
 
+_LOGIN_TOKEN_CLOCK_SKEW = 300
+
+
+def _identity_logins_error(pool: dict, identity_id: str | None, logins: dict):
+    """The NotAuthorizedException for Logins AWS would not accept for an identity (None: a new one), or None."""
+    identity = pool["_identities"][identity_id] if identity_id else {}
+    stored = identity.get("Logins") or {}
+    if not logins:
+        if not stored and not identity.get("_merged_into"):
+            return None
+        return error_response_json("NotAuthorizedException", f"Access to Identity '{identity_id}' is forbidden.", 400)
+    unsupported = "Token is not from a supported provider of this identity pool."
+    mismatch = "Logins don't match. Please include at least one valid login for this identity or identity pool."
+    if not isinstance(logins, dict):
+        return error_response_json("NotAuthorizedException", unsupported, 400)
+    not_oidc = "Invalid login token. Not a valid OpenId Connect identity token."
+    skewed_now = int(time.time()) - _LOGIN_TOKEN_CLOCK_SKEW
+    supported = set(pool.get("SupportedLoginProviders") or {}) | set(pool.get("SamlProviderARNs") or [])
+    supported |= {arn.split("oidc-provider/", 1)[-1] for arn in pool.get("OpenIdConnectProviderARNs") or []}
+    if pool.get("DeveloperProviderName"):
+        supported.add("cognito-identity.amazonaws.com")
+    for provider, token in logins.items():
+        clients = [p.get("ClientId") for p in pool.get("CognitoIdentityProviders") or []
+                   if p.get("ProviderName") == provider]
+        claims = _token_claims(token)
+        is_jwt = isinstance(token, str) and token.count(".") == 2 and bool(claims)
+        if provider == "accounts.google.com" and not is_jwt and provider in (pool.get("SupportedLoginProviders") or {}):
+            message = not_oidc
+        elif not provider.startswith("cognito-idp.") and provider not in supported:
+            message = unsupported
+        elif not provider.startswith("cognito-idp."):
+            # A supported provider's token is opaque here; an identity's own login must still be the one it holds.
+            if provider in stored and token != stored[provider] and (
+                    not claims.get("sub") or _token_claims(stored[provider]).get("sub") != claims.get("sub")):
+                message = mismatch
+            else:
+                continue
+        elif not clients:
+            message = unsupported
+        elif not is_jwt:
+            message = not_oidc
+        elif claims.get("iss") != f"https://{provider}":
+            message = "Invalid login token. Issuer doesn't match providerName"
+        elif _RSA_PRIVATE_KEY is not None and not _signature_valid(token):
+            message = "Invalid login token. Token signature invalid."
+        elif "aud" not in claims:
+            message = "Invalid login token. Missing a required claim: aud"
+        elif claims["aud"] not in clients:
+            message = unsupported
+        elif not isinstance(claims.get("exp"), (int, float)) or skewed_now >= claims["exp"]:
+            message = f"Invalid login token. Token expired: {skewed_now} >= {claims.get('exp')}"
+        elif provider in stored and _token_claims(stored[provider]).get("sub") != claims.get("sub"):
+            message = mismatch
+        else:
+            continue
+        return error_response_json("NotAuthorizedException", message, 400)
+    # An identity with a login needs one of its own; a disabled one, a login another identity holds.
+    if stored and not any(provider in stored for provider in logins) or (
+            identity.get("_merged_into") and not _login_owner(pool, logins)):
+        return error_response_json("NotAuthorizedException", mismatch, 400)
+    return None
+
+
+def _login_owner(pool: dict, logins: dict):
+    """The id of the pool's identity that already holds one of these logins, or None."""
+    if not isinstance(logins, dict):
+        return None
+    for provider, token in logins.items():
+        sub = _token_claims(token).get("sub")
+        for identity_id, identity in pool["_identities"].items():
+            held = (identity.get("Logins") or {}).get(provider)
+            # Only a user pool token is verified, so only its sub identifies a user.
+            if held is not None and (held == token or (
+                    sub and provider.startswith("cognito-idp.") and _token_claims(held).get("sub") == sub)):
+                return identity_id
+    return None
+
+
+def _link_logins(pool: dict, identity_id: str | None, logins: dict):
+    """Link Logins to the identity the call answers for, merge the identities holding them into it, return its id."""
+    identities = pool["_identities"]
+    caller = identities[identity_id] if identity_id else None
+    # An identity with a login answers for itself; one without (or disabled) gives way to the login's identity.
+    target = identity_id if caller and caller.get("Logins") else _login_owner(pool, logins) or identity_id
+    if target is None:
+        return None
+    identity = identities[target]
+    merged = dict.fromkeys(_login_owner(pool, {provider: token}) for provider, token in logins.items())
+    if target != identity_id and caller and not caller.get("_merged_into"):
+        merged[identity_id] = None
+    merged.pop(None, None)
+    merged.pop(target, None)
+    now = _now_epoch()
+    linked = dict(logins)
+    for other_id in merged:
+        other = identities[other_id]
+        linked = {**(other.get("Logins") or {}), **linked}
+        other.update(Logins={}, _merged_into=target, LastModifiedDate=now)
+    added = {provider: token for provider, token in linked.items() if provider not in (identity.get("Logins") or {})}
+    if added:
+        identity["Logins"] = {**(identity.get("Logins") or {}), **added}
+        identity["LastModifiedDate"] = now
+    return target
+
+
+def _identity_login_names(identity: dict) -> list:
+    """An identity's Logins as DescribeIdentity lists them; DISABLED and the region once merged into another."""
+    if identity.get("_merged_into"):
+        return ["DISABLED", identity["IdentityId"].partition(":")[0]]
+    return list((identity.get("Logins") or {}).keys())
+
+
 def _get_open_id_token(data):
+    from ministack.app import AUTH
     identity_id = data.get("IdentityId", new_uuid())
     # Find pool containing this identity
     pool_id = ""
+    logins = data.get("Logins") or {}
     for iid, pool in _identity_pools.items():
         if identity_id in pool["_identities"]:
             pool_id = iid
+            if AUTH:
+                error = _identity_logins_error(pool, identity_id, logins)
+                if error:
+                    return error
+            identity_id = _link_logins(pool, identity_id, logins)
+            logins = logins or pool["_identities"][identity_id].get("Logins") or {}
             break
-    token = _fake_token(identity_id, pool_id, "", "id")
-    return json_response({"IdentityId": identity_id, "Token": token})
+    if not pool_id:
+        return error_response_json("ResourceNotFoundException", f"Identity '{identity_id}' not found.", 400)
+    now = int(time.time())
+    claims = {
+        "sub": identity_id,
+        "aud": pool_id,
+        "amr": _identity_login_fields(logins)[0],
+        "iss": "https://cognito-identity.amazonaws.com",
+        "iat": now,
+        "exp": now + 600,
+        "https://cognito-identity.amazonaws.com/identity-pool-arn": (
+            f"arn:aws:cognito-identity:{get_region()}:{get_account_id()}:identitypool/{pool_id}"),
+    }
+    return json_response({"IdentityId": identity_id, "Token": _signed_jwt(claims)})
 
 
 def _set_identity_pool_roles(data):
@@ -3645,7 +10034,12 @@ def _set_identity_pool_roles(data):
     pool = _identity_pools.get(iid)
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Identity pool {iid} not found.", 400)
+    # The call sets the whole configuration: RoleMappings is optional on the
+    # API reference and no call removes a mapping on its own, so an omitted
+    # member clears what was there. Reasoned from the API surface, not
+    # measured against a live account.
     pool["_roles"] = data.get("Roles", {})
+    pool["_role_mappings"] = data.get("RoleMappings", {})
     return json_response({})
 
 
@@ -3657,8 +10051,67 @@ def _get_identity_pool_roles(data):
     return json_response({
         "IdentityPoolId": iid,
         "Roles": pool.get("_roles", {}),
-        "RoleMappings": {},
+        # .get, not indexing: pools created before this field existed (and the
+        # ones the CloudFormation provisioner builds itself) carry no entry.
+        "RoleMappings": pool.get("_role_mappings", {}),
     })
+
+
+def _principal_tag_target(data):
+    """Resolve the (IdentityPoolId, IdentityProviderName) pair both principal-tag
+    operations require. Returns (pool, provider_name, error_response)."""
+    iid = data.get("IdentityPoolId")
+    pool = _identity_pools.get(iid)
+    if not pool:
+        return None, "", error_response_json(
+            "ResourceNotFoundException", f"Identity pool {iid} not found.", 400)
+    provider = data.get("IdentityProviderName")
+    if not provider:
+        return None, "", error_response_json(
+            "InvalidParameterException", "IdentityProviderName is required.", 400)
+    return pool, provider, None
+
+
+def _principal_tag_out(iid, provider, mapping):
+    return {
+        "IdentityPoolId": iid,
+        "IdentityProviderName": provider,
+        "UseDefaults": mapping["UseDefaults"],
+        "PrincipalTags": mapping["PrincipalTags"],
+    }
+
+
+def _set_principal_tag_attribute_map(data):
+    pool, provider, err = _principal_tag_target(data)
+    if err:
+        return err
+    # Both members are optional and are stored exactly as sent. UseDefaults
+    # selects the per-provider default claim-to-tag mapping (`sub` and `aud`
+    # for a user pool IdP), which AWS applies when it vends credentials rather
+    # than materializing into PrincipalTags — so no default map is fabricated
+    # here. AWS accepts both members together: terraform-provider-aws sends
+    # UseDefaults with an empty PrincipalTags on every destroy.
+    mapping = {
+        "UseDefaults": data.get("UseDefaults", False),
+        "PrincipalTags": data.get("PrincipalTags", {}),
+    }
+    pool.setdefault("_principal_tags", {})[provider] = mapping
+    return json_response(_principal_tag_out(pool["IdentityPoolId"], provider, mapping))
+
+
+def _get_principal_tag_attribute_map(data):
+    pool, provider, err = _principal_tag_target(data)
+    if err:
+        return err
+    mapping = pool.get("_principal_tags", {}).get(provider)
+    if not mapping:
+        # A provider nobody has configured is not readable: AWS answers
+        # ResourceNotFoundException with this message rather than describing an
+        # empty mapping (verified against cognito-identity in ap-southeast-2).
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"No Principal Tags configured for Provider {provider}", 400)
+    return json_response(_principal_tag_out(pool["IdentityPoolId"], provider, mapping))
 
 
 def _list_identities(data):
@@ -3667,11 +10120,12 @@ def _list_identities(data):
     if not pool:
         return error_response_json("ResourceNotFoundException", f"Identity pool {iid} not found.", 400)
     max_results = min(data.get("MaxResults", 60), 60)
-    identities = list(pool["_identities"].values())[:max_results]
+    identities = [i for i in pool["_identities"].values()
+                  if not (data.get("HideDisabled") and i.get("_merged_into"))][:max_results]
     return json_response({
         "IdentityPoolId": iid,
         "Identities": [
-            {"IdentityId": i["IdentityId"], "Logins": list(i.get("Logins", {}).keys()),
+            {"IdentityId": i["IdentityId"], "Logins": _identity_login_names(i),
              "CreationDate": i["CreationDate"], "LastModifiedDate": i["LastModifiedDate"]}
             for i in identities
         ],
@@ -3685,7 +10139,7 @@ def _describe_identity(data):
         if identity:
             return json_response({
                 "IdentityId": identity_id,
-                "Logins": list(identity.get("Logins", {}).keys()),
+                "Logins": _identity_login_names(identity),
                 "CreationDate": identity["CreationDate"],
                 "LastModifiedDate": identity["LastModifiedDate"],
             })
@@ -3708,8 +10162,12 @@ def _unlink_identity(data):
 def _identity_tag_resource(data):
     arn = data.get("ResourceArn", "")
     tags = data.get("Tags", {})
-    # ARN format: arn:aws:cognito-identity:region:account:identitypool/id
-    iid = arn.split("/")[-1] if "/" in arn else arn
+    try:
+        iid = _identity_pool_id_from_arn(arn)
+    except _InvalidCognitoIdentityArn as exc:
+        return error_response_json("InvalidParameterException", str(exc), 400)
+    if not iid or iid not in _identity_pools:
+        return error_response_json("ResourceNotFoundException", f"Resource {arn} not found.", 400)
     _identity_tags.setdefault(iid, {}).update(tags)
     return json_response({})
 
@@ -3717,7 +10175,12 @@ def _identity_tag_resource(data):
 def _identity_untag_resource(data):
     arn = data.get("ResourceArn", "")
     tag_keys = data.get("TagKeys", [])
-    iid = arn.split("/")[-1] if "/" in arn else arn
+    try:
+        iid = _identity_pool_id_from_arn(arn)
+    except _InvalidCognitoIdentityArn as exc:
+        return error_response_json("InvalidParameterException", str(exc), 400)
+    if not iid or iid not in _identity_pools:
+        return error_response_json("ResourceNotFoundException", f"Resource {arn} not found.", 400)
     for k in tag_keys:
         _identity_tags.get(iid, {}).pop(k, None)
     return json_response({})
@@ -3725,7 +10188,12 @@ def _identity_untag_resource(data):
 
 def _identity_list_tags_for_resource(data):
     arn = data.get("ResourceArn", "")
-    iid = arn.split("/")[-1] if "/" in arn else arn
+    try:
+        iid = _identity_pool_id_from_arn(arn)
+    except _InvalidCognitoIdentityArn as exc:
+        return error_response_json("InvalidParameterException", str(exc), 400)
+    if not iid or iid not in _identity_pools:
+        return error_response_json("ResourceNotFoundException", f"Resource {arn} not found.", 400)
     return json_response({"Tags": _identity_tags.get(iid, {})})
 
 
@@ -3737,7 +10205,7 @@ def _identity_pool_out(pool: dict) -> dict:
 # MISC HELPERS
 # ===========================================================================
 
-def _generate_temp_password() -> str:
+def _generate_temp_password(pool) -> str:
     # Ensure at least one char from each required class to satisfy default policy
     required = [
         secrets.choice(string.ascii_uppercase),
@@ -3746,23 +10214,37 @@ def _generate_temp_password() -> str:
         secrets.choice("!@#$%^&*"),
     ]
     chars = string.ascii_uppercase + string.ascii_lowercase + string.digits + "!@#$%^&*"
-    remaining = [secrets.choice(chars) for _ in range(8)]
+    length = max(12, int(((pool.get("Policies") or {}).get("PasswordPolicy") or {}).get("MinimumLength") or 0))
+    remaining = [secrets.choice(chars) for _ in range(length - len(required))]
     password = required + remaining
     secrets.SystemRandom().shuffle(password)
     return "".join(password)
 
 
+# Attributes that AWS documents as case-sensitive in the ListUsers Filter; all
+# other searchable attributes match case-insensitively.
+_CASE_SENSITIVE_FILTER_ATTRIBUTES = {"username", "status"}
+
+
 def _apply_user_filter(users: list, filter_str: str) -> list:
     """
-    Supports simple Cognito filter syntax:
-      attribute_name = "value"
-      attribute_name ^= "value"   (starts with)
+    Supports Cognito filter syntax:
+      "attribute_name" = "value"   (AWS official syntax; attribute name quoted)
+      attribute_name = "value"     (unquoted, kept for backward compatibility)
+      attribute_name ^= "value"    (starts with)
       attribute_name != "value"
+
+    Attribute names are case-sensitive. Value matching is case-insensitive for
+    most searchable attributes, but the ListUsers API reference documents
+    "username" and "status" as case-sensitive.
     """
-    m = re.match(r'(\w+)\s*(=|\^=|!=)\s*"([^"]*)"', filter_str.strip())
+    m = re.match(r'"?(\w+)"?\s*(=|\^=|!=)\s*"([^"]*)"', filter_str.strip())
     if not m:
+        logger.warning("Cognito: ListUsers Filter could not be parsed, ignoring: %r", filter_str)
         return users
     attr_name, op, value = m.group(1), m.group(2), m.group(3)
+    case_sensitive = attr_name in _CASE_SENSITIVE_FILTER_ATTRIBUTES
+    value_key = value if case_sensitive else value.casefold()
     result = []
     for user in users:
         attr_dict = _attr_list_to_dict(user.get("Attributes", []))
@@ -3771,14 +10253,19 @@ def _apply_user_filter(users: list, filter_str: str) -> list:
         if attr_name == "username":
             field_val = user.get("Username", "")
         elif attr_name == "status":
-            field_val = user.get("UserStatus", "")
+            # "status" filters on the account's Enabled/Disabled state (toggled by
+            # AdminEnableUser/AdminDisableUser), not the UserStatus confirmation-state enum
+            # (CONFIRMED, FORCE_CHANGE_PASSWORD, etc.). Matches real AWS Cognito's ListUsers
+            # Filter semantics, where "status" = "Enabled" never matches UserStatus values.
+            field_val = "Enabled" if user.get("Enabled", True) else "Disabled"
         elif attr_name == "email_verified":
             field_val = attr_dict.get("email_verified", "")
-        if op == "=" and field_val == value:
+        field_key = field_val if case_sensitive else field_val.casefold()
+        if op == "=" and field_key == value_key:
             result.append(user)
-        elif op == "^=" and field_val.startswith(value):
+        elif op == "^=" and field_key.startswith(value_key):
             result.append(user)
-        elif op == "!=" and field_val != value:
+        elif op == "!=" and field_key != value_key:
             result.append(user)
     return result
 
@@ -3789,9 +10276,19 @@ def _apply_user_filter(users: list, filter_str: str) -> list:
 
 def reset():
     _user_pools.clear()
+    _pool_keys.clear()
+    shutil.rmtree(_POOL_KEYS_DIR, ignore_errors=True)
     _pool_domain_map.clear()
     _identity_pools.clear()
     _identity_tags.clear()
     _auth_codes.clear()
     _authorization_codes.clear()
     _refresh_tokens.clear()
+    _revoked_tokens.clear()
+    _signed_out_tokens.clear()
+    _refresh_token_families.clear()
+    _challenge_sessions.clear()
+    _pending_new_password.clear()
+    _pending_hosted_mfa.clear()
+    _mfa_setup_users.clear()
+    _pending_user_auth.clear()

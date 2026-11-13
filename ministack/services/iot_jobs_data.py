@@ -1,0 +1,260 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
+"""IoT Jobs Data Plane HTTP API (``iot-jobs-data`` AWS service).
+
+Implements the device-side REST surface of AWS IoT Jobs:
+``GetPendingJobExecutions``, ``StartNextPendingJobExecution``,
+``DescribeJobExecution``, and ``UpdateJobExecution``.
+
+Routing reaches us either through credential-scope detection (the SDK signs
+requests with the ``iot-jobs-data`` scope — botocore signingName) or via the
+host pattern ``{prefix}.jobs.iot.{region}.{host}``, the shape of the legacy
+``iot:Jobs`` endpoint.
+
+This module is a wire adapter: it parses requests, shapes responses, and logs.
+The job store, the execution store, and every rule of the execution state
+machine live in :mod:`ministack.services.iot`, reached through its public
+``jobs_*`` seam (the same way ``iot_data.py`` reaches the shadow store), so
+nothing here can mutate an execution behind the control plane's back.
+
+Timestamp contract: the shared records store epoch MILLISECONDS internally
+(so same-second executions keep their queue order), but every response emits
+epoch SECONDS — this plane's raw ``long`` shapes carry whole-second integers
+(the API reference words every JobExecution stamp as "the time, in seconds
+since the epoch"), and the ``iot`` control plane's ``timestamp`` shapes are
+what botocore parses into datetimes. See ``iot._jobs_now_ms``.
+"""
+
+from __future__ import annotations
+
+import logging
+from urllib.parse import unquote
+
+from ministack.core.responses import (
+    error_response_json,
+    get_account_id,
+    get_region,
+    json_response,
+)
+from ministack.services import iot as _iot_module
+
+logger = logging.getLogger("iot_jobs_data")
+
+
+# ---------------------------------------------------------------------------
+# Persistence (no state of our own — the iot module holds it)
+# ---------------------------------------------------------------------------
+
+
+def get_state() -> dict:
+    return {}
+
+
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data: dict | None) -> None:
+    return None
+
+
+def reset() -> None:
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher
+# ---------------------------------------------------------------------------
+
+
+async def handle_request(
+    method: str, path: str, headers: dict, body: bytes, query_params: dict
+) -> tuple:
+    """Route a device-plane request, then publish the job events it raised."""
+    _iot_module.jobs_device_host.set(headers.get("host", ""))
+    async with _iot_module.publishing_events():
+        return await _route_request(method, path, body, query_params)
+
+
+async def _route_request(method: str, path: str, body: bytes, query_params: dict) -> tuple:
+    qp = {k: (v[0] if isinstance(v, list) else v) for k, v in query_params.items()}
+
+    if not path.startswith("/things/"):
+        return _unsupported_path(method, path)
+    rest = path[len("/things/"):]
+    thing, separator, sub = rest.partition("/")
+    thing = unquote(thing)
+    if not separator:
+        return _unsupported_path(method, path)
+
+    if sub == "jobs":
+        # GetPendingJobExecutions is the only operation on the bare
+        # /things/{thingName}/jobs collection; anything else (a POST, say)
+        # is not part of this API and must not fall through to the {jobId}
+        # handlers with an empty job id.
+        if method == "GET":
+            return _get_pending(thing)
+        return _unsupported_path(method, path)
+
+    if not sub.startswith("jobs/"):
+        return _unsupported_path(method, path)
+
+    job_id = unquote(sub[len("jobs/"):])
+    # `$next` is a sentinel, not a job id, so it must be matched before the
+    # generic {jobId} routes.
+    if job_id == "$next":
+        if method == "GET":
+            return _start_next(thing, {}, peek=True)
+        if method == "PUT":
+            return _start_next(thing, _iot_module.parse_json_body(body), peek=False)
+        return _unsupported_path(method, path)
+    if method == "GET":
+        return _describe_execution(thing, job_id, qp)
+    if method == "POST":
+        return await _update_execution(thing, job_id, _iot_module.parse_json_body(body))
+    return _unsupported_path(method, path)
+
+
+def _unsupported_path(method: str, path: str) -> tuple:
+    return error_response_json(
+        "InvalidRequestException",
+        f"Unsupported iot-jobs-data path: {method} {path}",
+        400,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Handlers
+# ---------------------------------------------------------------------------
+
+
+def _execution_view(execution: dict, document: str | None) -> dict:
+    """Data-plane JobExecution — delegates to the shared view in ``iot`` so
+    the HTTP plane and the jobs-over-MQTT bridge speak one shape."""
+    return _iot_module.jobs_execution_view(execution, document)
+
+
+def _get_pending(thing: str) -> tuple:
+    """GetPendingJobExecutions — queued and in-progress, split; the shared
+    summary shape (whole-second stamps, same as the notify payload)."""
+    pending = _iot_module.jobs_pending_for_thing(thing)
+    return json_response({
+        "inProgressJobs": [
+            _iot_module.jobs_execution_summary(e)
+            for e in pending
+            if e["status"] == "IN_PROGRESS"
+        ],
+        "queuedJobs": [
+            _iot_module.jobs_execution_summary(e)
+            for e in pending
+            if e["status"] == "QUEUED"
+        ],
+    })
+
+
+def _start_next(thing: str, payload: dict, *, peek: bool) -> tuple:
+    """StartNextPendingJobExecution (PUT) / DescribeJobExecution of ``$next``
+    (GET, ``peek=True`` — reads without starting).
+
+    No jobs/notify(-next) publish: QUEUED -> IN_PROGRESS keeps the execution
+    both pending and at the front of the queue, and AWS stays silent
+    (live-captured)."""
+    if error := _iot_module._jobs_status_details_error(payload.get("statusDetails")):
+        return error
+    pending = _iot_module.jobs_pending_for_thing(thing)
+    starts = not peek and bool(pending) and pending[0]["status"] == "QUEUED"
+    execution = _iot_module.jobs_start_next_execution(
+        thing, status_details=payload.get("statusDetails"), peek=peek
+    )
+    step_timeout = payload.get("stepTimeoutInMinutes")
+    if execution is not None and starts and step_timeout is not None:
+        stored = _iot_module._job_executions[(thing, execution["jobId"])]
+        for target in (stored, execution):
+            target["stepTimeoutInMinutes"] = step_timeout
+            target["timeoutStartedAt"] = execution["startedAt"]
+    if execution is None:
+        # AWS returns an empty structure when nothing is pending.
+        return json_response({})
+    if not peek:
+        logger.info(
+            "IoT Jobs: handed job %s to thing %s (status %s, version %s)",
+            execution["jobId"], thing, execution["status"],
+            execution["versionNumber"],
+        )
+    document = _iot_module.jobs_job_document(execution["jobId"])
+    return json_response({"execution": _execution_view(execution, document)})
+
+
+def _describe_execution(thing: str, job_id: str, qp: dict) -> tuple:
+    execution = _iot_module.jobs_describe_execution(thing, job_id)
+    if execution is None:
+        return error_response_json(
+            "ResourceNotFoundException",
+            f"Job {job_id} not found for {thing}",
+            404,
+        )
+    execution_number = qp.get("executionNumber")
+    if execution_number is not None:
+        try:
+            execution_number = int(execution_number)
+        except (TypeError, ValueError):
+            return error_response_json(
+                "InvalidRequestException",
+                f"Invalid executionNumber: {execution_number!r}",
+                400,
+            )
+        if execution_number != execution["executionNumber"]:
+            return error_response_json(
+                "ResourceNotFoundException",
+                f"Job {job_id} not found for {thing}",
+                404,
+            )
+    error = _iot_module.jobs_reject_terminal_describe(execution)
+    if error:
+        return error
+    include_document = str(qp.get("includeJobDocument", "true")).lower() != "false"
+    document = _iot_module.jobs_job_document(job_id) if include_document else None
+    return json_response({"execution": _execution_view(execution, document)})
+
+
+async def _update_execution(thing: str, job_id: str, payload: dict) -> tuple:
+    # Only the newest execution takes updates; a rejoined thing's older ones
+    # are terminal.
+    execution_number = payload.get("executionNumber")
+    if execution_number is not None:
+        try:
+            execution_number = int(execution_number)
+        except (TypeError, ValueError):
+            return error_response_json(
+                "InvalidRequestException",
+                f"Invalid executionNumber: {execution_number!r}", 400,
+            )
+    prev_next = _iot_module.jobs_first_pending_job_id(thing)
+    execution, error = _iot_module.jobs_update_execution(
+        thing,
+        job_id,
+        status=payload.get("status"),
+        expected_version=payload.get("expectedVersion"),
+        status_details=payload.get("statusDetails"),
+        step_timeout_minutes=payload.get("stepTimeoutInMinutes"),
+        execution_number=execution_number,
+    )
+    if error:
+        return error
+    logger.info(
+        "IoT Jobs: thing %s reported job %s as %s (version %s)",
+        thing, job_id, execution["status"], execution["versionNumber"],
+    )
+
+    response: dict = {}
+    if str(payload.get("includeJobExecutionState", "")).lower() in ("true", "1"):
+        response["executionState"] = _iot_module.jobs_execution_state(execution)
+    if str(payload.get("includeJobDocument", "")).lower() in ("true", "1"):
+        response["jobDocument"] = _iot_module.jobs_job_document(job_id)
+    if execution["status"] in ("SUCCEEDED", "FAILED", "REJECTED"):
+        # A terminal report removed the execution from the pending set.
+        await _iot_module.jobs_notify_thing(
+            get_account_id(), get_region(), thing, prev_next
+        )
+        await _iot_module.jobs_abort_if_met(get_account_id(), get_region(), job_id)
+    return json_response(response)

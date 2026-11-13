@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 EventBridge Scheduler Service Emulator.
 REST/JSON protocol — /schedules/* and /schedule-groups/* paths.
@@ -15,10 +17,21 @@ import json
 import logging
 import os
 import re
+import threading
 import time
+from datetime import datetime, timezone
+from urllib.parse import unquote
 
-from ministack.core.persistence import load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region
+from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    AccountScopedDict,
+    get_account_id,
+    get_region,
+    new_uuid,
+    set_request_account_id,
+    set_request_region,
+)
 
 logger = logging.getLogger("scheduler")
 
@@ -28,9 +41,9 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # State
 # ---------------------------------------------------------------------------
 
-_schedules = AccountScopedDict()       # (group, name) -> schedule record
-_schedule_groups = AccountScopedDict()  # group_name -> group record
-_tags = AccountScopedDict()            # arn -> {key: value}
+_schedules = AccountRegionScopedDict()  # "group/name" -> schedule record
+_schedule_groups = AccountRegionScopedDict()  # group_name -> group record
+_tags = AccountScopedDict()  # ARN key embeds region; account scoping is sufficient.
 
 
 def reset():
@@ -40,10 +53,9 @@ def reset():
 
 
 def get_state():
-    # Preserve AccountScopedDict wrappers; casting to a plain dict drops the
-    # per-account scoping and would persist only the current request's
-    # tenants. AccountScopedDict has a JSON encoder hook in core/persistence
-    # that round-trips the (account, key) tuple correctly.
+    # Preserve scoped wrappers; casting to a plain dict drops account/region
+    # metadata and would persist only the current request's resources. Both
+    # wrapper types have JSON encoder hooks in core/persistence.
     return {
         "schedules": copy.deepcopy(_schedules),
         "schedule_groups": copy.deepcopy(_schedule_groups),
@@ -51,18 +63,16 @@ def get_state():
     }
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     _schedules.update(data.get("schedules", {}))
     _schedule_groups.update(data.get("schedule_groups", {}))
     _tags.update(data.get("tags", {}))
 
 
-try:
-    _restored = load_state("scheduler")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    logger.exception("Failed to restore persisted scheduler state; continuing fresh")
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +99,62 @@ def _error(status, code, message):
     return status, {"Content-Type": "application/json", "x-amzn-errortype": code}, json.dumps({"__type": code, "Message": message}).encode()
 
 
+# EventBridgeParameters.Source pattern, as AWS names it in its validation message.
+_EB_SOURCE_PATTERN = r"(?=[/\.\-_A-Za-z0-9]+)((?!aws\.).*)|(\$(\.[\w_-]+(\[(\d+|\*)\])*)*)"
+# The same pattern for Python: AWS's "." stops at every Java line terminator.
+_EB_SOURCE_RE = re.compile(
+    r"(?=[/\.\-_A-Za-z0-9]+)((?!aws\.)[^\n\r\u0085\u2028\u2029]*)|(\$(\.[\w_-]+(\[(\d+|\*)\])*)*)",
+    re.ASCII,
+)
+
+
+def _not_a_string_message(value):
+    """AWS's SerializationException message for a string member sent as another JSON type."""
+    if isinstance(value, bool):
+        return f"{'TRUE' if value else 'FALSE'}_VALUE can not be converted to a String"
+    if isinstance(value, (int, float)):
+        return "NUMBER_VALUE can not be converted to a String"
+    if isinstance(value, dict):
+        return "Start of structure or map found where not expected."
+    return "Start of list found where not expected"
+
+
+def _eventbridge_parameters_error(target):
+    """AWS's error for a CreateSchedule or UpdateSchedule Target.EventBridgeParameters, or None.
+    AWS reports a member of the wrong JSON type first, then aggregates validation errors,
+    before any schedule or group lookup and for every target type."""
+    params = target.get("EventBridgeParameters") if isinstance(target, dict) else None
+    if params is None:
+        return None
+    if isinstance(params, list):
+        return _error(400, "SerializationException", "Start of list found where not expected")
+    if not isinstance(params, dict):
+        return _error(400, "SerializationException", "Expected null")
+    members = (("DetailType", "detailType", 128), ("Source", "source", 256))
+    for member, _path, _max_len in members:
+        value = params.get(member)
+        if value is not None and not isinstance(value, str):
+            return _error(400, "SerializationException", _not_a_string_message(value))
+    errors = []
+    for member, path, max_len in members:
+        value = params.get(member)
+        where = f"at 'target.eventBridgeParameters.{path}' failed to satisfy constraint"
+        if value is None:
+            errors.append(f"Value null {where}: Member must not be null")
+            continue
+        if member == "Source" and not _EB_SOURCE_RE.fullmatch(value):
+            errors.append(f"Value '{value}' {where}: Member must satisfy regular expression pattern: "
+                          f"{_EB_SOURCE_PATTERN}")
+        if len(value) < 1:
+            errors.append(f"Value '{value}' {where}: Member must have length greater than or equal to 1")
+        elif len(value) > max_len:
+            errors.append(f"Value '{value}' {where}: Member must have length less than or equal to {max_len}")
+    if not errors:
+        return None
+    count = "1 validation error" if len(errors) == 1 else f"{len(errors)} validation errors"
+    return _error(400, "ValidationException", f"{count} detected: " + "; ".join(errors))
+
+
 def _ensure_default_group():
     """Ensure the 'default' group exists."""
     key = "default"
@@ -100,6 +166,39 @@ def _ensure_default_group():
             "CreationDate": _now(),
             "LastModificationDate": _now(),
         }
+
+
+def _tag_resource_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None, _error(400, "ValidationException", f"Invalid ResourceArn: {arn}")
+
+    if (
+        spec.partition != "aws"
+        or spec.service != "scheduler"
+        or spec.region != get_region()
+        or spec.account_id != get_account_id()
+    ):
+        return None, _error(404, "ResourceNotFoundException", f"Resource {arn} does not exist.")
+
+    parts = spec.resource.split("/")
+    if len(parts) == 3 and parts[0] == "schedule":
+        key = f"{parts[1]}/{parts[2]}"
+        schedule = _schedules.get(key)
+        if schedule and schedule.get("Arn") == arn:
+            return schedule["Arn"], None
+        return None, _error(404, "ResourceNotFoundException", f"Resource {arn} does not exist.")
+
+    if len(parts) == 2 and parts[0] == "schedule-group":
+        if parts[1] == "default":
+            _ensure_default_group()
+        group = _schedule_groups.get(parts[1])
+        if group and group.get("Arn") == arn:
+            return group["Arn"], None
+        return None, _error(404, "ResourceNotFoundException", f"Resource {arn} does not exist.")
+
+    return None, _error(404, "ResourceNotFoundException", f"Resource {arn} does not exist.")
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +213,7 @@ def _create_schedule(name, body):
 
     if key in _schedules:
         return _error(409, "ConflictException",
-                       f"Schedule {name} already exists in group {group}.")
+                       f"Schedule {name} already exists.")
 
     # Validate required fields
     if not body.get("ScheduleExpression"):
@@ -167,7 +266,7 @@ def _update_schedule(name, body):
 
     if key not in _schedules:
         return _error(404, "ResourceNotFoundException",
-                       f"Schedule {name} does not exist in group {group}.")
+                       f"Schedule {name} does not exist.")
 
     if not body.get("ScheduleExpression"):
         return _error(400, "ValidationException",
@@ -211,10 +310,25 @@ def _get_schedule(name, query):
     sched = _schedules.get(key)
     if not sched:
         return _error(404, "ResourceNotFoundException",
-                       f"Schedule {name} does not exist in group {group}.")
+                       f"Schedule {name} does not exist.")
 
     result = {k: v for k, v in sched.items() if v is not None}
     return _json_resp(200, result)
+
+
+def _paged(query, key, items):
+    try:
+        start = max(int(query.get("NextToken") or 0), 0)
+    except (TypeError, ValueError):
+        start = 0
+    try:
+        end = start + int(query.get("MaxResults") or 100)
+    except (TypeError, ValueError):
+        end = start + 100
+    body = {key: items[start:end]}
+    if end < len(items):
+        body["NextToken"] = str(end)
+    return _json_resp(200, body)
 
 
 def _list_schedules(query):
@@ -223,7 +337,6 @@ def _list_schedules(query):
     group_filter = query.get("ScheduleGroup")
     name_prefix = query.get("NamePrefix", "")
     state_filter = query.get("State")
-    max_results = int(query.get("MaxResults", 100))
 
     results = []
     for key, sched in _schedules.items():
@@ -243,8 +356,7 @@ def _list_schedules(query):
             "Target": {"Arn": sched["Target"].get("Arn", "")},
         })
 
-    results = results[:max_results]
-    return _json_resp(200, {"Schedules": results})
+    return _paged(query, "Schedules", results)
 
 
 def _delete_schedule(name, query):
@@ -253,7 +365,7 @@ def _delete_schedule(name, query):
 
     if key not in _schedules:
         return _error(404, "ResourceNotFoundException",
-                       f"Schedule {name} does not exist in group {group}.")
+                       f"Schedule {name} does not exist.")
 
     arn = _schedules[key]["Arn"]
     del _schedules[key]
@@ -307,7 +419,6 @@ def _list_schedule_groups(query):
     _ensure_default_group()
 
     name_prefix = query.get("NamePrefix", "")
-    max_results = int(query.get("MaxResults", 100))
 
     results = []
     for name, group in _schedule_groups.items():
@@ -315,8 +426,7 @@ def _list_schedule_groups(query):
             continue
         results.append(group)
 
-    results = results[:max_results]
-    return _json_resp(200, {"ScheduleGroups": results})
+    return _paged(query, "ScheduleGroups", results)
 
 
 def _delete_schedule_group(name, query):
@@ -347,6 +457,9 @@ def _delete_schedule_group(name, query):
 # ---------------------------------------------------------------------------
 
 def _tag_resource(arn, body):
+    arn, err = _tag_resource_arn(arn)
+    if err:
+        return err
     tags = body.get("Tags", [])
     existing = _tags.get(arn, {})
     existing.update({t["Key"]: t["Value"] for t in tags})
@@ -355,6 +468,9 @@ def _tag_resource(arn, body):
 
 
 def _untag_resource(arn, query):
+    arn, err = _tag_resource_arn(arn)
+    if err:
+        return err
     keys = query.get("TagKeys", [])
     if isinstance(keys, str):
         keys = [keys]
@@ -369,6 +485,9 @@ def _untag_resource(arn, query):
 
 
 def _list_tags(arn):
+    arn, err = _tag_resource_arn(arn)
+    if err:
+        return err
     existing = _tags.get(arn, {})
     tags = [{"Key": k, "Value": v} for k, v in existing.items()]
     return _json_resp(200, {"Tags": tags})
@@ -390,6 +509,10 @@ async def handle_request(method, path, headers, body_bytes, query_params):
     m = re.fullmatch(r"/schedules/([A-Za-z0-9_.@-]+)", path)
     if m:
         name = m.group(1)
+        if method in ("POST", "PUT"):
+            invalid = _eventbridge_parameters_error(body.get("Target"))
+            if invalid:
+                return invalid
         if method == "POST":
             return _create_schedule(name, body)
         if method == "GET":
@@ -418,7 +541,7 @@ async def handle_request(method, path, headers, body_bytes, query_params):
 
     # Tags routes: /tags/{arn+}
     if path.startswith("/tags/"):
-        arn = path[6:]  # Everything after /tags/
+        arn = unquote(path[6:])  # Everything after /tags/
         if method == "GET":
             return _list_tags(arn)
         if method == "POST":
@@ -427,3 +550,181 @@ async def handle_request(method, path, headers, body_bytes, query_params):
             return _untag_resource(arn, query)
 
     return _error(400, "ValidationException", f"No route for {method} {path}")
+
+
+# ---------------------------------------------------------------------------
+# Schedule firing (issue #958)
+# ---------------------------------------------------------------------------
+# A background sweep over ``_schedules`` that fires each due schedule's target,
+# mirroring ``eventbridge._tick_scheduled_rules`` but over the Scheduler store
+# and its single-``Target`` shape. Rate/cron parsing and target dispatch are
+# reused from EventBridge so behavior matches the rules path exactly; the extras
+# unique to Scheduler are handled here: ``at()`` one-time expressions,
+# ``ActionAfterCompletion`` one-shot delete, ``State`` and ``StartDate``/``EndDate``.
+
+_SCHEDULE_TICK_INTERVAL = 10  # seconds between sweeps
+_schedule_last_fired: dict = {}  # (account_id, region, "group/name") -> epoch; not persisted
+_ticker_thread: "threading.Thread | None" = None
+
+
+def _to_epoch(value):
+    """StartDate/EndDate arrive as rest-json unix timestamps (numbers); tolerate
+    ISO-8601 strings too. Returns a float epoch, or None."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _at_time_epoch(expr: str):
+    """Parse an ``at(yyyy-mm-ddThh:mm:ss)`` one-time expression to a UTC epoch,
+    or None when the expression is not an ``at()`` form."""
+    m = re.match(r"^\s*at\((.+)\)\s*$", expr)
+    if not m:
+        return None
+    try:
+        dt = datetime.fromisoformat(m.group(1).strip())
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _is_event_bus_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return False
+    return spec.service == "events" and spec.resource.startswith("event-bus/")
+
+
+def _tick_schedules():
+    """Fire every ENABLED schedule that is due, honoring State, Start/EndDate,
+    at()/rate()/cron() expressions and ActionAfterCompletion one-shot delete."""
+    from ministack.services import eventbridge as _eb
+
+    now = time.time()
+    now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
+    previous_account = get_account_id()
+    previous_region = get_region()
+    try:
+        for state_key, sched in list(_schedules._data.items()):
+            account_id, region, key = state_key
+            if sched.get("State") != "ENABLED":
+                continue
+            end = _to_epoch(sched.get("EndDate"))
+            if end is not None and now > end:
+                # A recurring schedule past its EndDate has "completed".
+                if sched.get("ActionAfterCompletion") == "DELETE":
+                    _schedules._data.pop(state_key, None)
+                    _schedule_last_fired.pop(state_key, None)
+                continue
+            start = _to_epoch(sched.get("StartDate"))
+            if start is not None and now < start:
+                continue
+
+            expr = sched.get("ScheduleExpression", "")
+            one_shot = False
+
+            at_epoch = _at_time_epoch(expr)
+            if at_epoch is not None:
+                # One-time at(): fire once when the moment has passed.
+                if now < at_epoch or state_key in _schedule_last_fired:
+                    continue
+                one_shot = True
+            else:
+                interval = _eb._parse_rate_seconds(expr)
+                if interval is not None:
+                    # rate(): countdown anchored to creation, then every interval.
+                    if state_key not in _schedule_last_fired:
+                        _schedule_last_fired[state_key] = sched.get("CreationDate", now)
+                    if now - _schedule_last_fired[state_key] < interval:
+                        continue
+                else:
+                    fields = _eb._parse_cron_fields(expr)
+                    if fields is None:
+                        continue  # unsupported / unparseable expression
+                    # cron(): fire once per scheduled occurrence.
+                    if state_key not in _schedule_last_fired:
+                        _schedule_last_fired[state_key] = now
+                        continue
+                    last_dt = datetime.fromtimestamp(_schedule_last_fired[state_key], tz=timezone.utc)
+                    next_fire = _eb._cron_next_fire(fields, last_dt)
+                    if next_fire is None or now_dt < next_fire:
+                        continue
+
+            _schedule_last_fired[state_key] = now
+            target = sched.get("Target") or {}
+            if not target.get("Arn"):
+                continue
+            # Fire under the schedule's own account and region so target dispatch
+            # observes the same request scope as the schedule resource.
+            set_request_account_id(account_id)
+            set_request_region(region)
+            event = {
+                "EventId": new_uuid(),
+                "Source": "aws.scheduler",
+                "DetailType": "Scheduled Event",
+                "Detail": "{}",
+                "Time": now,
+                "Resources": [sched.get("Arn", "")],
+                "Account": account_id,
+                "Region": get_region(),
+            }
+            # A templated PutEvents target publishes with its own Source and DetailType
+            # and no resources; without EventBridgeParameters AWS publishes nothing.
+            eb_params = target.get("EventBridgeParameters") or {}
+            publish = True
+            if _is_event_bus_arn(target["Arn"]):
+                publish = bool(eb_params)
+                event["Resources"] = []
+            if eb_params.get("Source"):
+                event["Source"] = eb_params["Source"]
+            if eb_params.get("DetailType"):
+                event["DetailType"] = eb_params["DetailType"]
+            try:
+                if publish:
+                    _eb._invoke_target(target, event, sched, from_rule=False)
+            except Exception:
+                logger.exception(
+                    "Scheduler dispatch error for %s (account %s, region %s)",
+                    key,
+                    account_id,
+                    region,
+                )
+
+            # ActionAfterCompletion=DELETE on a one-time at() schedule: remove after
+            # firing. Recurring DELETE schedules "complete" at EndDate (handled above);
+            # at() with NONE stays but never refires (guarded by _schedule_last_fired).
+            if one_shot and sched.get("ActionAfterCompletion") == "DELETE":
+                _schedules._data.pop(state_key, None)
+                _schedule_last_fired.pop(state_key, None)
+    finally:
+        set_request_account_id(previous_account)
+        set_request_region(previous_region)
+
+
+def _ticker_loop():
+    while True:
+        time.sleep(_SCHEDULE_TICK_INTERVAL)
+        try:
+            _tick_schedules()
+        except Exception:
+            logger.exception("Scheduler ticker error")
+
+
+def start_scheduler() -> None:
+    """Start the schedule-firing daemon (idempotent). Wired from the gateway
+    lifespan.startup, mirroring ``eventbridge.start_scheduler``."""
+    global _ticker_thread
+    if _ticker_thread is not None and _ticker_thread.is_alive():
+        return
+    _ticker_thread = threading.Thread(
+        target=_ticker_loop, daemon=True, name="evb-scheduler-ticker"
+    )
+    _ticker_thread.start()

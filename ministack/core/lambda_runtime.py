@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 Lambda warm/cold start worker pool.
 Each function gets a persistent worker process (Python or Node.js) that imports
@@ -5,10 +7,12 @@ the handler once (cold start) and then handles subsequent invocations without
 re-importing (warm).
 """
 
+import hashlib
 import json
 import logging
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -17,9 +21,33 @@ import threading
 import time
 import zipfile
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import _12_DIGIT_RE
 
 logger = logging.getLogger("lambda_runtime")
+
+# S3 Object Lambda handlers call WriteGetObjectResponse, whose modeled host
+# prefix (`<route>.<host>`) doesn't resolve against MiniStack's endpoint.
+# botocore reads this variable and skips the prefix; MiniStack routes the call
+# by its x-amz-request-route header instead. A function's own value wins.
+HOST_PREFIX_ENV = "AWS_DISABLE_HOST_PREFIX_INJECTION"
+
+_RESERVED_RUNTIME_ENV_VARS = {
+    "AWS_REGION",
+    "AWS_DEFAULT_REGION",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_LAMBDA_FUNCTION_NAME",
+    "AWS_LAMBDA_FUNCTION_MEMORY_SIZE",
+    "AWS_LAMBDA_FUNCTION_VERSION",
+    "AWS_LAMBDA_LOG_STREAM_NAME",
+    "_LAMBDA_FUNCTION_ARN",
+    "_LAMBDA_TIMEOUT",
+    "LAMBDA_TASK_ROOT",
+    "AWS_EXECUTION_ENV",
+}
+
 
 def _account_from_arn(arn: str) -> str:
     """Extract the 12-digit account ID from a Lambda function ARN.
@@ -35,15 +63,155 @@ def _account_from_arn(arn: str) -> str:
     return os.environ.get("AWS_ACCESS_KEY_ID", "test")
 
 
+def _lambda_function_account_region_from_arn(arn: str) -> tuple[str, str]:
+    spec = parse_arn(arn)
+    if spec.service != "lambda":
+        raise ArnParseError("arn: expected lambda service")
+    if not _12_DIGIT_RE.match(spec.account_id):
+        raise ArnParseError("arn: expected 12-digit account id")
+    if not spec.region:
+        raise ArnParseError("arn: expected region")
+    parts = spec.resource.split(":", 2)
+    if len(parts) < 2 or parts[0] != "function" or not parts[1]:
+        raise ArnParseError("arn: expected lambda function resource")
+    return spec.account_id, spec.region
+
+
+def _account_region_from_function_config(config: dict) -> tuple[str, str]:
+    arn = config.get("FunctionArn", "")
+    if not arn:
+        raise ArnParseError("arn: missing lambda function arn")
+    return _lambda_function_account_region_from_arn(arn)
+
+
+def execution_credentials(config: dict) -> dict[str, str]:
+    """Return account credentials or an AUTH execution-role session."""
+    account_id, _region = _account_region_from_function_config(config)
+    from ministack import app
+
+    if not app.AUTH:
+        return {
+            "AWS_ACCESS_KEY_ID": account_id,
+            "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", "test"),
+            "AWS_SESSION_TOKEN": os.environ.get("AWS_SESSION_TOKEN", ""),
+        }
+
+    role_arn = config.get("Role", "")
+    role_name = role_arn.rsplit("/", 1)[-1]
+    function_arn = config.get("FunctionArn", "")
+    digest = hashlib.sha256(f"{function_arn}:{role_arn}".encode()).hexdigest()
+    access_key = f"ASIA{digest[:16].upper()}"
+    secret_key = hashlib.sha256(f"secret:{digest}".encode()).hexdigest()
+    session_token = hashlib.sha256(f"token:{digest}".encode()).hexdigest()
+    session_name = config.get("FunctionName", "ministack-lambda")[:64]
+
+    from ministack.services import sts as sts_svc
+
+    sts_svc.register_session(access_key, {
+        "Arn": f"arn:aws:sts::{account_id}:assumed-role/{role_name}/{session_name}",
+        "UserId": f"{role_name}:{session_name}",
+        "SecretAccessKey": secret_key,
+        "SessionToken": session_token,
+    })
+    return {
+        "AWS_ACCESS_KEY_ID": access_key,
+        "AWS_SECRET_ACCESS_KEY": secret_key,
+        "AWS_SESSION_TOKEN": session_token,
+    }
+
+
 _workers: dict = {}
 _lock = threading.Lock()
+
+# No per-function ceiling on warm subprocesses: AWS lets an unreserved function
+# scale into the account pool, and capping width here would invent a throttle
+# AWS never sends and diverge from the docker executor, which spawns freely.
+# Concurrency is bounded once, at lambda_svc._acquire_execution_slot, via
+# ReservedConcurrentExecutions and the existing LAMBDA_ACCOUNT_CONCURRENCY.
+# The reaper reclaims the surplus subprocesses a burst leaves behind.
+_LOCAL_MAX_WORKERS = 0
+# Seconds a surplus worker may sit idle before it is reaped (the first worker
+# per function is never reaped, so warm starts are unaffected). Shares the knob
+# that already governs warm-container eviction rather than adding a second one.
+_LOCAL_WORKER_TTL = float(os.environ.get("LAMBDA_WARM_TTL_SECONDS", "300"))
+
+# ---------------------------------------------------------------------------
+# Recursive-loop lineage (runs inside every ministack-owned Python child)
+# ---------------------------------------------------------------------------
+
+# Name of the env var each executor sets to the current invocation's loop
+# depth, and of the header the child stamps onto outgoing SDK calls so the
+# nested Invoke can be attributed to its caller. Kept here (not in lambda_svc)
+# because both the worker script and lambda_svc's one-shot wrappers embed it.
+INVOKE_DEPTH_ENV = "_MINISTACK_INVOKE_DEPTH"
+INVOKE_DEPTH_HEADER = "X-Ministack-Invoke-Depth"
+# The warm worker's env is fixed at spawn time, so its depth travels in the
+# invocation envelope beside the payload — same channel as the X-Ray trace
+# header and the durable-execution variables below.
+
+# The durable-execution variables change on every invocation of the same
+# function, so a pooled worker cannot carry them in its spawn environment
+# either. They travel in the envelope as a mapping of the three names below,
+# and both worker bootstraps move them into the environment before the
+# handler runs.
+#
+# One declaration for both readers: lambda_svc builds the overlay from the
+# durable context under these keys, the bootstraps iterate the names to set
+# them and to delete them again. A fourth variable added to only one of the
+# two would be set and never cleared.
+DURABLE_ENV_VARS = {
+    "AWS_LAMBDA_DURABLE_EXECUTION_ARN": "arn",
+    "AWS_LAMBDA_DURABLE_CHECKPOINT_TOKEN": "token",
+    "AWS_LAMBDA_DURABLE_EXECUTION_NAME": "name",
+}
+
+
+def _sub_runtime_tokens(script: str) -> str:
+    """Substitute the per-invocation carrier names into a bootstrap script."""
+    return (
+        script.replace("__DEPTH_ENV__", INVOKE_DEPTH_ENV)
+        .replace("__DEPTH_HEADER__", INVOKE_DEPTH_HEADER)
+        .replace("__DURABLE_ENV_VARS__", json.dumps(list(DURABLE_ENV_VARS)))
+    )
+
+
+# Prepended to the Python bootstraps we own (warm worker + one-shot wrappers),
+# which call `_ms_install_invoke_depth()` once sys.path is set up and before
+# they import the handler module — botocore copies BUILTIN_HANDLERS into every
+# Session it builds, and handlers routinely build their clients at import time.
+#
+# botocore forwards `_X_AMZN_TRACE_ID` as `X-Amzn-Trace-Id` on every outgoing
+# call through its own `add_recursion_detection_header`; this registers a
+# handler alongside it for ministack's depth counter.
+#
+# Importing botocore is what a cold start pays for the counter (~0.15s here),
+# once per worker. The one-shot executor's wrapper carries the same bootstrap,
+# but nothing reaches it any more: python and nodejs go to the pool, and every
+# other runtime gets a mock answer before the subprocess starts. A function
+# whose environment has no botocore is not instrumented: it would have to be
+# calling Invoke over raw urllib, which never carried lineage anyway.
+INVOKE_DEPTH_BOOTSTRAP = _sub_runtime_tokens('''
+def _ms_install_invoke_depth():
+    import os
+    try:
+        import botocore.handlers
+    except ImportError:
+        return
+
+    def _ms_add_invoke_depth(params, **kwargs):
+        depth = os.environ.get("__DEPTH_ENV__")
+        if depth and "__DEPTH_HEADER__" not in params["headers"]:
+            params["headers"]["__DEPTH_HEADER__"] = depth
+
+    botocore.handlers.BUILTIN_HANDLERS.append(("before-call", _ms_add_invoke_depth))
+''')
 
 # ---------------------------------------------------------------------------
 # Python worker script (runs inside a persistent subprocess)
 # ---------------------------------------------------------------------------
 
-_PYTHON_WORKER_SCRIPT = '''
-import sys, json, importlib, traceback, os
+_PYTHON_WORKER_SCRIPT = INVOKE_DEPTH_BOOTSTRAP + _sub_runtime_tokens('''
+import sys, json, importlib, traceback, os, time
 
 def run():
     # Redirect print() to stderr so stdout stays clean for JSON-line protocol
@@ -61,14 +229,69 @@ def run():
         _py = os.path.join(_ld, "python")
         if os.path.isdir(_py):
             sys.path.insert(0, _py)
+            # AWS exposes <layer>/python/lib/python<ver>/site-packages as a
+            # site directory (processes .pth files / namespace packages), where
+            # `pip install -t` dependency layers land (#888).
+            _lib = os.path.join(_py, "lib")
+            if os.path.isdir(_lib):
+                import site as _site
+                for _v in os.listdir(_lib):
+                    _sp = os.path.join(_lib, _v, "site-packages")
+                    if os.path.isdir(_sp):
+                        _site.addsitedir(_sp)
         sys.path.insert(0, _ld)
+    # After sys.path is complete (so a function that bundles its own botocore
+    # gets that one) and before the handler module builds any client.
+    _ms_install_invoke_depth()
+    # The handler's module as the function names it, for the messages awslambdaric words with it.
+    _ms_modname = init.get("handler_module") or module_name
+
+    class _MsFault(Exception):
+        def __init__(self, etype, msg, trace=None):
+            super().__init__(msg)
+            self.etype, self.msg, self.trace = etype, msg, trace or []
+
     try:
-        mod = importlib.import_module(module_name)
-        handler_fn = getattr(mod, handler_name)
+        try:
+            mod = importlib.import_module(module_name)
+        except ImportError as e:
+            raise _MsFault("Runtime.ImportModuleError", "Unable to import module '%s': %s" % (_ms_modname, e))
+        except SyntaxError as e:
+            raise _MsFault("Runtime.UserCodeSyntaxError", "Syntax error in module '%s': %s" % (_ms_modname, e),
+                           ['  File "%s" Line %s\\n    %s' % (e.filename, e.lineno, e.text)])
+        try:
+            handler_fn = getattr(mod, handler_name)
+        except AttributeError:
+            raise _MsFault("Runtime.HandlerNotFound", "Handler '%s' missing on module '%s'" % (handler_name, _ms_modname))
+        if init.get("snapstart"):
+            # SnapStart runtime hooks (snapshot-restore-py, bundled in AWS's
+            # python3.12+ runtimes). Each environment of a published SnapStart
+            # version runs one snapshot/restore cycle: before-snapshot hooks
+            # in reverse registration order, then after-restore hooks in
+            # registration order, before the first invocation. A hook that
+            # raises fails the init, which fails the publish, as on AWS.
+            try:
+                from snapshot_restore_py import (
+                    get_after_restore,
+                    get_before_snapshot,
+                )
+            except ImportError:
+                pass
+            else:
+                for _fn, _args, _kwargs in reversed(get_before_snapshot()):
+                    _fn(*_args, **_kwargs)
+                for _fn, _args, _kwargs in get_after_restore():
+                    _fn(*_args, **_kwargs)
         _real_stdout.write(json.dumps({"status": "ready", "cold": True}) + "\\n")
         _real_stdout.flush()
     except Exception as e:
-        _real_stdout.write(json.dumps({"status": "error", "error": str(e)}) + "\\n")
+        if isinstance(e, _MsFault):
+            _ms_payload = {"errorMessage": e.msg, "errorType": e.etype, "requestId": "", "stackTrace": e.trace}
+        else:
+            _ms_payload = {"errorMessage": str(e), "errorType": type(e).__name__, "requestId": "",
+                           "stackTrace": traceback.format_list(traceback.extract_tb(e.__traceback__)[1:])}
+        _real_stdout.write(json.dumps({"status": "error", "error": _ms_payload["errorMessage"],
+                                       "errorType": _ms_payload["errorType"], "payload": _ms_payload}) + "\\n")
         _real_stdout.flush()
         return
 
@@ -76,28 +299,79 @@ def run():
         line = sys.stdin.readline()
         if not line:
             break
-        event = json.loads(line)
+        # One invocation, one envelope: {"event": <payload>, "ctx": {...}}.
+        # The payload is the caller's and reaches the handler exactly as it
+        # was sent, whatever its JSON type — on AWS the per-invocation values
+        # below are in the execution environment and the context object, never
+        # in the event.
+        _ms_msg = json.loads(line)
+        event = _ms_msg["event"]
+        _ms_ctx = _ms_msg.get("ctx") or {}
+        # X-Ray active tracing: _X_AMZN_TRACE_ID is a reserved environment
+        # variable that "changes with each invocation", so a pooled worker
+        # sets it per call.
+        _xray_tid = _ms_ctx.get("trace_id")
+        if _xray_tid:
+            os.environ["_X_AMZN_TRACE_ID"] = _xray_tid
+        elif "_X_AMZN_TRACE_ID" in os.environ:
+            del os.environ["_X_AMZN_TRACE_ID"]
+        # Recursive-loop depth: same per-invocation channel as the trace
+        # header, read by the before-call handler when this function calls out.
+        _ms_depth = _ms_ctx.get("depth")
+        if _ms_depth is not None:
+            os.environ["__DEPTH_ENV__"] = str(_ms_depth)
+        elif "__DEPTH_ENV__" in os.environ:
+            del os.environ["__DEPTH_ENV__"]
+        # Durable execution: the ARN, the checkpoint token and the execution
+        # name belong to this invocation only, and are dropped again when the
+        # next one is not durable.
+        _ms_durable = _ms_ctx.get("durable") or {}
+        for _ms_var in __DURABLE_ENV_VARS__:
+            if _ms_var in _ms_durable:
+                os.environ[_ms_var] = str(_ms_durable[_ms_var])
+            elif _ms_var in os.environ:
+                del os.environ[_ms_var]
+        _function_name = init.get("function_name", "")
+        _deadline = time.time() + float(os.environ.get("_LAMBDA_TIMEOUT", "3"))
         context = type("Context", (), {
             "function_name": init.get("function_name", ""),
+            "function_version": os.environ.get("AWS_LAMBDA_FUNCTION_VERSION", "$LATEST"),
             "memory_limit_in_mb": init.get("memory", 128),
-            "invoked_function_arn": init.get("arn", ""),
-            "aws_request_id": event.pop("_request_id", ""),
+            "invoked_function_arn": _ms_ctx.get("invoked_function_arn", init.get("arn", "")),
+            "aws_request_id": _ms_ctx.get("request_id", ""),
+            "log_group_name": os.environ.get("AWS_LAMBDA_LOG_GROUP_NAME", "/aws/lambda/" + _function_name),
+            "log_stream_name": os.environ.get("AWS_LAMBDA_LOG_STREAM_NAME", ""),
+            "identity": None,
+            "client_context": None,
+            "get_remaining_time_in_millis": lambda self: max(0, int((_deadline - time.time()) * 1000)),
         })()
+        _ms_rid = _ms_ctx.get("request_id", "")
         try:
             result = handler_fn(event, context)
-            _real_stdout.write(json.dumps({"status": "ok", "result": result}) + "\\n")
         except Exception as e:
-            _real_stdout.write(json.dumps({"status": "error", "error": str(e), "trace": traceback.format_exc()}) + "\\n")
+            # As awslambdaric reports it: the exception's own type, and the frames below the runtime's.
+            _ms_payload = {"errorMessage": str(e), "errorType": type(e).__name__, "requestId": _ms_rid,
+                           "stackTrace": traceback.format_list(traceback.extract_tb(e.__traceback__)[1:])}
+            _real_stdout.write(json.dumps({"status": "error", "error": str(e), "trace": traceback.format_exc(),
+                                           "payload": _ms_payload}) + "\\n")
+        else:
+            try:
+                _real_stdout.write(json.dumps({"status": "ok", "result": result}) + "\\n")
+            except Exception as e:
+                _ms_payload = {"errorMessage": "Unable to marshal response: %s" % e, "errorType": "Runtime.MarshalError",
+                               "requestId": _ms_rid, "stackTrace": []}
+                _real_stdout.write(json.dumps({"status": "error", "error": _ms_payload["errorMessage"],
+                                               "payload": _ms_payload}) + "\\n")
         _real_stdout.flush()
 
 run()
-'''
+''')
 
 # ---------------------------------------------------------------------------
 # Node.js worker script (runs inside a persistent subprocess)
 # ---------------------------------------------------------------------------
 
-_NODEJS_WORKER_SCRIPT = r'''
+_NODEJS_WORKER_SCRIPT = _sub_runtime_tokens(r'''
 const readline = require("readline");
 const path = require("path");
 const http = require("http");
@@ -106,10 +380,25 @@ const url = require("url");
 const Module = require("module");
 
 // Redirect stdout to stderr so stdout stays clean for JSON-line protocol
+const fs = require("fs");
 const _realStdoutWrite = process.stdout.write.bind(process.stdout);
 const _stderrWrite = process.stderr.write.bind(process.stderr);
 process.stdout.write = function(chunk, encoding, callback) {
   return _stderrWrite(chunk, encoding, callback);
+};
+const _stdoutFd = process.stdout.fd;
+const _realWriteSync = fs.writeSync.bind(fs);
+const _realWrite = fs.write.bind(fs);
+function _isStdoutFd(fd) {
+  return fd === 1 || fd === _stdoutFd;
+}
+fs.writeSync = function(fd, ...args) {
+  if (_isStdoutFd(fd)) fd = 2;
+  return _realWriteSync(fd, ...args);
+};
+fs.write = function(fd, ...args) {
+  if (_isStdoutFd(fd)) fd = 2;
+  return _realWrite(fd, ...args);
 };
 
 // Synthetic AWS SDK v3 stubs — real AWS Lambda (Node.js 18+) ships these
@@ -117,6 +406,38 @@ process.stdout.write = function(chunk, encoding, callback) {
 // a Lambda Layer with the actual SDK takes precedence; fall back to a stub
 // that routes through AWS_ENDPOINT_URL (Ministack).
 (function _installAwsSdkV3Stubs() {
+  // SigV4-sign a stub request with the function's credentials, as the real SDK does.
+  function _signedHeaders(service, method, ep, requestPath, body, headers) {
+    const crypto = require("crypto");
+    const accessKey = process.env.AWS_ACCESS_KEY_ID;
+    const secretKey = process.env.AWS_SECRET_ACCESS_KEY;
+    if (!accessKey || !secretKey) return headers;
+    const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "us-east-1";
+    const amzDate = new Date().toISOString().replace(/[-:]|\.\d{3}/g, "");
+    const scope = amzDate.slice(0, 8) + "/" + region + "/" + service + "/aws4_request";
+    const signed = Object.assign({}, headers, { host: ep.host, "x-amz-date": amzDate });
+    if (process.env.AWS_SESSION_TOKEN) signed["x-amz-security-token"] = process.env.AWS_SESSION_TOKEN;
+    const values = {};
+    for (const name of Object.keys(signed)) values[name.toLowerCase()] = String(signed[name]).trim();
+    const names = Object.keys(values).sort();
+    const encode = (v) => encodeURIComponent(v)
+      .replace(/[!'()*]/g, (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase());
+    const [rawPath, rawQuery] = requestPath.split("?");
+    const query = new URLSearchParams(rawQuery || "");
+    const canonicalQuery = [...query.entries()].map(([k, v]) => encode(k) + "=" + encode(v)).sort().join("&");
+    const hash = (data) => crypto.createHash("sha256").update(data).digest("hex");
+    const hmac = (key, data) => crypto.createHmac("sha256", key).update(data).digest();
+    const canonical = [method, rawPath.split("/").map(encode).join("/"), canonicalQuery,
+      names.map((n) => n + ":" + values[n] + "\n").join(""), names.join(";"), hash(body || "")].join("\n");
+    let key = hmac("AWS4" + secretKey, amzDate.slice(0, 8));
+    for (const part of [region, service, "aws4_request"]) key = hmac(key, part);
+    const signature = crypto.createHmac("sha256", key)
+      .update(["AWS4-HMAC-SHA256", amzDate, scope, hash(canonical)].join("\n")).digest("hex");
+    signed["Authorization"] = "AWS4-HMAC-SHA256 Credential=" + accessKey + "/" + scope
+      + ", SignedHeaders=" + names.join(";") + ", Signature=" + signature;
+    return signed;
+  }
+
   // ── Lambda stub (REST-based, not JSON-RPC) ─────────────────────────────
   function _lambdaInvoke(params) {
     const ep = new URL(process.env.AWS_ENDPOINT_URL || "http://127.0.0.1:4566");
@@ -127,14 +448,22 @@ process.stdout.write = function(chunk, encoding, callback) {
     const body = params.Payload instanceof Uint8Array
       ? Buffer.from(params.Payload)
       : (params.Payload || "");
+    const headers = { "Content-Type": "application/json" };
+    // Carry the caller's recursive-loop depth so ministack can attribute this
+    // nested Invoke to it (the counterpart of the botocore before-call handler
+    // on the Python side).
+    if (process.env.__DEPTH_ENV__) {
+      headers["__DEPTH_HEADER__"] = process.env.__DEPTH_ENV__;
+    }
+    const requestPath = "/2015-03-31/functions/" + fn + "/invocations" + qs;
     return new Promise((resolve, reject) => {
-      const req = http.request(
+      const req = (ep.protocol === "https:" ? https : http).request(
         {
           hostname: ep.hostname,
           port: parseInt(ep.port || "4566", 10),
           method: "POST",
-          path: "/2015-03-31/functions/" + fn + "/invocations" + qs,
-          headers: { "Content-Type": "application/json" },
+          path: requestPath,
+          headers: _signedHeaders("lambda", "POST", ep, requestPath, body, headers),
         },
         (res) => {
           const chunks = [];
@@ -154,79 +483,311 @@ process.stdout.write = function(chunk, encoding, callback) {
     });
   }
 
+  // GET /2017-03-31/tags/{Resource}
+  function _lambdaListTags(params) {
+    const ep = new URL(process.env.AWS_ENDPOINT_URL || "http://127.0.0.1:4566");
+    const resourceArn = params.Resource || "";
+    const requestPath = "/2017-03-31/tags/" + encodeURIComponent(resourceArn);
+    return new Promise((resolve, reject) => {
+      const req = (ep.protocol === "https:" ? https : http).request(
+        {
+          hostname: ep.hostname,
+          port: parseInt(ep.port || "4566", 10),
+          method: "GET",
+          path: requestPath,
+          headers: _signedHeaders("lambda", "GET", ep, requestPath, "", {}),
+        },
+        (res) => {
+          const chunks = [];
+          res.on("data", (c) => chunks.push(c));
+          res.on("end", () => {
+            const text = Buffer.concat(chunks).toString();
+            let parsed;
+            try { parsed = text ? JSON.parse(text) : {}; } catch (_) { parsed = {}; }
+            if (res.statusCode >= 400) {
+              const type = parsed.__type || parsed.Code || "ResourceNotFoundException";
+              const code = String(type).split("#").pop();
+              const err = new Error(parsed.Message || parsed.message || text || "Lambda ListTags error");
+              err.statusCode = res.statusCode;
+              err.code = code;
+              err.name = code;
+              reject(err);
+            } else {
+              resolve({ Tags: parsed.Tags || {} });
+            }
+          });
+        }
+      );
+      req.on("error", reject);
+      req.end();
+    });
+  }
+
   function _makeLambdaClientModule() {
     class Lambda {
       constructor(_cfg) {}
       invoke(params) { return _lambdaInvoke(params); }
+      listTags(params) { return _lambdaListTags(params); }
+      // Lambda is LambdaClient plus the generated convenience methods, so it also has .send().
+      send(cmd) { return cmd._run(); }
     }
     class LambdaClient {
       constructor(_cfg) {}
       send(cmd) { return cmd._run(); }
+    }
+    class ListTagsCommand {
+      constructor(params) { this._p = params; }
+      _run() { return _lambdaListTags(this._p); }
     }
     class InvokeCommand {
       constructor(params) { this._p = params; }
       _run() { return _lambdaInvoke(this._p); }
     }
     async function waitUntilFunctionActiveV2() { return { state: "SUCCESS" }; }
-    return { Lambda, LambdaClient, InvokeCommand, waitUntilFunctionActiveV2 };
+    return { Lambda, LambdaClient, InvokeCommand, ListTagsCommand, waitUntilFunctionActiveV2 };
+  }
+
+  // ── OpenSearch stub (REST-JSON, not JSON-RPC) ─────────────────────────
+  function _openSearchRequest(opName, params) {
+    const ep = new URL(process.env.AWS_ENDPOINT_URL || "http://127.0.0.1:4566");
+    const input = Object.assign({}, params || {});
+    const domainName = input.DomainName;
+    const encodedName = encodeURIComponent(domainName || "");
+    let method = "GET";
+    let requestPath;
+    let body;
+
+    switch (opName) {
+      case "CreateDomain":
+        method = "POST";
+        requestPath = "/2021-01-01/opensearch/domain";
+        body = input;
+        break;
+      case "DescribeDomain":
+        requestPath = "/2021-01-01/opensearch/domain/" + encodedName;
+        break;
+      case "DescribeDomains":
+        method = "POST";
+        requestPath = "/2021-01-01/opensearch/domain-info";
+        body = input;
+        break;
+      case "DeleteDomain":
+        method = "DELETE";
+        requestPath = "/2021-01-01/opensearch/domain/" + encodedName;
+        break;
+      case "ListDomainNames":
+        requestPath = "/2021-01-01/opensearch/domain";
+        if (input.EngineType) {
+          requestPath += "?engineType=" + encodeURIComponent(input.EngineType);
+        }
+        break;
+      case "UpdateDomainConfig":
+        method = "POST";
+        requestPath = "/2021-01-01/opensearch/domain/" + encodedName + "/config";
+        delete input.DomainName;
+        body = input;
+        break;
+      case "DescribeDomainConfig":
+        requestPath = "/2021-01-01/opensearch/domain/" + encodedName + "/config";
+        break;
+      case "DescribeDomainChangeProgress":
+        requestPath = "/2021-01-01/opensearch/domain/" + encodedName + "/progress";
+        if (input.ChangeId) {
+          requestPath += "?changeId=" + encodeURIComponent(input.ChangeId);
+        }
+        break;
+      case "ListVersions": {
+        requestPath = "/2021-01-01/opensearch/versions";
+        const query = new URLSearchParams();
+        if (input.MaxResults !== undefined) query.set("maxResults", input.MaxResults);
+        if (input.NextToken) query.set("nextToken", input.NextToken);
+        const suffix = query.toString();
+        if (suffix) requestPath += "?" + suffix;
+        break;
+      }
+      case "GetCompatibleVersions":
+        requestPath = "/2021-01-01/opensearch/compatibleVersions";
+        if (input.DomainName) {
+          requestPath += "?domainName=" + encodeURIComponent(input.DomainName);
+        }
+        break;
+      case "AddTags":
+        method = "POST";
+        requestPath = "/2021-01-01/tags";
+        body = input;
+        break;
+      case "ListTags":
+        requestPath = "/2021-01-01/tags?arn=" + encodeURIComponent(input.ARN || "");
+        break;
+      case "RemoveTags":
+        method = "POST";
+        requestPath = "/2021-01-01/tags-removal";
+        body = input;
+        break;
+      default:
+        return Promise.reject(new Error("Unsupported OpenSearch operation: " + opName));
+    }
+
+    const encodedBody = body === undefined ? "" : JSON.stringify(body);
+    return new Promise((resolve, reject) => {
+      // REST-JSON requests do not carry X-Amz-Target. The lightweight shim
+      // does not cryptographically sign them, but supplies the credential
+      // scope MiniStack's router uses to select OpenSearch. Let Node set Host
+      // from the endpoint: a synthetic ``opensearch.localhost`` host is
+      // indistinguishable from a virtual-hosted S3 bucket at the edge.
+      const headers = {
+        "Accept": "application/json",
+      };
+      const region = process.env.AWS_REGION || process.env.AWS_DEFAULT_REGION || "us-east-1";
+      const accessKey = process.env.AWS_ACCESS_KEY_ID || "test";
+      headers["Authorization"] =
+        "AWS4-HMAC-SHA256 Credential=" + accessKey + "/19700101/" + region
+        + "/es/aws4_request, SignedHeaders=host, Signature=ministack";
+      if (encodedBody) {
+        headers["Content-Type"] = "application/json";
+        headers["Content-Length"] = Buffer.byteLength(encodedBody);
+      }
+      const req = (ep.protocol === "https:" ? https : http).request(
+        {
+          hostname: ep.hostname,
+          port: parseInt(ep.port || "4566", 10),
+          method: method,
+          path: requestPath,
+          headers: headers,
+        },
+        (res) => {
+          const chunks = [];
+          res.on("data", (c) => chunks.push(c));
+          res.on("end", () => {
+            const text = Buffer.concat(chunks).toString();
+            let parsed;
+            try { parsed = text ? JSON.parse(text) : {}; } catch (_) { parsed = {}; }
+            if (res.statusCode >= 400) {
+              const type = parsed.__type || parsed.Code || "OpenSearchServiceError";
+              const code = String(type).split("#").pop();
+              const err = new Error(
+                parsed.Message || parsed.message || text || "OpenSearch service error"
+              );
+              err.statusCode = res.statusCode;
+              err.code = code;
+              err.name = code;
+              reject(err);
+            } else {
+              resolve(parsed);
+            }
+          });
+        }
+      );
+      req.on("error", reject);
+      if (encodedBody) req.write(encodedBody);
+      req.end();
+    });
+  }
+
+  function _makeOpenSearchClientModule() {
+    class OpenSearchClient {
+      constructor(cfg) {
+        const clientConfig = cfg || {};
+        this.config = {
+          apiVersion: clientConfig.apiVersion,
+          region: async () => clientConfig.region
+            || process.env.AWS_REGION
+            || process.env.AWS_DEFAULT_REGION
+            || "us-east-1",
+        };
+      }
+      send(cmd) { return cmd._run(); }
+    }
+
+    class OpenSearch {
+      constructor(_cfg) {}
+    }
+
+    const operations = [
+      "CreateDomain",
+      "DescribeDomain",
+      "DescribeDomains",
+      "DeleteDomain",
+      "ListDomainNames",
+      "UpdateDomainConfig",
+      "DescribeDomainConfig",
+      "DescribeDomainChangeProgress",
+      "ListVersions",
+      "GetCompatibleVersions",
+      "AddTags",
+      "ListTags",
+      "RemoveTags",
+    ];
+    const exports = { OpenSearch, OpenSearchClient };
+    for (const opName of operations) {
+      OpenSearch.prototype[opName[0].toLowerCase() + opName.slice(1)] = function(params) {
+        return _openSearchRequest(opName, params);
+      };
+      exports[opName + "Command"] = class {
+        constructor(params) { this._params = params; }
+        _run() { return _openSearchRequest(opName, this._params); }
+      };
+    }
+    return exports;
   }
 
   // ── Generic JSON-RPC stub (covers SSM, SFN, STS, CloudWatch, Logs, etc.) ─
   // Most AWS SDK v3 packages use awsJson1.x: POST / with X-Amz-Target header.
   // Ministack's router maps target prefixes to service modules.
   const _JSON_RPC_TARGETS = {
-    // JSON-RPC (awsJson1.x) services — keyed by @aws-sdk/client-{key} suffix.
+    // JSON-RPC (awsJson1.x) services — keyed by full module specifier.
     // Target prefixes match Ministack's router.py SERVICE_PATTERNS target_prefixes.
-    "ssm":                         "AmazonSSM",
-    "sfn":                         "AWSStepFunctions",
+    "@aws-sdk/client-ssm":                         "AmazonSSM",
+    "@aws-sdk/client-sfn":                         "AWSStepFunctions",
     // sts, sns: query protocol — @aws-sdk/client-{sts,sns} sends Action= form-encoded POST
     // cloudwatch: smithy-rpc-v2-cbor — @aws-sdk/client-cloudwatch sends path-based requests
     // All three are handled by Ministack's native query/path routing when the real SDK is present
-    "cloudwatch-logs":             "Logs_20140328",
-    "logs":                        "Logs_20140328",
-    "secretsmanager":              "secretsmanager",
-    "events":                      "AmazonEventBridge",
-    "eventbridge":                 "AmazonEventBridge",
-    "kinesis":                     "Kinesis_20131202",
-    "ecs":                         "AmazonEC2ContainerServiceV20141113",
-    "dynamodb":                    "DynamoDB_20120810",
-    "dynamodb-streams":            "DynamoDBStreams_20120810",
-    "sqs":                         "AmazonSQS",
-    "glue":                        "AWSGlue",
-    "athena":                      "AmazonAthena",
-    "firehose":                    "Firehose_20150804",
-    "cognito-identity-provider":   "AWSCognitoIdentityProviderService",
-    "cognito-identity":            "AWSCognitoIdentityService",
-    "emr":                         "ElasticMapReduce",
-    "ecr":                         "AmazonEC2ContainerRegistry_V20150921",
-    "acm":                         "CertificateManager",
-    "wafv2":                       "AWSWAF_20190729",
-    "waf":                         "AWSWAF_20150824",
-    "waf-regional":                "AWSWAF_Regional_20161128",
-    "organizations":               "AWSOrganizationsV20161128",
-    "kms":                         "TrentService",
-    "codebuild":                   "CodeBuild_20161006",
-    "transfer":                    "TransferService",
-    "servicediscovery":            "Route53AutoNaming_v20170314",
-    "resource-groups-tagging-api": "ResourceGroupsTaggingAPI_20170126",
-    "cloudtrail":                  "com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101",
+    "@aws-sdk/client-cloudwatch-logs":             "Logs_20140328",
+    "@aws-sdk/client-logs":                        "Logs_20140328",
+    "@aws-sdk/client-secrets-manager":             "secretsmanager",
+    "@aws-sdk/client-events":                      "AmazonEventBridge",
+    "@aws-sdk/client-eventbridge":                 "AmazonEventBridge",
+    "@aws-sdk/client-kinesis":                     "Kinesis_20131202",
+    "@aws-sdk/client-ecs":                         "AmazonEC2ContainerServiceV20141113",
+    "@aws-sdk/client-dynamodb":                    "DynamoDB_20120810",
+    "@aws-sdk/client-dynamodb-streams":            "DynamoDBStreams_20120810",
+    "@aws-sdk/client-sqs":                         "AmazonSQS",
+    "@aws-sdk/client-glue":                        "AWSGlue",
+    "@aws-sdk/client-athena":                      "AmazonAthena",
+    "@aws-sdk/client-firehose":                    "Firehose_20150804",
+    "@aws-sdk/client-cognito-identity-provider":   "AWSCognitoIdentityProviderService",
+    "@aws-sdk/client-cognito-identity":            "AWSCognitoIdentityService",
+    "@aws-sdk/client-emr":                         "ElasticMapReduce",
+    "@aws-sdk/client-ecr":                         "AmazonEC2ContainerRegistry_V20150921",
+    "@aws-sdk/client-acm":                         "CertificateManager",
+    "@aws-sdk/client-wafv2":                       "AWSWAF_20190729",
+    "@aws-sdk/client-waf":                         "AWSWAF_20150824",
+    "@aws-sdk/client-waf-regional":                "AWSWAF_Regional_20161128",
+    "@aws-sdk/client-organizations":               "AWSOrganizationsV20161128",
+    "@aws-sdk/client-kms":                         "TrentService",
+    "@aws-sdk/client-codebuild":                   "CodeBuild_20161006",
+    "@aws-sdk/client-transfer":                    "TransferService",
+    "@aws-sdk/client-servicediscovery":            "Route53AutoNaming_v20170314",
+    "@aws-sdk/client-resource-groups-tagging-api": "ResourceGroupsTaggingAPI_20170126",
+    "@aws-sdk/client-cloudtrail":                  "com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101",
+    "@aws-sdk/client-translate":                   "AWSShineFrontendService_20170701",
   };
 
-  function _jsonRpcRequest(targetPrefix, opName, params) {
+  function _jsonRpcRequest(targetPrefix, opName, params, service) {
     const ep = new URL(process.env.AWS_ENDPOINT_URL || "http://127.0.0.1:4566");
     const body = JSON.stringify(params || {});
     return new Promise((resolve, reject) => {
-      const req = http.request(
+      const req = (ep.protocol === "https:" ? https : http).request(
         {
           hostname: ep.hostname,
           port: parseInt(ep.port || "4566", 10),
           method: "POST",
           path: "/",
-          headers: {
+          headers: _signedHeaders(service, "POST", ep, "/", body, {
             "Content-Type": "application/x-amz-json-1.1",
             "X-Amz-Target": targetPrefix + "." + opName,
             "Content-Length": Buffer.byteLength(body),
-          },
+          }),
         },
         (res) => {
           const chunks = [];
@@ -255,12 +816,21 @@ process.stdout.write = function(chunk, encoding, callback) {
     });
   }
 
-  function _makeGenericJsonServiceModule(targetPrefix) {
+  // Signing names that differ from the package name.
+  const _SIGNING_NAMES = {
+    "sfn": "states", "cloudwatch-logs": "logs", "secrets-manager": "secretsmanager", "eventbridge": "events",
+    "dynamodb-streams": "dynamodb", "cognito-identity-provider": "cognito-idp", "emr": "elasticmapreduce",
+    "resource-groups-tagging-api": "tagging",
+  };
+
+  function _makeGenericJsonServiceModule(targetPrefix, id) {
+    const pkg = id.replace(/^@aws-sdk\/client-/, "");
+    const service = _SIGNING_NAMES[pkg] || pkg;
     // Command class factory: new PutParameterCommand(params) → has _run()
     function _cmdClass(opName) {
       return class {
         constructor(params) { this._params = params; }
-        _run() { return _jsonRpcRequest(targetPrefix, opName, this._params); }
+        _run() { return _jsonRpcRequest(targetPrefix, opName, this._params, service); }
       };
     }
 
@@ -277,7 +847,7 @@ process.stdout.write = function(chunk, encoding, callback) {
           get(_, prop) {
             if (typeof prop !== "string") return undefined;
             const opName = prop[0].toUpperCase() + prop.slice(1);
-            return (params) => _jsonRpcRequest(targetPrefix, opName, params);
+            return (params) => _jsonRpcRequest(targetPrefix, opName, params, service);
           },
         });
       },
@@ -306,6 +876,7 @@ process.stdout.write = function(chunk, encoding, callback) {
   // ── require() intercept ────────────────────────────────────────────────
   const _SPECIFIC_STUBS = {
     "@aws-sdk/client-lambda": _makeLambdaClientModule(),
+    "@aws-sdk/client-opensearch": _makeOpenSearchClientModule(),
   };
   const _SDK_CLIENT_RE = /^@aws-sdk\/client-(.+)$/;
 
@@ -318,11 +889,25 @@ process.stdout.write = function(chunk, encoding, callback) {
       return specific;
     }
     // 2. Generic JSON-RPC stubs for known @aws-sdk/client-* packages
-    const m = id.match(_SDK_CLIENT_RE);
-    if (m) {
-      try { return _origRequire.apply(this, arguments); } catch (_) {}
-      const prefix = _JSON_RPC_TARGETS[m[1]];
-      if (prefix) return _makeGenericJsonServiceModule(prefix);
+    if (_SDK_CLIENT_RE.test(id)) {
+      let requireError;
+      try {
+        return _origRequire.apply(this, arguments);
+      } catch (err) {
+        requireError = err;
+      }
+      const prefix = _JSON_RPC_TARGETS[id];
+      if (prefix) return _makeGenericJsonServiceModule(prefix, id);
+      if (
+        requireError.code !== "MODULE_NOT_FOUND"
+        || !requireError.message.includes("'" + id + "'")
+      ) {
+        throw requireError;
+      }
+      throw new Error(
+        "MiniStack local executor has no stub for '" + id
+        + "'; bundle the module with your function or use LAMBDA_EXECUTOR=docker."
+      );
     }
     return _origRequire.apply(this, arguments);
   };
@@ -359,20 +944,31 @@ function patchAwsSdk() {
     };
   } catch (_) {}
 
-  // Patch https.request for bundled SDK
+  // Patch https.request for bundled SDK. Under USE_SSL the gateway serves only
+  // HTTPS, so requests to it keep TLS and only their port is rewritten.
+  const msTls = parsed.protocol === "https:";
   const origHttpsReq = https.request;
-  https.request = function(options, callback) {
-    if (typeof options === "string") options = url.parse(options);
-    else if (options instanceof url.URL) options = url.parse(options.toString());
-    else options = Object.assign({}, options);
+  https.request = function(input, options, callback) {
+    // Node takes (url[, options][, callback]) and (options[, callback]).
+    const original = Array.prototype.slice.call(arguments);
+    if (typeof options === "function") { callback = options; options = undefined; }
+    if (typeof input === "string") input = url.parse(input);
+    else if (input instanceof url.URL) input = url.parse(input.toString());
+    options = Object.assign({}, input, options);
 
     const host = options.hostname || options.host || "";
     if (host.endsWith(".amazonaws.com") || host.endsWith(".amazonaws.com.cn")) {
-      options.protocol = "http:";
       options.hostname = msHost;
       options.host = msHost + ":" + msPort;
       options.port = msPort;
       options.path = options.path || "/";
+      if (msTls) {
+        // Verify the gateway's name, not the AWS host the Host header carries.
+        options.protocol = "https:";
+        options.servername = require("net").isIP(msHost) ? "" : msHost;
+        return origHttpsReq.call(https, options, callback);
+      }
+      options.protocol = "http:";
       if (options.agent instanceof https.Agent) {
         options.agent = new http.Agent({ keepAlive: true });
       } else if (options.agent === undefined) {
@@ -385,10 +981,18 @@ function patchAwsSdk() {
     // Downgrade HTTPS to HTTP for localhost — CDK Provider Framework's
     // cfn-response.js calls https.request unconditionally for the ResponseURL
     // PUT, and also drops the port when constructing options.  Intercept here
-    // so the PUT reaches Ministack's HTTP server on msPort, not port 443.
-    if (host === "127.0.0.1" || host === "localhost" || host === msHost) {
+    // so the PUT reaches Ministack on msPort, not port 443 (over TLS under USE_SSL).
+    const advertised = (process.env.MINISTACK_HOST || "").split(":")[0];
+    if (host === "127.0.0.1" || host === "localhost" || host === msHost
+        || (advertised && host === advertised)) {
+      // The https default port means the gateway port here, as in the container shim.
+      options.port = options.port && String(options.port) !== "443" ? options.port : msPort;
+      if (msTls) {
+        options.protocol = "https:";
+        options.hostname = host;
+        return origHttpsReq.call(https, options, callback);
+      }
       options.protocol = "http:";
-      options.port = options.port || msPort;
       options.host = host + ":" + options.port;
       options.agent = new http.Agent({ keepAlive: true });
       delete options._defaultAgent;
@@ -409,16 +1013,49 @@ function patchAwsSdk() {
       return http.request(options, callback);
     }
 
-    return origHttpsReq.call(https, options, callback);
+    return origHttpsReq.apply(https, original);
   };
-  https.get = function(options, callback) {
-    var req = https.request(options, callback);
+  https.get = function() {
+    var req = https.request.apply(https, arguments);
     req.end();
     return req;
   };
 }
 
 let handlerFn = null;
+
+// The error document AWS's Node.js runtime client posts (formatError in src/utils/error.ts).
+function _msFormatError(error) {
+  try {
+    if (error instanceof Error) {
+      return {
+        errorType: error.name?.replaceAll("\x7F", "%7F"),
+        errorMessage: error.message?.replaceAll("\x7F", "%7F"),
+        trace: error.stack?.replaceAll("\x7F", "%7F").split("\n") || [],
+      };
+    }
+    return { errorType: typeof error, errorMessage: String(error), trace: [] };
+  } catch {
+    return {
+      errorType: "handled",
+      errorMessage: "callback called with Error argument, but there was a problem while retrieving one or more of its message, name, and stack",
+      trace: [],
+    };
+  }
+}
+
+function _msRuntimeError(name, message, stack) {
+  const e = new Error(message);
+  e.name = name;
+  e.stack = stack || String(e.stack).replace(/^Error/, name);
+  return e;
+}
+
+function _msFail(error, extra) {
+  const payload = _msFormatError(error);
+  _realStdoutWrite(JSON.stringify(Object.assign(
+    { status: "error", error: payload.errorMessage, payload }, extra || {})) + "\n");
+}
 
 const rl = readline.createInterface({ input: process.stdin, terminal: false });
 let lineNum = 0;
@@ -459,7 +1096,7 @@ rl.on("line", async (line) => {
         try {
           mod = require(resolvedPath);
         } catch (reqErr) {
-          if (reqErr.code === "ERR_REQUIRE_ESM") {
+          if (reqErr.code === "ERR_REQUIRE_ESM" || reqErr.code === "ERR_REQUIRE_ASYNC_MODULE") {
             const { pathToFileURL } = require("url");
             mod = await import(pathToFileURL(resolvedPath).href);
           } else {
@@ -468,37 +1105,89 @@ rl.on("line", async (line) => {
         }
         handlerFn = mod[handlerName] || (mod.default && mod.default[handlerName]) || mod.default;
         if (typeof handlerFn !== "function") {
-          _realStdoutWrite(JSON.stringify({
-            status: "error",
-            error: `Handler ${handlerName} is not a function in ${modPath}`
-          }) + "\n");
+          const full = modPath + "." + handlerName;
+          const err = _msRuntimeError("Runtime.HandlerNotFound", handlerFn === undefined
+            ? `${full} is undefined or not exported` : `${full} is not a function`);
+          _msFail(err, { errorType: err.name });
+          return;
+        }
+        // AWS's Node.js 24+ runtime refuses a callback-based handler at init.
+        const major = /^AWS_Lambda_nodejs(\d+)/.exec(process.env.AWS_EXECUTION_ENV || "");
+        if (major && Number(major[1]) >= 24 && handlerFn.length >= 3
+            && !handlerFn[Symbol.for("aws.lambda.runtime.handler.streaming")]) {
+          const err = _msRuntimeError("Runtime.CallbackHandlerDeprecated",
+            "ERROR: AWS Lambda has removed support for callback-based function handlers starting with "
+              + "Node.js 24. You need to modify this function to use a supported handler signature to use Node.js 24 or "
+              + "later. For more information see https://docs.aws.amazon.com/lambda/latest/dg/nodejs-handler.html.");
+          _msFail(err, { errorType: err.name });
           return;
         }
         _realStdoutWrite(JSON.stringify({ status: "ready", cold: true }) + "\n");
       } catch (e) {
-        _realStdoutWrite(JSON.stringify({
-          status: "error", error: e.message
-        }) + "\n");
+        // As the runtime client loads the module: a syntax error or a missing CommonJS module is
+        // reported under its Runtime.* name with String(err) as the message; anything else as itself.
+        let err = e;
+        if (e instanceof SyntaxError) {
+          err = _msRuntimeError("Runtime.UserCodeSyntaxError", String(e), e.stack);
+        } else if (e instanceof Error && e.code === "MODULE_NOT_FOUND") {
+          err = _msRuntimeError("Runtime.ImportModuleError", String(e));
+        }
+        const payload = _msFormatError(err);
+        _msFail(err, { errorType: payload.errorType });
       }
       return;
     }
 
-    // Subsequent lines are event invocations
-    const event = msg;
+    // Subsequent lines are one invocation each: {"event": <payload>, "ctx": {...}}.
+    // The payload is the caller's and reaches the handler exactly as it was
+    // sent, whatever its JSON type — on AWS the values below live in the
+    // execution environment and the context object, never in the event.
+    const event = msg.event;
+    const ctx = msg.ctx || {};
+    const _msDeadline = Date.now() + Number(ctx.timeout_ms || 300000);
     const context = {
-      functionName: event._function_name || "",
-      memoryLimitInMB: event._memory || "128",
-      invokedFunctionArn: event._arn || "",
-      awsRequestId: event._request_id || "",
-      getRemainingTimeInMillis: () => 300000,
+      functionName: process.env.AWS_LAMBDA_FUNCTION_NAME || "",
+      functionVersion: process.env.AWS_LAMBDA_FUNCTION_VERSION || "$LATEST",
+      memoryLimitInMB: process.env.AWS_LAMBDA_FUNCTION_MEMORY_SIZE || "128",
+      invokedFunctionArn: ctx.invoked_function_arn || process.env._LAMBDA_FUNCTION_ARN || "",
+      awsRequestId: ctx.request_id || "",
+      logGroupName: process.env.AWS_LAMBDA_LOG_GROUP_NAME
+        || ("/aws/lambda/" + (process.env.AWS_LAMBDA_FUNCTION_NAME || "")),
+      logStreamName: process.env.AWS_LAMBDA_LOG_STREAM_NAME || "",
+      identity: null,
+      clientContext: null,
+      callbackWaitsForEmptyEventLoop: true,
+      getRemainingTimeInMillis: () => Math.max(0, _msDeadline - Date.now()),
       done: () => {},
       succeed: () => {},
       fail: () => {},
     };
-    delete event._request_id;
-    delete event._function_name;
-    delete event._memory;
-    delete event._arn;
+    // X-Ray active tracing: _X_AMZN_TRACE_ID is a reserved environment
+    // variable that "changes with each invocation", so a pooled worker sets
+    // it per call and the AWS X-Ray SDK reads it on require().
+    if (ctx.trace_id) {
+      process.env._X_AMZN_TRACE_ID = ctx.trace_id;
+    } else if ("_X_AMZN_TRACE_ID" in process.env) {
+      delete process.env._X_AMZN_TRACE_ID;
+    }
+    // Recursive-loop depth rides the same per-invocation channel, and the
+    // bundled Lambda stub reads it back off process.env when the handler
+    // invokes another function.
+    if (ctx.depth !== undefined && ctx.depth !== null) {
+      process.env.__DEPTH_ENV__ = String(ctx.depth);
+    } else if ("__DEPTH_ENV__" in process.env) {
+      delete process.env.__DEPTH_ENV__;
+    }
+    // Durable execution: per-invocation values, dropped again when the next
+    // invocation is not durable.
+    const _msDurable = ctx.durable || {};
+    for (const _msVar of __DURABLE_ENV_VARS__) {
+      if (_msVar in _msDurable) {
+        process.env[_msVar] = String(_msDurable[_msVar]);
+      } else if (_msVar in process.env) {
+        delete process.env[_msVar];
+      }
+    }
 
     try {
       let settled = false;
@@ -506,12 +1195,17 @@ rl.on("line", async (line) => {
         if (settled) return;
         settled = true;
         if (err) {
-          _realStdoutWrite(JSON.stringify({
-            status: "error", error: String(err.message || err), trace: err.stack || ""
-          }) + "\n");
-        } else {
-          _realStdoutWrite(JSON.stringify({ status: "ok", result: res }) + "\n");
+          _msFail(err, { trace: (err && err.stack) || "" });
+          return;
         }
+        let out;
+        try {
+          out = JSON.stringify({ status: "ok", result: res === undefined ? null : res });
+        } catch (_e) {
+          _msFail(_msRuntimeError("Runtime.JSONStringifyError", "Unable to stringify response body"));
+          return;
+        }
+        _realStdoutWrite(out + "\n");
       };
       const callback = (err, res) => settle(err, res);
       context.done = (err, res) => settle(err, res);
@@ -529,9 +1223,7 @@ rl.on("line", async (line) => {
       // If handler accepts callback (arity >= 3) or returned undefined,
       // we wait for callback/context.done/context.succeed/context.fail
     } catch (e) {
-      _realStdoutWrite(JSON.stringify({
-        status: "error", error: e.message, trace: e.stack
-      }) + "\n");
+      _msFail(e, { trace: (e && e.stack) || "" });
     }
   } catch (e) {
     _realStdoutWrite(JSON.stringify({
@@ -539,7 +1231,7 @@ rl.on("line", async (line) => {
     }) + "\n");
   }
 });
-'''
+''')
 
 
 def _detect_runtime_binary(runtime: str) -> tuple[str, str]:
@@ -567,6 +1259,10 @@ class Worker:
         self._proc = None
         self._tmpdir = None
         self._lock = threading.Lock()
+        # Leased out to an in-flight invocation. Guarded by the module ``_lock``
+        # (see acquire_worker/release_worker), not by ``self._lock``.
+        self.in_use = False
+        self.last_used = time.time()
         self._cold = True
         self._start_time = None
         self._stderr_queue: queue.Queue = queue.Queue()
@@ -582,11 +1278,14 @@ class Worker:
 
     def _spawn(self):
         """Extract zip and start worker process."""
+        # Clean up any previous tmpdir before creating a new one (respawn scenario)
+        if self._tmpdir and os.path.exists(self._tmpdir):
+            shutil.rmtree(self._tmpdir, ignore_errors=True)
         self._tmpdir = tempfile.mkdtemp(prefix=f"ministack-lambda-{self.func_name}-")
         runtime = self.config.get("Runtime", "python3.12")
         binary, worker_script = _detect_runtime_binary(runtime)
         if not binary:
-            raise RuntimeError(f"Unsupported runtime: {runtime}")
+            raise LambdaServiceError(f"no local runtime binary for {runtime}")
 
         ext = _worker_script_extension(runtime)
         worker_path = os.path.join(self._tmpdir, f"_worker{ext}")
@@ -611,7 +1310,7 @@ class Worker:
             if not layer_arn:
                 continue
             try:
-                layer_data = _resolve_layer_zip(layer_arn)
+                layer_data = _resolve_layer_zip(layer_ref)
                 if layer_data:
                     layer_dir = os.path.join(self._tmpdir, f"layer_{len(layers_dirs)}")
                     os.makedirs(layer_dir)
@@ -653,6 +1352,16 @@ class Worker:
                             os.symlink(src, dst)
 
         handler = self.config.get("Handler", "index.handler")
+        if "." not in handler:
+            # The runtime client refuses it at init: awslambdaric words the unpack error, the Node.js client says "Bad handler".
+            if runtime.startswith("python"):
+                message = f"Bad handler '{handler}': not enough values to unpack (expected 2, got 1)"
+                payload = {"errorMessage": message, "errorType": "Runtime.MalformedHandlerName",
+                           "requestId": "", "stackTrace": []}
+            else:
+                message = "Bad handler"
+                payload = {"errorType": "Runtime.MalformedHandlerName", "errorMessage": message, "trace": []}
+            raise ProvidedRuntimeError(message, "Runtime.MalformedHandlerName", payload)
         module_name, handler_name = handler.rsplit(".", 1)
         # AWS Python Lambda accepts both dot (``pkg.mod.fn``) and slash
         # (``pkg/mod.fn``) in nested handler paths; ``__import__`` only
@@ -660,19 +1369,22 @@ class Worker:
         # because they don't use Python module resolution.
         if runtime.startswith("python"):
             module_name = module_name.replace("/", ".")
-        env_vars = self.config.get("Environment", {}).get("Variables", {})
+        env_vars = {
+            key: value
+            for key, value in self.config.get("Environment", {}).get("Variables", {}).items()
+            if key not in _RESERVED_RUNTIME_ENV_VARS
+        }
         spawn_env = {**os.environ, **env_vars}
         # Inject standard Lambda runtime env vars to match the Docker and
         # provided-runtime execution paths in lambda_svc.py.  Real AWS
         # Lambda always injects these; the warm-worker path was missing them.
         # Per AWS docs:
         #   https://docs.aws.amazon.com/lambda/latest/dg/configuration-envvars.html
-        from ministack.core.responses import get_region, new_uuid
-        spawn_env.setdefault("AWS_REGION", get_region())
-        spawn_env.setdefault("AWS_DEFAULT_REGION", get_region())
-        spawn_env.setdefault("AWS_ACCESS_KEY_ID", _account_from_arn(self.config.get("FunctionArn", "")))
-        spawn_env.setdefault("AWS_SECRET_ACCESS_KEY", os.environ.get("AWS_SECRET_ACCESS_KEY", "test"))
-        spawn_env.setdefault("AWS_SESSION_TOKEN", os.environ.get("AWS_SESSION_TOKEN", ""))
+        from ministack.core.responses import new_uuid
+        account_id, region = _account_region_from_function_config(self.config)
+        spawn_env["AWS_REGION"] = region
+        spawn_env["AWS_DEFAULT_REGION"] = region
+        spawn_env.update(execution_credentials(self.config))
         # AWS_ENDPOINT_URL precedence matches real AWS: function
         # Environment.Variables wins, then host env, then the internal
         # default that points at this MiniStack instance.  Real AWS Lambda
@@ -682,10 +1394,18 @@ class Worker:
         # already present; setdefault only fills in the default when neither
         # the function nor the host set one.
         port = os.environ.get("GATEWAY_PORT", os.environ.get("EDGE_PORT", "4566"))
-        spawn_env.setdefault("AWS_ENDPOINT_URL", f"http://127.0.0.1:{port}")
+        from ministack.core import tls as _tls
+        if "AWS_ENDPOINT_URL" not in spawn_env:
+            if _tls.use_ssl_enabled():
+                spawn_env["AWS_ENDPOINT_URL"] = f"https://127.0.0.1:{port}"
+                _tls.trust_gateway_cert(spawn_env)
+            else:
+                spawn_env["AWS_ENDPOINT_URL"] = f"http://127.0.0.1:{port}"
         if "LOCALSTACK_HOSTNAME" in os.environ:
             spawn_env["LOCALSTACK_HOSTNAME"] = os.environ["LOCALSTACK_HOSTNAME"]
+        spawn_env.setdefault(HOST_PREFIX_ENV, "true")
         spawn_env.setdefault("LAMBDA_TASK_ROOT", code_dir)
+        spawn_env["AWS_EXECUTION_ENV"] = f"AWS_Lambda_{runtime}"
         spawn_env.setdefault("AWS_LAMBDA_FUNCTION_NAME", self.config.get("FunctionName", ""))
         spawn_env.setdefault("AWS_LAMBDA_FUNCTION_MEMORY_SIZE", str(self.config.get("MemorySize", 128)))
         spawn_env.setdefault("AWS_LAMBDA_FUNCTION_VERSION", self.config.get("Version", "$LATEST"))
@@ -718,6 +1438,7 @@ class Worker:
 
         self._proc = subprocess.Popen(
             [binary, worker_path],
+            cwd=code_dir,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -735,11 +1456,17 @@ class Worker:
         init = {
             "code_dir": code_dir,
             "module": module_name,
+            "handler_module": handler.rsplit(".", 1)[0],
             "handler": handler_name,
             "env": env_vars,
             "function_name": self.config.get("FunctionName", ""),
             "memory": self.config.get("MemorySize", 128),
             "arn": self.config.get("FunctionArn", ""),
+            # A published SnapStart version runs its snapshot/restore runtime
+            # hooks during init (see the worker script). $LATEST never does —
+            # it has no snapshot on AWS either.
+            "snapstart": (self.config.get("SnapStart") or {}).get(
+                "OptimizationStatus") == "On",
         }
         self._proc.stdin.write(json.dumps(init) + "\n")
         self._proc.stdin.flush()
@@ -754,7 +1481,11 @@ class Worker:
                     stderr_out = self._proc.stderr.read(4096)
                 except Exception:
                     pass
-                raise RuntimeError(f"Worker process exited immediately. stderr: {stderr_out}")
+                try:
+                    returncode = self._proc.wait(timeout=5)
+                except Exception:
+                    returncode = 1
+                raise RuntimeExitError(returncode, stderr_out)
             response_line = response_line.strip()
             if not response_line or not response_line.startswith("{"):
                 continue
@@ -764,9 +1495,11 @@ class Worker:
             except json.JSONDecodeError:
                 continue
         if response is None:
-            raise RuntimeError("No JSON init response from worker")
+            raise LambdaServiceError("No JSON init response from worker")
         if response.get("status") != "ready":
-            raise RuntimeError(f"Worker init failed: {response.get('error')}")
+            if response.get("errorType"):
+                raise ProvidedRuntimeError(response.get("error", ""), response["errorType"], response.get("payload"))
+            raise LambdaServiceError(f"Worker init failed: {response.get('error')}")
 
         self._start_time = time.time()
         logger.info("Lambda worker spawned for %s (%s, cold start)", self.func_name, runtime)
@@ -821,7 +1554,15 @@ class Worker:
                 time.sleep(0.001)
         return "\n".join(lines)
 
-    def invoke(self, event: dict, request_id: str) -> dict:
+    def invoke(self, event, request_id: str, *, trace_id: str | None = None,
+               depth=None, durable: dict | None = None, invoked_function_arn: str | None = None) -> dict:
+        """Run one invocation on this worker.
+
+        The per-invocation values travel beside the payload, not inside it:
+        on AWS they are the execution environment (`_X_AMZN_TRACE_ID` is
+        reserved and "changes with each invocation") and the context object,
+        so the handler's event is the caller's payload of any JSON type.
+        """
         with self._lock:
             cold = self._cold
 
@@ -833,17 +1574,36 @@ class Worker:
                 cold = False
 
             timeout = self.config.get("Timeout", 30)
-            event["_request_id"] = request_id
+            # Only what genuinely differs per invocation. The function's own
+            # identity (name, version, memory, log group and stream) is
+            # already in the worker's environment, where AWS puts it, and both
+            # bootstraps build their context object from there.
+            envelope = {
+                "event": event,
+                "ctx": {
+                    "request_id": request_id,
+                    "invoked_function_arn": invoked_function_arn if invoked_function_arn is not None else self.config.get("FunctionArn", ""),
+                    "timeout_ms": int(float(timeout) * 1000),
+                    "trace_id": trace_id,
+                    "depth": depth,
+                    "durable": durable or {},
+                },
+            }
             result_box: list = []
 
             def _read_response():
                 try:
-                    self._proc.stdin.write(json.dumps(event) + "\n")
+                    self._proc.stdin.write(json.dumps(envelope) + "\n")
                     self._proc.stdin.flush()
                     for _ in range(200):
                         response_line = self._proc.stdout.readline()
                         if not response_line:
-                            result_box.append({"status": "error", "error": "Worker process died"})
+                            try:
+                                returncode = self._proc.wait(timeout=5)
+                            except Exception:
+                                returncode = 1
+                            result_box.append({"status": "error", "error_type": RuntimeExitError.error_type,
+                                               "error": runtime_exit_message(request_id, runtime_exit_reason(returncode))})
                             return
                         response_line = response_line.strip()
                         if not response_line:
@@ -851,13 +1611,15 @@ class Worker:
                         if response_line.startswith("{"):
                             try:
                                 response = json.loads(response_line)
-                                result_box.append(response)
-                                return
+                                if response.get("status") in ("ok", "error"):
+                                    result_box.append(response)
+                                    return
                             except json.JSONDecodeError:
                                 continue
-                    result_box.append({"status": "error", "error": "No JSON response from worker after 200 lines"})
+                    result_box.append({"status": "error", "service_error": True,
+                                       "error": "No JSON response from worker after 200 lines"})
                 except Exception as e:
-                    result_box.append({"status": "error", "error": str(e)})
+                    result_box.append({"status": "error", "service_error": True, "error": str(e)})
 
             reader = threading.Thread(target=_read_response, daemon=True)
             reader.start()
@@ -866,9 +1628,9 @@ class Worker:
             if reader.is_alive():
                 # Timeout — kill the worker process
                 logger.warning("Lambda %s timed out after %ds — killing worker", self.func_name, timeout)
-                if self._proc:
-                    self._proc.kill()
-                self._proc = None
+                proc, self._proc = self._proc, None
+                _signal(proc)
+                _collect(proc, time.monotonic() + _REAP_GRACE)
                 return {
                     "status": "error",
                     "error": f"Task timed out after {timeout}.00 seconds",
@@ -878,73 +1640,877 @@ class Worker:
 
             if not result_box:
                 self._proc = None
-                return {"status": "error", "error": "Worker returned no response", "cold_start": cold}
+                return {"status": "error", "service_error": True, "error": "Worker returned no response",
+                        "cold_start": cold}
 
             response = result_box[0]
             if response.get("status") == "error":
-                self._proc = None
+                proc, self._proc = self._proc, None
+                _signal(proc)
+                _collect(proc, time.monotonic() + _REAP_GRACE)
             response["cold_start"] = cold
             # Bounded drain — replaces the fixed 50ms sleep that was paid
             # by every warm invocation. Typical completion is 1–10ms.
             response["log"] = self._drain_stderr_bounded()
             return response
 
-    def kill(self):
-        if self._proc and self._proc.poll() is None:
-            self._proc.terminate()
-            self._proc = None
+    def _discard_tmpdir(self):
         if self._tmpdir and os.path.exists(self._tmpdir):
             shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def kill(self):
+        kill_workers([self])
+
+
+# Seconds a worker gets to exit on SIGTERM before it is SIGKILLed. Paid once per
+# *batch*, never once per worker — see kill_workers.
+_REAP_GRACE = 2.0
+
+
+def _signal(proc) -> None:
+    """Ask a worker subprocess to exit. Does not wait."""
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+    except Exception:
+        pass
+
+
+def _collect(proc, deadline: float) -> None:
+    """Wait for a signalled subprocess and reap it, escalating if it ignores SIGTERM.
+
+    Collecting is the point. Signalling alone leaves a zombie: ``subprocess``
+    only reaps an abandoned Popen lazily, when the *next* Popen is constructed,
+    so an **idle** server keeps every zombie it made. On a host that is invisible
+    — the count is small and something else is always spawning — but in a
+    container MiniStack is PID 1: the zombies are its own children, nothing else
+    will ever collect them, and they hold PID-table slots against the container's
+    pid limit. Measured: a 320-invocation burst left 244 zombies that survived
+    indefinitely while the server sat idle.
+
+    Warm-worker pooling is what made this reachable. One worker per function was
+    killed rarely; a pool of them is reaped by the hundred.
+    """
+    if proc is None:
+        return
+    try:
+        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+    except Exception:
+        try:
+            proc.kill()
+            proc.wait(timeout=0.5)
+        except Exception:
+            pass                # unkillable: leave it rather than block the caller
+
+
+def kill_workers(workers) -> None:
+    """Terminate and reap a batch of workers, paying the grace period once.
+
+    Two-phase on purpose. Signalling every worker first and only then waiting
+    makes a mass teardown cost ``_REAP_GRACE`` in total; doing it worker by
+    worker would cost ``n * _REAP_GRACE``, which on a pool built by a burst is
+    minutes — and ``reset()`` used to pay it holding the global worker lock.
+    """
+    workers = [w for w in workers if w is not None]
+    if not workers:
+        return
+    procs = []
+    for worker in workers:
+        proc, worker._proc = worker._proc, None
+        procs.append(proc)
+        _signal(proc)
+    deadline = time.monotonic() + _REAP_GRACE
+    for proc in procs:
+        _collect(proc, deadline)
+    for worker in workers:
+        try:
+            worker._discard_tmpdir()
+        except Exception:
+            pass
+
+
+def _worker_key(func_name: str, config: dict, qualifier: str) -> str:
+    # Include account ID and region in the key to isolate workers across
+    # accounts and regions. Two regions deploying the same function name must
+    # not share a worker.
+    account, region = _account_region_from_function_config(config)
+    return f"{account}:{region}:{func_name}:{qualifier}"
+
+
+def _worker_class_for(config: dict):
+    """Pick the execution environment implementation for a function's runtime.
+
+    ``provided.*`` speaks the HTTP Lambda Runtime API; python/nodejs speak the
+    JSON-line stdio protocol of the bundled worker scripts.
+    """
+    if str(config.get("Runtime", "")).startswith("provided"):
+        return ProvidedWorker
+    return Worker
+
+
+def acquire_worker(func_name: str, config: dict, code_zip: bytes,
+                   qualifier: str = "$LATEST", max_concurrency: int | None = None):
+    """Lease a free execution environment for this function.
+
+    Each key holds a *pool* of workers, mirroring how AWS gives concurrent
+    invocations separate execution environments (and how the Docker executor's
+    ``_warm_pool`` already behaves). A single shared worker per function could
+    not: ``Worker.invoke`` holds the worker's lock for the whole handler, so a
+    handler that invokes its own function — which real AWS supports, up to the
+    ~16-hop recursive-loop limit — waited on the lock its own caller held and
+    deadlocked. The thread the invocation runs on is irrelevant to that; the
+    lock is the bottleneck.
+
+    ``max_concurrency`` is an optional *resource* ceiling on how many warm
+    subprocesses may exist for one function, not a concurrency limit — AWS
+    concurrency is enforced upstream in ``lambda_svc._acquire_execution_slot``,
+    once, for every executor. It defaults to unbounded, matching the docker
+    executor. At a ceiling the caller gets ``(None, "func_cap")`` rather than a
+    blocking wait, because waiting for a worker held by your own caller is the
+    deadlock this exists to remove.
+
+    Returns ``(worker, "reused"|"spawn")`` or ``(None, "func_cap")``. Release
+    with :func:`release_worker`.
+    """
+    key = _worker_key(func_name, config, qualifier)
+    cap = max_concurrency or _LOCAL_MAX_WORKERS
+    with _lock:
+        entries = _workers.setdefault(key, [])
+        for worker in entries:
+            if not worker.in_use:
+                worker.in_use = True
+                worker.last_used = time.time()
+                return worker, "reused"
+        if cap and len(entries) >= cap:
+            return None, "func_cap"
+        worker = _worker_class_for(config)(func_name, config, code_zip)
+        worker.in_use = True
+        worker.last_used = time.time()
+        entries.append(worker)
+        return worker, "spawn"
+
+
+def reap_idle_workers(ttl: float = None) -> int:
+    """Kill workers idle longer than ``ttl`` and drop them from their pool.
+
+    Without this the pools only ever grow: a burst of concurrency leaves its
+    extra subprocesses alive forever. The first worker of each key is kept so
+    the common warm-start path is unaffected.
+    """
+    ttl = _LOCAL_WORKER_TTL if ttl is None else ttl
+    now = time.time()
+    killed = []
+    with _lock:
+        for key, entries in list(_workers.items()):
+            keep = []
+            for i, worker in enumerate(entries):
+                idle = now - getattr(worker, "last_used", now)
+                # The first worker per key is kept warm indefinitely — except
+                # for a published SnapStart version's worker, which exists
+                # because PublishVersion pre-initialized it: without the
+                # exception every publish would pin one subprocess forever.
+                # Reaping it costs a re-init on the next invoke, the same as
+                # the docker pool's TTL eviction.
+                snapstart_version = (
+                    (worker.config.get("SnapStart") or {}).get(
+                        "OptimizationStatus") == "On"
+                    and worker.config.get("Version", "$LATEST") != "$LATEST"
+                )
+                if worker.in_use or idle < ttl or (i == 0 and not snapstart_version):
+                    keep.append(worker)
+                else:
+                    killed.append(worker)
+            if keep:
+                _workers[key] = keep
+            else:
+                _workers.pop(key, None)
+    kill_workers(killed)
+    return len(killed)
+
+
+def ensure_spawned(worker: Worker) -> None:
+    """Spawn the worker's subprocess now if it isn't running.
+
+    SnapStart moves initialization to PublishVersion: the publish path leases
+    a worker for the new version and forces the cold start here, so an init
+    failure fails the publish (version State=Failed, as on AWS) and the first
+    invoke finds the environment already warm.
+    """
+    with worker._lock:
+        if worker._proc is None or worker._proc.poll() is not None:
+            worker._spawn()
+            worker._cold = False
+
+
+def release_worker(worker: Worker) -> None:
+    """Return a leased worker to its pool."""
+    if worker is None:
+        return
+    with _lock:
+        worker.in_use = False
+
+
+def workers_in_use() -> int:
+    """Count of leased workers across every function, for concurrency limits."""
+    with _lock:
+        return sum(1 for lst in _workers.values() for w in lst if w.in_use)
 
 
 def get_or_create_worker(func_name: str, config: dict, code_zip: bytes,
                          qualifier: str = "$LATEST") -> Worker:
-    # Include account ID in the key to isolate workers across accounts.
-    # Two accounts deploying the same function name must not share a worker.
-    account = _account_from_arn(config.get("FunctionArn", ""))
-    key = f"{account}:{func_name}:{qualifier}"
-    with _lock:
-        worker = _workers.get(key)
-        if worker is not None:
-            return worker
-        worker = Worker(func_name, config, code_zip)
-        _workers[key] = worker
-        return worker
+    """Back-compat lease that never reports a cap and is released immediately.
+
+    Retained for callers that hold a worker only for the duration of a single
+    ``invoke`` on the calling thread. The lease is dropped before returning, so
+    such callers still serialize on ``Worker._lock`` exactly as before rather
+    than silently retaining a pool slot they never release.
+    """
+    worker, _reason = acquire_worker(func_name, config, code_zip, qualifier=qualifier)
+    release_worker(worker)
+    return worker
 
 
-def invalidate_worker(func_name: str, qualifier: str = None, account: str = None):
+def invalidate_worker(func_name: str, qualifier: str = None,
+                      account: str = None, region: str = None):
     """Kill and remove workers for a function.
 
     If qualifier is provided, only kill that specific version/alias worker.
     Otherwise kill all workers for the function (used on delete).
-    If account is provided, scope the invalidation to that account.
+    If account or region is provided, scope the invalidation to that account
+    and/or region.
     """
-    # Worker keys are "{account}:{func_name}:{qualifier}". Lambda function names
-    # cannot contain ':' (AWS naming rule), so splitting on ':' is unambiguous.
+    # Worker keys are "{account}:{region}:{func_name}:{qualifier}". Older
+    # in-process keys may be "{account}:{func_name}:{qualifier}" during local
+    # development, so tolerate both shapes.
     def _matches(k: str) -> bool:
         parts = k.split(":")
-        if len(parts) != 3:
+        if len(parts) == 4:
+            k_account, k_region, k_func, k_qualifier = parts
+        elif len(parts) == 3:
+            k_account, k_func, k_qualifier = parts
+            k_region = None
+        else:
             return False
-        k_account, k_func, k_qualifier = parts
         if k_func != func_name:
             return False
         if account is not None and k_account != account:
+            return False
+        if region is not None and k_region is not None and k_region != region:
             return False
         if qualifier is not None and k_qualifier != qualifier:
             return False
         return True
 
     with _lock:
-        to_remove = [k for k in _workers if _matches(k)]
-        for k in to_remove:
-            worker = _workers.pop(k, None)
-            if worker:
-                worker.kill()
+        doomed = [w for k in [k for k in _workers if _matches(k)]
+                  for w in (_workers.pop(k, []) or [])]
+    # Outside the lock: terminating a batch takes as long as the slowest worker
+    # takes to exit, and holding the pool lock for that blocks every invocation.
+    kill_workers(doomed)
 
 
 def reset():
     """Terminate all warm workers, clean up temp dirs, and clear the pool."""
     with _lock:
-        for worker in list(_workers.values()):
-            worker.kill()
+        doomed = [w for entries in _workers.values() for w in entries]
         _workers.clear()
+    kill_workers(doomed)
+
+
+# ---------------------------------------------------------------------------
+# provided.* (Go / Rust / custom runtime) warm worker
+# ---------------------------------------------------------------------------
+
+# Seconds the bootstrap binary gets to complete its cold start and issue its
+# first GET /runtime/invocation/next. AWS fixes this: "The Init phase is
+# limited to 10 seconds. If all three tasks do not complete within 10 seconds,
+# Lambda retries the Init phase at the time of the first function invocation
+# with the configured function timeout" (lambda-runtime-environment.html), so
+# the number is not ours to tune — and blowing it is not a failed invocation,
+# it re-runs init under the function's own Timeout (see _spawn).
+_PROVIDED_INIT_TIMEOUT = 10.0
+
+# How often init/invocation waits check whether the bootstrap is still alive.
+_PROVIDED_POLL = 0.05
+
+# Log lines buffered per environment between drains; the oldest are dropped
+# rather than letting a chatty handler grow the buffer without bound.
+_PROVIDED_LOG_MAX_LINES = 10000
+
+# /2018-06-01/runtime/invocation/<request-id>/{response,error}
+_INVOCATION_RESULT_RE = re.compile(r"/runtime/invocation/([^/]+)/(response|error)/?$")
+
+
+# What Go's syscall.Signal.String() names each Linux signal; the RIE reports a
+# runtime killed by a signal as "signal: <name>" (supervisor/model/model.go).
+_GO_SIGNAL_NAMES = {
+    1: "hangup", 2: "interrupt", 3: "quit", 4: "illegal instruction", 5: "trace/breakpoint trap",
+    6: "aborted", 7: "bus error", 8: "floating point exception", 9: "killed", 10: "user defined signal 1",
+    11: "segmentation fault", 12: "user defined signal 2", 13: "broken pipe", 14: "alarm clock",
+    15: "terminated",
+}
+
+
+def runtime_exit_reason(returncode: int) -> str:
+    """The error the Lambda runtime reports when the runtime process exits, as the RIE words it."""
+    if returncode == 0:
+        return "Runtime exited without providing a reason"
+    if returncode < 0:
+        return f"Runtime exited with error: signal: {_GO_SIGNAL_NAMES.get(-returncode, f'signal {-returncode}')}"
+    return f"Runtime exited with error: exit status {returncode}"
+
+
+# AWS's errorMessage for a provided.* function with no bootstrap (Runtime.InvalidEntrypoint).
+MISSING_BOOTSTRAP_MESSAGE = "Couldn't find valid bootstrap(s): [/var/task/bootstrap /opt/bootstrap]"
+
+
+def runtime_exit_message(request_id: str, reason: str) -> str:
+    return f"RequestId: {request_id} Error: {reason}" if request_id else f"Error: {reason}"
+
+
+class RuntimeExitError(RuntimeError):
+    """The runtime process exited: AWS's Runtime.ExitError, with the process's output as its log."""
+
+    error_type = "Runtime.ExitError"
+
+    def __init__(self, returncode: int, log: str = ""):
+        self.reason = runtime_exit_reason(returncode)
+        self.log = log
+        super().__init__(self.reason)
+
+
+class LambdaServiceError(RuntimeError):
+    """MiniStack's own execution machinery failed, not the function: Invoke answers ServiceException."""
+
+
+class ProvidedInitTimeout(RuntimeError):
+    """The bootstrap started but did not reach the Runtime API in time."""
+
+    error_type = "Runtime.Unknown"
+
+
+class ProvidedRuntimeError(RuntimeError):
+    """A runtime failure that carries the error type AWS reports."""
+
+    def __init__(self, message: str, error_type: str, payload: dict | None = None):
+        super().__init__(message)
+        self.error_type = error_type
+        # The runtime's own error document, when it reported one, returned to Invoke as is.
+        self.payload = payload
+
+
+class ProvidedWorker(Worker):
+    """A reusable execution environment for a ``provided.*`` Lambda.
+
+    ``lambda_svc._execute_function_provided`` starts the bootstrap binary,
+    serves exactly one ``/runtime/invocation/next``, and kills the process —
+    so every invocation pays a full cold start. The Lambda Runtime API is
+    already a long-poll loop, which is precisely how real Lambda reuses an
+    environment: hold the HTTP server and the process open and the same binary
+    picks up the next event off ``/next``.
+
+    Reuses ``Worker``'s pool bookkeeping (lease/release, idle reaping,
+    invalidation on code update); only the spawn and invoke mechanics differ,
+    because a custom runtime speaks HTTP rather than the JSON-line stdio
+    protocol the Python/Node worker scripts use.
+
+    Each running environment is a *generation*: ``_spawn`` creates one (server,
+    process, log pump, event queue), ``_teardown`` destroys it. A generation's
+    queues are captured by its own handler threads, and results are accepted
+    only for the current generation's in-flight request ID, so a timed-out or
+    crashed environment cannot feed the invocation that replaces it.
+    """
+
+    def __init__(self, func_name: str, config: dict, code_zip: bytes):
+        super().__init__(func_name, config, code_zip)
+        self._server = None
+        self._server_thread = None
+        self._log_thread = None
+        # One in-flight invocation at a time: the pool leases a worker
+        # exclusively (``in_use``), so a second event can never be queued
+        # behind a first on the same environment — matching AWS, where
+        # concurrent invocations get separate environments.
+        self._pending: queue.Queue = queue.Queue(maxsize=1)
+        self._result: dict = {}
+        self._response_ready = threading.Event()
+        self._init_error = None
+        self._first_poll = threading.Event()
+        # Set by the first /next poll or by an /init/error POST, so the init
+        # wait is not a fixed sleep.
+        self._init_settled = threading.Event()
+        self._stopping = True
+        # Guards state shared with the Runtime API handler threads. Distinct
+        # from ``self._lock``, which is held across a whole invocation.
+        self._state_lock = threading.Lock()
+        self._generation = 0
+        self._current_request_id = None
+
+    # -- State transitions driven by the Runtime API handler threads ------
+
+    def _mark_first_poll(self, generation: int) -> bool:
+        with self._state_lock:
+            if generation != self._generation or self._stopping:
+                return False
+            self._first_poll.set()
+            self._init_settled.set()
+            return True
+
+    def _record_init_error(self, generation: int, payload) -> None:
+        with self._state_lock:
+            if generation != self._generation:
+                return
+            self._init_error = payload
+            self._init_settled.set()
+            if self._current_request_id is not None:
+                # Init can fail on a respawn an invocation is waiting on: fail
+                # it now instead of at the timeout.
+                self._current_request_id = None
+                self._result = {"error": payload}
+                self._response_ready.set()
+
+    def _record_result(self, generation: int, request_id: str, kind: str,
+                       payload) -> bool:
+        """Accept a ``/response`` or ``/error`` POST for the in-flight request.
+
+        False means the ID is not the one we handed out: a duplicate, or a late
+        POST from an environment already torn down, whose result must not reach
+        the invocation that replaced it.
+        """
+        with self._state_lock:
+            if generation != self._generation:
+                return False
+            if not self._current_request_id or request_id != self._current_request_id:
+                return False
+            self._current_request_id = None
+            self._result = ({"error": payload} if kind == "error"
+                            else {"response": payload})
+            self._response_ready.set()
+            return True
+
+    def _build_handler_class(self, generation: int, pending: queue.Queue):
+        worker = self
+
+        import http.server
+
+        class RuntimeAPIHandler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, fmt, *args):
+                pass
+
+            def _read_body(self):
+                encoding = self.headers.get("Transfer-Encoding", "")
+                if "chunked" in encoding.lower():
+                    chunks = []
+                    while True:
+                        size = int(self.rfile.readline().strip(), 16)
+                        if size == 0:
+                            self.rfile.readline()
+                            break
+                        chunks.append(self.rfile.read(size))
+                        self.rfile.readline()
+                    return b"".join(chunks)
+                length = int(self.headers.get("Content-Length", 0))
+                return self.rfile.read(length) if length else b""
+
+            def _respond(self, code: int, body: bytes = b""):
+                self.send_response(code)
+                if body:
+                    self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if body:
+                    self.wfile.write(body)
+
+            def _stopped(self):
+                self._respond(500, b'{"errorMessage":"execution environment stopped"}')
+
+            def do_GET(self):
+                if "/runtime/invocation/next" not in self.path:
+                    self._respond(404)
+                    return
+                # Reaching /next means init finished; the binary long-polls
+                # here between invocations exactly as on AWS.
+                if not worker._mark_first_poll(generation):
+                    self._stopped()
+                    return
+                while True:
+                    if worker._stopping or generation != worker._generation:
+                        # Tell a runtime left over from a dead generation to
+                        # exit rather than serve the live environment's events.
+                        self._stopped()
+                        return
+                    try:
+                        request_id, event, deadline_ms, trace_id, invoked_function_arn = pending.get(
+                            timeout=0.1)
+                        break
+                    except queue.Empty:
+                        continue
+                payload = json.dumps(event).encode()
+                self.send_response(200)
+                self.send_header("Lambda-Runtime-Aws-Request-Id", request_id)
+                self.send_header("Lambda-Runtime-Deadline-Ms", str(deadline_ms))
+                self.send_header(
+                    "Lambda-Runtime-Invoked-Function-Arn",
+                    invoked_function_arn,
+                )
+                if trace_id:
+                    # The Runtime API header is how AWS hands X-Ray context to
+                    # a custom runtime per invocation. The one-shot executor
+                    # used a spawn-time env var, which a reused environment
+                    # cannot do — this is both warm-safe and closer to AWS.
+                    self.send_header("Lambda-Runtime-Trace-Id", trace_id)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_POST(self):
+                body = self._read_body()
+                try:
+                    parsed = json.loads(body)
+                except json.JSONDecodeError:
+                    parsed = body.decode("utf-8", errors="replace")
+
+                if "/runtime/init/error" in self.path:
+                    worker._record_init_error(generation, parsed)
+                    self._respond(202)
+                    return
+
+                match = _INVOCATION_RESULT_RE.search(self.path)
+                if not match:
+                    self._respond(404)
+                    return
+                request_id, kind = match.group(1), match.group(2)
+                if not worker._record_result(generation, request_id, kind, parsed):
+                    # The shape AWS's own Runtime Interface Emulator renders:
+                    # 400 with {"errorMessage": "Invalid request ID",
+                    # "errorType": "InvalidRequestID"} (RIE
+                    # internal/lambda/rapi/rendering/render_error.go).
+                    self._respond(400, json.dumps({
+                        "errorMessage": "Invalid request ID",
+                        "errorType": "InvalidRequestID",
+                    }).encode())
+                    return
+                self._respond(202)
+
+        return RuntimeAPIHandler
+
+    # -- Logs -------------------------------------------------------------
+
+    def _pump_output(self, stream, log_queue: queue.Queue) -> None:
+        """Drain the bootstrap's output into ``log_queue`` for its whole life.
+
+        stdout and stderr are merged into one pipe (a custom runtime logs to
+        either) and read continuously: an undrained pipe fills at ~64KiB and
+        blocks the bootstrap on its next write. The queue belongs to one
+        generation, so a dying environment's tail never mixes into the next.
+        """
+        try:
+            for raw in iter(stream.readline, b""):
+                if not raw:
+                    break
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", errors="replace")
+                line = raw.rstrip("\r\n")
+                try:
+                    log_queue.put_nowait(line)
+                except queue.Full:
+                    # Drop the oldest, never block: blocking here would stall
+                    # the pipe this thread exists to drain.
+                    try:
+                        log_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        log_queue.put_nowait(line)
+                    except queue.Full:
+                        pass
+        except Exception:
+            pass
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    # -- Lifecycle --------------------------------------------------------
+
+    def _spawn(self, init_timeout: float | None = None):
+        import socketserver
+
+        from ministack.services.lambda_svc import (
+            _provided_code_lock,
+            _provided_runtime_code_dir,
+            _provided_worker_env,
+        )
+
+        # A respawn used to abandon the previous generation's HTTP server,
+        # thread and listening socket — one leaked set per bootstrap crash.
+        self._teardown()
+
+        code_dir = _provided_runtime_code_dir(self.code_zip)
+        bootstrap_path = os.path.join(code_dir, "bootstrap")
+        if not os.path.exists(bootstrap_path) or not os.access(bootstrap_path, os.X_OK):
+            # "If the bootstrap file doesn't exist or isn't executable, your
+            # function returns a Runtime.InvalidEntrypoint error upon
+            # invocation" (runtimes-custom.html).
+            raise ProvidedRuntimeError(
+                MISSING_BOOTSTRAP_MESSAGE if not os.path.exists(bootstrap_path)
+                else "Couldn't execute the bootstrap binary: permission denied",
+                "Runtime.InvalidEntrypoint",
+            )
+
+        pending: queue.Queue = queue.Queue(maxsize=1)
+        log_queue: queue.Queue = queue.Queue(maxsize=_PROVIDED_LOG_MAX_LINES)
+        with self._state_lock:
+            self._generation += 1
+            generation = self._generation
+            self._stopping = False
+            self._first_poll.clear()
+            self._init_settled.clear()
+            self._init_error = None
+            self._result = {}
+            self._response_ready.clear()
+            self._current_request_id = None
+            self._pending = pending
+            self._stderr_queue = log_queue
+
+        class _QuietThreadingServer(socketserver.ThreadingTCPServer):
+            daemon_threads = True
+            allow_reuse_address = True
+
+            def handle_error(self, request, client_address):
+                _, exc, _ = sys.exc_info()
+                if isinstance(exc, (BrokenPipeError, ConnectionResetError,
+                                    ConnectionAbortedError)):
+                    return
+                super().handle_error(request, client_address)
+
+        try:
+            # Threading server: /next long-polls, so a single-threaded server
+            # would wedge the response POST behind the next poll.
+            self._server = _QuietThreadingServer(
+                ("127.0.0.1", 0), self._build_handler_class(generation, pending))
+            port = self._server.server_address[1]
+            self._server_thread = threading.Thread(
+                target=self._server.serve_forever, kwargs={"poll_interval": 0.1},
+                daemon=True, name=f"provided-api-{self.func_name}")
+            self._server_thread.start()
+
+            proc_env = _provided_worker_env(self.config, code_dir, port)
+
+            # Spawn under the code lock: no fork may overlap an extraction write
+            # elsewhere, or the child inherits the open write fd and execve fails
+            # with ETXTBSY (#1051).
+            with _provided_code_lock:
+                try:
+                    self._proc = subprocess.Popen(
+                        [bootstrap_path],
+                        cwd=code_dir,
+                        env=proc_env,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                    )
+                except OSError as exc:
+                    # A bootstrap the host cannot execute is the same class of
+                    # failure as a missing one, and AWS names it the same way.
+                    raise ProvidedRuntimeError(
+                        f"Couldn't execute the bootstrap binary: {exc}",
+                        "Runtime.InvalidEntrypoint",
+                    ) from exc
+
+            self._log_thread = threading.Thread(
+                target=self._pump_output, args=(self._proc.stdout, log_queue),
+                daemon=True, name=f"provided-log-{self.func_name}")
+            self._log_thread.start()
+            self._stderr_thread = self._log_thread
+
+            self._await_init(init_timeout)
+        except BaseException:
+            # Never leave a half-built environment behind.
+            self._teardown()
+            raise
+
+        self._start_time = time.time()
+        logger.info("Lambda provided-runtime environment spawned for %s (cold start)",
+                    self.func_name)
+
+    def _await_init(self, init_timeout: float | None = None) -> None:
+        """Wait for the bootstrap to reach /next, bounded and interruptible.
+
+        Returns as soon as init settles: a first poll, an /init/error POST, or
+        the process exiting. Only a live but silent binary waits out the
+        deadline, and that raises ``ProvidedInitTimeout`` so the caller can do
+        what AWS does — run init again under the function's own timeout.
+        """
+        budget = _PROVIDED_INIT_TIMEOUT if init_timeout is None else init_timeout
+        deadline = time.monotonic() + budget
+        while not self._init_settled.wait(_PROVIDED_POLL):
+            exit_code = self._proc.poll() if self._proc is not None else -1
+            if exit_code is not None:
+                raise RuntimeExitError(exit_code, self._drain_stderr_bounded(first_line_wait=0.1))
+            if time.monotonic() >= deadline:
+                raise ProvidedInitTimeout(
+                    f"bootstrap did not reach the Runtime API within "
+                    f"{budget:g}s{self._init_log_suffix()}")
+        if self._init_error is not None:
+            raise ProvidedRuntimeError(f"init error: {self._init_error}", "Runtime.Unknown")
+
+    def _init_log_suffix(self) -> str:
+        log = self._drain_stderr_bounded(first_line_wait=0.1)
+        return f": {log}" if log else ""
+
+    def invoke(self, event: dict, request_id: str, *, trace_id: str = None, invoked_function_arn: str | None = None) -> dict:
+        """Run one invocation on this environment.
+
+        ``trace_id`` is per-invocation X-Ray context, passed separately rather
+        than through a reserved key in ``event``: the payload belongs to the
+        caller. It leaves as the ``Lambda-Runtime-Trace-Id`` header, where a
+        custom runtime expects it.
+        """
+        with self._lock:
+            cold = False
+            timeout = self.config.get("Timeout", 30)
+            if self._proc is None or self._proc.poll() is not None:
+                try:
+                    self._spawn()
+                except ProvidedInitTimeout:
+                    # AWS: an Init phase that overruns its 10 seconds is not a
+                    # failed invocation — "Lambda retries the Init phase at the
+                    # time of the first function invocation with the configured
+                    # function timeout" (lambda-runtime-environment.html).
+                    logger.info(
+                        "Lambda %s: init exceeded %gs; re-running it under the "
+                        "function timeout (%ss)",
+                        self.func_name, _PROVIDED_INIT_TIMEOUT, timeout)
+                    self._spawn(init_timeout=timeout)
+                cold = True
+                self._cold = False
+
+            generation = self._generation
+
+            with self._state_lock:
+                self._result = {}
+                self._response_ready.clear()
+                self._current_request_id = request_id
+                pending = self._pending
+            deadline_ms = int((time.time() + timeout) * 1000)
+            pending.put((request_id, event, deadline_ms, trace_id,
+                         invoked_function_arn if invoked_function_arn is not None else self.config.get("FunctionArn", "")))
+
+            deadline = time.monotonic() + timeout
+            failure = None
+            failure_type = "Runtime.ExitError"
+            while not self._response_ready.wait(
+                    min(_PROVIDED_POLL, max(0.0, deadline - time.monotonic()))):
+                proc = self._proc
+                if proc is None or proc.poll() is not None:
+                    # The process can exit after sending its response but
+                    # before the HTTP handler thread records it.
+                    if self._response_ready.wait(_PROVIDED_POLL):
+                        break
+                    failure = runtime_exit_message(
+                        request_id, runtime_exit_reason(proc.poll() if proc is not None else 1))
+                    break
+                if time.monotonic() >= deadline:
+                    failure = f"Task timed out after {timeout}.00 seconds"
+                    failure_type = "Sandbox.Timedout"
+                    break
+            if failure is not None:
+                logger.warning("Lambda %s: %s", self.func_name, failure)
+                self._teardown()
+                return {
+                    "status": "error",
+                    "error": failure,
+                    "error_payload": {"errorMessage": failure, "errorType": failure_type},
+                    "cold_start": cold,
+                    "log": self._drain_stderr(),
+                }
+
+            with self._state_lock:
+                result, self._result = self._result, {}
+                self._current_request_id = None
+                init_failed = self._init_error is not None
+            log = self._drain_stderr_bounded()
+            # An environment whose process is gone cannot serve the next
+            # invocation; drop it now so its server and threads go with it.
+            died = (self._proc is None or self._proc.poll() is not None
+                    or generation != self._generation)
+
+            if "error" in result:
+                # A handler error does not poison the environment on AWS — the
+                # runtime reports it and goes back to polling /next. Only an
+                # init failure (or a dead process) means it is unusable.
+                if init_failed or died:
+                    self._teardown()
+                err = result["error"]
+                return {
+                    "status": "error",
+                    "error": (err.get("errorMessage") if isinstance(err, dict)
+                              else str(err)),
+                    "error_payload": err,
+                    "cold_start": cold,
+                    "log": log,
+                }
+
+            if died:
+                self._teardown()
+
+            return {
+                "status": "ok",
+                "result": result.get("response"),
+                "cold_start": cold,
+                "log": log,
+            }
+
+    def _teardown(self):
+        """Destroy the current generation: process, server, threads.
+
+        Idempotent. Buffered log lines are kept so the invocation that
+        triggered the teardown can still report them.
+        """
+        with self._state_lock:
+            self._stopping = True
+            self._current_request_id = None
+        proc, self._proc = self._proc, None
+        _signal(proc)
+        _collect(proc, time.monotonic() + _REAP_GRACE)
+        self._shutdown_server()
+        self._join_log_thread()
+
+    def _join_log_thread(self) -> None:
+        thread, self._log_thread = self._log_thread, None
+        self._stderr_thread = None
+        # The pipe closes with the process, so the pump ends on its own; the
+        # join only keeps it from outliving the generation.
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+
+    def _shutdown_server(self):
+        server, self._server = self._server, None
+        thread, self._server_thread = self._server_thread, None
+        if server is not None:
+            try:
+                server.shutdown()
+            except Exception:
+                pass
+            try:
+                server.server_close()
+            except Exception:
+                pass
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+
+    def _discard_tmpdir(self):
+        # kill_workers() reaps the process and then calls this; piggyback the
+        # server teardown so a reaped worker leaves no listening socket or
+        # thread behind. The code dir is the shared content-addressed cache
+        # from _provided_runtime_code_dir — nothing to remove here.
+        with self._state_lock:
+            self._stopping = True
+        self._shutdown_server()
+        self._join_log_thread()

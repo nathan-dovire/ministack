@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 IAM Service Emulator (AWS-compatible).
 
@@ -6,19 +8,29 @@ STS actions are in sts.py.
 IAM actions:
   CreateUser, GetUser, ListUsers, DeleteUser,
   CreateRole, GetRole, ListRoles, DeleteRole,
+  UpdateRoleDescription, PutRolePermissionsBoundary, DeleteRolePermissionsBoundary,
+  PutUserPermissionsBoundary, DeleteUserPermissionsBoundary,
   CreatePolicy, GetPolicy, GetPolicyVersion, ListPolicyVersions, ListPolicies, DeletePolicy,
   CreatePolicyVersion, DeletePolicyVersion,
   AttachRolePolicy, DetachRolePolicy, ListAttachedRolePolicies,
   PutRolePolicy, GetRolePolicy, DeleteRolePolicy, ListRolePolicies,
   AttachUserPolicy, DetachUserPolicy, ListAttachedUserPolicies,
   PutUserPolicy, GetUserPolicy, DeleteUserPolicy, ListUserPolicies,
-  CreateAccessKey, ListAccessKeys, DeleteAccessKey,
+  CreateAccessKey, ListAccessKeys, DeleteAccessKey, UpdateAccessKey, GetAccessKeyLastUsed,
+  CreateServiceSpecificCredential, ListServiceSpecificCredentials,
+  UpdateServiceSpecificCredential, ResetServiceSpecificCredential,
+  DeleteServiceSpecificCredential,
+  UploadServerCertificate, ListServerCertificates, GetServerCertificate,
+  UpdateServerCertificate, DeleteServerCertificate, ListServerCertificateTags,
   CreateInstanceProfile, DeleteInstanceProfile, GetInstanceProfile,
   AddRoleToInstanceProfile, RemoveRoleFromInstanceProfile,
   ListInstanceProfiles, ListInstanceProfilesForRole,
+  TagInstanceProfile, UntagInstanceProfile, ListInstanceProfileTags,
   UpdateAssumeRolePolicy,
   CreateGroup, GetGroup, DeleteGroup, ListGroups,
   AddUserToGroup, RemoveUserFromGroup, ListGroupsForUser,
+  AttachGroupPolicy, DetachGroupPolicy, ListAttachedGroupPolicies,
+  PutGroupPolicy, GetGroupPolicy, DeleteGroupPolicy, ListGroupPolicies,
   CreateServiceLinkedRole, DeleteServiceLinkedRole, GetServiceLinkedRoleDeletionStatus,
   CreateOpenIDConnectProvider, GetOpenIDConnectProvider, DeleteOpenIDConnectProvider,
   TagRole, UntagRole, ListRoleTags,
@@ -27,15 +39,21 @@ IAM actions:
   SimulatePrincipalPolicy, SimulateCustomPolicy.
 """
 
+import base64
+import binascii
 import copy
 import json
 import logging
 import os
+import re
 import time
 from urllib.parse import parse_qs
 from urllib.parse import quote as _url_quote
+from xml.sax.saxutils import escape as _xml_escape
 
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, json_response, new_uuid
+from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.router import extract_access_key_id
 
 logger = logging.getLogger("iam")
 
@@ -44,7 +62,6 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # ---------------------------------------------------------------------------
 # Module-level state
 # ---------------------------------------------------------------------------
-from ministack.core.persistence import PERSIST_STATE, load_state
 
 _users = AccountScopedDict()
 _roles = AccountScopedDict()
@@ -53,8 +70,18 @@ _access_keys = AccountScopedDict()
 _instance_profiles = AccountScopedDict()
 _groups = AccountScopedDict()
 _user_inline_policies = AccountScopedDict()
+_group_inline_policies = AccountScopedDict()
 _oidc_providers = AccountScopedDict()
 _service_linked_role_deletion_tasks = AccountScopedDict()
+_sla_jobs = AccountScopedDict()
+_saml_providers = AccountScopedDict()
+_mfa_devices = AccountScopedDict()
+_login_profiles = AccountScopedDict()
+_credential_reports = AccountScopedDict()
+_account_password_policy = AccountScopedDict()
+_account_aliases = AccountScopedDict()
+_service_specific_credentials = AccountScopedDict()
+_server_certificates = AccountScopedDict()
 
 
 # -- AWS-managed policies ---------------------------------------------------
@@ -136,11 +163,18 @@ def _autovivify_aws_managed_policy(arn: str) -> dict:
 
 
 def _make_aws_managed_record(name: str, document: str, description: str = "") -> dict:
-    """Build a policy record matching the shape ``_create_policy`` stores."""
+    """Build a policy record matching the shape ``_create_policy`` stores.
+
+    ``name`` is the ARN's resource part, path included
+    (``service-role/AWSLambdaBasicExecutionRole``): the path becomes the
+    record's ``Path`` and only the last segment its ``PolicyName``, as AWS
+    reports them — Terraform's ``aws_iam_policy`` data source and
+    ``ListPolicies PathPrefix`` both read those two fields."""
     arn = f"{_AWS_MANAGED_POLICY_PREFIX}{name}"
+    path, _, policy_name = name.rpartition("/")
     created = _now()
     return {
-        "PolicyName": name,
+        "PolicyName": policy_name,
         "Arn": arn,
         "PolicyId": _gen_id("ANPA"),
         "CreateDate": created,
@@ -148,7 +182,7 @@ def _make_aws_managed_record(name: str, document: str, description: str = "") ->
         "DefaultVersionId": "v1",
         "AttachmentCount": 0,
         "IsAttachable": True,
-        "Path": "/",
+        "Path": f"/{path}/" if path else "/",
         "Description": description,
         "Tags": [],
         "Versions": {
@@ -178,6 +212,13 @@ def _policy_exists(arn: str) -> bool:
     return _lookup_policy(arn) is not None
 
 
+def policy_known(arn: str, account_id: str | None = None) -> bool:
+    """Whether ``arn`` names a known AWS managed policy or one stored in ``account_id`` (default: the caller's)."""
+    if _is_aws_managed_arn(arn) or account_id is None:
+        return _lookup_policy(arn) is not None
+    return _policies.get_scoped(account_id, None, arn) is not None
+
+
 def _seed_aws_managed_policies() -> None:
     """Seed the global AWS-managed policy store with the canonical
     documents for the most commonly referenced AWS-managed policies.
@@ -187,6 +228,44 @@ def _seed_aws_managed_policies() -> None:
     update via ``aws iam get-policy-version`` against real AWS when
     a new policy version ships."""
     seeds = [
+        # The service-role/* policies live under that path on AWS: it is the
+        # only ARN CDK, SAM and Serverless emit for a Lambda execution role.
+        # A path-less spelling of them does not exist on AWS and answers
+        # NoSuchEntity here too; the one-line fix for a template written
+        # against the old seeds is to attach the real service-role/ ARN.
+        ('service-role/AWSLambdaBasicExecutionRole',
+         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}',
+         "Provides write permissions to CloudWatch Logs."),
+        ('service-role/AWSLambdaVPCAccessExecutionRole',
+         '{"Version":"2012-10-17","Statement":[{"Sid":"AWSLambdaVPCAccessExecutionPermissions","Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents","ec2:CreateNetworkInterface","ec2:DescribeNetworkInterfaces","ec2:DescribeSubnets","ec2:DeleteNetworkInterface","ec2:AssignPrivateIpAddresses","ec2:UnassignPrivateIpAddresses"],"Resource":"*"}]}',
+         "Provides minimum permissions for a Lambda function to execute while accessing a resource within a VPC - create, describe, delete network interfaces and write permissions to CloudWatch Logs."),
+        ('service-role/AWSLambdaRole',
+         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["lambda:InvokeFunction"],"Resource":["*"]}]}',
+         "Default policy for AWS Lambda service role."),
+        ('service-role/AmazonECSTaskExecutionRolePolicy',
+         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ecr:GetAuthorizationToken","ecr:BatchCheckLayerAvailability","ecr:GetDownloadUrlForLayer","ecr:BatchGetImage","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}',
+         "Provides access to other AWS service resources that are required to run Amazon ECS tasks"),
+        ('service-role/AmazonAPIGatewayPushToCloudWatchLogs',
+         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:DescribeLogGroups","logs:DescribeLogStreams","logs:PutLogEvents","logs:GetLogEvents","logs:FilterLogEvents"],"Resource":"*"}]}',
+         "Allows API Gateway to push logs to user's account."),
+        ('service-role/AWSIoTThingsRegistration',
+         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["iot:AddThingToThingGroup","iot:AttachPolicy","iot:AttachPrincipalPolicy","iot:AttachThingPrincipal","iot:CreateCertificateFromCsr","iot:CreatePolicy","iot:CreateThing","iot:DescribeCertificate","iot:DescribeThing","iot:DescribeThingGroup","iot:DescribeThingType","iot:DetachPolicy","iot:DetachThingPrincipal","iot:GetPolicy","iot:ListAttachedPolicies","iot:ListPolicyPrincipals","iot:ListPrincipalPolicies","iot:ListPrincipalThings","iot:ListTargetsForPolicy","iot:ListThingGroupsForThing","iot:ListThingPrincipals","iot:RegisterCertificate","iot:RegisterThing","iot:RemoveThingFromThingGroup","iot:UpdateCertificate","iot:UpdateThing","iot:UpdateThingGroupsForThing","iot:AddThingToBillingGroup","iot:DescribeBillingGroup","iot:RemoveThingFromBillingGroup"],"Resource":["*"]}]}',
+         "This policy allows users to register things at bulk using AWS IoT StartThingRegistrationTask API"),
+        ('AWSCloudFormationReadOnlyAccess',
+         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["cloudformation:Describe*","cloudformation:BatchDescribe*","cloudformation:EstimateTemplateCost","cloudformation:Get*","cloudformation:List*","cloudformation:ValidateTemplate","cloudformation:Detect*"],"Resource":"*"}]}',
+         "Provides access to AWS CloudFormation via the AWS Management Console."),
+        ('CloudWatchLambdaInsightsExecutionRolePolicy',
+         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"logs:CreateLogGroup","Resource":"*"},{"Effect":"Allow","Action":["logs:CreateLogStream","logs:PutLogEvents"],"Resource":"arn:aws:logs:*:*:log-group:/aws/lambda-insights:*"}]}',
+         "Policy required for the Lambda Insights Extension"),
+        ('service-role/AWSLambdaSQSQueueExecutionRole',
+         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["sqs:ReceiveMessage","sqs:DeleteMessage","sqs:GetQueueAttributes","logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}',
+         "Provides receive message, delete message, and read attribute access to SQS queues, and write permissions to CloudWatch logs."),
+        ('service-role/AWSLambdaKinesisExecutionRole',
+         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["kinesis:DescribeStream","kinesis:DescribeStreamSummary","kinesis:GetRecords","kinesis:GetShardIterator","kinesis:ListShards","kinesis:ListStreams","kinesis:SubscribeToShard","logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}',
+         "Provides list and read access to Kinesis streams and write permissions to CloudWatch logs."),
+        ('service-role/AWSLambdaDynamoDBExecutionRole',
+         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["dynamodb:DescribeStream","dynamodb:GetRecords","dynamodb:GetShardIterator","dynamodb:ListStreams","logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}',
+         "Provides list and read access to DynamoDB streams and write permissions to CloudWatch logs."),
         ('AdministratorAccess',
          '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}',
          "Provides full access to AWS services and resources."),
@@ -223,21 +302,12 @@ def _seed_aws_managed_policies() -> None:
         ('AmazonDynamoDBFullAccess',
          '{"Version":"2012-10-17","Statement":[{"Action":["dynamodb:*","dax:*","application-autoscaling:DeleteScalingPolicy","application-autoscaling:DeregisterScalableTarget","application-autoscaling:DescribeScalableTargets","application-autoscaling:DescribeScalingActivities","application-autoscaling:DescribeScalingPolicies","application-autoscaling:PutScalingPolicy","application-autoscaling:RegisterScalableTarget","cloudwatch:DeleteAlarms","cloudwatch:DescribeAlarmHistory","cloudwatch:DescribeAlarms","cloudwatch:DescribeAlarmsForMetric","cloudwatch:GetMetricStatistics","cloudwatch:ListMetrics","cloudwatch:PutMetricAlarm","cloudwatch:GetMetricData","datapipeline:ActivatePipeline","datapipeline:CreatePipeline","datapipeline:DeletePipeline","datapipeline:DescribeObjects","datapipeline:DescribePipelines","datapipeline:GetPipelineDefinition","datapipeline:ListPipelines","datapipeline:PutPipelineDefinition","datapipeline:QueryObjects","ec2:DescribeVpcs","ec2:DescribeSubnets","ec2:DescribeSecurityGroups","iam:GetRole","iam:ListRoles","kms:DescribeKey","kms:ListAliases","sns:CreateTopic","sns:DeleteTopic","sns:ListSubscriptions","sns:ListSubscriptionsByTopic","sns:ListTopics","sns:Subscribe","sns:Unsubscribe","sns:SetTopicAttributes","lambda:CreateFunction","lambda:ListFunctions","lambda:ListEventSourceMappings","lambda:CreateEventSourceMapping","lambda:DeleteEventSourceMapping","lambda:GetFunctionConfiguration","lambda:DeleteFunction","resource-groups:ListGroups","resource-groups:ListGroupResources","resource-groups:GetGroup","resource-groups:GetGroupQuery","resource-groups:DeleteGroup","resource-groups:CreateGroup","tag:GetResources","kinesis:ListStreams","kinesis:DescribeStream","kinesis:DescribeStreamSummary"],"Effect":"Allow","Resource":"*"},{"Action":"cloudwatch:GetInsightRuleReport","Effect":"Allow","Resource":"arn:aws:cloudwatch:*:*:insight-rule/DynamoDBContributorInsights*"},{"Action":["iam:PassRole"],"Effect":"Allow","Resource":"*","Condition":{"StringLike":{"iam:PassedToService":["application-autoscaling.amazonaws.com","application-autoscaling.amazonaws.com.cn","dax.amazonaws.com"]}}},{"Effect":"Allow","Action":["iam:CreateServiceLinkedRole"],"Resource":"*","Condition":{"StringEquals":{"iam:AWSServiceName":["replication.dynamodb.amazonaws.com","dax.amazonaws.com","dynamodb.application-autoscaling.amazonaws.com","contributorinsights.dynamodb.amazonaws.com","kinesisreplication.dynamodb.amazonaws.com"]}}}]}',
          "Provides full access to Amazon DynamoDB via the AWS Management Console."),
-        ('AWSLambdaBasicExecutionRole',
-         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}',
-         "Provides write permissions to CloudWatch Logs."),
-        ('AWSLambdaVPCAccessExecutionRole',
-         '{"Version":"2012-10-17","Statement":[{"Sid":"AWSLambdaVPCAccessExecutionPermissions","Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents","ec2:CreateNetworkInterface","ec2:DescribeNetworkInterfaces","ec2:DescribeSubnets","ec2:DeleteNetworkInterface","ec2:AssignPrivateIpAddresses","ec2:UnassignPrivateIpAddresses"],"Resource":"*"}]}',
-         "Provides minimum permissions for a Lambda function to execute while accessing a resource within a VPC - create, describe, delete network interfaces and write permissions to CloudWatch Logs."),
         ('AmazonSQSFullAccess',
          '{"Version":"2012-10-17","Statement":[{"Action":["sqs:*"],"Effect":"Allow","Resource":"*"}]}',
          "Provides full access to Amazon SQS via the AWS Management Console."),
         ('AmazonSNSFullAccess',
          '{"Version":"2012-10-17","Statement":[{"Sid":"SNSFullAccess","Effect":"Allow","Action":"sns:*","Resource":"*"},{"Sid":"SMSAccessViaSNS","Effect":"Allow","Action":["sms-voice:DescribeVerifiedDestinationNumbers","sms-voice:CreateVerifiedDestinationNumber","sms-voice:SendDestinationNumberVerificationCode","sms-voice:SendTextMessage","sms-voice:DeleteVerifiedDestinationNumber","sms-voice:VerifyDestinationNumber","sms-voice:DescribeAccountAttributes","sms-voice:DescribeSpendLimits","sms-voice:DescribePhoneNumbers","sms-voice:SetTextMessageSpendLimitOverride","sms-voice:DescribeOptedOutNumbers","sms-voice:DeleteOptedOutNumber"],"Resource":"*","Condition":{"StringEquals":{"aws:CalledViaLast":"sns.amazonaws.com"}}}]}',
          "Provides full access to Amazon SNS via the AWS Management Console."),
-        ('AmazonECSTaskExecutionRolePolicy',
-         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ecr:GetAuthorizationToken","ecr:BatchCheckLayerAvailability","ecr:GetDownloadUrlForLayer","ecr:BatchGetImage","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}',
-         "Provides access to other AWS service resources that are required to run Amazon ECS tasks"),
         ('CloudWatchAgentServerPolicy',
          '{"Version":"2012-10-17","Statement":[{"Sid":"CWACloudWatchServerPermissions","Effect":"Allow","Action":["cloudwatch:PutMetricData","ec2:DescribeVolumes","ec2:DescribeTags","logs:PutLogEvents","logs:PutRetentionPolicy","logs:DescribeLogStreams","logs:DescribeLogGroups","logs:CreateLogStream","logs:CreateLogGroup","xray:PutTraceSegments","xray:PutTelemetryRecords","xray:GetSamplingRules","xray:GetSamplingTargets","xray:GetSamplingStatisticSummaries"],"Resource":"*"},{"Sid":"CWASSMServerPermissions","Effect":"Allow","Action":["ssm:GetParameter"],"Resource":"arn:aws:ssm:*:*:parameter/AmazonCloudWatch-*"}]}',
          "Permissions required to use AmazonCloudWatchAgent on servers"),
@@ -247,13 +317,35 @@ def _seed_aws_managed_policies() -> None:
         ('AWSCloudFormationFullAccess',
          '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["cloudformation:*"],"Resource":"*"}]}',
          "Provides full access to AWS CloudFormation."),
+        ('AmazonEKSClusterPolicy',
+         '{"Version":"2012-10-17","Statement":[{"Sid":"AmazonEKSClusterPolicy","Effect":"Allow","Action":["autoscaling:DescribeAutoScalingGroups","autoscaling:UpdateAutoScalingGroup","ec2:AttachVolume","ec2:AuthorizeSecurityGroupIngress","ec2:CreateRoute","ec2:CreateSecurityGroup","ec2:CreateTags","ec2:CreateVolume","ec2:DeleteRoute","ec2:DeleteSecurityGroup","ec2:DeleteVolume","ec2:DescribeInstances","ec2:DescribeRouteTables","ec2:DescribeSecurityGroups","ec2:DescribeSubnets","ec2:DescribeVolumes","ec2:DescribeVolumesModifications","ec2:DescribeVpcs","ec2:DescribeDhcpOptions","ec2:DescribeNetworkInterfaces","ec2:DescribeAvailabilityZones","ec2:DetachVolume","ec2:ModifyInstanceAttribute","ec2:ModifyVolume","ec2:RevokeSecurityGroupIngress","ec2:DescribeAccountAttributes","ec2:DescribeAddresses","ec2:DescribeInternetGateways","ec2:DescribeInstanceTopology","elasticloadbalancing:AddTags","elasticloadbalancing:ApplySecurityGroupsToLoadBalancer","elasticloadbalancing:AttachLoadBalancerToSubnets","elasticloadbalancing:ConfigureHealthCheck","elasticloadbalancing:CreateListener","elasticloadbalancing:CreateLoadBalancer","elasticloadbalancing:CreateLoadBalancerListeners","elasticloadbalancing:CreateLoadBalancerPolicy","elasticloadbalancing:CreateTargetGroup","elasticloadbalancing:DeleteListener","elasticloadbalancing:DeleteLoadBalancer","elasticloadbalancing:DeleteLoadBalancerListeners","elasticloadbalancing:DeleteTargetGroup","elasticloadbalancing:DeregisterInstancesFromLoadBalancer","elasticloadbalancing:DeregisterTargets","elasticloadbalancing:DescribeListeners","elasticloadbalancing:DescribeLoadBalancerAttributes","elasticloadbalancing:DescribeLoadBalancerPolicies","elasticloadbalancing:DescribeLoadBalancers","elasticloadbalancing:DescribeTargetGroupAttributes","elasticloadbalancing:DescribeTargetGroups","elasticloadbalancing:DescribeTargetHealth","elasticloadbalancing:DetachLoadBalancerFromSubnets","elasticloadbalancing:ModifyListener","elasticloadbalancing:ModifyLoadBalancerAttributes","elasticloadbalancing:ModifyTargetGroup","elasticloadbalancing:ModifyTargetGroupAttributes","elasticloadbalancing:RegisterInstancesWithLoadBalancer","elasticloadbalancing:RegisterTargets","elasticloadbalancing:SetLoadBalancerPoliciesForBackendServer","elasticloadbalancing:SetLoadBalancerPoliciesOfListener","kms:DescribeKey"],"Resource":"*"},{"Sid":"AmazonEKSClusterPolicySLRCreate","Effect":"Allow","Action":"iam:CreateServiceLinkedRole","Resource":"*","Condition":{"StringEquals":{"iam:AWSServiceName":"elasticloadbalancing.amazonaws.com"}}},{"Sid":"AmazonEKSClusterPolicyENIDelete","Effect":"Allow","Action":"ec2:DeleteNetworkInterface","Resource":"*","Condition":{"StringEquals":{"ec2:ResourceTag/eks:eni:owner":"amazon-vpc-cni"}}}]}',
+         "Provides Kubernetes the permissions it requires to manage resources on your behalf."),
+        ('AmazonEKSWorkerNodePolicy',
+         '{"Version":"2012-10-17","Statement":[{"Sid":"WorkerNodePermissions","Effect":"Allow","Action":["ec2:DescribeInstances","ec2:DescribeInstanceTypes","ec2:DescribeRouteTables","ec2:DescribeSecurityGroups","ec2:DescribeSubnets","ec2:DescribeVolumes","ec2:DescribeVolumesModifications","ec2:DescribeVpcs","eks:DescribeCluster","eks-auth:AssumeRoleForPodIdentity"],"Resource":"*"}]}',
+         "This policy allows Amazon EKS worker nodes to connect to Amazon EKS Clusters."),
+        ('AmazonEKS_CNI_Policy',
+         '{"Version":"2012-10-17","Statement":[{"Sid":"AmazonEKSCNIPolicy","Effect":"Allow","Action":["ec2:AssignPrivateIpAddresses","ec2:AttachNetworkInterface","ec2:CreateNetworkInterface","ec2:DeleteNetworkInterface","ec2:DescribeInstances","ec2:DescribeTags","ec2:DescribeNetworkInterfaces","ec2:DescribeInstanceTypes","ec2:DescribeSubnets","ec2:DescribeSecurityGroups","ec2:DetachNetworkInterface","ec2:ModifyNetworkInterfaceAttribute","ec2:UnassignPrivateIpAddresses"],"Resource":"*"},{"Sid":"AmazonEKSCNIPolicyENITag","Effect":"Allow","Action":["ec2:CreateTags"],"Resource":["arn:aws:ec2:*:*:network-interface/*"]}]}',
+         "Provides the Amazon VPC CNI Plugin (amazon-vpc-cni-k8s) the permissions it requires to modify the IP address configuration on your EKS worker nodes."),
+        ('AmazonEKSServicePolicy',
+         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ec2:CreateNetworkInterface","ec2:CreateNetworkInterfacePermission","ec2:DeleteNetworkInterface","ec2:DescribeInstances","ec2:DescribeNetworkInterfaces","ec2:DetachNetworkInterface","ec2:DescribeSecurityGroups","ec2:DescribeSubnets","ec2:DescribeVpcs","ec2:ModifyNetworkInterfaceAttribute","iam:ListAttachedRolePolicies","eks:UpdateClusterVersion","ec2:GetSecurityGroupsForVpc"],"Resource":"*"},{"Effect":"Allow","Action":["ec2:CreateTags","ec2:DeleteTags"],"Resource":["arn:aws:ec2:*:*:vpc/*","arn:aws:ec2:*:*:subnet/*"]},{"Effect":"Allow","Action":["ec2:CreateTags"],"Resource":["arn:aws:ec2:*:*:network-interface/*"],"Condition":{"StringLike":{"aws:RequestTag/Name":"eks-cluster-*"}}},{"Effect":"Allow","Action":"route53:AssociateVPCWithHostedZone","Resource":"*"},{"Effect":"Allow","Action":"logs:CreateLogGroup","Resource":"*"},{"Effect":"Allow","Action":["logs:CreateLogStream","logs:DescribeLogStreams"],"Resource":"arn:aws:logs:*:*:log-group:/aws/eks/*:*"},{"Effect":"Allow","Action":"logs:PutLogEvents","Resource":"arn:aws:logs:*:*:log-group:/aws/eks/*:*:*"},{"Effect":"Allow","Action":"iam:CreateServiceLinkedRole","Resource":"arn:aws:iam::*:role/aws-service-role/eks.amazonaws.com/AWSServiceRoleForAmazonEKS","Condition":{"StringLike":{"iam:AWSServiceName":"eks.amazonaws.com"}}}]}',
+         "This policy allows Amazon Elastic Container Service for Kubernetes to create and manage the necessary resources to operate EKS Clusters."),
+        # X-Ray daemon-side write + reader access. Heavily referenced by
+        # the upstream terraform-aws-modules/lambda module: every Lambda
+        # function module that sets `attach_tracing_policy = true` does
+        # `data "aws_iam_policy" "tracing" { arn = "arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess" }`,
+        # so any Terraform stack that wires Lambdas with tracing on hits this.
+        ('AWSXRayDaemonWriteAccess',
+         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["xray:PutTraceSegments","xray:PutTelemetryRecords","xray:GetSamplingRules","xray:GetSamplingTargets","xray:GetSamplingStatisticSummaries"],"Resource":["*"]}]}',
+         "AWS X-Ray Daemon write access — permissions required by the X-Ray daemon to upload telemetry segments to X-Ray and fetch sampling rules."),
+        ('AWSXrayReadOnlyAccess',
+         '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["xray:GetSamplingRules","xray:GetSamplingTargets","xray:GetSamplingStatisticSummaries","xray:BatchGetTraces","xray:BatchGetTraceSummaryById","xray:GetDistinctTraceGraphs","xray:GetServiceGraph","xray:GetTraceGraph","xray:GetTraceSummaries","xray:GetGroups","xray:GetGroup","xray:ListTagsForResource","xray:ListResourcePolicies","xray:GetTimeSeriesServiceStatistics","xray:GetInsightSummaries","xray:GetInsight","xray:GetInsightEvents","xray:GetInsightImpactGraph"],"Resource":["*"]}]}',
+         "AWS X-Ray read-only access. Grants permission to retrieve trace data, service graphs, and sampling rules."),
     ]
 
     for name, document, description in seeds:
         _aws_managed_policies[f"{_AWS_MANAGED_POLICY_PREFIX}{name}"] = _make_aws_managed_record(
             name, document, description,
         )
-
 
 # ── Persistence ────────────────────────────────────────────
 
@@ -268,11 +360,25 @@ def get_state():
         "oidc_providers": copy.deepcopy(_oidc_providers),
         "service_linked_role_deletion_tasks": copy.deepcopy(_service_linked_role_deletion_tasks),
         "user_inline_policies": copy.deepcopy(_user_inline_policies),
+        "group_inline_policies": copy.deepcopy(_group_inline_policies),
         "aws_managed_attachment_counts": copy.deepcopy(_aws_managed_attachment_counts),
+        "sla_jobs": copy.deepcopy(_sla_jobs),
+        "saml_providers": copy.deepcopy(_saml_providers),
+        "mfa_devices": copy.deepcopy(_mfa_devices),
+        "login_profiles": copy.deepcopy(_login_profiles),
+        "credential_reports": copy.deepcopy(_credential_reports),
+        "account_password_policy": copy.deepcopy(_account_password_policy),
+        "account_aliases": copy.deepcopy(_account_aliases),
+        "service_specific_credentials": copy.deepcopy(_service_specific_credentials),
+        "server_certificates": copy.deepcopy(_server_certificates),
     }
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     if data:
         _users.update(data.get("users", {}))
         _roles.update(data.get("roles", {}))
@@ -283,18 +389,19 @@ def restore_state(data):
         _oidc_providers.update(data.get("oidc_providers", {}))
         _service_linked_role_deletion_tasks.update(data.get("service_linked_role_deletion_tasks", {}))
         _user_inline_policies.update(data.get("user_inline_policies", {}))
+        _group_inline_policies.update(data.get("group_inline_policies", {}))
         _aws_managed_attachment_counts.update(data.get("aws_managed_attachment_counts", {}))
+        _sla_jobs.update(data.get("sla_jobs", {}))
+        _saml_providers.update(data.get("saml_providers", {}))
+        _mfa_devices.update(data.get("mfa_devices", {}))
+        _login_profiles.update(data.get("login_profiles", {}))
+        _credential_reports.update(data.get("credential_reports", {}))
+        _account_password_policy.update(data.get("account_password_policy", {}))
+        _account_aliases.update(data.get("account_aliases", {}))
+        _service_specific_credentials.update(data.get("service_specific_credentials", {}))
+        _server_certificates.update(data.get("server_certificates", {}))
 
 
-try:
-    _restored = load_state("iam")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
 
 
 # ===================================================================== IAM
@@ -320,6 +427,13 @@ async def handle_request(method, path, headers, body, query_params):
         for k, v in parse_qs(body.decode("utf-8", errors="replace")).items():
             params[k] = v
 
+    # Some ops (the ServiceSpecificCredential family) let an IAM user omit
+    # UserName, which AWS then takes from the caller. The caller's access key
+    # resolves it here; non-user callers get AWS's InvalidInput at the op.
+    access_key = extract_access_key_id(headers, query_params)
+    # Always set, so a request cannot supply its own _caller_user.
+    params["_caller_user"] = _access_keys.get(access_key, {}).get("UserName", "") if access_key else ""
+
     action = _p(params, "Action")
     handler = _IAM_HANDLERS.get(action)
     if not handler:
@@ -334,6 +448,12 @@ def _create_user(p):
     if name in _users:
         return _error(409, "EntityAlreadyExists",
                       f"User with name {name} already exists.", ns="iam")
+    boundary_err = _p(p, "PermissionsBoundary") and _boundary_policy_error(_p(p, "PermissionsBoundary"))
+    if boundary_err:
+        return boundary_err
+    tags = _extract_tags(p)
+    if _identity_tags_have_duplicate_keys(tags):
+        return _error(400, "InvalidInput", DUPLICATE_IDENTITY_TAG_KEYS, ns="iam")
     path = _p(p, "Path") or "/"
     _users[name] = {
         "UserName": name,
@@ -341,8 +461,9 @@ def _create_user(p):
         "UserId": _gen_id("AIDA"),
         "CreateDate": _now(),
         "Path": path,
+        "PermissionsBoundary": _p(p, "PermissionsBoundary"),
         "AttachedPolicies": [],
-        "Tags": _extract_tags(p),
+        "Tags": tags,
     }
     return _xml(200, "CreateUserResponse",
                 f"<CreateUserResult><User>{_user_xml(name)}</User></CreateUserResult>",
@@ -371,15 +492,42 @@ def _get_user(p):
 
 def _list_users(p):
     prefix = _p(p, "PathPrefix") or "/"
-    members = "".join(
-        f"<member>{_user_xml(n)}</member>"
+    members = list(
+        f"<member>{_user_xml(n, boundary=False)}</member>"
         for n, u in _users.items()
         if u.get("Path", "/").startswith(prefix)
     )
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListUsersResponse",
                 f"<ListUsersResult><Users>{members}</Users>"
-                "<IsTruncated>false</IsTruncated></ListUsersResult>",
+                f"{tail}</ListUsersResult>",
                 ns="iam")
+
+
+def _put_user_permissions_boundary(p):
+    name = _p(p, "UserName")
+    user = _users.get(name)
+    if not user:
+        return _error(404, "NoSuchEntity",
+                      f"The user with name {name} cannot be found.", ns="iam")
+    boundary_err = _boundary_policy_error(_p(p, "PermissionsBoundary"))
+    if boundary_err:
+        return boundary_err
+    user["PermissionsBoundary"] = _p(p, "PermissionsBoundary")
+    return _xml(200, "PutUserPermissionsBoundaryResponse", "", ns="iam")
+
+
+def _delete_user_permissions_boundary(p):
+    name = _p(p, "UserName")
+    user = _users.get(name)
+    if not user:
+        return _error(404, "NoSuchEntity",
+                      f"The user with name {name} cannot be found.", ns="iam")
+    absent_err = _absent_boundary_error(user, user["UserId"])
+    if absent_err:
+        return absent_err
+    user["PermissionsBoundary"] = None
+    return _xml(200, "DeleteUserPermissionsBoundaryResponse", "", ns="iam")
 
 
 def _delete_user(p):
@@ -401,11 +549,73 @@ def _delete_user(p):
 
 # -------------------- Role management --------------------
 
+# IAM restricts a role's Description to tab / CR / LF plus printable ASCII and
+# the Latin-1 supplement (botocore `roleDescriptionType`), max 1000 chars. A
+# character outside that set — an em dash, say — is a 400 ValidationError on
+# real AWS; without this check MiniStack stored it verbatim, so an invalid
+# template deployed fine locally and only failed once it reached a real account.
+_ROLE_DESCRIPTION_RE = re.compile("[\u0009\u000A\u000D\u0020-\u007E\u00A1-\u00FF]*")
+
+
+
+def _validate_role_description(description):
+    """None when the description is absent or valid; a 400 ValidationError otherwise."""
+    if description is None:
+        return None
+    if len(description) > 1000:
+        return _error(
+            400, "ValidationError",
+            "1 validation error detected: Value at 'description' failed to satisfy "
+            "constraint: Member must have length less than or equal to 1000",
+            ns="iam")
+    if _ROLE_DESCRIPTION_RE.fullmatch(description) is None:
+        return _error(
+            400, "ValidationError",
+            "1 validation error detected: Value at 'description' failed to satisfy "
+            "constraint: Member must satisfy regular expression pattern: "
+            "[\\u0009\\u000A\\u000D\\u0020-\\u007E\\u00A1-\\u00FF]*",
+            ns="iam")
+    return None
+
+
+def _trust_policy_not_principal_error(doc):
+    """IAM's message refusing a role trust policy that carries NotPrincipal, or None."""
+    if isinstance(doc, str):
+        try:
+            doc = json.loads(doc)
+        except ValueError:
+            return None
+    statements = doc.get("Statement") if isinstance(doc, dict) else None
+    if isinstance(statements, dict):
+        statements = [statements]
+    if not isinstance(statements, list):
+        return None
+    flagged = [s for s in statements if isinstance(s, dict) and "NotPrincipal" in s]
+    if any(s.get("Effect") == "Allow" for s in flagged):
+        return "Allow with NotPrincipal is not allowed."
+    if flagged:
+        return "AssumeRole policy must not contain NotPrincipal field."
+    return None
+
+
 def _create_role(p):
     name = _p(p, "RoleName")
+    description = _p(p, "Description")
+    desc_err = _validate_role_description(description)
+    if desc_err:
+        return desc_err
     if name in _roles:
         return _error(409, "EntityAlreadyExists",
                       f"Role with name {name} already exists.", ns="iam")
+    trust_err = _trust_policy_not_principal_error(_p(p, "AssumeRolePolicyDocument"))
+    if trust_err:
+        return _error(400, "MalformedPolicyDocument", trust_err, ns="iam")
+    boundary_err = _p(p, "PermissionsBoundary") and _boundary_policy_error(_p(p, "PermissionsBoundary"))
+    if boundary_err:
+        return boundary_err
+    tags = _extract_tags(p)
+    if _identity_tags_have_duplicate_keys(tags):
+        return _error(400, "InvalidInput", DUPLICATE_IDENTITY_TAG_KEYS, ns="iam")
     path = _p(p, "Path") or "/"
     _roles[name] = {
         "RoleName": name,
@@ -414,11 +624,12 @@ def _create_role(p):
         "CreateDate": _now(),
         "Path": path,
         "AssumeRolePolicyDocument": _p(p, "AssumeRolePolicyDocument"),
-        "Description": _p(p, "Description"),
+        "Description": description,
         "MaxSessionDuration": int(_p(p, "MaxSessionDuration") or 3600),
+        "PermissionsBoundary": _p(p, "PermissionsBoundary"),
         "AttachedPolicies": [],
         "InlinePolicies": {},
-        "Tags": _extract_tags(p),
+        "Tags": tags,
     }
     return _xml(200, "CreateRoleResponse",
                 f"<CreateRoleResult><Role>{_role_xml(name)}</Role></CreateRoleResult>",
@@ -437,14 +648,15 @@ def _get_role(p):
 
 def _list_roles(p):
     prefix = _p(p, "PathPrefix") or "/"
-    members = "".join(
-        f"<member>{_role_xml(n)}</member>"
+    members = list(
+        f"<member>{_role_xml(n, boundary=False)}</member>"
         for n, r in _roles.items()
         if r.get("Path", "/").startswith(prefix)
     )
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListRolesResponse",
                 f"<ListRolesResult><Roles>{members}</Roles>"
-                "<IsTruncated>false</IsTruncated></ListRolesResult>",
+                f"{tail}</ListRolesResult>",
                 ns="iam")
 
 
@@ -474,7 +686,11 @@ def _update_role(p):
     if not role:
         return _error(404, "NoSuchEntity", f"Role {name} not found.", ns="iam")
     if "Description" in p:
-        role["Description"] = _p(p, "Description")
+        description = _p(p, "Description")
+        desc_err = _validate_role_description(description)
+        if desc_err:
+            return desc_err
+        role["Description"] = description
     if "MaxSessionDuration" in p:
         role["MaxSessionDuration"] = int(_p(p, "MaxSessionDuration", "3600"))
     return _xml(200, "UpdateRoleResponse", "<UpdateRoleResult></UpdateRoleResult>", ns="iam")
@@ -485,11 +701,127 @@ def _update_assume_role_policy(p):
     if name not in _roles:
         return _error(404, "NoSuchEntity",
                       f"Role {name} not found.", ns="iam")
+    trust_err = _trust_policy_not_principal_error(_p(p, "PolicyDocument"))
+    if trust_err:
+        return _error(400, "MalformedPolicyDocument", trust_err, ns="iam")
     _roles[name]["AssumeRolePolicyDocument"] = _p(p, "PolicyDocument")
     return _xml(200, "UpdateAssumeRolePolicyResponse", "", ns="iam")
 
 
+def _update_role_description(p):
+    name = _p(p, "RoleName")
+    role = _roles.get(name)
+    if not role:
+        return _error(404, "NoSuchEntity",
+                      f"Role {name} not found.", ns="iam")
+    description = _p(p, "Description")
+    desc_err = _validate_role_description(description)
+    if desc_err:
+        return desc_err
+    role["Description"] = description
+    return _xml(200, "UpdateRoleDescriptionResponse",
+                f"<UpdateRoleDescriptionResult><Role>{_role_xml(name)}</Role></UpdateRoleDescriptionResult>",
+                ns="iam")
+
+
+def _put_role_permissions_boundary(p):
+    name = _p(p, "RoleName")
+    role = _roles.get(name)
+    if not role:
+        return _error(404, "NoSuchEntity",
+                      f"Role {name} not found.", ns="iam")
+    boundary_err = _boundary_policy_error(_p(p, "PermissionsBoundary"))
+    if boundary_err:
+        return boundary_err
+    role["PermissionsBoundary"] = _p(p, "PermissionsBoundary")
+    return _xml(200, "PutRolePermissionsBoundaryResponse", "", ns="iam")
+
+
+def _delete_role_permissions_boundary(p):
+    name = _p(p, "RoleName")
+    role = _roles.get(name)
+    if not role:
+        return _error(404, "NoSuchEntity",
+                      f"Role {name} not found.", ns="iam")
+    absent_err = _absent_boundary_error(role, role["RoleId"])
+    if absent_err:
+        return absent_err
+    role["PermissionsBoundary"] = None
+    return _xml(200, "DeleteRolePermissionsBoundaryResponse", "", ns="iam")
+
+
+def _boundary_policy_error(arn):
+    """Under AUTH, ValidationError for a malformed ARN and NoSuchEntity unless it names a known policy."""
+    from ministack.app import AUTH
+    if not AUTH:
+        return None
+    try:
+        parse_arn(arn)
+    except ArnParseError:
+        return _error(400, "ValidationError", "Invalid ARN:  Could not be parsed!", ns="iam")
+    if _policy_exists(arn):
+        return None
+    return _error(404, "NoSuchEntity",
+                  f"Scope ARN: {arn} does not exist or is not attachable.", ns="iam")
+
+
+def _absent_boundary_error(entity, principal_id):
+    """Under AUTH, NoSuchEntity for deleting a permissions boundary that is not set."""
+    from ministack.app import AUTH
+    if AUTH and not entity.get("PermissionsBoundary"):
+        return _error(404, "NoSuchEntity", f"Principal {principal_id} does not have scope", ns="iam")
+    return None
+
+
+def _boundary_usage_counts():
+    """The number of users and roles that use each policy ARN as their permissions boundary."""
+    counts = {}
+    for entity in (*_roles.values(), *_users.values()):
+        if entity.get("PermissionsBoundary"):
+            counts[entity["PermissionsBoundary"]] = counts.get(entity["PermissionsBoundary"], 0) + 1
+    return counts
+
+
 # -------------------- Managed policy management --------------------
+
+def store_policy(arn: str, name: str, path: str, document, *,
+                 description: str = "", tags=None) -> dict:
+    """Create and store a customer-managed policy record, and return it.
+
+    The record shape is not incidental: ``Versions`` is a dict keyed by version
+    id because GetPolicyVersion, CreatePolicyVersion, DeletePolicyVersion and
+    ListPolicyVersions all index it that way. Writers outside this module (the
+    CloudFormation provisioners) build policies through here rather than
+    assembling the dict themselves, which is what keeps those four operations
+    working on a CFN-created policy.
+    """
+    version_id = "v1"
+    if not isinstance(document, str):
+        document = json.dumps(document)
+    record = {
+        "PolicyName": name,
+        "Arn": arn,
+        "PolicyId": _gen_id("ANPA"),
+        "CreateDate": _now(),
+        "UpdateDate": _now(),
+        "DefaultVersionId": version_id,
+        "AttachmentCount": 0,
+        "IsAttachable": True,
+        "Path": path,
+        "Description": description,
+        "Tags": list(tags or []),
+        "Versions": {
+            version_id: {
+                "Document": document,
+                "VersionId": version_id,
+                "IsDefaultVersion": True,
+                "CreateDate": _now(),
+            }
+        },
+    }
+    _policies[arn] = record
+    return record
+
 
 def _create_policy(p):
     name = _p(p, "PolicyName")
@@ -503,32 +835,14 @@ def _create_policy(p):
         return _error(409, "EntityAlreadyExists",
                       f"A policy called {name} already exists.", ns="iam")
     doc = _p(p, "PolicyDocument")
+    from ministack.core.iam_evaluator import validate_policy_document
+    validation_err = validate_policy_document(doc)
+    if validation_err:
+        return _error(400, "MalformedPolicyDocument", validation_err, ns="iam")
     description = _p(p, "Description", "")
     # #445 (follow-up): CreatePolicy accepts Tags — honour them on create.
     create_tags = _extract_tags(p)
-    policy_id = _gen_id("ANPA")
-    version_id = "v1"
-    _policies[arn] = {
-        "PolicyName": name,
-        "Arn": arn,
-        "PolicyId": policy_id,
-        "CreateDate": _now(),
-        "UpdateDate": _now(),
-        "DefaultVersionId": version_id,
-        "AttachmentCount": 0,
-        "IsAttachable": True,
-        "Path": path,
-        "Description": description,
-        "Tags": list(create_tags or []),
-        "Versions": {
-            version_id: {
-                "Document": doc,
-                "VersionId": version_id,
-                "IsDefaultVersion": True,
-                "CreateDate": _now(),
-            }
-        },
-    }
+    store_policy(arn, name, path, doc, description=description, tags=create_tags)
     return _xml(200, "CreatePolicyResponse",
                 f"<CreatePolicyResult><Policy>{_managed_policy_xml(arn)}</Policy></CreatePolicyResult>",
                 ns="iam")
@@ -571,15 +885,16 @@ def _list_policy_versions(p):
     pol = _lookup_policy(arn)
     if not pol:
         return _error(404, "NoSuchEntity", "Policy not found.", ns="iam")
-    members = ""
+    members = []
     for vid, ver in pol["Versions"].items():
         is_default = "true" if ver.get("IsDefaultVersion") else "false"
-        members += (f"<member><VersionId>{vid}</VersionId>"
+        members.append(f"<member><VersionId>{vid}</VersionId>"
                     f"<IsDefaultVersion>{is_default}</IsDefaultVersion>"
                     f"<CreateDate>{ver['CreateDate']}</CreateDate></member>")
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListPolicyVersionsResponse",
                 f"<ListPolicyVersionsResult><Versions>{members}</Versions>"
-                "<IsTruncated>false</IsTruncated></ListPolicyVersionsResult>",
+                f"{tail}</ListPolicyVersionsResult>",
                 ns="iam")
 
 
@@ -596,6 +911,10 @@ def _create_policy_version(p):
         return _error(409, "LimitExceeded",
                       "A managed policy can have at most 5 versions.", ns="iam")
     doc = _p(p, "PolicyDocument")
+    from ministack.core.iam_evaluator import validate_policy_document
+    validation_err = validate_policy_document(doc)
+    if validation_err:
+        return _error(400, "MalformedPolicyDocument", validation_err, ns="iam")
     set_default = _p(p, "SetAsDefault").lower() in ("true", "1") if _p(p, "SetAsDefault") else False
     next_v = max((int(v.lstrip("v")) for v in pol["Versions"]), default=0) + 1
     vid = f"v{next_v}"
@@ -644,22 +963,24 @@ def _delete_policy_version(p):
 def _list_policies(p):
     scope = _p(p, "Scope") or "All"
     prefix = _p(p, "PathPrefix") or "/"
-    members = ""
+    members = []
+    usage_counts = _boundary_usage_counts()
     # Customer-managed policies — always returned unless scope == "AWS".
     if scope != "AWS":
         for arn, pol in _policies.items():
             if not pol.get("Path", "/").startswith(prefix):
                 continue
-            members += f"<member>{_managed_policy_xml(arn)}</member>"
+            members.append(f"<member>{_managed_policy_xml(arn, usage_counts)}</member>")
     # AWS-managed policies — returned for scope "All" or "AWS".
     if scope != "Local":
         for arn, pol in _aws_managed_policies.items():
             if not pol.get("Path", "/").startswith(prefix):
                 continue
-            members += f"<member>{_managed_policy_xml(arn)}</member>"
+            members.append(f"<member>{_managed_policy_xml(arn, usage_counts)}</member>")
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListPoliciesResponse",
                 f"<ListPoliciesResult><Policies>{members}</Policies>"
-                "<IsTruncated>false</IsTruncated></ListPoliciesResult>",
+                f"{tail}</ListPoliciesResult>",
                 ns="iam")
 
 
@@ -671,7 +992,8 @@ def _delete_policy(p):
     if arn not in _policies:
         return _error(404, "NoSuchEntity", f"Policy {arn} not found.", ns="iam")
     pol = _policies[arn]
-    if pol.get("AttachmentCount", 0) > 0:
+    from ministack.app import AUTH
+    if pol.get("AttachmentCount", 0) > 0 or (AUTH and _boundary_usage_counts().get(arn)):
         return _error(409, "DeleteConflict",
                       "Cannot delete a policy attached to entities.", ns="iam")
     del _policies[arn]
@@ -686,45 +1008,94 @@ def _list_entities_for_policy(p):
         return _error(404, "NoSuchEntity", f"Policy {arn} not found.", ns="iam")
     entity_filter = _p(p, "EntityFilter") or ""
     path_prefix = _p(p, "PathPrefix") or "/"
+    usage_filter = _p(p, "PolicyUsageFilter")
 
-    groups_xml = ""
+    def uses(entity):
+        return ((usage_filter != "PermissionsBoundary" and arn in entity.get("AttachedPolicies", []))
+                or (usage_filter != "PermissionsPolicy" and entity.get("PermissionsBoundary") == arn))
+
+    groups_xml = []
     if entity_filter in ("", "Group"):
         for g in _groups.values():
             if not g.get("Path", "/").startswith(path_prefix):
                 continue
-            if arn in g.get("AttachedPolicies", []):
-                groups_xml += (f"<member><GroupName>{g['GroupName']}</GroupName>"
+            if uses(g):
+                groups_xml.append(f"<member><GroupName>{g['GroupName']}</GroupName>"
                                f"<GroupId>{g['GroupId']}</GroupId></member>")
 
-    roles_xml = ""
+    roles_xml = []
     if entity_filter in ("", "Role"):
         for r in _roles.values():
             if not r.get("Path", "/").startswith(path_prefix):
                 continue
-            if arn in r.get("AttachedPolicies", []):
-                roles_xml += (f"<member><RoleName>{r['RoleName']}</RoleName>"
+            if uses(r):
+                roles_xml.append(f"<member><RoleName>{r['RoleName']}</RoleName>"
                               f"<RoleId>{r['RoleId']}</RoleId></member>")
 
-    users_xml = ""
+    users_xml = []
     if entity_filter in ("", "User"):
         for u in _users.values():
             if not u.get("Path", "/").startswith(path_prefix):
                 continue
-            if arn in u.get("AttachedPolicies", []):
-                users_xml += (f"<member><UserName>{u['UserName']}</UserName>"
+            if uses(u):
+                users_xml.append(f"<member><UserName>{u['UserName']}</UserName>"
                               f"<UserId>{u['UserId']}</UserId></member>")
 
+    groups_xml, roles_xml, users_xml, tail = _iam_page(p, groups_xml, roles_xml, users_xml)
     return _xml(200, "ListEntitiesForPolicyResponse",
                 f"<ListEntitiesForPolicyResult>"
                 f"<PolicyGroups>{groups_xml}</PolicyGroups>"
                 f"<PolicyRoles>{roles_xml}</PolicyRoles>"
                 f"<PolicyUsers>{users_xml}</PolicyUsers>"
-                f"<IsTruncated>false</IsTruncated>"
+                f"{tail}"
                 f"</ListEntitiesForPolicyResult>",
                 ns="iam")
 
 
 # -------------------- Attached role policies --------------------
+
+def _unattachable_policy_error(policy_arn: str):
+    if _is_aws_managed_arn(policy_arn) or policy_arn in _policies:
+        return None
+    return _error(404, "NoSuchEntity", f"Policy {policy_arn} does not exist or is not attachable.", ns="iam")
+
+
+def attach_managed_policy(entity: dict, policy_arn: str) -> None:
+    """Attach a managed policy to a role, user or group record.
+
+    ``AttachedPolicies`` holds bare ARN strings. Every consumer reads it that
+    way — GetAccountAuthorizationDetails and ListAttachedRolePolicies feed the
+    entries to _lookup_policy, and ListEntitiesForPolicy tests membership with
+    ``arn in ...`` — so a writer that stores anything else breaks all three.
+    Callers outside this module (the CloudFormation provisioner) go through
+    here rather than appending themselves, which is also what keeps
+    AttachmentCount in step with the API path.
+    """
+    if policy_arn in entity.setdefault("AttachedPolicies", []):
+        return
+    entity["AttachedPolicies"].append(policy_arn)
+    if _is_aws_managed_arn(policy_arn):
+        _bump_aws_managed_attachment(policy_arn, +1)
+    else:
+        pol = _policies.get(policy_arn)
+        if pol:
+            pol["AttachmentCount"] = pol.get("AttachmentCount", 0) + 1
+
+
+def detach_managed_policy(entity: dict, policy_arn: str) -> None:
+    """Inverse of attach_managed_policy, with the same bookkeeping contract:
+    the bare-ARN list and AttachmentCount stay in step, exactly as
+    DetachRolePolicy keeps them. Idempotent when the policy isn't attached."""
+    if policy_arn not in entity.get("AttachedPolicies", []):
+        return
+    entity["AttachedPolicies"].remove(policy_arn)
+    if _is_aws_managed_arn(policy_arn):
+        _bump_aws_managed_attachment(policy_arn, -1)
+    else:
+        pol = _policies.get(policy_arn)
+        if pol:
+            pol["AttachmentCount"] = max(pol.get("AttachmentCount", 1) - 1, 0)
+
 
 def _attach_role_policy(p):
     role_name = _p(p, "RoleName")
@@ -733,14 +1104,9 @@ def _attach_role_policy(p):
     if not role:
         return _error(404, "NoSuchEntity",
                       f"Role {role_name} not found.", ns="iam")
-    if policy_arn not in role["AttachedPolicies"]:
-        role["AttachedPolicies"].append(policy_arn)
-        if _is_aws_managed_arn(policy_arn):
-            _bump_aws_managed_attachment(policy_arn, +1)
-        else:
-            pol = _policies.get(policy_arn)
-            if pol:
-                pol["AttachmentCount"] = pol.get("AttachmentCount", 0) + 1
+    if err := _unattachable_policy_error(policy_arn):
+        return err
+    attach_managed_policy(role, policy_arn)
     return _xml(200, "AttachRolePolicyResponse", "", ns="iam")
 
 
@@ -770,28 +1136,36 @@ def _list_attached_role_policies(p):
     if not role:
         return _error(404, "NoSuchEntity",
                       f"Role {role_name} not found.", ns="iam")
-    members = ""
+    members = []
     for arn in role["AttachedPolicies"]:
         pol = _lookup_policy(arn)
         pname = pol["PolicyName"] if pol else arn.rsplit("/", 1)[-1]
-        members += (f"<member><PolicyName>{pname}</PolicyName>"
+        members.append(f"<member><PolicyName>{pname}</PolicyName>"
                     f"<PolicyArn>{arn}</PolicyArn></member>")
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListAttachedRolePoliciesResponse",
                 f"<ListAttachedRolePoliciesResult><AttachedPolicies>{members}</AttachedPolicies>"
-                "<IsTruncated>false</IsTruncated></ListAttachedRolePoliciesResult>",
+                f"{tail}</ListAttachedRolePoliciesResult>",
                 ns="iam")
 
 
 # -------------------- Inline role policies --------------------
 
 def _put_role_policy(p):
+    """The role is resolved before the document is read. Measured: a call
+    naming a role that does not exist with a malformed document is answered
+    NoSuchEntity. PutUserPolicy and PutGroupPolicy use the same order."""
     role_name = _p(p, "RoleName")
     policy_name = _p(p, "PolicyName")
     policy_doc = _p(p, "PolicyDocument")
     role = _roles.get(role_name)
     if not role:
         return _error(404, "NoSuchEntity",
-                      f"Role {role_name} not found.", ns="iam")
+                      f"The role with name {role_name} cannot be found.", ns="iam")
+    from ministack.core.iam_evaluator import validate_policy_document
+    validation_err = validate_policy_document(policy_doc)
+    if validation_err:
+        return _error(400, "MalformedPolicyDocument", validation_err, ns="iam")
     role["InlinePolicies"][policy_name] = policy_doc
     return _xml(200, "PutRolePolicyResponse", "", ns="iam")
 
@@ -843,13 +1217,14 @@ def _list_role_policies(p):
     if not role:
         return _error(404, "NoSuchEntity",
                       f"Role {role_name} not found.", ns="iam")
-    members = "".join(
+    members = list(
         f"<member>{name}</member>"
         for name in role["InlinePolicies"]
     )
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListRolePoliciesResponse",
                 f"<ListRolePoliciesResult><PolicyNames>{members}</PolicyNames>"
-                "<IsTruncated>false</IsTruncated></ListRolePoliciesResult>",
+                f"{tail}</ListRolePoliciesResult>",
                 ns="iam")
 
 
@@ -862,6 +1237,8 @@ def _attach_user_policy(p):
     if not user:
         return _error(404, "NoSuchEntity",
                       f"The user with name {user_name} cannot be found.", ns="iam")
+    if err := _unattachable_policy_error(policy_arn):
+        return err
     if policy_arn not in user["AttachedPolicies"]:
         user["AttachedPolicies"].append(policy_arn)
         if _is_aws_managed_arn(policy_arn):
@@ -899,15 +1276,16 @@ def _list_attached_user_policies(p):
     if not user:
         return _error(404, "NoSuchEntity",
                       f"The user with name {user_name} cannot be found.", ns="iam")
-    members = ""
+    members = []
     for arn in user["AttachedPolicies"]:
         pol = _lookup_policy(arn)
         pname = pol["PolicyName"] if pol else arn.rsplit("/", 1)[-1]
-        members += (f"<member><PolicyName>{pname}</PolicyName>"
+        members.append(f"<member><PolicyName>{pname}</PolicyName>"
                     f"<PolicyArn>{arn}</PolicyArn></member>")
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListAttachedUserPoliciesResponse",
                 f"<ListAttachedUserPoliciesResult><AttachedPolicies>{members}</AttachedPolicies>"
-                "<IsTruncated>false</IsTruncated></ListAttachedUserPoliciesResult>",
+                f"{tail}</ListAttachedUserPoliciesResult>",
                 ns="iam")
 
 
@@ -942,17 +1320,18 @@ def _create_access_key(p):
 
 def _list_access_keys(p):
     user_name = _p(p, "UserName") or "default"
-    members = ""
+    members = []
     for kid, v in _access_keys.items():
         if v["UserName"] == user_name:
-            members += (f"<member><AccessKeyId>{kid}</AccessKeyId>"
+            members.append(f"<member><AccessKeyId>{kid}</AccessKeyId>"
                         f"<Status>{v['Status']}</Status>"
                         f"<UserName>{user_name}</UserName>"
                         f"<CreateDate>{v['CreateDate']}</CreateDate>"
                         f"</member>")
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListAccessKeysResponse",
                 f"<ListAccessKeysResult><AccessKeyMetadata>{members}</AccessKeyMetadata>"
-                "<IsTruncated>false</IsTruncated></ListAccessKeysResult>",
+                f"{tail}</ListAccessKeysResult>",
                 ns="iam")
 
 
@@ -965,7 +1344,72 @@ def _delete_access_key(p):
     return _xml(200, "DeleteAccessKeyResponse", "", ns="iam")
 
 
+def _update_access_key(p):
+    key_id = _p(p, "AccessKeyId")
+    status = _p(p, "Status")
+    user_name = _p(p, "UserName")
+
+    if not key_id:
+        return _error(400, "InvalidInput", "AccessKeyId is required.", ns="iam")
+    if status not in ("Active", "Inactive"):
+        return _error(400, "InvalidInput",
+                      f"Invalid status value: {status!r}. Must be Active or Inactive.",
+                      ns="iam")
+    if key_id not in _access_keys:
+        return _error(404, "NoSuchEntity",
+                      f"The Access Key with id {key_id} cannot be found.", ns="iam")
+    if user_name and _access_keys[key_id]["UserName"] != user_name:
+        return _error(404, "NoSuchEntity",
+                      f"The Access Key with id {key_id} cannot be found.", ns="iam")
+    _access_keys[key_id]["Status"] = status
+    return _xml(200, "UpdateAccessKeyResponse", "", ns="iam")
+
+
+def _get_access_key_last_used(p):
+    key_id = _p(p, "AccessKeyId")
+    if not key_id:
+        return _error(400, "InvalidInput", "AccessKeyId is required.", ns="iam")
+    if key_id not in _access_keys:
+        return _error(404, "NoSuchEntity",
+                      f"The Access Key with id {key_id} cannot be found.", ns="iam")
+    user_name = _access_keys[key_id]["UserName"]
+    # Ministack does not track per-key usage; return the "never used" shape
+    # that real AWS returns for keys that have never made a signed request
+    # (no LastUsedDate element, Region/ServiceName = "N/A").
+    return _xml(200, "GetAccessKeyLastUsedResponse",
+                f"<GetAccessKeyLastUsedResult>"
+                f"<UserName>{user_name}</UserName>"
+                f"<AccessKeyLastUsed>"
+                f"<Region>N/A</Region>"
+                f"<ServiceName>N/A</ServiceName>"
+                f"</AccessKeyLastUsed>"
+                f"</GetAccessKeyLastUsedResult>",
+                ns="iam")
+
+
 # -------------------- Instance profiles --------------------
+
+def _lookup_instance_profile(name="", arn=""):
+    if name:
+        profile = _instance_profiles.get(name)
+        if not profile:
+            return None
+        if arn and profile.get("Arn") != arn:
+            return None
+        return profile
+    if arn:
+        for profile in _instance_profiles.values():
+            if profile.get("Arn") == arn:
+                return profile
+    return None
+
+
+def instance_profile_arn(name, path="/"):
+    """The ARN CreateInstanceProfile mints. The path is part of it and
+    already carries its slashes ("/" for the default, "/team/" for a nested
+    one), so it needs no separator of its own."""
+    return f"arn:aws:iam::{get_account_id()}:instance-profile{path or '/'}{name}"
+
 
 def _create_instance_profile(p):
     name = _p(p, "InstanceProfileName")
@@ -974,9 +1418,7 @@ def _create_instance_profile(p):
                       f"Instance profile {name} already exists.", ns="iam")
     path = _p(p, "Path") or "/"
     ip_id = _gen_id("AIPA")
-    arn = (f"arn:aws:iam::{get_account_id()}:instance-profile{path}{name}"
-           if path != "/" else
-           f"arn:aws:iam::{get_account_id()}:instance-profile/{name}")
+    arn = instance_profile_arn(name, path)
     _instance_profiles[name] = {
         "InstanceProfileName": name,
         "InstanceProfileId": ip_id,
@@ -984,6 +1426,7 @@ def _create_instance_profile(p):
         "Path": path,
         "CreateDate": _now(),
         "Roles": [],
+        "Tags": _extract_tags(p),
     }
     return _xml(200, "CreateInstanceProfileResponse",
                 f"<CreateInstanceProfileResult>"
@@ -1053,14 +1496,15 @@ def _remove_role_from_instance_profile(p):
 
 def _list_instance_profiles(p):
     prefix = _p(p, "PathPrefix") or "/"
-    members = "".join(
+    members = list(
         f"<member>{_instance_profile_xml(name)}</member>"
         for name, ip in _instance_profiles.items()
         if ip["Path"].startswith(prefix)
     )
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListInstanceProfilesResponse",
                 f"<ListInstanceProfilesResult><InstanceProfiles>{members}</InstanceProfiles>"
-                "<IsTruncated>false</IsTruncated></ListInstanceProfilesResult>",
+                f"{tail}</ListInstanceProfilesResult>",
                 ns="iam")
 
 
@@ -1069,14 +1513,59 @@ def _list_instance_profiles_for_role(p):
     if role_name not in _roles:
         return _error(404, "NoSuchEntity",
                       f"Role {role_name} not found.", ns="iam")
-    members = "".join(
+    members = list(
         f"<member>{_instance_profile_xml(name)}</member>"
         for name, ip in _instance_profiles.items()
         if role_name in ip["Roles"]
     )
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListInstanceProfilesForRoleResponse",
                 f"<ListInstanceProfilesForRoleResult><InstanceProfiles>{members}</InstanceProfiles>"
-                "<IsTruncated>false</IsTruncated></ListInstanceProfilesForRoleResult>",
+                f"{tail}</ListInstanceProfilesForRoleResult>",
+                ns="iam")
+
+
+# -------------------- Tags: instance profiles --------------------
+
+def _tag_instance_profile(p):
+    ip_name = _p(p, "InstanceProfileName")
+    ip = _instance_profiles.get(ip_name)
+    if not ip:
+        return _error(404, "NoSuchEntity",
+                      f"Instance profile {ip_name} not found.", ns="iam")
+    new_tags = _extract_tags(p)
+    existing = {t["Key"]: t for t in ip.get("Tags", [])}
+    for t in new_tags:
+        existing[t["Key"]] = t
+    ip["Tags"] = list(existing.values())
+    return _xml(200, "TagInstanceProfileResponse", "", ns="iam")
+
+
+def _untag_instance_profile(p):
+    ip_name = _p(p, "InstanceProfileName")
+    ip = _instance_profiles.get(ip_name)
+    if not ip:
+        return _error(404, "NoSuchEntity",
+                      f"Instance profile {ip_name} not found.", ns="iam")
+    keys_to_remove = _extract_tag_keys(p)
+    ip["Tags"] = [t for t in ip.get("Tags", []) if t["Key"] not in keys_to_remove]
+    return _xml(200, "UntagInstanceProfileResponse", "", ns="iam")
+
+
+def _list_instance_profile_tags(p):
+    ip_name = _p(p, "InstanceProfileName")
+    ip = _instance_profiles.get(ip_name)
+    if not ip:
+        return _error(404, "NoSuchEntity",
+                      f"Instance profile {ip_name} not found.", ns="iam")
+    members = list(
+        f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
+        for t in ip.get("Tags", [])
+    )
+    members, tail = _iam_page(p, members)
+    return _xml(200, "ListInstanceProfileTagsResponse",
+                f"<ListInstanceProfileTagsResult><Tags>{members}</Tags>"
+                f"{tail}</ListInstanceProfileTagsResult>",
                 ns="iam")
 
 
@@ -1089,9 +1578,11 @@ def _tag_role(p):
         return _error(404, "NoSuchEntity",
                       f"Role {role_name} not found.", ns="iam")
     new_tags = _extract_tags(p)
-    existing = {t["Key"]: t for t in role["Tags"]}
+    if _identity_tags_have_duplicate_keys(new_tags):
+        return _error(400, "InvalidInput", DUPLICATE_IDENTITY_TAG_KEYS, ns="iam")
+    existing = {_identity_tag_key(t["Key"]): t for t in role["Tags"]}
     for t in new_tags:
-        existing[t["Key"]] = t
+        existing[_identity_tag_key(t["Key"])] = t
     role["Tags"] = list(existing.values())
     return _xml(200, "TagRoleResponse", "", ns="iam")
 
@@ -1102,8 +1593,8 @@ def _untag_role(p):
     if not role:
         return _error(404, "NoSuchEntity",
                       f"Role {role_name} not found.", ns="iam")
-    keys_to_remove = _extract_tag_keys(p)
-    role["Tags"] = [t for t in role["Tags"] if t["Key"] not in keys_to_remove]
+    keys_to_remove = {_identity_tag_key(key) for key in _extract_tag_keys(p)}
+    role["Tags"] = [t for t in role["Tags"] if _identity_tag_key(t["Key"]) not in keys_to_remove]
     return _xml(200, "UntagRoleResponse", "", ns="iam")
 
 
@@ -1113,17 +1604,31 @@ def _list_role_tags(p):
     if not role:
         return _error(404, "NoSuchEntity",
                       f"Role {role_name} not found.", ns="iam")
-    members = "".join(
+    members = list(
         f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
         for t in role["Tags"]
     )
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListRoleTagsResponse",
                 f"<ListRoleTagsResult><Tags>{members}</Tags>"
-                "<IsTruncated>false</IsTruncated></ListRoleTagsResult>",
+                f"{tail}</ListRoleTagsResult>",
                 ns="iam")
 
 
 # -------------------- Tags: users --------------------
+
+DUPLICATE_IDENTITY_TAG_KEYS = "Duplicate tag keys found. Please note that Tag keys are case insensitive."
+
+
+def _identity_tag_key(key):
+    """User and role tag keys compare without case; the stored spelling is kept."""
+    return key.lower()
+
+
+def _identity_tags_have_duplicate_keys(tags):
+    keys = [_identity_tag_key(t["Key"]) for t in tags]
+    return len(keys) != len(set(keys))
+
 
 def _tag_user(p):
     user_name = _p(p, "UserName")
@@ -1132,9 +1637,11 @@ def _tag_user(p):
         return _error(404, "NoSuchEntity",
                       f"The user with name {user_name} cannot be found.", ns="iam")
     new_tags = _extract_tags(p)
-    existing = {t["Key"]: t for t in user["Tags"]}
+    if _identity_tags_have_duplicate_keys(new_tags):
+        return _error(400, "InvalidInput", DUPLICATE_IDENTITY_TAG_KEYS, ns="iam")
+    existing = {_identity_tag_key(t["Key"]): t for t in user["Tags"]}
     for t in new_tags:
-        existing[t["Key"]] = t
+        existing[_identity_tag_key(t["Key"])] = t
     user["Tags"] = list(existing.values())
     return _xml(200, "TagUserResponse", "", ns="iam")
 
@@ -1145,8 +1652,8 @@ def _untag_user(p):
     if not user:
         return _error(404, "NoSuchEntity",
                       f"The user with name {user_name} cannot be found.", ns="iam")
-    keys_to_remove = _extract_tag_keys(p)
-    user["Tags"] = [t for t in user["Tags"] if t["Key"] not in keys_to_remove]
+    keys_to_remove = {_identity_tag_key(key) for key in _extract_tag_keys(p)}
+    user["Tags"] = [t for t in user["Tags"] if _identity_tag_key(t["Key"]) not in keys_to_remove]
     return _xml(200, "UntagUserResponse", "", ns="iam")
 
 
@@ -1156,39 +1663,79 @@ def _list_user_tags(p):
     if not user:
         return _error(404, "NoSuchEntity",
                       f"The user with name {user_name} cannot be found.", ns="iam")
-    members = "".join(
+    members = list(
         f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
         for t in user["Tags"]
     )
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListUserTagsResponse",
                 f"<ListUserTagsResult><Tags>{members}</Tags>"
-                "<IsTruncated>false</IsTruncated></ListUserTagsResult>",
+                f"{tail}</ListUserTagsResult>",
                 ns="iam")
 
 
-# -------------------- Simulate (stubs) --------------------
+# -------------------- Simulate --------------------
 
 def _simulate_principal_policy(p):
-    results = _build_simulate_results(p)
+    from ministack.core.responses import get_account_id
+    principal_arn = _p(p, "PolicySourceArn")
+    if not principal_arn:
+        return _error(400, "ValidationError",
+                      "PolicySourceArn is required.", ns="iam")
+    actions, resource_arn = _extract_simulate_params(p)
+    account_id = get_account_id()
+    # Resolve the principal's policies
+    # Extract entity type and name from ARN
+    parts = principal_arn.split(":")
+    policies = []
+    if len(parts) >= 6:
+        resource = parts[5]
+        if resource.startswith("user/"):
+            from ministack.core.iam_evaluator import _gather_user_policies
+            policies = _gather_user_policies(resource.split("/", 1)[1], account_id)
+        elif resource.startswith("role/"):
+            from ministack.core.iam_evaluator import _gather_role_policies
+            policies = _gather_role_policies(resource.split("/", 1)[1], account_id)
+    results = _build_simulate_results_real(actions, resource_arn, principal_arn,
+                                           account_id, policies)
+    results, tail = _iam_page(p, results)
     return _xml(200, "SimulatePrincipalPolicyResponse",
                 f"<SimulatePrincipalPolicyResult>"
                 f"<EvaluationResults>{results}</EvaluationResults>"
-                "<IsTruncated>false</IsTruncated>"
+                f"{tail}"
                 f"</SimulatePrincipalPolicyResult>",
                 ns="iam")
 
 
 def _simulate_custom_policy(p):
-    results = _build_simulate_results(p)
+    from ministack.core.iam_evaluator import parse_policy_document
+    from ministack.core.responses import get_account_id
+    actions, resource_arn = _extract_simulate_params(p)
+    account_id = get_account_id()
+    # Parse the caller-supplied policy documents
+    policies = []
+    idx = 1
+    while True:
+        doc = _p(p, f"PolicyInputList.member.{idx}")
+        if not doc:
+            break
+        stmts = parse_policy_document(doc)
+        if stmts:
+            policies.append(stmts)
+        idx += 1
+    results = _build_simulate_results_real(
+        actions, resource_arn,
+        f"arn:aws:iam::{account_id}:root", account_id, policies)
+    results, tail = _iam_page(p, results)
     return _xml(200, "SimulateCustomPolicyResponse",
                 f"<SimulateCustomPolicyResult>"
                 f"<EvaluationResults>{results}</EvaluationResults>"
-                "<IsTruncated>false</IsTruncated>"
+                f"{tail}"
                 f"</SimulateCustomPolicyResult>",
                 ns="iam")
 
 
-def _build_simulate_results(p):
+def _extract_simulate_params(p):
     actions = []
     idx = 1
     while True:
@@ -1200,12 +1747,39 @@ def _build_simulate_results(p):
     if not actions:
         actions = ["sts:AssumeRole"]
     resource_arn = _p(p, "ResourceArns.member.1") or "*"
-    members = ""
+    return actions, resource_arn
+
+
+def _build_simulate_results_real(actions, resource_arn, principal_arn,
+                                 account_id, policies):
+    from ministack.core.iam_evaluator import EvalContext, evaluate
+    members = []
     for action in actions:
-        members += (f"<member>"
+        if policies:
+            ctx = EvalContext(
+                principal_arn=principal_arn,
+                principal_type="User",
+                principal_account=account_id,
+                action=action,
+                resource_arn=resource_arn,
+                region=get_region(),
+                source_ip="127.0.0.1",
+                secure_transport=False,
+            )
+            result = evaluate(ctx, policies)
+            raw = result.decision
+            if raw == "Allow":
+                decision = "allowed"
+            elif raw == "Deny":
+                decision = "explicitDeny"
+            else:
+                decision = "implicitDeny"
+        else:
+            decision = "implicitDeny"
+        members.append(f"<member>"
                     f"<EvalActionName>{action}</EvalActionName>"
                     f"<EvalResourceName>{resource_arn}</EvalResourceName>"
-                    f"<EvalDecision>allowed</EvalDecision>"
+                    f"<EvalDecision>{decision}</EvalDecision>"
                     f"<MatchedStatements></MatchedStatements>"
                     f"<MissingContextValues></MissingContextValues>"
                     f"</member>")
@@ -1227,6 +1801,7 @@ def _create_group(p):
         "Path": path,
         "CreateDate": _now(),
         "Users": [],
+        "AttachedPolicies": [],
     }
     return _xml(200, "CreateGroupResponse",
                 f"<CreateGroupResult><Group>{_group_xml(name)}</Group></CreateGroupResult>",
@@ -1239,15 +1814,16 @@ def _get_group(p):
         return _error(404, "NoSuchEntity",
                       f"The group with name {name} cannot be found.", ns="iam")
     g = _groups[name]
-    user_members = ""
+    user_members = []
     for uname in g["Users"]:
         if uname in _users:
-            user_members += f"<member>{_user_xml(uname)}</member>"
+            user_members.append(f"<member>{_user_xml(uname)}</member>")
+    user_members, tail = _iam_page(p, user_members)
     return _xml(200, "GetGroupResponse",
                 f"<GetGroupResult>"
                 f"<Group>{_group_xml(name)}</Group>"
                 f"<Users>{user_members}</Users>"
-                f"<IsTruncated>false</IsTruncated>"
+                f"{tail}"
                 f"</GetGroupResult>",
                 ns="iam")
 
@@ -1258,19 +1834,21 @@ def _delete_group(p):
         return _error(404, "NoSuchEntity",
                       f"The group with name {name} cannot be found.", ns="iam")
     _groups.pop(name, None)
+    _group_inline_policies.pop(name, None)
     return _xml(200, "DeleteGroupResponse", "", ns="iam")
 
 
 def _list_groups(p):
     prefix = _p(p, "PathPrefix") or "/"
-    members = "".join(
+    members = list(
         f"<member>{_group_xml(n)}</member>"
         for n, g in _groups.items()
         if g.get("Path", "/").startswith(prefix)
     )
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListGroupsResponse",
                 f"<ListGroupsResult><Groups>{members}</Groups>"
-                "<IsTruncated>false</IsTruncated></ListGroupsResult>",
+                f"{tail}</ListGroupsResult>",
                 ns="iam")
 
 
@@ -1308,14 +1886,155 @@ def _list_groups_for_user(p):
     if user_name not in _users:
         return _error(404, "NoSuchEntity",
                       f"The user with name {user_name} cannot be found.", ns="iam")
-    members = "".join(
+    members = list(
         f"<member>{_group_xml(n)}</member>"
         for n, g in _groups.items()
         if user_name in g["Users"]
     )
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListGroupsForUserResponse",
                 f"<ListGroupsForUserResult><Groups>{members}</Groups>"
-                "<IsTruncated>false</IsTruncated></ListGroupsForUserResult>",
+                f"{tail}</ListGroupsForUserResult>",
+                ns="iam")
+
+
+# -------------------- Managed group policies --------------------
+
+def _attach_group_policy(p):
+    group_name = _p(p, "GroupName")
+    policy_arn = _p(p, "PolicyArn")
+    group = _groups.get(group_name)
+    if not group:
+        return _error(404, "NoSuchEntity",
+                      f"The group with name {group_name} cannot be found.", ns="iam")
+    if err := _unattachable_policy_error(policy_arn):
+        return err
+    attached = group.setdefault("AttachedPolicies", [])
+    if policy_arn not in attached:
+        attached.append(policy_arn)
+        if _is_aws_managed_arn(policy_arn):
+            _bump_aws_managed_attachment(policy_arn, +1)
+        else:
+            pol = _policies.get(policy_arn)
+            if pol:
+                pol["AttachmentCount"] = pol.get("AttachmentCount", 0) + 1
+    return _xml(200, "AttachGroupPolicyResponse", "", ns="iam")
+
+
+def _detach_group_policy(p):
+    group_name = _p(p, "GroupName")
+    policy_arn = _p(p, "PolicyArn")
+    group = _groups.get(group_name)
+    if not group:
+        return _error(404, "NoSuchEntity",
+                      f"The group with name {group_name} cannot be found.", ns="iam")
+    attached = group.setdefault("AttachedPolicies", [])
+    if policy_arn not in attached:
+        return _error(404, "NoSuchEntity",
+                      f"Policy {policy_arn} is not attached to group {group_name}.", ns="iam")
+    attached.remove(policy_arn)
+    if _is_aws_managed_arn(policy_arn):
+        _bump_aws_managed_attachment(policy_arn, -1)
+    else:
+        pol = _policies.get(policy_arn)
+        if pol:
+            pol["AttachmentCount"] = max(pol.get("AttachmentCount", 1) - 1, 0)
+    return _xml(200, "DetachGroupPolicyResponse", "", ns="iam")
+
+
+def _list_attached_group_policies(p):
+    group_name = _p(p, "GroupName")
+    group = _groups.get(group_name)
+    if not group:
+        return _error(404, "NoSuchEntity",
+                      f"The group with name {group_name} cannot be found.", ns="iam")
+    members = []
+    for arn in group.get("AttachedPolicies", []):
+        pol = _lookup_policy(arn)
+        pname = pol["PolicyName"] if pol else arn.rsplit("/", 1)[-1]
+        members.append(f"<member><PolicyName>{pname}</PolicyName>"
+                    f"<PolicyArn>{arn}</PolicyArn></member>")
+    members, tail = _iam_page(p, members)
+    return _xml(200, "ListAttachedGroupPoliciesResponse",
+                f"<ListAttachedGroupPoliciesResult><AttachedPolicies>{members}</AttachedPolicies>"
+                f"{tail}</ListAttachedGroupPoliciesResult>",
+                ns="iam")
+
+
+# -------------------- Inline group policies --------------------
+
+def _put_group_policy(p):
+    group_name = _p(p, "GroupName")
+    policy_name = _p(p, "PolicyName")
+    policy_doc = _p(p, "PolicyDocument")
+    if group_name not in _groups:
+        return _error(404, "NoSuchEntity",
+                      f"The group with name {group_name} cannot be found.", ns="iam")
+    from ministack.core.iam_evaluator import validate_policy_document
+    validation_err = validate_policy_document(policy_doc)
+    if validation_err:
+        return _error(400, "MalformedPolicyDocument", validation_err, ns="iam")
+    group_policies = _group_inline_policies.get(group_name)
+    if group_policies is None:
+        group_policies = {}
+        _group_inline_policies[group_name] = group_policies
+    group_policies[policy_name] = policy_doc
+    return _xml(200, "PutGroupPolicyResponse", "", ns="iam")
+
+
+def _get_group_policy(p):
+    group_name = _p(p, "GroupName")
+    policy_name = _p(p, "PolicyName")
+    if group_name not in _groups:
+        return _error(404, "NoSuchEntity",
+                      f"The group with name {group_name} cannot be found.", ns="iam")
+    doc = (_group_inline_policies.get(group_name) or {}).get(policy_name)
+    if doc is None:
+        return _error(404, "NoSuchEntity",
+                      f"The group policy with name {policy_name} cannot be found.", ns="iam")
+    if isinstance(doc, (dict, list)):
+        doc_str = json.dumps(doc)
+    elif isinstance(doc, (bytes, bytearray)):
+        doc_str = doc.decode("utf-8")
+    else:
+        doc_str = doc
+    encoded_doc = _url_quote(doc_str, safe="")
+    return _xml(200, "GetGroupPolicyResponse",
+                f"<GetGroupPolicyResult>"
+                f"<GroupName>{group_name}</GroupName>"
+                f"<PolicyName>{policy_name}</PolicyName>"
+                f"<PolicyDocument>{encoded_doc}</PolicyDocument>"
+                f"</GetGroupPolicyResult>",
+                ns="iam")
+
+
+def _delete_group_policy(p):
+    group_name = _p(p, "GroupName")
+    policy_name = _p(p, "PolicyName")
+    if group_name not in _groups:
+        return _error(404, "NoSuchEntity",
+                      f"The group with name {group_name} cannot be found.", ns="iam")
+    group_policies = _group_inline_policies.get(group_name) or {}
+    if policy_name not in group_policies:
+        return _error(404, "NoSuchEntity",
+                      f"The group policy with name {policy_name} cannot be found.", ns="iam")
+    del group_policies[policy_name]
+    return _xml(200, "DeleteGroupPolicyResponse", "", ns="iam")
+
+
+def _list_group_policies(p):
+    group_name = _p(p, "GroupName")
+    if group_name not in _groups:
+        return _error(404, "NoSuchEntity",
+                      f"The group with name {group_name} cannot be found.", ns="iam")
+    members = list(
+        f"<member>{pname}</member>"
+        for pname in (_group_inline_policies.get(group_name) or {})
+    )
+    members, tail = _iam_page(p, members)
+    return _xml(200, "ListGroupPoliciesResponse",
+                f"<ListGroupPoliciesResult><PolicyNames>{members}</PolicyNames>"
+                f"{tail}</ListGroupPoliciesResult>",
                 ns="iam")
 
 
@@ -1328,6 +2047,10 @@ def _put_user_policy(p):
     if user_name not in _users:
         return _error(404, "NoSuchEntity",
                       f"The user with name {user_name} cannot be found.", ns="iam")
+    from ministack.core.iam_evaluator import validate_policy_document
+    validation_err = validate_policy_document(policy_doc)
+    if validation_err:
+        return _error(400, "MalformedPolicyDocument", validation_err, ns="iam")
     user_policies = _user_inline_policies.get(user_name)
     if user_policies is None:
         user_policies = {}
@@ -1381,13 +2104,14 @@ def _list_user_policies(p):
     if user_name not in _users:
         return _error(404, "NoSuchEntity",
                       f"The user with name {user_name} cannot be found.", ns="iam")
-    members = "".join(
+    members = list(
         f"<member>{pname}</member>"
         for pname in (_user_inline_policies.get(user_name) or {})
     )
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListUserPoliciesResponse",
                 f"<ListUserPoliciesResult><PolicyNames>{members}</PolicyNames>"
-                "<IsTruncated>false</IsTruncated></ListUserPoliciesResult>",
+                f"{tail}</ListUserPoliciesResult>",
                 ns="iam")
 
 
@@ -1397,6 +2121,8 @@ def _create_service_linked_role(p):
     service_name = _p(p, "AWSServiceName")
     suffix = service_name.split(".")[0] if "." in service_name else service_name
     role_name = f"AWSServiceRoleFor{suffix.capitalize()}"
+    if _p(p, "CustomSuffix"):
+        role_name += f"_{_p(p, 'CustomSuffix')}"
     path = f"/aws-service-role/{service_name}/"
 
     if role_name in _roles:
@@ -1419,7 +2145,7 @@ def _create_service_linked_role(p):
         "CreateDate": _now(),
         "Path": path,
         "AssumeRolePolicyDocument": trust_policy,
-        "Description": f"Service-linked role for {service_name}",
+        "Description": _p(p, "Description"),
         "MaxSessionDuration": 3600,
         "AttachedPolicies": [],
         "InlinePolicies": {},
@@ -1468,6 +2194,494 @@ def _get_service_linked_role_deletion_status(p):
                 f"<Status>{task['Status']}</Status>"
                 f"{reason}"
                 f"</GetServiceLinkedRoleDeletionStatusResult>",
+                ns="iam")
+
+
+# -------------------- GetAccountAuthorizationDetails --------------------
+
+
+def _get_account_authorization_details(p):
+    # Extract Filter.member.N list; empty = all
+    filters = set()
+    idx = 1
+    while True:
+        f = _p(p, f"Filter.member.{idx}")
+        if not f:
+            break
+        filters.add(f)
+        idx += 1
+    include_all = not filters
+
+    # ---- UserDetailList ----
+    user_detail_xml = []
+    if include_all or "User" in filters:
+        for name, user in _users.items():
+            # Inline user policies
+            upols = _user_inline_policies.get(name) or {}
+            inline_xml = "".join(
+                f"<member>"
+                f"<PolicyName>{pn}</PolicyName>"
+                f"<PolicyDocument>{_url_quote(pd, safe='')}</PolicyDocument>"
+                f"</member>"
+                for pn, pd in upols.items()
+            )
+            # Attached managed policies
+            attached_xml = ""
+            for arn in user.get("AttachedPolicies", []):
+                # The attachment is reported whether or not the policy document
+                # is readable here: AWS lists it either way, and an unseeded
+                # AWS-managed ARN has no local record unless autovivify is on.
+                # Same fallback ListAttachedRolePolicies already uses.
+                pol = _lookup_policy(arn)
+                pname = pol["PolicyName"] if pol else arn.rsplit("/", 1)[-1]
+                attached_xml += (f"<member>"
+                                 f"<PolicyName>{pname}</PolicyName>"
+                                 f"<PolicyArn>{arn}</PolicyArn>"
+                                 f"</member>")
+            # Groups the user belongs to
+            group_xml = "".join(
+                f"<member>{g['GroupName']}</member>"
+                for g in _groups.values()
+                if name in g.get("Users", [])
+            )
+            # Tags
+            tags_xml = "".join(
+                f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
+                for t in user.get("Tags", [])
+            )
+            user_detail_xml.append(
+                f"<member>"
+                f"<UserName>{user['UserName']}</UserName>"
+                f"<UserId>{user['UserId']}</UserId>"
+                f"<Arn>{user['Arn']}</Arn>"
+                f"<Path>{user['Path']}</Path>"
+                f"<CreateDate>{user['CreateDate']}</CreateDate>"
+                f"<UserPolicyList>{inline_xml}</UserPolicyList>"
+                f"<GroupList>{group_xml}</GroupList>"
+                f"<AttachedManagedPolicies>{attached_xml}</AttachedManagedPolicies>"
+                f"<Tags>{tags_xml}</Tags>"
+                f"</member>"
+            )
+
+    # ---- GroupDetailList ----
+    group_detail_xml = []
+    if include_all or "Group" in filters:
+        for name, g in _groups.items():
+            # Inline group policies
+            gpols = _group_inline_policies.get(name) or {}
+            inline_xml = "".join(
+                f"<member>"
+                f"<PolicyName>{pn}</PolicyName>"
+                f"<PolicyDocument>{_url_quote(pd, safe='')}</PolicyDocument>"
+                f"</member>"
+                for pn, pd in gpols.items()
+            )
+            # Attached managed policies
+            attached_xml = ""
+            for arn in g.get("AttachedPolicies", []):
+                # The attachment is reported whether or not the policy document
+                # is readable here: AWS lists it either way, and an unseeded
+                # AWS-managed ARN has no local record unless autovivify is on.
+                # Same fallback ListAttachedRolePolicies already uses.
+                pol = _lookup_policy(arn)
+                pname = pol["PolicyName"] if pol else arn.rsplit("/", 1)[-1]
+                attached_xml += (f"<member>"
+                                 f"<PolicyName>{pname}</PolicyName>"
+                                 f"<PolicyArn>{arn}</PolicyArn>"
+                                 f"</member>")
+            group_detail_xml.append(
+                f"<member>"
+                f"<GroupName>{g['GroupName']}</GroupName>"
+                f"<GroupId>{g['GroupId']}</GroupId>"
+                f"<Arn>{g['Arn']}</Arn>"
+                f"<Path>{g['Path']}</Path>"
+                f"<CreateDate>{g['CreateDate']}</CreateDate>"
+                f"<GroupPolicyList>{inline_xml}</GroupPolicyList>"
+                f"<AttachedManagedPolicies>{attached_xml}</AttachedManagedPolicies>"
+                f"</member>"
+            )
+
+    # ---- RoleDetailList ----
+    role_detail_xml = []
+    if include_all or "Role" in filters:
+        for name, role in _roles.items():
+            assume_doc = _url_quote(role.get("AssumeRolePolicyDocument") or "{}", safe="")
+            # Inline role policies
+            inline_xml = "".join(
+                f"<member>"
+                f"<PolicyName>{pn}</PolicyName>"
+                f"<PolicyDocument>{_url_quote(pd, safe='')}</PolicyDocument>"
+                f"</member>"
+                for pn, pd in (role.get("InlinePolicies") or {}).items()
+            )
+            # Attached managed policies
+            attached_xml = ""
+            for arn in role.get("AttachedPolicies", []):
+                # The attachment is reported whether or not the policy document
+                # is readable here: AWS lists it either way, and an unseeded
+                # AWS-managed ARN has no local record unless autovivify is on.
+                # Same fallback ListAttachedRolePolicies already uses.
+                pol = _lookup_policy(arn)
+                pname = pol["PolicyName"] if pol else arn.rsplit("/", 1)[-1]
+                attached_xml += (f"<member>"
+                                 f"<PolicyName>{pname}</PolicyName>"
+                                 f"<PolicyArn>{arn}</PolicyArn>"
+                                 f"</member>")
+            # Instance profiles
+            ip_xml = "".join(
+                f"<member>{_instance_profile_xml(ipn)}</member>"
+                for ipn, ip in _instance_profiles.items()
+                if name in ip.get("Roles", [])
+            )
+            # Tags
+            tags_xml = "".join(
+                f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
+                for t in role.get("Tags", [])
+            )
+            role_detail_xml.append(
+                f"<member>"
+                f"<RoleName>{role['RoleName']}</RoleName>"
+                f"<RoleId>{role['RoleId']}</RoleId>"
+                f"<Arn>{role['Arn']}</Arn>"
+                f"<Path>{role['Path']}</Path>"
+                f"<CreateDate>{role['CreateDate']}</CreateDate>"
+                f"<AssumeRolePolicyDocument>{assume_doc}</AssumeRolePolicyDocument>"
+                f"<RolePolicyList>{inline_xml}</RolePolicyList>"
+                f"<AttachedManagedPolicies>{attached_xml}</AttachedManagedPolicies>"
+                f"<InstanceProfileList>{ip_xml}</InstanceProfileList>"
+                f"<Tags>{tags_xml}</Tags>"
+                f"</member>"
+            )
+
+    # ---- Policies (customer-managed) ----
+    policies_xml = []
+    if include_all or "LocalManagedPolicy" in filters:
+        for arn, pol in _policies.items():
+            default_vid = pol.get("DefaultVersionId", "v1")
+            versions_xml = "".join(
+                f"<member>"
+                f"<Document>{_url_quote(v.get('Document') or '{}', safe='')}</Document>"
+                f"<VersionId>{v['VersionId']}</VersionId>"
+                f"<IsDefaultVersion>{'true' if v.get('IsDefaultVersion') else 'false'}</IsDefaultVersion>"
+                f"</member>"
+                for v in pol.get("Versions", {}).values()
+            )
+            policies_xml.append(
+                f"<member>"
+                f"<PolicyName>{pol['PolicyName']}</PolicyName>"
+                f"<PolicyId>{pol['PolicyId']}</PolicyId>"
+                f"<Arn>{arn}</Arn>"
+                f"<Path>{pol.get('Path', '/')}</Path>"
+                f"<DefaultVersionId>{default_vid}</DefaultVersionId>"
+                f"<PolicyVersionList>{versions_xml}</PolicyVersionList>"
+                f"</member>"
+            )
+
+    user_detail_xml, group_detail_xml, role_detail_xml, policies_xml, tail = _iam_page(
+        p, user_detail_xml, group_detail_xml, role_detail_xml, policies_xml)
+    return _xml(200, "GetAccountAuthorizationDetailsResponse",
+                f"<GetAccountAuthorizationDetailsResult>"
+                f"<UserDetailList>{user_detail_xml}</UserDetailList>"
+                f"<GroupDetailList>{group_detail_xml}</GroupDetailList>"
+                f"<RoleDetailList>{role_detail_xml}</RoleDetailList>"
+                f"<Policies>{policies_xml}</Policies>"
+                f"{tail}"
+                f"</GetAccountAuthorizationDetailsResult>",
+                ns="iam")
+
+
+# -------------------- Virtual MFA devices --------------------
+
+
+def _virtual_mfa_xml(serial, include_user=True):
+    dev = _mfa_devices[serial]
+    seed_b64 = base64.b64encode(dev["Base32StringSeed"].encode()).decode()
+    # QRCode: tiny placeholder bytes, base64-encoded (blob field)
+    qr_b64 = base64.b64encode(b"QR").decode()
+    inner = (f"<SerialNumber>{dev['SerialNumber']}</SerialNumber>"
+             f"<Base32StringSeed>{seed_b64}</Base32StringSeed>"
+             f"<QRCodePNG>{qr_b64}</QRCodePNG>")
+    if include_user and dev.get("User"):
+        user_name = dev["User"]
+        if user_name in _users:
+            inner += f"<User>{_user_xml(user_name)}</User>"
+        inner += f"<EnableDate>{dev['EnableDate']}</EnableDate>"
+    return inner
+
+
+def _create_virtual_mfa_device(p):
+    name = _p(p, "VirtualMFADeviceName")
+    path = _p(p, "Path") or "/"
+    acct = get_account_id()
+    if path == "/":
+        serial = f"arn:aws:iam::{acct}:mfa/{name}"
+    else:
+        serial = f"arn:aws:iam::{acct}:mfa{path}{name}"
+    if serial in _mfa_devices:
+        return _error(409, "EntityAlreadyExists",
+                      f"MFA device {serial} already exists.", ns="iam")
+    seed = new_uuid().replace("-", "")[:32].upper()
+    _mfa_devices[serial] = {
+        "SerialNumber": serial,
+        "Path": path,
+        "CreateDate": _now(),
+        "User": None,
+        "EnableDate": None,
+        "Base32StringSeed": seed,
+        "Tags": _extract_tags(p),
+    }
+    return _xml(200, "CreateVirtualMFADeviceResponse",
+                f"<CreateVirtualMFADeviceResult>"
+                f"<VirtualMFADevice>{_virtual_mfa_xml(serial, include_user=False)}</VirtualMFADevice>"
+                f"</CreateVirtualMFADeviceResult>",
+                ns="iam")
+
+
+def _enable_mfa_device(p):
+    user_name = _p(p, "UserName")
+    serial = _p(p, "SerialNumber")
+    if user_name not in _users:
+        return _error(404, "NoSuchEntity",
+                      f"The user with name {user_name} cannot be found.", ns="iam")
+    if serial not in _mfa_devices:
+        return _error(404, "NoSuchEntity",
+                      f"MFA device {serial} not found.", ns="iam")
+    dev = _mfa_devices[serial]
+    if dev["User"] is not None:
+        return _error(409, "EntityAlreadyExists",
+                      f"MFA device {serial} is already assigned.", ns="iam")
+    dev["User"] = user_name
+    dev["EnableDate"] = _now()
+    return _xml(200, "EnableMFADeviceResponse", "", ns="iam")
+
+
+def _deactivate_mfa_device(p):
+    user_name = _p(p, "UserName")
+    serial = _p(p, "SerialNumber")
+    dev = _mfa_devices.get(serial)
+    if dev is None or dev.get("User") != user_name:
+        return _error(404, "NoSuchEntity",
+                      f"MFA device {serial} is not assigned to user {user_name}.", ns="iam")
+    dev["User"] = None
+    dev["EnableDate"] = None
+    return _xml(200, "DeactivateMFADeviceResponse", "", ns="iam")
+
+
+def _resync_mfa_device(p):
+    user_name = _p(p, "UserName")
+    serial = _p(p, "SerialNumber")
+    dev = _mfa_devices.get(serial)
+    if dev is None or dev.get("User") != user_name:
+        return _error(404, "NoSuchEntity",
+                      f"MFA device {serial} not found or not assigned to {user_name}.", ns="iam")
+    return _xml(200, "ResyncMFADeviceResponse", "", ns="iam")
+
+
+def _list_mfa_devices(p):
+    user_name = _p(p, "UserName")
+    members = []
+    for serial, dev in _mfa_devices.items():
+        if dev.get("User") == user_name:
+            members.append(f"<member>"
+                        f"<UserName>{dev['User']}</UserName>"
+                        f"<SerialNumber>{dev['SerialNumber']}</SerialNumber>"
+                        f"<EnableDate>{dev['EnableDate']}</EnableDate>"
+                        f"</member>")
+    members, tail = _iam_page(p, members)
+    return _xml(200, "ListMFADevicesResponse",
+                f"<ListMFADevicesResult>"
+                f"<MFADevices>{members}</MFADevices>"
+                f"{tail}"
+                f"</ListMFADevicesResult>",
+                ns="iam")
+
+
+def _list_virtual_mfa_devices(p):
+    status = _p(p, "AssignmentStatus") or "Assigned"
+    members = []
+    for serial, dev in _mfa_devices.items():
+        is_assigned = dev.get("User") is not None
+        if status == "Assigned" and not is_assigned:
+            continue
+        if status == "Unassigned" and is_assigned:
+            continue
+        member_xml = f"<SerialNumber>{dev['SerialNumber']}</SerialNumber>"
+        if is_assigned:
+            user_name = dev["User"]
+            if user_name in _users:
+                member_xml += f"<User>{_user_xml(user_name)}</User>"
+            member_xml += f"<EnableDate>{dev['EnableDate']}</EnableDate>"
+        members.append(f"<member>{member_xml}</member>")
+    members, tail = _iam_page(p, members)
+    return _xml(200, "ListVirtualMFADevicesResponse",
+                f"<ListVirtualMFADevicesResult>"
+                f"<VirtualMFADevices>{members}</VirtualMFADevices>"
+                f"{tail}"
+                f"</ListVirtualMFADevicesResult>",
+                ns="iam")
+
+
+def _delete_virtual_mfa_device(p):
+    serial = _p(p, "SerialNumber")
+    dev = _mfa_devices.get(serial)
+    if dev is None:
+        return _error(404, "NoSuchEntity",
+                      f"MFA device {serial} not found.", ns="iam")
+    if dev.get("User") is not None:
+        return _error(409, "DeleteConflict",
+                      f"MFA device {serial} is still assigned to a user.", ns="iam")
+    del _mfa_devices[serial]
+    return _xml(200, "DeleteVirtualMFADeviceResponse", "", ns="iam")
+# -------------------- Login profiles --------------------
+
+
+def _login_profile_xml(name):
+    lp = _login_profiles[name]
+    pwr = "true" if lp.get("PasswordResetRequired") else "false"
+    return (f"<UserName>{lp['UserName']}</UserName>"
+            f"<CreateDate>{lp['CreateDate']}</CreateDate>"
+            f"<PasswordResetRequired>{pwr}</PasswordResetRequired>")
+
+
+def _create_login_profile(p):
+    name = _p(p, "UserName")
+    if name not in _users:
+        return _error(404, "NoSuchEntity",
+                      f"The user with name {name} cannot be found.", ns="iam")
+    if name in _login_profiles:
+        return _error(409, "EntityAlreadyExists",
+                      f"Login profile for user {name} already exists.", ns="iam")
+    _login_profiles[name] = {
+        "UserName": name,
+        "CreateDate": _now(),
+        "PasswordResetRequired": _p(p, "PasswordResetRequired", "false").lower() == "true",
+    }
+    return _xml(200, "CreateLoginProfileResponse",
+                f"<CreateLoginProfileResult>"
+                f"<LoginProfile>{_login_profile_xml(name)}</LoginProfile>"
+                f"</CreateLoginProfileResult>",
+                ns="iam")
+
+
+def _get_login_profile(p):
+    name = _p(p, "UserName")
+    if name not in _login_profiles:
+        return _error(404, "NoSuchEntity",
+                      f"Login profile for user {name} cannot be found.", ns="iam")
+    return _xml(200, "GetLoginProfileResponse",
+                f"<GetLoginProfileResult>"
+                f"<LoginProfile>{_login_profile_xml(name)}</LoginProfile>"
+                f"</GetLoginProfileResult>",
+                ns="iam")
+
+
+def _update_login_profile(p):
+    name = _p(p, "UserName")
+    if name not in _login_profiles:
+        return _error(404, "NoSuchEntity",
+                      f"Login profile for user {name} cannot be found.", ns="iam")
+    pwr = _p(p, "PasswordResetRequired", "")
+    if pwr:
+        _login_profiles[name]["PasswordResetRequired"] = pwr.lower() == "true"
+    return _xml(200, "UpdateLoginProfileResponse", "", ns="iam")
+
+
+def _delete_login_profile(p):
+    name = _p(p, "UserName")
+    if name not in _login_profiles:
+        return _error(404, "NoSuchEntity",
+                      f"Login profile for user {name} cannot be found.", ns="iam")
+    del _login_profiles[name]
+    return _xml(200, "DeleteLoginProfileResponse", "", ns="iam")
+
+
+# -------------------- Credential report --------------------
+
+_CRED_REPORT_HEADER = (
+    "user,arn,user_creation_time,password_enabled,password_last_used,"
+    "password_last_changed,password_next_rotation,mfa_active,"
+    "access_key_1_active,access_key_1_last_rotated,access_key_1_last_used_date,"
+    "access_key_1_last_used_region,access_key_1_last_used_service,"
+    "access_key_2_active,access_key_2_last_rotated,access_key_2_last_used_date,"
+    "access_key_2_last_used_region,access_key_2_last_used_service,"
+    "cert_1_active,cert_1_last_rotated,cert_2_active,cert_2_last_rotated"
+)
+
+
+def _build_credential_report():
+    acct = get_account_id()
+    rows = [_CRED_REPORT_HEADER]
+
+    # Synthetic root account row
+    rows.append(
+        f"<root_account>,arn:aws:iam::{acct}:root,{_now()},"
+        "not_supported,not_supported,not_supported,not_supported,false,"
+        "false,N/A,N/A,N/A,N/A,"
+        "false,N/A,N/A,N/A,N/A,"
+        "false,N/A,false,N/A"
+    )
+
+    # One row per user
+    for name, user in _users.items():
+        has_password = name in _login_profiles
+        has_mfa = any(
+            dev.get("User") == name for dev in _mfa_devices.values()
+        )
+
+        # Collect up to 2 active access keys (sorted by creation for stable output)
+        user_keys = sorted(
+            [v for v in _access_keys.values() if v["UserName"] == name],
+            key=lambda k: k.get("CreateDate", ""),
+        )
+        key1 = user_keys[0] if len(user_keys) > 0 else None
+        key2 = user_keys[1] if len(user_keys) > 1 else None
+
+        def _key_cols(k):
+            if k is None:
+                return "false,N/A,N/A,N/A,N/A"
+            active = "true" if k.get("Status") == "Active" else "false"
+            rotated = k.get("CreateDate", "N/A")
+            return f"{active},{rotated},N/A,N/A,N/A"
+
+        row = (
+            f"{name},{user['Arn']},{user['CreateDate']},"
+            f"{'true' if has_password else 'false'},"
+            f"N/A,N/A,N/A,"
+            f"{'true' if has_mfa else 'false'},"
+            f"{_key_cols(key1)},"
+            f"{_key_cols(key2)},"
+            "false,N/A,false,N/A"
+        )
+        rows.append(row)
+
+    return "\n".join(rows)
+
+
+def _generate_credential_report(p):
+    _credential_reports["report"] = {
+        "content": _build_credential_report(),
+        "generated_time": _now(),
+    }
+    return _xml(200, "GenerateCredentialReportResponse",
+                "<GenerateCredentialReportResult>"
+                "<State>COMPLETE</State>"
+                "<Description>No report exists. Starting a new report generation task</Description>"
+                "</GenerateCredentialReportResult>",
+                ns="iam")
+
+
+def _get_credential_report(p):
+    report = _credential_reports.get("report")
+    if not report:
+        return _error(410, "ReportNotPresent",
+                      "No credential report exists. Generate one with GenerateCredentialReport.", ns="iam")
+    content_b64 = base64.b64encode(report["content"].encode("utf-8")).decode()
+    return _xml(200, "GetCredentialReportResponse",
+                f"<GetCredentialReportResult>"
+                f"<Content>{content_b64}</Content>"
+                f"<ReportFormat>text/csv</ReportFormat>"
+                f"<GeneratedTime>{report['generated_time']}</GeneratedTime>"
+                f"</GetCredentialReportResult>",
                 ns="iam")
 
 
@@ -1547,6 +2761,624 @@ def _delete_oidc_provider(p):
     return _xml(200, "DeleteOpenIDConnectProviderResponse", "", ns="iam")
 
 
+# -------------------- Service last accessed (Access Advisor) --------------------
+
+
+def _generate_service_last_accessed_details(p):
+    arn = _p(p, "Arn")
+    job_id = new_uuid()
+    _sla_jobs[job_id] = {"Arn": arn, "JobStatus": "COMPLETED", "JobCreationDate": _now()}
+    return _xml(200, "GenerateServiceLastAccessedDetailsResponse",
+                f"<GenerateServiceLastAccessedDetailsResult>"
+                f"<JobId>{job_id}</JobId>"
+                f"</GenerateServiceLastAccessedDetailsResult>",
+                ns="iam")
+
+
+def _get_service_last_accessed_details(p):
+    job_id = _p(p, "JobId")
+    job = _sla_jobs.get(job_id)
+    if not job:
+        return _error(404, "NoSuchEntity",
+                      f"Job {job_id} not found.", ns="iam")
+    return _xml(200, "GetServiceLastAccessedDetailsResponse",
+                f"<GetServiceLastAccessedDetailsResult>"
+                f"<JobStatus>{job['JobStatus']}</JobStatus>"
+                f"<JobCreationDate>{job['JobCreationDate']}</JobCreationDate>"
+                f"<JobCompletionDate>{job['JobCreationDate']}</JobCompletionDate>"
+                f"<ServicesLastAccessed></ServicesLastAccessed>"
+                f"<IsTruncated>false</IsTruncated>"
+                f"</GetServiceLastAccessedDetailsResult>",
+                ns="iam")
+
+
+def _list_oidc_providers(p):
+    members = "".join(
+        f"<member><Arn>{arn}</Arn></member>"
+        for arn in _oidc_providers
+    )
+    return _xml(200, "ListOpenIDConnectProvidersResponse",
+                f"<ListOpenIDConnectProvidersResult>"
+                f"<OpenIDConnectProviderList>{members}</OpenIDConnectProviderList>"
+                f"</ListOpenIDConnectProvidersResult>",
+                ns="iam")
+
+
+# -------------------- SAML providers --------------------
+
+
+def _create_saml_provider(p):
+    name = _p(p, "Name")
+    acct = get_account_id()
+    arn = f"arn:aws:iam::{acct}:saml-provider/{name}"
+    if arn in _saml_providers:
+        return _error(409, "EntityAlreadyExists",
+                      f"SAML provider {arn} already exists.", ns="iam")
+    metadata = _p(p, "SAMLMetadataDocument")
+    _saml_providers[arn] = {
+        "Arn": arn,
+        "Name": name,
+        "SAMLMetadataDocument": metadata,
+        "AssertionEncryptionMode": _p(p, "AssertionEncryptionMode") or None,
+        "CreateDate": _now(),
+        "ValidUntil": _future(365 * 24 * 3600),
+        "Tags": _extract_tags(p),
+    }
+    return _xml(200, "CreateSAMLProviderResponse",
+                f"<CreateSAMLProviderResult>"
+                f"<SAMLProviderArn>{arn}</SAMLProviderArn>"
+                f"</CreateSAMLProviderResult>",
+                ns="iam")
+
+
+def _get_saml_provider(p):
+    arn = _p(p, "SAMLProviderArn")
+    prov = _saml_providers.get(arn)
+    if not prov:
+        return _error(404, "NoSuchEntity",
+                      f"SAML provider {arn} not found.", ns="iam")
+    tag_members = "".join(
+        f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
+        for t in prov.get("Tags", [])
+    )
+    return _xml(200, "GetSAMLProviderResponse",
+                f"<GetSAMLProviderResult>"
+                f"<SAMLMetadataDocument>{_xml_escape(prov['SAMLMetadataDocument'])}</SAMLMetadataDocument>"
+                f"<CreateDate>{prov['CreateDate']}</CreateDate>"
+                f"<ValidUntil>{prov['ValidUntil']}</ValidUntil>"
+                f"<Tags>{tag_members}</Tags>"
+                + (f"<AssertionEncryptionMode>{prov['AssertionEncryptionMode']}</AssertionEncryptionMode>"
+                   if prov.get("AssertionEncryptionMode") else "")
+                + "</GetSAMLProviderResult>",
+                ns="iam")
+
+
+def _list_saml_providers(p):
+    members = "".join(
+        f"<member>"
+        f"<Arn>{prov['Arn']}</Arn>"
+        f"<ValidUntil>{prov['ValidUntil']}</ValidUntil>"
+        f"<CreateDate>{prov['CreateDate']}</CreateDate>"
+        f"</member>"
+        for prov in _saml_providers.values()
+    )
+    return _xml(200, "ListSAMLProvidersResponse",
+                f"<ListSAMLProvidersResult>"
+                f"<SAMLProviderList>{members}</SAMLProviderList>"
+                f"</ListSAMLProvidersResult>",
+                ns="iam")
+
+
+def _update_saml_provider(p):
+    arn = _p(p, "SAMLProviderArn")
+    prov = _saml_providers.get(arn)
+    if not prov:
+        return _error(404, "NoSuchEntity",
+                      f"SAML provider {arn} not found.", ns="iam")
+    if _p(p, "SAMLMetadataDocument"):
+        prov["SAMLMetadataDocument"] = _p(p, "SAMLMetadataDocument")
+    if _p(p, "AssertionEncryptionMode"):
+        prov["AssertionEncryptionMode"] = _p(p, "AssertionEncryptionMode")
+    return _xml(200, "UpdateSAMLProviderResponse",
+                f"<UpdateSAMLProviderResult>"
+                f"<SAMLProviderArn>{arn}</SAMLProviderArn>"
+                f"</UpdateSAMLProviderResult>",
+                ns="iam")
+
+
+def _delete_saml_provider(p):
+    arn = _p(p, "SAMLProviderArn")
+    if arn not in _saml_providers:
+        return _error(404, "NoSuchEntity",
+                      f"SAML provider {arn} not found.", ns="iam")
+    del _saml_providers[arn]
+    return _xml(200, "DeleteSAMLProviderResponse", "", ns="iam")
+
+
+# -------------------- Service-specific credentials --------------------
+#
+# UserName on this whole family is optional only for IAM-user callers —
+# every other principal gets "UserName must be specified when calling with
+# a non-user principal" (observed on AWS 2026-10-29 for list, update, reset
+# and delete alike). ``_caller_user`` is injected by handle_request.
+
+
+# CreateServiceSpecificCredential API reference and "API keys for AWS services": a user name and
+# password for CodeCommit and Keyspaces, an alias and secret (long-term API key) for the others.
+_PASSWORD_CREDENTIAL_SERVICES = frozenset({"codecommit.amazonaws.com", "cassandra.amazonaws.com"})
+_API_KEY_CREDENTIAL_SERVICES = frozenset({"bedrock.amazonaws.com", "aws-external-anthropic.amazonaws.com",
+                                          "cloudwatch.amazonaws.com", "logs.amazonaws.com"})
+
+
+def _unsupported_service(service):
+    if service in _PASSWORD_CREDENTIAL_SERVICES or service in _API_KEY_CREDENTIAL_SERVICES:
+        return None
+    return _error(404, "NotSupportedService",
+                  "The specified service does not support service-specific credentials.", ns="iam")
+
+
+def _credential_user(p):
+    user = _p(p, "UserName") or _p(p, "_caller_user")
+    if not user:
+        return None, _error(
+            400, "InvalidInput",
+            "UserName must be specified when calling with a non-user principal",
+            ns="iam")
+    if user != "default" and user not in _users:
+        return None, _error(404, "NoSuchEntity",
+                            f"The user with name {user} cannot be found.", ns="iam")
+    return user, None
+
+
+def _service_credential_fields(c, with_secret=False):
+    """The member fields AWS returns; ``ServiceCredentialSecret`` only ever
+    appears on create and reset responses (AWS 2026-10-29)."""
+    inner = ""
+    if with_secret and c.get("ServicePassword"):
+        inner += f"<ServicePassword>{_xml_escape(c['ServicePassword'])}</ServicePassword>"
+    if c.get("ServiceUserName"):
+        inner += f"<ServiceUserName>{_xml_escape(c['ServiceUserName'])}</ServiceUserName>"
+    if c.get("ServiceCredentialAlias"):
+        inner += f"<ServiceCredentialAlias>{_xml_escape(c['ServiceCredentialAlias'])}</ServiceCredentialAlias>"
+    inner += f"<CreateDate>{c['CreateDate']}</CreateDate>"
+    if c.get("ExpirationDate"):
+        inner += f"<ExpirationDate>{c['ExpirationDate']}</ExpirationDate>"
+    if with_secret and c.get("ServiceCredentialSecret"):
+        inner += (f"<ServiceCredentialSecret>{c['ServiceCredentialSecret']}"
+                  f"</ServiceCredentialSecret>")
+    return (inner +
+            f"<ServiceSpecificCredentialId>{c['Id']}</ServiceSpecificCredentialId>"
+            f"<ServiceName>{_xml_escape(c['ServiceName'])}</ServiceName>"
+            f"<UserName>{_xml_escape(c['UserName'])}</UserName>"
+            f"<Status>{c['Status']}</Status>")
+
+
+def _gen_service_credential():
+    """id ``ACCA`` + 17 chars and an opaque base64 secret, AWS's shapes."""
+    cred_id = "ACCA" + new_uuid().replace("-", "")[:17].upper()
+    secret = base64.b64encode(os.urandom(72)).decode()
+    return cred_id, secret
+
+
+def _new_service_secret(cred):
+    """A new secret of the credential's kind: a password (44 characters, as the API reference's
+    example) for a user-name credential, else the API key secret."""
+    if cred.get("ServiceUserName"):
+        cred["ServicePassword"] = base64.b64encode(os.urandom(32)).decode()
+    else:
+        _, cred["ServiceCredentialSecret"] = _gen_service_credential()
+
+
+def _create_service_specific_credential(p):
+    user, err = _credential_user(p)
+    if err:
+        return err
+    service = _p(p, "ServiceName")
+    unsupported = _unsupported_service(service)
+    if unsupported:
+        return unsupported
+    cred_id, _secret = _gen_service_credential()
+    cred = {
+        "Id": cred_id,
+        "UserName": user,
+        "ServiceName": service,
+        "Status": "Active",
+        "CreateDate": _now(),
+    }
+    if service in _PASSWORD_CREDENTIAL_SERVICES:
+        cred["ServiceUserName"] = f"{user}-at-{get_account_id()}"
+    else:
+        cred["ServiceCredentialAlias"] = f"{user}-at-{get_account_id()}"
+        age_days = _p(p, "CredentialAgeDays")
+        if age_days.isdigit() and int(age_days) > 0:
+            cred["ExpirationDate"] = _future(int(age_days) * 86400)
+    _new_service_secret(cred)
+    _service_specific_credentials[cred_id] = cred
+    return _xml(200, "CreateServiceSpecificCredentialResponse",
+                f"<CreateServiceSpecificCredentialResult>"
+                f"<ServiceSpecificCredential>"
+                f"{_service_credential_fields(cred, with_secret=True)}"
+                f"</ServiceSpecificCredential>"
+                f"</CreateServiceSpecificCredentialResult>",
+                ns="iam")
+
+
+def _list_service_specific_credentials(p):
+    user, err = _credential_user(p)
+    if err:
+        return err
+    service = _p(p, "ServiceName")
+    unsupported = service and _unsupported_service(service)
+    if unsupported:
+        return unsupported
+    members = list(
+        f"<member>{_service_credential_fields(c)}</member>"
+        for c in _service_specific_credentials.values()
+        if c["UserName"] == user and (not service or c["ServiceName"] == service)
+    )
+    members, tail = _iam_page(p, members)
+    return _xml(200, "ListServiceSpecificCredentialsResponse",
+                f"<ListServiceSpecificCredentialsResult>"
+                f"<ServiceSpecificCredentials>{members}</ServiceSpecificCredentials>"
+                f"{tail}"
+                f"</ListServiceSpecificCredentialsResult>",
+                ns="iam")
+
+
+def _lookup_service_credential(p):
+    user, err = _credential_user(p)
+    if err:
+        return None, err
+    cred_id = _p(p, "ServiceSpecificCredentialId")
+    cred = _service_specific_credentials.get(cred_id)
+    if not cred or cred["UserName"] != user:
+        return None, _error(
+            404, "NoSuchEntity",
+            f"The service specific credential with credential id {cred_id} "
+            f"cannot be found.", ns="iam")
+    return cred, None
+
+
+def _update_service_specific_credential(p):
+    cred, err = _lookup_service_credential(p)
+    if err:
+        return err
+    status = _p(p, "Status")
+    if status in ("Active", "Inactive"):
+        cred["Status"] = status
+    return _xml(200, "UpdateServiceSpecificCredentialResponse", "", ns="iam")
+
+
+def _reset_service_specific_credential(p):
+    cred, err = _lookup_service_credential(p)
+    if err:
+        return err
+    _new_service_secret(cred)
+    return _xml(200, "ResetServiceSpecificCredentialResponse",
+                f"<ResetServiceSpecificCredentialResult>"
+                f"<ServiceSpecificCredential>"
+                f"{_service_credential_fields(cred, with_secret=True)}"
+                f"</ServiceSpecificCredential>"
+                f"</ResetServiceSpecificCredentialResult>",
+                ns="iam")
+
+
+def _delete_service_specific_credential(p):
+    cred, err = _lookup_service_credential(p)
+    if err:
+        return err
+    del _service_specific_credentials[cred["Id"]]
+    return _xml(200, "DeleteServiceSpecificCredentialResponse", "", ns="iam")
+
+
+# -------------------- Server certificates --------------------
+
+
+def _cert_expiration(pem: str) -> str | None:
+    """notAfter of a PEM cert, like AWS parses it on upload; "" when it can't be read without the
+    optional cryptography package; None when the body is not a certificate."""
+    import importlib.util
+    if importlib.util.find_spec("cryptography") is None:
+        match = re.fullmatch(r"\s*-----BEGIN CERTIFICATE-----\s*([A-Za-z0-9+/=\s]+?)\s*-----END CERTIFICATE-----\s*", pem or "")
+        try:
+            return "" if match and base64.b64decode("".join(match.group(1).split()), validate=True) else None
+        except (binascii.Error, ValueError):
+            return None
+    try:
+        from cryptography import x509
+        cert = x509.load_pem_x509_certificate(pem.encode())
+        return cert.not_valid_after_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return None
+
+
+def _gen_server_cert_id():
+    return "ASCA" + new_uuid().replace("-", "")[:17].upper()
+
+
+def _server_cert_metadata(c):
+    inner = (f"<Path>{_xml_escape(c['Path'])}</Path>"
+             f"<ServerCertificateName>{_xml_escape(c['Name'])}</ServerCertificateName>"
+             f"<ServerCertificateId>{c['Id']}</ServerCertificateId>"
+             f"<Arn>{c['Arn']}</Arn>"
+             f"<UploadDate>{c['UploadDate']}</UploadDate>")
+    if c.get("Expiration"):
+        inner += f"<Expiration>{c['Expiration']}</Expiration>"
+    return inner
+
+
+def _server_cert_arn(path: str, name: str) -> str:
+    return (f"arn:aws:iam::{get_account_id()}:server-certificate"
+            f"{path}{name}")
+
+
+def _normalize_iam_path(path: str) -> str:
+    path = path or "/"
+    if not path.startswith("/"):
+        path = "/" + path
+    if not path.endswith("/"):
+        path += "/"
+    return path
+
+
+def _upload_server_certificate(p):
+    name = _p(p, "ServerCertificateName")
+    path = _normalize_iam_path(_p(p, "Path"))
+    arn = _server_cert_arn(path, name)
+    if any(c["Name"] == name for c in _server_certificates.values()):
+        return _error(409, "EntityAlreadyExists",
+                      f"The Server Certificate with name {name} already exists.",
+                      ns="iam")
+    body_pem = _p(p, "CertificateBody")
+    expiration = _cert_expiration(body_pem)
+    if expiration is None:
+        return _error(400, "MalformedCertificate",
+                      "Unable to parse certificate.", ns="iam")
+    cert = {
+        "Name": name,
+        "Path": path,
+        "Id": _gen_server_cert_id(),
+        "Arn": arn,
+        "Body": body_pem,
+        "PrivateKey": _p(p, "PrivateKey"),
+        "CertificateChain": _p(p, "CertificateChain"),
+        "UploadDate": _now(),
+        "Expiration": expiration,
+        "Tags": _extract_tags(p),
+    }
+    _server_certificates[arn] = cert
+    return _xml(200, "UploadServerCertificateResponse",
+                f"<UploadServerCertificateResult>"
+                f"<ServerCertificateMetadata>{_server_cert_metadata(cert)}"
+                f"</ServerCertificateMetadata>"
+                f"</UploadServerCertificateResult>",
+                ns="iam")
+
+
+def _list_server_certificates(p):
+    prefix = _p(p, "PathPrefix")
+    members = list(
+        f"<member>{_server_cert_metadata(c)}</member>"
+        for c in _server_certificates.values()
+        if not prefix or c["Path"].startswith(prefix)
+    )
+    members, tail = _iam_page(p, members)
+    return _xml(200, "ListServerCertificatesResponse",
+                f"<ListServerCertificatesResult>"
+                f"<ServerCertificateMetadataList>{members}"
+                f"</ServerCertificateMetadataList>"
+                f"{tail}"
+                f"</ListServerCertificatesResult>",
+                ns="iam")
+
+
+def _lookup_server_certificate(p):
+    name = _p(p, "ServerCertificateName")
+    cert = next((c for c in _server_certificates.values()
+                 if c["Name"] == name), None)
+    if not cert:
+        return None, _error(
+            404, "NoSuchEntity",
+            f"The Server Certificate with name {name} cannot be found.",
+            ns="iam")
+    return cert, None
+
+
+def _tags_xml(tags):
+    return "".join(
+        f"<member><Key>{_xml_escape(t['Key'])}</Key>"
+        f"<Value>{_xml_escape(t['Value'])}</Value></member>"
+        for t in tags
+    )
+
+
+def _get_server_certificate(p):
+    cert, err = _lookup_server_certificate(p)
+    if err:
+        return err
+    return _xml(200, "GetServerCertificateResponse",
+                f"<GetServerCertificateResult><ServerCertificate>"
+                f"<ServerCertificateMetadata>{_server_cert_metadata(cert)}"
+                f"</ServerCertificateMetadata>"
+                f"<CertificateBody>{_xml_escape(cert['Body'])}</CertificateBody>"
+                + (f"<CertificateChain>{_xml_escape(cert['CertificateChain'])}</CertificateChain>"
+                   if cert.get("CertificateChain") else "")
+                + f"<Tags>{_tags_xml(cert.get('Tags', []))}</Tags>"
+                f"</ServerCertificate></GetServerCertificateResult>",
+                ns="iam")
+
+
+def _update_server_certificate(p):
+    cert, err = _lookup_server_certificate(p)
+    if err:
+        return err
+    new_name = _p(p, "NewServerCertificateName")
+    new_path = _normalize_iam_path(_p(p, "NewPath") or cert["Path"])
+    new_arn = _server_cert_arn(new_path, new_name or cert["Name"])
+    if new_name and new_name != cert["Name"] and any(c["Name"] == new_name for c in _server_certificates.values()):
+        return _error(409, "EntityAlreadyExists",
+                      "The Server Certificate with name "
+                      f"{new_name or cert['Name']} already exists.", ns="iam")
+    del _server_certificates[cert["Arn"]]
+    cert["Name"] = new_name or cert["Name"]
+    cert["Path"] = new_path
+    cert["Arn"] = new_arn
+    _server_certificates[new_arn] = cert
+    return _xml(200, "UpdateServerCertificateResponse", "", ns="iam")
+
+
+def _delete_server_certificate(p):
+    cert, err = _lookup_server_certificate(p)
+    if err:
+        return err
+    del _server_certificates[cert["Arn"]]
+    return _xml(200, "DeleteServerCertificateResponse", "", ns="iam")
+
+
+def _list_server_certificate_tags(p):
+    cert, err = _lookup_server_certificate(p)
+    if err:
+        return err
+    tags = [_tags_xml([t]) for t in cert.get("Tags", [])]
+    tags, tail = _iam_page(p, tags)
+    return _xml(200, "ListServerCertificateTagsResponse",
+                f"<ListServerCertificateTagsResult>"
+                f"<Tags>{tags}</Tags>"
+                f"{tail}"
+                f"</ListServerCertificateTagsResult>",
+                ns="iam")
+
+
+# -------------------- Account summary / password policy / aliases --------------------
+
+
+def _get_account_summary(p):
+    num_users = len(_users)
+    num_groups = len(_groups)
+    num_roles = len(_roles)
+    num_policies = len(_policies)
+    num_mfa = len(_mfa_devices)
+    num_mfa_in_use = sum(1 for d in _mfa_devices.values() if d.get("User") is not None)
+    acct_mfa_enabled = 1 if num_mfa_in_use > 0 else 0
+
+    summary = {
+        "Users": num_users,
+        "UsersQuota": 5000,
+        "Groups": num_groups,
+        "GroupsQuota": 300,
+        "GroupsPerUserQuota": 10,
+        "Roles": num_roles,
+        "RolesQuota": 1000,
+        "Policies": num_policies,
+        "PoliciesQuota": 1500,
+        "PolicySizeQuota": 6144,
+        "PolicyVersionsInUse": num_policies,
+        "PolicyVersionsInUseQuota": 10000,
+        "MFADevices": num_mfa,
+        "MFADevicesInUse": num_mfa_in_use,
+        "AccountMFAEnabled": acct_mfa_enabled,
+        "AccountAccessKeysPresent": 0,
+        "AccountSigningCertificatesPresent": 0,
+        "AccessKeysPerUserQuota": 2,
+        "AssumeRolePolicySizeQuota": 2048,
+        "GroupPolicySizeQuota": 5120,
+        "UserPolicySizeQuota": 2048,
+        "AttachedPoliciesPerGroupQuota": 10,
+        "AttachedPoliciesPerRoleQuota": 10,
+        "AttachedPoliciesPerUserQuota": 10,
+        "VersionsPerPolicyQuota": 5,
+        "ServerCertificates": 0,
+        "ServerCertificatesQuota": 20,
+        "SigningCertificatesPerUserQuota": 2,
+    }
+    entries = "".join(
+        f"<entry><key>{k}</key><value>{v}</value></entry>"
+        for k, v in summary.items()
+    )
+    return _xml(200, "GetAccountSummaryResponse",
+                f"<GetAccountSummaryResult>"
+                f"<SummaryMap>{entries}</SummaryMap>"
+                f"</GetAccountSummaryResult>",
+                ns="iam")
+
+
+def _get_account_password_policy(p):
+    pol = _account_password_policy.get("policy")
+    if not pol:
+        return _error(404, "NoSuchEntity",
+                      "The account password policy does not exist.", ns="iam")
+    fields = (
+        f"<MinimumPasswordLength>{pol.get('MinimumPasswordLength', 6)}</MinimumPasswordLength>"
+        f"<RequireSymbols>{'true' if pol.get('RequireSymbols') else 'false'}</RequireSymbols>"
+        f"<RequireNumbers>{'true' if pol.get('RequireNumbers') else 'false'}</RequireNumbers>"
+        f"<RequireUppercaseCharacters>{'true' if pol.get('RequireUppercaseCharacters') else 'false'}</RequireUppercaseCharacters>"
+        f"<RequireLowercaseCharacters>{'true' if pol.get('RequireLowercaseCharacters') else 'false'}</RequireLowercaseCharacters>"
+        f"<AllowUsersToChangePassword>{'true' if pol.get('AllowUsersToChangePassword') else 'false'}</AllowUsersToChangePassword>"
+        f"<ExpirePasswords>{'true' if pol.get('MaxPasswordAge') else 'false'}</ExpirePasswords>"
+        f"<HardExpiry>{'true' if pol.get('HardExpiry') else 'false'}</HardExpiry>"
+    )
+    if pol.get("MaxPasswordAge"):
+        fields += f"<MaxPasswordAge>{pol['MaxPasswordAge']}</MaxPasswordAge>"
+    if pol.get("PasswordReusePrevention"):
+        fields += f"<PasswordReusePrevention>{pol['PasswordReusePrevention']}</PasswordReusePrevention>"
+    return _xml(200, "GetAccountPasswordPolicyResponse",
+                f"<GetAccountPasswordPolicyResult>"
+                f"<PasswordPolicy>{fields}</PasswordPolicy>"
+                f"</GetAccountPasswordPolicyResult>",
+                ns="iam")
+
+
+def _update_account_password_policy(p):
+    # No partial updates: every omitted parameter reverts to its default.
+    pol = {"MinimumPasswordLength": 6}
+    for field in ("MinimumPasswordLength", "MaxPasswordAge", "PasswordReusePrevention"):
+        val = _p(p, field, "")
+        if val:
+            pol[field] = int(val)
+    for field in ("RequireSymbols", "RequireNumbers", "RequireUppercaseCharacters",
+                  "RequireLowercaseCharacters", "AllowUsersToChangePassword", "HardExpiry"):
+        val = _p(p, field, "")
+        if val:
+            pol[field] = val.lower() == "true"
+    _account_password_policy["policy"] = pol
+    return _xml(200, "UpdateAccountPasswordPolicyResponse", "", ns="iam")
+
+
+def _delete_account_password_policy(p):
+    if "policy" not in _account_password_policy:
+        return _error(404, "NoSuchEntity",
+                      "The account password policy does not exist.", ns="iam")
+    del _account_password_policy["policy"]
+    return _xml(200, "DeleteAccountPasswordPolicyResponse", "", ns="iam")
+
+
+def _list_account_aliases(p):
+    aliases = _account_aliases.get("aliases") or []
+    members = list(f"<member>{a}</member>" for a in aliases)
+    members, tail = _iam_page(p, members)
+    return _xml(200, "ListAccountAliasesResponse",
+                f"<ListAccountAliasesResult>"
+                f"<AccountAliases>{members}</AccountAliases>"
+                f"{tail}"
+                f"</ListAccountAliasesResult>",
+                ns="iam")
+
+
+def _create_account_alias(p):
+    alias = _p(p, "AccountAlias")
+    _account_aliases["aliases"] = [alias]
+    return _xml(200, "CreateAccountAliasResponse", "", ns="iam")
+
+
+def _delete_account_alias(p):
+    alias = _p(p, "AccountAlias")
+    aliases = _account_aliases.get("aliases") or []
+    if alias in aliases:
+        aliases.remove(alias)
+        _account_aliases["aliases"] = aliases
+    return _xml(200, "DeleteAccountAliasResponse", "", ns="iam")
+
+
 # -------------------- Tags: policies --------------------
 
 def _tag_policy(p):
@@ -1586,13 +3418,14 @@ def _list_policy_tags(p):
     if not pol:
         return _error(404, "NoSuchEntity",
                       f"Policy {arn} not found.", ns="iam")
-    members = "".join(
+    members = list(
         f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
         for t in pol.get("Tags", [])
     )
+    members, tail = _iam_page(p, members)
     return _xml(200, "ListPolicyTagsResponse",
                 f"<ListPolicyTagsResult><Tags>{members}</Tags>"
-                "<IsTruncated>false</IsTruncated></ListPolicyTagsResult>",
+                f"{tail}</ListPolicyTagsResult>",
                 ns="iam")
 
 
@@ -1604,6 +3437,24 @@ def _list_policy_tags(p):
 def _p(params, key, default=""):
     val = params.get(key, [default])
     return val[0] if isinstance(val, list) else val
+
+
+def _iam_page(p, *groups):
+    items = [(n, m) for n, g in enumerate(groups) for m in g]
+    try:
+        limit = max(int(_p(p, "MaxItems") or 100), 1)
+    except ValueError:
+        limit = 100
+    try:
+        start = max(int(base64.b64decode(_p(p, "Marker"), validate=True).decode()), 0)
+    except (ValueError, binascii.Error):
+        start = 0
+    end = start + limit
+    pages = ["".join(m for n, m in items[start:end] if n == g) for g in range(len(groups))]
+    if end < len(items):
+        marker = base64.b64encode(str(end).encode()).decode()
+        return (*pages, f"<IsTruncated>true</IsTruncated><Marker>{marker}</Marker>")
+    return (*pages, "<IsTruncated>false</IsTruncated>")
 
 
 def _now():
@@ -1663,7 +3514,7 @@ def _extract_tag_keys(p):
 
 # -------------------- XML builders --------------------
 
-def _user_xml(name):
+def _user_xml(name, boundary=True):
     u = _users[name]
     # Tags are emitted when present (#441). _role_xml follows the same pattern.
     tags_xml = ""
@@ -1673,15 +3524,24 @@ def _user_xml(name):
             for t in u["Tags"]
         )
         tags_xml = f"<Tags>{tag_members}</Tags>"
+    boundary_xml = ""
+    if boundary and u.get("PermissionsBoundary"):
+        boundary_xml = (
+            "<PermissionsBoundary>"
+            "<PermissionsBoundaryType>PermissionsBoundaryPolicy</PermissionsBoundaryType>"
+            f"<PermissionsBoundaryArn>{u['PermissionsBoundary']}</PermissionsBoundaryArn>"
+            "</PermissionsBoundary>"
+        )
     return (f"<UserName>{u['UserName']}</UserName>"
             f"<UserId>{u['UserId']}</UserId>"
             f"<Arn>{u['Arn']}</Arn>"
             f"<Path>{u['Path']}</Path>"
             f"<CreateDate>{u['CreateDate']}</CreateDate>"
+            f"{boundary_xml}"
             f"{tags_xml}")
 
 
-def _role_xml(name):
+def _role_xml(name, boundary=True):
     r = _roles[name]
     assume_doc = _url_quote(r.get("AssumeRolePolicyDocument") or "{}", safe="")
     desc = r.get("Description") or ""
@@ -1689,22 +3549,31 @@ def _role_xml(name):
     tags_xml = ""
     if r.get("Tags"):
         tag_members = "".join(
-            f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
+            f"<member><Key>{_xml_escape(t['Key'])}</Key><Value>{_xml_escape(t['Value'])}</Value></member>"
             for t in r["Tags"]
         )
         tags_xml = f"<Tags>{tag_members}</Tags>"
+    boundary_xml = ""
+    if boundary and r.get("PermissionsBoundary"):
+        boundary_xml = (
+            "<PermissionsBoundary>"
+            "<PermissionsBoundaryType>PermissionsBoundaryPolicy</PermissionsBoundaryType>"
+            f"<PermissionsBoundaryArn>{r['PermissionsBoundary']}</PermissionsBoundaryArn>"
+            "</PermissionsBoundary>"
+        )
     return (f"<RoleName>{r['RoleName']}</RoleName>"
             f"<RoleId>{r['RoleId']}</RoleId>"
             f"<Arn>{r['Arn']}</Arn>"
             f"<Path>{r['Path']}</Path>"
             f"<CreateDate>{r['CreateDate']}</CreateDate>"
             f"<AssumeRolePolicyDocument>{assume_doc}</AssumeRolePolicyDocument>"
-            f"<Description>{desc}</Description>"
-            f"<MaxSessionDuration>{max_dur}</MaxSessionDuration>"
+            + (f"<Description>{_xml_escape(desc)}</Description>" if desc else "")
+            + f"<MaxSessionDuration>{max_dur}</MaxSessionDuration>"
+            f"{boundary_xml}"
             f"{tags_xml}")
 
 
-def _managed_policy_xml(arn):
+def _managed_policy_xml(arn, usage_counts=None):
     pol = _lookup_policy(arn)
     # Description is omitted when empty to match real AWS (#438).
     description = pol.get("Description") or ""
@@ -1732,6 +3601,9 @@ def _managed_policy_xml(arn):
             f"<PolicyId>{pol['PolicyId']}</PolicyId>"
             f"<DefaultVersionId>{pol['DefaultVersionId']}</DefaultVersionId>"
             f"<AttachmentCount>{attachment_count}</AttachmentCount>"
+            f"<PermissionsBoundaryUsageCount>"
+            f"{(_boundary_usage_counts() if usage_counts is None else usage_counts).get(arn, 0)}"
+            f"</PermissionsBoundaryUsageCount>"
             f"<IsAttachable>true</IsAttachable>"
             f"<CreateDate>{pol['CreateDate']}</CreateDate>"
             f"<UpdateDate>{pol.get('UpdateDate', pol['CreateDate'])}</UpdateDate>"
@@ -1755,12 +3627,22 @@ def _instance_profile_xml(name):
     for rname in ip["Roles"]:
         if rname in _roles:
             roles_xml += f"<member>{_role_xml(rname)}</member>"
+    # Tags are emitted when present so GetInstanceProfile / ListInstanceProfiles
+    # read them back. _user_xml / _role_xml follow the same pattern.
+    tags_xml = ""
+    if ip.get("Tags"):
+        tag_members = "".join(
+            f"<member><Key>{t['Key']}</Key><Value>{t['Value']}</Value></member>"
+            for t in ip["Tags"]
+        )
+        tags_xml = f"<Tags>{tag_members}</Tags>"
     return (f"<InstanceProfileName>{ip['InstanceProfileName']}</InstanceProfileName>"
             f"<InstanceProfileId>{ip['InstanceProfileId']}</InstanceProfileId>"
             f"<Arn>{ip['Arn']}</Arn>"
             f"<Path>{ip['Path']}</Path>"
             f"<CreateDate>{ip['CreateDate']}</CreateDate>"
-            f"<Roles>{roles_xml}</Roles>")
+            f"<Roles>{roles_xml}</Roles>"
+            f"{tags_xml}")
 
 
 def _xml(status, root_tag, inner, ns="iam"):
@@ -1781,9 +3663,10 @@ def _error(status, code, message, ns="iam"):
         "iam": "https://iam.amazonaws.com/doc/2010-05-08/",
         "sts": "https://sts.amazonaws.com/doc/2011-06-15/",
     }.get(ns, "")
-    body = (f'<?xml version="1.0" encoding="UTF-8"?>'
-            f'<ErrorResponse xmlns="{ns_url}">'
-            f'<Error><Code>{code}</Code><Message>{message}</Message></Error>'
+    # Query error envelope: <Type> in <Error>, no <?xml?> (AWS captures).
+    fault_type = "Sender" if status < 500 else "Receiver"
+    body = (f'<ErrorResponse xmlns="{ns_url}">'
+            f'<Error><Type>{fault_type}</Type><Code>{code}</Code><Message>{message}</Message></Error>'
             f'<RequestId>{new_uuid()}</RequestId>'
             f'</ErrorResponse>').encode("utf-8")
     return status, {"Content-Type": "application/xml"}, body
@@ -1823,6 +3706,8 @@ _IAM_HANDLERS = {
     "CreateAccessKey": _create_access_key,
     "ListAccessKeys": _list_access_keys,
     "DeleteAccessKey": _delete_access_key,
+    "UpdateAccessKey": _update_access_key,
+    "GetAccessKeyLastUsed": _get_access_key_last_used,
     "CreateInstanceProfile": _create_instance_profile,
     "DeleteInstanceProfile": _delete_instance_profile,
     "GetInstanceProfile": _get_instance_profile,
@@ -1830,7 +3715,15 @@ _IAM_HANDLERS = {
     "RemoveRoleFromInstanceProfile": _remove_role_from_instance_profile,
     "ListInstanceProfiles": _list_instance_profiles,
     "ListInstanceProfilesForRole": _list_instance_profiles_for_role,
+    "TagInstanceProfile": _tag_instance_profile,
+    "UntagInstanceProfile": _untag_instance_profile,
+    "ListInstanceProfileTags": _list_instance_profile_tags,
     "UpdateAssumeRolePolicy": _update_assume_role_policy,
+    "UpdateRoleDescription": _update_role_description,
+    "PutRolePermissionsBoundary": _put_role_permissions_boundary,
+    "PutUserPermissionsBoundary": _put_user_permissions_boundary,
+    "DeleteUserPermissionsBoundary": _delete_user_permissions_boundary,
+    "DeleteRolePermissionsBoundary": _delete_role_permissions_boundary,
     "TagRole": _tag_role,
     "UntagRole": _untag_role,
     "ListRoleTags": _list_role_tags,
@@ -1846,6 +3739,13 @@ _IAM_HANDLERS = {
     "AddUserToGroup": _add_user_to_group,
     "RemoveUserFromGroup": _remove_user_from_group,
     "ListGroupsForUser": _list_groups_for_user,
+    "AttachGroupPolicy": _attach_group_policy,
+    "DetachGroupPolicy": _detach_group_policy,
+    "ListAttachedGroupPolicies": _list_attached_group_policies,
+    "PutGroupPolicy": _put_group_policy,
+    "GetGroupPolicy": _get_group_policy,
+    "DeleteGroupPolicy": _delete_group_policy,
+    "ListGroupPolicies": _list_group_policies,
     "PutUserPolicy": _put_user_policy,
     "GetUserPolicy": _get_user_policy,
     "DeleteUserPolicy": _delete_user_policy,
@@ -1856,6 +3756,46 @@ _IAM_HANDLERS = {
     "CreateOpenIDConnectProvider": _create_oidc_provider,
     "GetOpenIDConnectProvider": _get_oidc_provider,
     "DeleteOpenIDConnectProvider": _delete_oidc_provider,
+    "GenerateServiceLastAccessedDetails": _generate_service_last_accessed_details,
+    "GetServiceLastAccessedDetails": _get_service_last_accessed_details,
+    "CreateSAMLProvider": _create_saml_provider,
+    "GetSAMLProvider": _get_saml_provider,
+    "ListSAMLProviders": _list_saml_providers,
+    "UpdateSAMLProvider": _update_saml_provider,
+    "DeleteSAMLProvider": _delete_saml_provider,
+    "CreateServiceSpecificCredential": _create_service_specific_credential,
+    "ListServiceSpecificCredentials": _list_service_specific_credentials,
+    "UpdateServiceSpecificCredential": _update_service_specific_credential,
+    "ResetServiceSpecificCredential": _reset_service_specific_credential,
+    "DeleteServiceSpecificCredential": _delete_service_specific_credential,
+    "UploadServerCertificate": _upload_server_certificate,
+    "ListServerCertificates": _list_server_certificates,
+    "GetServerCertificate": _get_server_certificate,
+    "UpdateServerCertificate": _update_server_certificate,
+    "DeleteServerCertificate": _delete_server_certificate,
+    "ListServerCertificateTags": _list_server_certificate_tags,
+    "ListOpenIDConnectProviders": _list_oidc_providers,
+    "GetAccountAuthorizationDetails": _get_account_authorization_details,
+    "CreateVirtualMFADevice": _create_virtual_mfa_device,
+    "EnableMFADevice": _enable_mfa_device,
+    "DeactivateMFADevice": _deactivate_mfa_device,
+    "ResyncMFADevice": _resync_mfa_device,
+    "ListMFADevices": _list_mfa_devices,
+    "ListVirtualMFADevices": _list_virtual_mfa_devices,
+    "DeleteVirtualMFADevice": _delete_virtual_mfa_device,
+    "CreateLoginProfile": _create_login_profile,
+    "GetLoginProfile": _get_login_profile,
+    "UpdateLoginProfile": _update_login_profile,
+    "DeleteLoginProfile": _delete_login_profile,
+    "GenerateCredentialReport": _generate_credential_report,
+    "GetCredentialReport": _get_credential_report,
+    "GetAccountSummary": _get_account_summary,
+    "GetAccountPasswordPolicy": _get_account_password_policy,
+    "UpdateAccountPasswordPolicy": _update_account_password_policy,
+    "DeleteAccountPasswordPolicy": _delete_account_password_policy,
+    "ListAccountAliases": _list_account_aliases,
+    "CreateAccountAlias": _create_account_alias,
+    "DeleteAccountAlias": _delete_account_alias,
     "TagPolicy": _tag_policy,
     "UntagPolicy": _untag_policy,
     "ListPolicyTags": _list_policy_tags,
@@ -1870,8 +3810,18 @@ def reset():
     _instance_profiles.clear()
     _groups.clear()
     _user_inline_policies.clear()
+    _group_inline_policies.clear()
     _oidc_providers.clear()
     _service_linked_role_deletion_tasks.clear()
+    _sla_jobs.clear()
+    _saml_providers.clear()
+    _mfa_devices.clear()
+    _login_profiles.clear()
+    _credential_reports.clear()
+    _account_password_policy.clear()
+    _account_aliases.clear()
+    _service_specific_credentials.clear()
+    _server_certificates.clear()
     # Re-seed AWS-managed policies. They're not customer state, so a
     # reset call should restore the canonical set rather than leave the
     # store empty. Per-account attachment counters are session state

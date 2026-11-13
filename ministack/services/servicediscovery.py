@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 AWS Cloud Map (Service Discovery) emulator.
 JSON-based API via X-Amz-Target: Route53AutoNaming_v20170314.
@@ -9,14 +11,20 @@ import logging
 import os
 import time
 import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape
 
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
     get_region,
-    json_response,
     new_uuid,
+    to_output_shape,
+)
+from ministack.core.responses import (
+    json_response as _core_json_response,
 )
 from ministack.services import route53
 
@@ -24,15 +32,29 @@ logger = logging.getLogger("servicediscovery")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-# In-memory state
-_namespaces = AccountScopedDict()     # ns_id -> namespace dict
-_services = AccountScopedDict()       # svc_id -> service dict
-_instances = AccountScopedDict()      # svc_id -> {instance_id -> instance dict}
-_operations = AccountScopedDict()     # op_id -> operation dict
-_resource_tags = AccountScopedDict()  # resource_arn -> [{"Key": ..., "Value": ...}]
-_service_attributes = AccountScopedDict()      # svc_id -> {key: value}
-_instance_health_status = AccountScopedDict()  # svc_id -> {instance_id: status}
-_instances_revision = AccountScopedDict()      # svc_id -> int
+# In-memory state. Resource and child stores are regional. ARN-keyed tags stay
+# account-scoped because the resource ARN already includes its region.
+_namespaces = AccountRegionScopedDict()     # ns_id -> namespace dict
+_services = AccountRegionScopedDict()       # svc_id -> service dict
+_instances = AccountRegionScopedDict()      # svc_id -> {instance_id -> instance dict}
+_operations = AccountRegionScopedDict()     # op_id -> operation dict
+_resource_tags = AccountScopedDict()        # resource_arn -> [{"Key": ..., "Value": ...}]
+_service_attributes = AccountRegionScopedDict()      # svc_id -> {key: value}
+_instance_health_status = AccountRegionScopedDict()  # svc_id -> {instance_id: status}
+_instances_revision = AccountRegionScopedDict()      # svc_id -> int
+
+
+def _drop_none(value):
+    """AWS omits unset members; it never sends null."""
+    if isinstance(value, dict):
+        return {k: _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
+def json_response(data, status=200, **kwargs):
+    return _core_json_response(_drop_none(data), status, **kwargs)
 
 
 def get_state():
@@ -48,17 +70,65 @@ def get_state():
     }
 
 
+def _restore_regional_store(target, saved, region_for_value=None):
+    if isinstance(saved, AccountRegionScopedDict):
+        target.update(saved)
+        return
+
+    if isinstance(saved, AccountScopedDict):
+        saved_items = saved._data.items()
+    else:
+        account_id = get_account_id()
+        saved_items = (((account_id, key), value) for key, value in saved.items())
+
+    for (account_id, key), value in saved_items:
+        region = region_for_value(account_id, key, value) if region_for_value else None
+        region = region or target._region_for_legacy_value(key, value)
+        target.set_scoped(account_id, region, key, value)
+
+
 def load_persisted_state(data):
     if not data:
         return
     _namespaces.update(data.get("namespaces", {}))
     _services.update(data.get("services", {}))
-    _instances.update(data.get("instances", {}))
-    _operations.update(data.get("operations", {}))
+
+    namespace_regions = {
+        (account_id, namespace_id): region
+        for (account_id, region, namespace_id), _namespace in _namespaces.all_items()
+    }
+    service_regions = {
+        (account_id, service_id): region
+        for (account_id, region, service_id), _service in _services.all_items()
+    }
+
+    def service_region(account_id, service_id, _value):
+        return service_regions.get((account_id, service_id))
+
+    def operation_region(account_id, _operation_id, operation):
+        targets = operation.get("Targets", {})
+        service_id = targets.get("SERVICE")
+        namespace_id = targets.get("NAMESPACE")
+        return service_regions.get((account_id, service_id)) or namespace_regions.get(
+            (account_id, namespace_id)
+        )
+
+    # Legacy child records have no ARN of their own. Keep them beside their
+    # migrated parent service instead of assigning them to the boot region.
+    _restore_regional_store(_instances, data.get("instances", {}), service_region)
+    _restore_regional_store(_operations, data.get("operations", {}), operation_region)
     _resource_tags.update(data.get("resource_tags", {}))
-    _service_attributes.update(data.get("service_attributes", {}))
-    _instance_health_status.update(data.get("instance_health_status", {}))
-    _instances_revision.update(data.get("instances_revision", {}))
+    _restore_regional_store(
+        _service_attributes, data.get("service_attributes", {}), service_region
+    )
+    _restore_regional_store(
+        _instance_health_status,
+        data.get("instance_health_status", {}),
+        service_region,
+    )
+    _restore_regional_store(
+        _instances_revision, data.get("instances_revision", {}), service_region
+    )
 
 
 def reset():
@@ -137,6 +207,44 @@ def _service_arn(svc_id: str) -> str:
     return f"arn:aws:servicediscovery:{get_region()}:{get_account_id()}:service/{svc_id}"
 
 
+def _invalid_resource_arn(arn):
+    return error_response_json("InvalidInput", f"Invalid ResourceARN: {arn}", 400)
+
+
+def _resolve_taggable_resource_arn(arn):
+    if not arn:
+        return None, error_response_json("InvalidInput", "ResourceARN is required", 400)
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None, _invalid_resource_arn(arn)
+    if (
+        spec.partition != "aws"
+        or spec.service != "servicediscovery"
+        or spec.account_id != get_account_id()
+        or spec.region != get_region()
+    ):
+        return None, _invalid_resource_arn(arn)
+
+    resource_type, separator, resource_id = spec.resource.partition("/")
+    if separator != "/" or not resource_id or "/" in resource_id:
+        return None, _invalid_resource_arn(arn)
+
+    if resource_type == "namespace":
+        namespace = _namespaces.get(resource_id)
+        if not namespace or namespace.get("Arn") != arn:
+            return None, error_response_json("NamespaceNotFound", "Namespace not found", 404)
+        return arn, None
+
+    if resource_type == "service":
+        service = _services.get(resource_id)
+        if not service or service.get("Arn") != arn:
+            return None, error_response_json("ServiceNotFound", "Service not found", 404)
+        return arn, None
+
+    return None, _invalid_resource_arn(arn)
+
+
 def _create_operation(op_type: str, targets=None):
     op_id = new_uuid()
     targets = targets or {}
@@ -162,11 +270,7 @@ async def _create_namespace(data):
     ns_name = data.get("Name")
     if not ns_name:
         return error_response_json("InvalidInput", "Name is required", 400)
-    for existing in _namespaces.values():
-        if existing["Name"] == ns_name:
-            return error_response_json("NamespaceAlreadyExists", f"Namespace {ns_name} already exists", 409)
 
-    ns_id = f"ns-{new_uuid()[:8]}"
     action = data.get("_action", "")
 
     # Infer namespace type from action; fallback uses request fields.
@@ -193,61 +297,74 @@ async def _create_namespace(data):
     elif is_http:
         ns_type = "HTTP"
 
+    soa = ((data.get("Properties") or {}).get("DnsProperties") or {}).get("SOA") or {}
+    namespace, err = _create_namespace_record(
+        ns_name, ns_type, data.get("Description"), data.get("Tags", []), soa.get("TTL"),
+        data.get("Vpc") if ns_type == "DNS_PRIVATE" else None,
+    )
+    if err:
+        return err
+
+    op_id = _create_operation("CREATE_NAMESPACE", {"NAMESPACE": namespace["Id"]})
+    return json_response({"OperationId": op_id})
+
+
+def _create_namespace_record(name, ns_type, description=None, tags=None, soa_ttl=None, vpc=None):
+    """Create a namespace and, for a DNS type, its hosted zone. Returns
+    (namespace, None), or (None, error response) for the caller to return.
+    Synchronous so the CloudFormation provisioners can call it."""
+    for existing in _namespaces.values():
+        if existing["Name"] == name:
+            return None, error_response_json("NamespaceAlreadyExists", f"Namespace {name} already exists", 409)
+
+    ns_id = f"ns-{new_uuid()[:8]}"
     namespace = {
         "Id": ns_id,
         "Arn": _namespace_arn(ns_id),
-        "Name": ns_name,
+        "Name": name,
         "Type": ns_type,
-        "Description": data.get("Description"),
+        "Description": description,
         "CreateDate": int(time.time()),
     }
 
     if ns_type != "HTTP":
-        zone_name = ns_name if ns_name.endswith(".") else ns_name + "."
+        zone_name = name if name.endswith(".") else name + "."
+        vpc_xml = (f"<VPC><VPCRegion>{get_region()}</VPCRegion><VPCId>{escape(vpc)}</VPCId></VPC>"
+                   if vpc else "")
         xml_body = f"""<CreateHostedZoneRequest xmlns=\"https://route53.amazonaws.com/doc/2013-04-01/\">
             <Name>{zone_name}</Name>
             <CallerReference>{new_uuid()}</CallerReference>
             <HostedZoneConfig>
                 <Comment>Created by Cloud Map</Comment>
-                <PrivateZone>{"true" if is_private else "false"}</PrivateZone>
-            </HostedZoneConfig>
+                <PrivateZone>{"true" if ns_type == "DNS_PRIVATE" else "false"}</PrivateZone>
+            </HostedZoneConfig>{vpc_xml}
         </CreateHostedZoneRequest>"""
 
-        status, _, body = await route53.handle_request(
-            "POST",
-            "/2013-04-01/hostedzone",
-            {},
-            xml_body.encode("utf-8"),
-            {},
-        )
+        status, _, body = route53._create_hosted_zone(xml_body.encode("utf-8"), {})
         if status >= 300:
-            return error_response_json("InternalFailure", "Failed to create Route53 hosted zone", 500)
+            return None, error_response_json("InternalFailure", "Failed to create Route53 hosted zone", 500)
 
         root = ET.fromstring(body)
         zone_id_el = root.find(".//{https://route53.amazonaws.com/doc/2013-04-01/}Id")
         if zone_id_el is None or not zone_id_el.text:
-            return error_response_json("InternalFailure", "Hosted zone ID missing in Route53 response", 500)
+            return None, error_response_json("InternalFailure", "Hosted zone ID missing in Route53 response", 500)
         zone_id = zone_id_el.text.split("/")[-1]
 
-        namespace["Properties"] = {
-            "DnsProperties": {
-                "HostedZoneId": zone_id,
-            }
-        }
+        dns_properties = {"HostedZoneId": zone_id}
+        if soa_ttl is not None:
+            dns_properties["SOA"] = {"TTL": int(soa_ttl)}
+        namespace["Properties"] = {"DnsProperties": dns_properties}
     else:
         namespace["Properties"] = {
             "HttpProperties": {
-                "HttpName": ns_name,
+                "HttpName": name,
             }
         }
 
     _namespaces[ns_id] = namespace
-    tags = data.get("Tags", [])
     if tags:
         _resource_tags[namespace["Arn"]] = tags
-
-    op_id = _create_operation("CREATE_NAMESPACE", {"NAMESPACE": ns_id})
-    return json_response({"OperationId": op_id})
+    return namespace, None
 
 
 def _delete_namespace(data):
@@ -256,9 +373,21 @@ def _delete_namespace(data):
         return error_response_json("InvalidInput", "Id is required", 400)
     if ns_id not in _namespaces:
         return error_response_json("NamespaceNotFound", "Namespace not found", 404)
+    if any(s.get("NamespaceId") == ns_id for s in _services.values()):
+        return error_response_json(
+            "ResourceInUse", "Namespace has associated services; delete the services before deleting the namespace", 400)
 
     namespace = _namespaces.pop(ns_id)
     _resource_tags.pop(namespace.get("Arn", ""), None)
+
+    # AWS removes the hosted zone with the namespace. A zone that is already
+    # gone is fine; one holding records outside Cloud Map stays, and the
+    # namespace delete still succeeds.
+    zone_id = ((namespace.get("Properties") or {}).get("DnsProperties") or {}).get("HostedZoneId")
+    if zone_id:
+        status, _, body = route53._delete_hosted_zone(zone_id)
+        if status >= 300 and status != 404:
+            logger.warning("Hosted zone %s of namespace %s not deleted: %s", zone_id, ns_id, body)
 
     op_id = _create_operation("DELETE_NAMESPACE", {"NAMESPACE": ns_id})
     return json_response({"OperationId": op_id})
@@ -293,6 +422,7 @@ def _create_service(data):
         "Arn": _service_arn(svc_id),
         "Name": name,
         "NamespaceId": ns_id,
+        "Type": data.get("Type") or ("DNS_HTTP" if data.get("DnsConfig") else "HTTP"),
         "Description": data.get("Description"),
         "DnsConfig": data.get("DnsConfig"),
         "HealthCheckConfig": data.get("HealthCheckConfig"),
@@ -350,7 +480,8 @@ def _get_service(data):
 
 
 def _list_services(data):
-    return json_response({"Services": list(_services.values())})
+    return json_response({"Services": [to_output_shape("servicediscovery", "ServiceSummary", v)
+                                       for v in _services.values()]})
 
 
 def _register_instance(data):
@@ -433,22 +564,35 @@ def _discover_instances(data):
     if not service:
         return error_response_json("ServiceNotFound", "Service not found", 404)
 
-    out = []
-    requested_health_status = data.get("HealthStatus", "")
-    for inst in _instances.get(service["Id"], {}).values():
-        health = _instance_health_status.get(service["Id"], {}).get(inst["Id"], "HEALTHY")
-        if requested_health_status and requested_health_status != "ALL" and health != requested_health_status:
-            continue
-        out.append(
-            {
-                "InstanceId": inst["Id"],
-                "NamespaceName": ns_name,
-                "ServiceName": svc_name,
-                "Attributes": inst.get("Attributes", {}),
-                "HealthStatus": health,
-            }
-        )
-    return json_response({"Instances": out})
+    out = [
+        {
+            "InstanceId": inst["Id"],
+            "NamespaceName": ns_name,
+            "ServiceName": svc_name,
+            "Attributes": inst.get("Attributes", {}),
+            "HealthStatus": _instance_health_status.get(service["Id"], {}).get(inst["Id"], "HEALTHY"),
+        }
+        for inst in _instances.get(service["Id"], {}).values()
+    ]
+    # HealthStatus is ignored for services without a health check (service-2.json).
+    requested = data.get("HealthStatus") or "ALL"
+    if service.get("HealthCheckConfig") or service.get("HealthCheckCustomConfig"):
+        if requested in ("HEALTHY", "UNHEALTHY"):
+            out = [i for i in out if i["HealthStatus"] == requested]
+        elif requested == "HEALTHY_OR_ELSE_ALL":
+            out = [i for i in out if i["HealthStatus"] == "HEALTHY"] or out
+
+    def matches(inst, params):
+        return all(inst["Attributes"].get(k) == v for k, v in params.items())
+
+    query = data.get("QueryParameters") or {}
+    out = [i for i in out if matches(i, query)]
+    optional = data.get("OptionalParameters") or {}
+    if optional:
+        out = [i for i in out if matches(i, optional)] or out
+    max_results = int(data.get("MaxResults") or 100)
+    return json_response({"Instances": out[:max_results],
+                          "InstancesRevision": int(_instances_revision.get(service["Id"], 1))})
 
 
 def _discover_instances_revision(data):
@@ -529,7 +673,7 @@ def _list_operations(data):
     start = int(next_token) if str(next_token).isdigit() else 0
     page = ops[start:start + max_results]
 
-    result = {"Operations": page}
+    result = {"Operations": [to_output_shape("servicediscovery", "OperationSummary", o) for o in page]}
     if start + max_results < len(ops):
         result["NextToken"] = str(start + max_results)
     return json_response(result)
@@ -576,6 +720,10 @@ def _update_namespace(data):
     namespace_update = data.get("Namespace", {})
     if "Description" in namespace_update:
         ns["Description"] = namespace_update.get("Description")
+    soa = ((namespace_update.get("Properties") or {}).get("DnsProperties") or {}).get("SOA")
+    dns_properties = (ns.get("Properties") or {}).get("DnsProperties")
+    if soa and "TTL" in soa and dns_properties is not None:
+        dns_properties["SOA"] = {"TTL": int(soa["TTL"])}
 
     op_id = _create_operation("UPDATE_NAMESPACE", {"NAMESPACE": ns_id})
     return json_response({"OperationId": op_id})
@@ -621,9 +769,9 @@ def _update_service(data):
 
 
 def _tag_resource(data):
-    arn = data.get("ResourceARN")
-    if not arn:
-        return error_response_json("InvalidInput", "ResourceARN is required", 400)
+    arn, err = _resolve_taggable_resource_arn(data.get("ResourceARN"))
+    if err:
+        return err
 
     incoming = data.get("Tags", [])
     existing = {t.get("Key"): t for t in _resource_tags.get(arn, []) if t.get("Key")}
@@ -636,9 +784,9 @@ def _tag_resource(data):
 
 
 def _untag_resource(data):
-    arn = data.get("ResourceARN")
-    if not arn:
-        return error_response_json("InvalidInput", "ResourceARN is required", 400)
+    arn, err = _resolve_taggable_resource_arn(data.get("ResourceARN"))
+    if err:
+        return err
 
     keys = set(data.get("TagKeys", []))
     if arn in _resource_tags:
@@ -647,7 +795,7 @@ def _untag_resource(data):
 
 
 def _list_tags_for_resource(data):
-    arn = data.get("ResourceARN")
-    if not arn:
-        return error_response_json("InvalidInput", "ResourceARN is required", 400)
+    arn, err = _resolve_taggable_resource_arn(data.get("ResourceARN"))
+    if err:
+        return err
     return json_response({"Tags": _resource_tags.get(arn, [])})

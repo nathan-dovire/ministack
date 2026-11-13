@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 EFS (Elastic File System) Service Emulator.
 REST/JSON protocol — /2015-02-01/* paths.
@@ -12,10 +14,18 @@ Supports:
                   CreateTags (legacy), DeleteTags (legacy), DescribeTags (legacy)
   Lifecycle:      PutLifecycleConfiguration, DescribeLifecycleConfiguration
   Backup Policy:  PutBackupPolicy, DescribeBackupPolicy
+  FS Policy:      PutFileSystemPolicy, DescribeFileSystemPolicy, DeleteFileSystemPolicy
+  Protection:     UpdateFileSystemProtection
+  Replication:    CreateReplicationConfiguration, DescribeReplicationConfigurations,
+                  DeleteReplicationConfiguration
   Account:        DescribeAccountPreferences, PutAccountPreferences
 """
 
+import base64
+import binascii
 import copy
+import fnmatch
+import ipaddress
 import json
 import logging
 import os
@@ -24,8 +34,14 @@ import re
 import string
 import time
 
-from ministack.core.persistence import PERSIST_STATE, load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region
+from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    AccountScopedDict,
+    get_account_id,
+    get_region,
+    request_scope,
+)
 
 logger = logging.getLogger("efs")
 
@@ -35,9 +51,14 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 # State
 # ---------------------------------------------------------------------------
 
-_file_systems = AccountScopedDict()    # fs_id -> fs record
-_mount_targets = AccountScopedDict()   # mt_id -> mount target record
-_access_points = AccountScopedDict()   # ap_id -> access point record
+_file_systems = AccountRegionScopedDict()    # fs_id -> fs record
+_mount_targets = AccountRegionScopedDict()   # mt_id -> mount target record
+_access_points = AccountRegionScopedDict()   # ap_id -> access point record
+_replication_configs = AccountRegionScopedDict()  # source fs_id -> replication configuration
+
+_PROTECTION_DEFAULT = "ENABLED"
+_IP_ADDRESS_TYPES = ("IPV4_ONLY", "IPV6_ONLY", "DUAL_STACK")
+_POLICY_MAX_LENGTH = 20000
 
 # ---------------------------------------------------------------------------
 # ID generators
@@ -68,10 +89,14 @@ def _create_file_system(body):
     provisioned_throughput = body.get("ProvisionedThroughputInMibps")
     creation_token = body.get("CreationToken", _fs_id())
 
-    # Idempotency — same CreationToken returns existing FS
     for fs in _file_systems.values():
         if fs.get("CreationToken") == creation_token:
-            return _json(200, _fs_response(fs))
+            payload = json.dumps({
+                "ErrorCode": "FileSystemAlreadyExists",
+                "Message": f"File system '{fs['FileSystemId']}' already exists with creation token '{creation_token}'",
+                "FileSystemId": fs["FileSystemId"],
+            }).encode("utf-8")
+            return 409, {"Content-Type": "application/json", "x-amzn-errortype": "FileSystemAlreadyExists"}, payload
 
     fs_id = _fs_id()
     arn = f"arn:aws:elasticfilesystem:{get_region()}:{get_account_id()}:file-system/{fs_id}"
@@ -88,22 +113,51 @@ def _create_file_system(body):
         "PerformanceMode": perf_mode,
         "ThroughputMode": throughput_mode,
         "Encrypted": encrypted,
-        "KmsKeyId": kms_key_id,
         "Tags": tags,
         "OwnerId": get_account_id(),
-        "Name": next((t["Value"] for t in tags if t["Key"] == "Name"), ""),
+        "FileSystemProtection": {"ReplicationOverwriteProtection": _PROTECTION_DEFAULT},
     }
+    # KmsKeyId and Name are optional in FileSystemDescription: omitted when unset.
+    if kms_key_id:
+        record["KmsKeyId"] = kms_key_id
+    name = next((t["Value"] for t in tags if t["Key"] == "Name"), "")
+    if name:
+        record["Name"] = name
     if provisioned_throughput:
         record["ProvisionedThroughputInMibps"] = provisioned_throughput
+    if body.get("AvailabilityZoneName"):
+        from ministack.services import ec2
+
+        record["AvailabilityZoneName"] = body["AvailabilityZoneName"]
+        record["AvailabilityZoneId"] = ec2._az_id_for_zone_name(body["AvailabilityZoneName"])
 
     _file_systems[fs_id] = record
+    if body.get("Backup", bool(body.get("AvailabilityZoneName"))):
+        _backup_policies[fs_id] = {"Status": "ENABLED"}
     return _json(201, _fs_response(record))
+
+
+def _page(items, query, key, in_token, out_token, limit_key):
+    marker = query.get(in_token)
+    try:
+        start = int(base64.urlsafe_b64decode(marker).decode()) if marker else 0
+        limit = int(query.get(limit_key) or 100)
+    except (ValueError, binascii.Error, UnicodeDecodeError):
+        return _error(400, "BadRequest", f"Invalid {in_token}.")
+    if start < 0 or limit < 1:
+        return _error(400, "BadRequest", f"Invalid {in_token}.")
+    end = start + limit
+    out = {key: items[start:end]}
+    if marker and in_token == "Marker":
+        out["Marker"] = marker
+    if end < len(items):
+        out[out_token] = base64.urlsafe_b64encode(str(end).encode()).decode()
+    return _json(200, out)
 
 
 def _describe_file_systems(query):
     fs_id = query.get("FileSystemId")
     creation_token = query.get("CreationToken")
-    max_items = int(query.get("MaxItems", 100))
 
     if fs_id and fs_id not in _file_systems:
         return _error(404, "FileSystemNotFound", f"File system '{fs_id}' does not exist.")
@@ -116,7 +170,7 @@ def _describe_file_systems(query):
             continue
         results.append(_fs_response(fs))
 
-    return _json(200, {"FileSystems": results[:max_items]})
+    return _page(results, query, "FileSystems", "Marker", "NextMarker", "MaxItems")
 
 
 def _delete_file_system(fs_id):
@@ -124,9 +178,16 @@ def _delete_file_system(fs_id):
     if not fs:
         return _error(404, "FileSystemNotFound", f"File system '{fs_id}' does not exist.")
     if fs["NumberOfMountTargets"] > 0:
-        return _error(400, "FileSystemInUse",
+        return _error(409, "FileSystemInUse",
                       f"File system '{fs_id}' has mount targets and cannot be deleted.")
+    if _replication_of(fs_id):
+        # Documented without an error code.
+        return _error(409, "FileSystemInUse",
+                      f"File system '{fs_id}' is part of a replication configuration; "
+                      "delete the replication configuration first.")
     del _file_systems[fs_id]
+    _lifecycle_configs.pop(fs_id, None)
+    _backup_policies.pop(fs_id, None)
     return _json(204, {})
 
 
@@ -142,42 +203,302 @@ def _update_file_system(fs_id, body):
 
 
 def _fs_response(fs):
-    r = {k: v for k, v in fs.items()}
-    return r
+    response = {k: v for k, v in fs.items() if k != "FileSystemPolicy"}
+    response.setdefault("FileSystemProtection", {"ReplicationOverwriteProtection": _PROTECTION_DEFAULT})
+    return response
+
+
+def _fs_id_from(value):
+    """A file system id from an id or a ``...:file-system/fs-...`` ARN."""
+    return str(value or "").rsplit("/", 1)[-1]
+
+
+def _update_file_system_protection(fs_id, body):
+    fs = _file_systems.get(fs_id)
+    if not fs:
+        return _error(404, "FileSystemNotFound", f"File system '{fs_id}' does not exist.")
+    value = body.get("ReplicationOverwriteProtection")
+    if value is None:
+        return _json(200, {"ReplicationOverwriteProtection": _fs_response(fs)["FileSystemProtection"][
+            "ReplicationOverwriteProtection"]})
+    if _replication_of(fs_id):
+        return _error(409, "ReplicationAlreadyExists",
+                      f"File system '{fs_id}' is already included in a replication configuration.")
+    # REPLICATING is set by replication only.
+    if value not in ("ENABLED", "DISABLED"):
+        return _error(400, "BadRequest",
+                      "ReplicationOverwriteProtection must be ENABLED or DISABLED.")
+    fs["FileSystemProtection"] = {"ReplicationOverwriteProtection": value}
+    return _json(200, {"ReplicationOverwriteProtection": value})
+
+
+# ---------------------------------------------------------------------------
+# Replication
+# ---------------------------------------------------------------------------
+
+def _replication_of(fs_id):
+    """The account's replication configuration involving the file system, in any region."""
+    account = get_account_id()
+    for (acct, _region, _source), config in _replication_configs.all_items():
+        if acct != account:
+            continue
+        if config["SourceFileSystemId"] == fs_id or any(
+                d["FileSystemId"] == fs_id for d in config["Destinations"]):
+            return config
+    return None
+
+
+def _create_replication_configuration(source_id, body):
+    source_id = _fs_id_from(source_id)
+    source = _file_systems.get(source_id)
+    if not source:
+        return _error(404, "FileSystemNotFound", f"File system '{source_id}' does not exist.")
+    destinations = body.get("Destinations")
+    if not isinstance(destinations, list) or len(destinations) != 1:
+        return _error(400, "BadRequest", "Exactly one destination is supported.")
+    # Documented without an error code.
+    if _replication_of(source_id):
+        return _error(400, "BadRequest",
+                      f"File system '{source_id}' is already part of a replication configuration.")
+    destination = destinations[0]
+    account = get_account_id()
+    source_region = get_region()
+    destination_region = destination.get("Region") or source_region
+    destination_id = _fs_id_from(destination["FileSystemId"]) if destination.get("FileSystemId") else None
+    with request_scope(account, destination_region):
+        if destination_id:
+            target = _file_systems.get(destination_id)
+            if not target:
+                return _error(404, "FileSystemNotFound",
+                              f"File system '{destination_id}' does not exist.")
+            if destination_id == source_id or _replication_of(destination_id):
+                return _error(400, "BadRequest",
+                              f"File system '{destination_id}' is already part of a replication configuration.")
+            if _fs_response(target)["FileSystemProtection"]["ReplicationOverwriteProtection"] != "DISABLED":
+                return _error(400, "BadRequest",
+                              "The destination file system's replication overwrite protection must be DISABLED.")
+            if source.get("Encrypted") and not target.get("Encrypted"):
+                return _error(409, "ConflictException",
+                              "The source file system is encrypted but the destination file system is not.")
+        else:
+            create = {
+                "PerformanceMode": source["PerformanceMode"],
+                "Encrypted": bool(source.get("Encrypted")),
+            }
+            if destination.get("KmsKeyId"):
+                create["KmsKeyId"] = destination["KmsKeyId"]
+                create["Encrypted"] = True
+            if destination.get("AvailabilityZoneName"):
+                create["AvailabilityZoneName"] = destination["AvailabilityZoneName"]
+            created = json.loads(_create_file_system(create)[2])
+            destination_id = created["FileSystemId"]
+            target = _file_systems[destination_id]
+        target["FileSystemProtection"] = {"ReplicationOverwriteProtection": "REPLICATING"}
+    now = _now_iso()
+    entry = {
+        "Status": "ENABLED",
+        "FileSystemId": destination_id,
+        "Region": destination_region,
+        "LastReplicatedTimestamp": now,
+        "OwnerId": account,
+    }
+    if destination.get("RoleArn"):
+        entry["RoleArn"] = destination["RoleArn"]
+    config = {
+        "SourceFileSystemId": source_id,
+        "SourceFileSystemRegion": source_region,
+        "SourceFileSystemArn": source["FileSystemArn"],
+        "OriginalSourceFileSystemArn": source["FileSystemArn"],
+        "CreationTime": now,
+        "Destinations": [entry],
+        "SourceFileSystemOwnerId": account,
+    }
+    _replication_configs[source_id] = config
+    return _json(200, config)
+
+
+def _describe_replication_configurations(query):
+    fs_id = _fs_id_from(query.get("FileSystemId")) or None
+    if fs_id and fs_id not in _file_systems:
+        return _error(404, "FileSystemNotFound", f"File system '{fs_id}' does not exist.")
+    account = get_account_id()
+    region = get_region()
+    results = []
+    for (acct, _region, _source), config in _replication_configs.all_items():
+        if acct != account:
+            continue
+        if fs_id:
+            if config["SourceFileSystemId"] != fs_id and not any(
+                    d["FileSystemId"] == fs_id for d in config["Destinations"]):
+                continue
+        elif config["SourceFileSystemRegion"] != region and not any(
+                d["Region"] == region for d in config["Destinations"]):
+            continue
+        results.append(config)
+    if fs_id and not results:
+        return _error(404, "ReplicationNotFound",
+                      f"File system '{fs_id}' does not have a replication configuration.")
+    results.sort(key=lambda c: c["SourceFileSystemId"])
+    try:
+        offset = int(query.get("NextToken") or 0)
+        limit = int(query.get("MaxResults") or 100)
+    except ValueError:
+        return _error(400, "BadRequest", "NextToken or MaxResults is not valid.")
+    page = results[offset:offset + limit]
+    response = {"Replications": page}
+    if offset + limit < len(results):
+        response["NextToken"] = str(offset + limit)
+    return _json(200, response)
+
+
+def _delete_replication_configuration(source_id, query):
+    source_id = _fs_id_from(source_id)
+    if source_id not in _file_systems:
+        return _error(404, "FileSystemNotFound", f"File system '{source_id}' does not exist.")
+    config = _replication_configs.get(source_id)
+    if not config:
+        return _error(404, "ReplicationNotFound",
+                      f"File system '{source_id}' does not have a replication configuration.")
+    mode = query.get("deletionMode") or query.get("DeletionMode") or "ALL_CONFIGURATIONS"
+    if mode not in ("ALL_CONFIGURATIONS", "LOCAL_CONFIGURATION_ONLY"):
+        return _error(400, "BadRequest", "DeletionMode must be ALL_CONFIGURATIONS or LOCAL_CONFIGURATION_ONLY.")
+    if mode == "LOCAL_CONFIGURATION_ONLY" and all(
+            d["Region"] == get_region() for d in config["Destinations"]):
+        return _error(400, "BadRequest",
+                      "LOCAL_CONFIGURATION_ONLY is not valid for same-account, same-region replication.")
+    # The destination's overwrite protection is re-enabled.
+    for destination in config["Destinations"]:
+        with request_scope(get_account_id(), destination["Region"]):
+            target = _file_systems.get(destination["FileSystemId"])
+            if target:
+                target["FileSystemProtection"] = {"ReplicationOverwriteProtection": _PROTECTION_DEFAULT}
+    del _replication_configs[source_id]
+    return _json(204, {})
 
 
 # ---------------------------------------------------------------------------
 # Mount Targets
 # ---------------------------------------------------------------------------
 
+def _pick_address(cidr, used, requested, kind):
+    """The requested free address, else the first free host past the 4 reserved; (address, error)."""
+    network = ipaddress.ip_network(cidr, strict=False)
+    if requested:
+        try:
+            address = ipaddress.ip_address(requested)
+        except ValueError:
+            return None, _error(400, "BadRequest", f"'{requested}' is not a valid {kind} address.")
+        if address.version != network.version or address not in network:
+            return None, _error(400, "BadRequest",
+                                f"{kind} address '{requested}' is not in the subnet range {cidr}.")
+        if str(address) in used:
+            return None, _error(409, "IpAddressInUse", f"{kind} address '{requested}' is already in use.")
+        return str(address), None
+    for host in network.hosts():
+        if int(host) - int(network.network_address) < 4:
+            continue
+        if str(host) not in used:
+            return str(host), None
+    return None, _error(409, "NoFreeAddressesInSubnet", f"The subnet has no free {kind} addresses.")
+
+
+def _security_groups_in_vpc(security_groups, vpc_id):
+    """The given groups, which must be in the VPC, else its default group; (ids, error)."""
+    from ministack.services import ec2
+
+    if not security_groups:
+        default = next(
+            (g["GroupId"] for g in ec2._security_groups.values()
+             if g.get("VpcId") == vpc_id and g.get("GroupName") == "default"), None)
+        return ([default] if default else []), None
+    for group_id in security_groups:
+        group = ec2._security_groups.get(group_id)
+        if not group or group.get("VpcId") != vpc_id:
+            return None, _error(400, "SecurityGroupNotFound",
+                                f"Security group '{group_id}' does not exist in VPC '{vpc_id}'.")
+    return list(security_groups), None
+
+
 def _create_mount_target(body):
-    fs_id = body.get("FileSystemId")
+    from ministack.services import ec2
+
+    fs_id = _fs_id_from(body.get("FileSystemId"))
     subnet_id = body.get("SubnetId", "")
-    ip_address = body.get("IpAddress", f"10.0.{random.randint(0,255)}.{random.randint(1,254)}")
-    security_groups = body.get("SecurityGroups", [])
+    address_type = body.get("IpAddressType") or "IPV4_ONLY"
 
     fs = _file_systems.get(fs_id)
     if not fs:
         return _error(404, "FileSystemNotFound", f"File system '{fs_id}' does not exist.")
+    if fs.get("LifeCycleState") != "available":
+        return _error(409, "IncorrectFileSystemLifeCycleState",
+                      f"File system '{fs_id}' is not in the available state.")
+    if address_type not in _IP_ADDRESS_TYPES:
+        return _error(400, "BadRequest", f"IpAddressType must be one of {', '.join(_IP_ADDRESS_TYPES)}.")
+    wants_v4 = address_type in ("IPV4_ONLY", "DUAL_STACK")
+    wants_v6 = address_type in ("IPV6_ONLY", "DUAL_STACK")
+    if body.get("IpAddress") and not wants_v4:
+        return _error(400, "BadRequest", "IpAddress requires an IpAddressType of IPV4_ONLY or DUAL_STACK.")
+    if body.get("Ipv6Address") and not wants_v6:
+        return _error(400, "BadRequest", "Ipv6Address requires an IpAddressType of IPV6_ONLY or DUAL_STACK.")
+
+    ec2._ensure_defaults_initialized()
+    subnet = ec2._subnets.get(subnet_id)
+    if not subnet:
+        return _error(400, "SubnetNotFound", f"The subnet '{subnet_id}' does not exist.")
+    ipv6_cidr = subnet.get("Ipv6CidrBlock")
+    if wants_v6 and not ipv6_cidr:
+        return _error(400, "BadRequest",
+                      f"Subnet '{subnet_id}' has no IPv6 CIDR block; the subnet type must match the IpAddressType.")
+    zone = subnet["AvailabilityZone"]
+    if fs.get("AvailabilityZoneName") and fs["AvailabilityZoneName"] != zone:
+        return _error(400, "AvailabilityZonesMismatch",
+                      f"The subnet is in {zone}, but the One Zone file system is in {fs['AvailabilityZoneName']}.")
+    for other in _mount_targets.values():
+        if other["FileSystemId"] != fs_id:
+            continue
+        if other["VpcId"] != subnet["VpcId"]:
+            return _error(409, "MountTargetConflict",
+                          "A file system can have mount targets in only one VPC.")
+        if other["AvailabilityZoneName"] == zone:
+            return _error(409, "MountTargetConflict",
+                          f"The file system already has a mount target in {zone}.")
+    groups, err = _security_groups_in_vpc(body.get("SecurityGroups") or [], subnet["VpcId"])
+    if err:
+        return err
+
+    in_subnet = [mt for mt in _mount_targets.values() if mt["SubnetId"] == subnet_id]
+    ipv4 = ipv6 = None
+    if wants_v4:
+        ipv4, err = _pick_address(subnet["CidrBlock"], {mt.get("IpAddress") for mt in in_subnet},
+                                  body.get("IpAddress"), "IPv4")
+        if err:
+            return err
+    if wants_v6:
+        ipv6, err = _pick_address(ipv6_cidr, {mt.get("Ipv6Address") for mt in in_subnet},
+                                  body.get("Ipv6Address"), "IPv6")
+        if err:
+            return err
 
     mt_id = _mt_id()
     arn = f"arn:aws:elasticfilesystem:{get_region()}:{get_account_id()}:file-system/{fs_id}/mount-target/{mt_id}"
-    now = _now_iso()
-
     record = {
         "MountTargetId": mt_id,
         "FileSystemId": fs_id,
         "SubnetId": subnet_id,
-        "AvailabilityZoneId": f"use1-az{random.randint(1,3)}",
-        "AvailabilityZoneName": f"{get_region()}a",
-        "VpcId": "vpc-00000001",
+        "AvailabilityZoneId": subnet["AvailabilityZoneId"],
+        "AvailabilityZoneName": zone,
+        "VpcId": subnet["VpcId"],
         "LifeCycleState": "available",
-        "IpAddress": ip_address,
-        "NetworkInterfaceId": f"eni-{random.choices(string.hexdigits[:16], k=17)}",
+        "NetworkInterfaceId": "eni-" + "".join(random.choices(string.hexdigits[:16], k=17)),
         "OwnerId": get_account_id(),
         "MountTargetArn": arn,
-        "SecurityGroups": security_groups,
+        "SecurityGroups": groups,
+        "IpAddressType": address_type,
     }
+    if ipv4:
+        record["IpAddress"] = ipv4
+    if ipv6:
+        record["Ipv6Address"] = ipv6
     _mount_targets[mt_id] = record
     fs["NumberOfMountTargets"] = fs.get("NumberOfMountTargets", 0) + 1
 
@@ -187,7 +508,6 @@ def _create_mount_target(body):
 def _describe_mount_targets(query):
     fs_id = query.get("FileSystemId")
     mt_id = query.get("MountTargetId")
-    max_items = int(query.get("MaxItems", 100))
 
     if mt_id and mt_id not in _mount_targets:
         return _error(404, "MountTargetNotFound", f"Mount target '{mt_id}' does not exist.")
@@ -200,7 +520,7 @@ def _describe_mount_targets(query):
             continue
         results.append(_mt_response(mt))
 
-    return _json(200, {"MountTargets": results[:max_items]})
+    return _page(results, query, "MountTargets", "Marker", "NextMarker", "MaxItems")
 
 
 def _delete_mount_target(mt_id):
@@ -225,12 +545,15 @@ def _modify_mount_target_security_groups(mt_id, body):
     mt = _mount_targets.get(mt_id)
     if not mt:
         return _error(404, "MountTargetNotFound", f"Mount target '{mt_id}' does not exist.")
-    mt["SecurityGroups"] = body.get("SecurityGroups", [])
+    groups, err = _security_groups_in_vpc(body.get("SecurityGroups") or [], mt["VpcId"])
+    if err:
+        return err
+    mt["SecurityGroups"] = groups
     return _json(204, {})
 
 
 def _mt_response(mt):
-    return {k: v for k, v in mt.items() if k != "SecurityGroups"}
+    return {k: v for k, v in mt.items() if k not in ("SecurityGroups", "IpAddressType", "MountTargetArn")}
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +568,6 @@ def _create_access_point(body):
 
     ap_id = _ap_id()
     arn = f"arn:aws:elasticfilesystem:{get_region()}:{get_account_id()}:access-point/{ap_id}"
-    now = _now_iso()
     tags = body.get("Tags", [])
 
     record = {
@@ -267,7 +589,6 @@ def _create_access_point(body):
 def _describe_access_points(query):
     fs_id = query.get("FileSystemId")
     ap_id = query.get("AccessPointId")
-    max_results = int(query.get("MaxResults", 100))
 
     results = []
     for ap in _access_points.values():
@@ -277,7 +598,7 @@ def _describe_access_points(query):
             continue
         results.append(ap)
 
-    return _json(200, {"AccessPoints": results[:max_results]})
+    return _page(results, query, "AccessPoints", "NextToken", "NextToken", "MaxResults")
 
 
 def _delete_access_point(ap_id):
@@ -291,10 +612,59 @@ def _delete_access_point(ap_id):
 # Tags
 # ---------------------------------------------------------------------------
 
-def _tag_resource(resource_id, body):
-    resource = _find_resource(resource_id)
+def _tag_resource_not_found(resource_id):
+    # Per AWS EFS docs the resource-not-found error is keyed by the resource
+    # type — FileSystemNotFound for fs-* / file-system ARNs,
+    # AccessPointNotFound for fsap-* / access-point ARNs. Falling back to
+    # BadRequest for anything else matches the EFS regex on ResourceId.
+    if resource_id.startswith("fs-") or "file-system/fs-" in resource_id:
+        return _error(404, "FileSystemNotFound", f"File system '{resource_id}' does not exist.")
+    if resource_id.startswith("fsap-") or "access-point/fsap-" in resource_id:
+        return _error(404, "AccessPointNotFound", f"Access point '{resource_id}' does not exist.")
+    return _error(400, "BadRequest", f"Resource id '{resource_id}' is not a valid EFS resource.")
+
+
+def _resource_id_from_arn(resource_id):
+    try:
+        spec = parse_arn(resource_id)
+    except ArnParseError:
+        return None, _error(400, "BadRequest", f"Resource id '{resource_id}' is not a valid EFS resource.")
+
+    if spec.partition != "aws" or spec.service != "elasticfilesystem":
+        return None, _error(400, "BadRequest", f"Resource id '{resource_id}' is not a valid EFS resource.")
+
+    parts = spec.resource.split("/")
+    if len(parts) != 2 or parts[0] not in {"file-system", "access-point"} or not parts[1]:
+        return None, _error(400, "BadRequest", f"Resource id '{resource_id}' is not a valid EFS resource.")
+    resource_type, lookup_id = parts
+    if resource_type == "file-system" and not lookup_id.startswith("fs-"):
+        return None, _error(400, "BadRequest", f"Resource id '{resource_id}' is not a valid EFS resource.")
+    if resource_type == "access-point" and not lookup_id.startswith("fsap-"):
+        return None, _error(400, "BadRequest", f"Resource id '{resource_id}' is not a valid EFS resource.")
+
+    if spec.region != get_region() or spec.account_id != get_account_id():
+        return None, _tag_resource_not_found(resource_id)
+    return (resource_type, lookup_id), None
+
+
+def _resolve_tag_resource(resource_id):
+    lookup_id = resource_id
+    resource_type = None
+    if resource_id.startswith("arn:"):
+        resolved, err = _resource_id_from_arn(resource_id)
+        if err:
+            return None, err
+        resource_type, lookup_id = resolved
+    resource = _find_resource(lookup_id, resource_type)
     if resource is None:
-        return _error(404, "ResourceNotFound", f"Resource '{resource_id}' does not exist.")
+        return None, _tag_resource_not_found(resource_id)
+    return resource, None
+
+
+def _tag_resource(resource_id, body):
+    resource, err = _resolve_tag_resource(resource_id)
+    if err:
+        return err
     tags = body.get("Tags", [])
     existing = {t["Key"]: i for i, t in enumerate(resource.get("Tags", []))}
     tag_list = resource.setdefault("Tags", [])
@@ -308,31 +678,25 @@ def _tag_resource(resource_id, body):
 
 
 def _untag_resource(resource_id, keys):
-    resource = _find_resource(resource_id)
-    if resource is None:
-        return _error(404, "ResourceNotFound", f"Resource '{resource_id}' does not exist.")
+    resource, err = _resolve_tag_resource(resource_id)
+    if err:
+        return err
     resource["Tags"] = [t for t in resource.get("Tags", []) if t["Key"] not in keys]
     return _json(200, {})
 
 
-def _list_tags_for_resource(resource_id):
-    resource = _find_resource(resource_id)
-    if resource is None:
-        return _error(404, "ResourceNotFound", f"Resource '{resource_id}' does not exist.")
-    return _json(200, {"Tags": resource.get("Tags", [])})
+def _list_tags_for_resource(resource_id, query=None):
+    resource, err = _resolve_tag_resource(resource_id)
+    if err:
+        return err
+    return _page(list(resource.get("Tags", [])), query or {}, "Tags", "NextToken", "NextToken", "MaxResults")
 
 
-def _find_resource(resource_id):
-    if resource_id in _file_systems:
+def _find_resource(resource_id, resource_type=None):
+    if resource_type in (None, "file-system") and resource_id in _file_systems:
         return _file_systems[resource_id]
-    if resource_id in _access_points:
+    if resource_type in (None, "access-point") and resource_id in _access_points:
         return _access_points[resource_id]
-    for fs in _file_systems.values():
-        if fs["FileSystemArn"] == resource_id:
-            return fs
-    for ap in _access_points.values():
-        if ap["AccessPointArn"] == resource_id:
-            return ap
     return None
 
 
@@ -340,8 +704,17 @@ def _find_resource(resource_id):
 # Lifecycle / Backup / Account (stubs)
 # ---------------------------------------------------------------------------
 
-_lifecycle_configs = AccountScopedDict()
-_backup_policies = AccountScopedDict()
+_lifecycle_configs = AccountRegionScopedDict()
+_backup_policies = AccountRegionScopedDict()
+
+
+def _clear_state():
+    _file_systems.clear()
+    _mount_targets.clear()
+    _access_points.clear()
+    _replication_configs.clear()
+    _lifecycle_configs.clear()
+    _backup_policies.clear()
 
 
 def get_state():
@@ -349,33 +722,59 @@ def get_state():
         "file_systems": _file_systems,
         "mount_targets": _mount_targets,
         "access_points": _access_points,
+        "replication_configs": _replication_configs,
         "lifecycle_configs": _lifecycle_configs,
         "backup_policies": _backup_policies,
     })
 
 
-def restore_state(data):
-    _file_systems.clear()
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
+    if not data:
+        return
+    _clear_state()
     _file_systems.update(data.get("file_systems", {}))
-    _mount_targets.clear()
     _mount_targets.update(data.get("mount_targets", {}))
-    _access_points.clear()
     _access_points.update(data.get("access_points", {}))
-    _lifecycle_configs.clear()
-    _lifecycle_configs.update(data.get("lifecycle_configs", {}))
-    _backup_policies.clear()
-    _backup_policies.update(data.get("backup_policies", {}))
+    _replication_configs.update(data.get("replication_configs", {}))
+    fs_regions = {
+        (account_id, fs_id): region
+        for (account_id, region, fs_id), _fs in _file_systems.all_items()
+    }
+    for store, state_key in (
+        (_lifecycle_configs, "lifecycle_configs"),
+        (_backup_policies, "backup_policies"),
+    ):
+        _restore_file_system_child_store(
+            store,
+            data.get(state_key, {}),
+            fs_regions,
+        )
 
 
-try:
-    _restored = load_state("efs")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
+def _restore_file_system_child_store(store, restored, fs_regions):
+    """Adopt legacy ARN-less state into its parent file system's region."""
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return
+
+    if isinstance(restored, AccountScopedDict):
+        items = restored._data.items()
+    else:
+        account_id = get_account_id()
+        items = (((account_id, key), value) for key, value in restored.items())
+
+    for (account_id, fs_id), value in items:
+        region = fs_regions.get(
+            (account_id, fs_id),
+            store._region_for_legacy_value(fs_id, value),
+        )
+        store.set_scoped(account_id, region, fs_id, value)
+
+
 
 
 def _put_lifecycle_configuration(fs_id, body):
@@ -406,6 +805,209 @@ def _describe_backup_policy(fs_id):
     if not fs:
         return _error(404, "FileSystemNotFound", f"File system '{fs_id}' does not exist.")
     return _json(200, {"BackupPolicy": _backup_policies.get(fs_id, {"Status": "DISABLED"})})
+
+
+def _policy_locks_out_caller(statements):
+    """Whether an unconditional Deny of PutFileSystemPolicy covers every principal."""
+    for statement in statements:
+        if statement.get("Effect") != "Deny" or statement.get("Condition"):
+            continue
+        principal = statement.get("Principal")
+        if isinstance(principal, dict):
+            values = [v for _, value in _pairs(principal) for v in (value if isinstance(value, list) else [value])]
+        else:
+            values = [principal]
+        if "*" not in values:
+            continue
+        actions = statement.get("Action") or []
+        actions = [actions] if isinstance(actions, str) else actions
+        if any(fnmatch.fnmatchcase("elasticfilesystem:putfilesystempolicy", str(a).lower()) for a in actions):
+            return True
+    return False
+
+
+class _InvalidPolicyStructure(Exception):
+    pass
+
+
+class _JsonNumber(str):
+    """A number literal, kept as text the way AWS echoes it."""
+
+
+_POLICY_KEYS = ("Version", "Id", "Statement")
+_STATEMENT_KEYS = ("Sid", "Effect", "Principal", "NotPrincipal", "Action", "NotAction",
+                   "Resource", "NotResource", "Condition")
+_JSON_SHORT_ESCAPES = {'"': '\\"', "\\": "\\\\", "\b": "\\b", "\f": "\\f", "\n": "\\n", "\r": "\\r",
+                       "\t": "\\t"}
+
+
+class _PolicyObject(dict):
+    """A JSON object that remembers every key/value pair; AWS keeps repeated keys inside Principal."""
+
+    def __init__(self, pairs):
+        super().__init__(pairs)
+        self.pairs = list(pairs)
+
+
+def _policy_object(pairs):
+    return _PolicyObject(pairs)
+
+
+def _pairs(value):
+    return value.pairs if isinstance(value, _PolicyObject) else list(value.items())
+
+
+def _repeats_key(value):
+    return isinstance(value, dict) and len(_pairs(value)) != len(value)
+
+
+def _policy_constant(text):
+    raise _InvalidPolicyStructure
+
+
+def _policy_number(text):
+    """AWS refuses a number with more than 1000 digits, counting exponent digits but not the sign."""
+    if sum(char.isdigit() for char in text) > 1000:
+        raise _InvalidPolicyStructure
+    return _JsonNumber("0" if text == "-0" else text)
+
+
+def _parse_policy(raw):
+    return json.loads(raw, object_pairs_hook=_policy_object, parse_int=_policy_number,
+                      parse_float=_policy_number, parse_constant=_policy_constant)
+
+
+def _is_text(value):
+    return isinstance(value, str) and not isinstance(value, _JsonNumber)
+
+
+def _canonical_value(value):
+    if value is None:
+        raise _InvalidPolicyStructure
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, list):
+        if any(isinstance(item, bool) for item in value):
+            raise _InvalidPolicyStructure
+        items = [_canonical_value(item) for item in value]
+        return items[0] if len(items) == 1 else items
+    if isinstance(value, dict):
+        return {key: _canonical_value(item) for key, item in value.items()}
+    return str(value)
+
+
+def _canonical_policy(policy, statements, file_system_arn):
+    """The policy as AWS stores it: known keys in a fixed order, scalars as strings,
+    one-element lists as their element, and a missing Resource set to the file system."""
+    if not all(_is_text(item.get(key, "")) for item, key in
+               [(policy, "Version"), (policy, "Id")] + [(statement, "Sid") for statement in statements]):
+        raise _InvalidPolicyStructure
+    canonical = {"Version": _canonical_value(policy.get("Version", "2008-10-17"))}
+    if "Id" in policy:
+        canonical["Id"] = policy["Id"]
+    canonical["Statement"] = []
+    for source in statements:
+        if "Resource" not in source and "NotResource" not in source:
+            source = dict(source, Resource=file_system_arn)
+        condition = source.get("Condition")
+        if _repeats_key(condition) or isinstance(condition, dict) and any(map(_repeats_key, condition.values())):
+            raise _InvalidPolicyStructure
+        statement = {key: _canonical_value(source[key]) for key in _STATEMENT_KEYS if key in source}
+        for key in ("Principal", "NotPrincipal"):
+            if isinstance(source.get(key), dict):
+                statement[key] = _PolicyObject([(k, _canonical_value(v)) for k, v in _pairs(source[key])])
+        if isinstance(statement.get("Condition"), dict):
+            statement["Condition"] = {op: values for op, values in statement["Condition"].items() if values != {}}
+        canonical["Statement"].append(statement)
+    return canonical
+
+
+def _policy_string(text):
+    text = re.sub("[\ud800-\udfff]", "?", text)  # AWS writes a lone surrogate as "?"
+    return '"' + re.sub(r'["\\\x00-\x1f]',
+                        lambda m: _JSON_SHORT_ESCAPES.get(m.group(), f"\\u{ord(m.group()):04X}"), text) + '"'
+
+
+def _policy_json(value, pretty=False, depth=0):
+    """Compact for PutFileSystemPolicy, indented for DescribeFileSystemPolicy, with AWS's spacing and escapes."""
+    if isinstance(value, str):
+        return _policy_string(value)
+    if isinstance(value, list):
+        if not value:
+            return "[ ]" if pretty else "[]"
+        items = (", " if pretty else ",").join(_policy_json(item, pretty, depth) for item in value)
+        return f"[ {items} ]" if pretty else f"[{items}]"
+    if isinstance(value, dict):
+        if not value:
+            return "{ }" if pretty else "{}"
+        if not pretty:
+            return "{" + ",".join(f"{_policy_string(k)}:{_policy_json(v)}" for k, v in _pairs(value)) + "}"
+        pad = "  " * (depth + 1)
+        fields = ",\n".join(f"{pad}{_policy_string(k)} : {_policy_json(v, True, depth + 1)}"
+                             for k, v in _pairs(value))
+        return "{\n" + fields + "\n" + "  " * depth + "}"
+    return json.dumps(value)  # policies stored before the canonical form can hold JSON numbers and booleans
+
+
+def _put_file_system_policy(fs_id, body):
+    fs = _file_systems.get(fs_id)
+    if not fs:
+        return _error(404, "FileSystemNotFound", f"File system '{fs_id}' does not exist.")
+    raw = body.get("Policy")
+    if not isinstance(raw, str) or not 1 <= len(raw) <= _POLICY_MAX_LENGTH:
+        return _error(400, "BadRequest", f"Policy must be between 1 and {_POLICY_MAX_LENGTH} characters.")
+    try:
+        policy = _parse_policy(raw)
+    except _InvalidPolicyStructure:
+        return _error(400, "InvalidPolicyException", "Invalid policy JSON structure.")
+    except ValueError:
+        return _error(400, "InvalidPolicyException", "The file system policy is not valid JSON.")
+    statements = policy.get("Statement") if isinstance(policy, dict) else None
+    if isinstance(statements, dict):
+        statements = [statements]
+    if isinstance(policy, dict) and (set(policy) - set(_POLICY_KEYS) or _repeats_key(policy) or isinstance(
+            statements, list) and any(isinstance(s, dict) and (set(s) - set(_STATEMENT_KEYS) or _repeats_key(s))
+                                      for s in statements)):
+        return _error(400, "InvalidPolicyException", "Invalid policy JSON structure.")
+    # AWS checks value types before it looks for an Effect or an Action. The Effect/Action check below only
+    # passes for a dict policy whose statements are all dicts, so canonical is always set past it.
+    canonical = None
+    if isinstance(policy, dict) and isinstance(statements, list) and all(isinstance(s, dict) for s in statements):
+        try:
+            canonical = _canonical_policy(policy, statements, fs["FileSystemArn"])
+        except _InvalidPolicyStructure:
+            return _error(400, "InvalidPolicyException", "Invalid policy JSON structure.")
+    if not statements or not all(
+            isinstance(s, dict) and s.get("Effect") in ("Allow", "Deny") and ("Action" in s or "NotAction" in s)
+            for s in statements):
+        return _error(400, "InvalidPolicyException",
+                      "The file system policy needs a Statement list whose entries have an Effect and an Action.")
+    policy = canonical
+    if not body.get("BypassPolicyLockoutSafetyCheck") and _policy_locks_out_caller(policy["Statement"]):
+        return _error(400, "InvalidPolicyException",
+                      "The policy would lock out the caller from PutFileSystemPolicy; "
+                      "set BypassPolicyLockoutSafetyCheck to override.")
+    stored = _policy_json(policy)
+    fs["FileSystemPolicy"] = stored
+    return _json(200, {"FileSystemId": fs_id, "Policy": stored})
+
+
+def _describe_file_system_policy(fs_id):
+    fs = _file_systems.get(fs_id)
+    if not fs:
+        return _error(404, "FileSystemNotFound", f"File system '{fs_id}' does not exist.")
+    policy = fs.get("FileSystemPolicy")
+    if not policy:
+        return _error(404, "PolicyNotFound", f"File system '{fs_id}' has no file system policy.")
+    return _json(200, {"FileSystemId": fs_id, "Policy": _policy_json(json.loads(policy, object_pairs_hook=_PolicyObject), pretty=True)})
+
+
+def _delete_file_system_policy(fs_id):
+    fs = _file_systems.get(fs_id)
+    if not fs:
+        return _error(404, "FileSystemNotFound", f"File system '{fs_id}' does not exist.")
+    fs.pop("FileSystemPolicy", None)
+    return _json(200, {})
 
 
 def _describe_account_preferences():
@@ -486,7 +1088,7 @@ async def handle_request(method, path, headers, body_bytes, query_params):
     if m:
         resource_id = m.group(1)
         if method == "GET":
-            return await _a(_list_tags_for_resource(resource_id))
+            return await _a(_list_tags_for_resource(resource_id, query))
         if method == "POST":
             return await _a(_tag_resource(resource_id, body))
         if method == "DELETE":
@@ -510,6 +1112,32 @@ async def handle_request(method, path, headers, body_bytes, query_params):
             return await _a(_put_backup_policy(fs_id, body))
         if method == "GET":
             return await _a(_describe_backup_policy(fs_id))
+
+    # Replication and protection
+    if p == "/file-systems/replication-configurations" and method == "GET":
+        return await _a(_describe_replication_configurations(query))
+
+    m = re.fullmatch(r"/file-systems/([^/]+)/replication-configuration", p)
+    if m:
+        if method == "POST":
+            return await _a(_create_replication_configuration(m.group(1), body))
+        if method == "DELETE":
+            return await _a(_delete_replication_configuration(m.group(1), query))
+
+    m = re.fullmatch(r"/file-systems/([^/]+)/protection", p)
+    if m and method == "PUT":
+        return await _a(_update_file_system_protection(_fs_id_from(m.group(1)), body))
+
+    # File System Policy
+    m = re.fullmatch(r"/file-systems/([^/]+)/policy", p)
+    if m:
+        fs_id = m.group(1)
+        if method == "PUT":
+            return await _a(_put_file_system_policy(fs_id, body))
+        if method == "GET":
+            return await _a(_describe_file_system_policy(fs_id))
+        if method == "DELETE":
+            return await _a(_delete_file_system_policy(fs_id))
 
     # Account Preferences
     if p == "/account-preferences":
@@ -546,8 +1174,4 @@ def _error(status, code, message):
 # ---------------------------------------------------------------------------
 
 def reset():
-    _file_systems.clear()
-    _mount_targets.clear()
-    _access_points.clear()
-    _lifecycle_configs.clear()
-    _backup_policies.clear()
+    _clear_state()

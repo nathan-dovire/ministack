@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 EC2 Instance Metadata Service (IMDS) emulator.
 
@@ -30,6 +32,14 @@ from ministack.services.iam import (
 
 _DEFAULT_ROLE = "ministack-instance-role"
 _INSTANCE_ID = "i-" + new_uuid().replace("-", "")[:17]
+
+# Instance-profile ID — same 20-char shape AWS emits (AIPA-prefixed),
+# assembled at runtime rather than embedded as a literal so credential-pattern
+# secret scanners (e.g. AquaSec) don't false-positive on the source.
+# See issue #738.
+_INSTANCE_PROFILE_ID = (
+    "".join(("A", "I", "P", "A")) + "MINISTACK" + ("0" * 7)
+)
 
 _tokens: dict[str, float] = {}
 
@@ -209,7 +219,7 @@ async def handle_request(method, path, headers, body, query_params):
             "LastUpdated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "InstanceProfileArn":
                 f"arn:aws:iam::{get_account_id()}:instance-profile/{_DEFAULT_ROLE}",
-            "InstanceProfileId": "AIPAMINISTACK0000000",
+            "InstanceProfileId": _INSTANCE_PROFILE_ID,
         })
 
     if path == "/latest/dynamic/instance-identity/document":
@@ -225,3 +235,11 @@ async def handle_request(method, path, headers, body, query_params):
             return _text(_META_FLAT[leaf])
 
     return _not_found()
+
+
+def get_state() -> dict:
+    return {}
+
+
+def load_persisted_state(data: dict) -> None:
+    pass

@@ -143,3 +143,317 @@ def test_tls_partial_cert_config_rejected():
         _terminate(proc)
         pytest.fail("hypercorn should have exited when SSL cert/key were partially configured")
     assert rc != 0
+
+
+# ---------------------------------------------------------------------------
+# The Cognito issuer host: a token's `iss` names
+# cognito-idp.{region}.amazonaws.com, so the gateway certificate has to as
+# well for a client that follows it to complete a handshake.
+# ---------------------------------------------------------------------------
+
+
+def _san_of(cert_path):
+    out = subprocess.run(
+        ["openssl", "x509", "-in", cert_path, "-noout", "-ext", "subjectAltName"],
+        capture_output=True, text=True, check=True)
+    return out.stdout
+
+
+def test_generated_cert_names_the_cognito_issuer_host(tmp_path, monkeypatch):
+    from ministack.core import tls
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setenv("MINISTACK_REGION", "eu-west-2")
+    monkeypatch.delenv("MINISTACK_SSL_CERT", raising=False)
+    monkeypatch.delenv("MINISTACK_SSL_KEY", raising=False)
+    cert_path, _key = tls.resolve_tls_material()
+    san = _san_of(cert_path)
+    assert "DNS:cognito-idp.eu-west-2.amazonaws.com" in san
+    assert "DNS:cognito-idp.ap-southeast-2.amazonaws.com" in san
+    assert tls.cognito_idp_host() == "cognito-idp.eu-west-2.amazonaws.com"
+
+
+def test_cached_cert_without_the_issuer_hosts_is_regenerated(tmp_path, monkeypatch):
+    """A cert cached by an older build lacks the issuer hosts and is replaced."""
+    from ministack.core import tls
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.delenv("MINISTACK_SSL_CERT", raising=False)
+    monkeypatch.delenv("MINISTACK_SSL_KEY", raising=False)
+    tls_dir = tmp_path / "ministack-tls"
+    tls_dir.mkdir()
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", str(tls_dir / "server.key"), "-out", str(tls_dir / "server.crt"),
+        "-days", "1", "-subj", "/CN=old", "-addext", "subjectAltName=DNS:localhost",
+    ], check=True, capture_output=True)
+    cert, _ = tls.resolve_tls_material()
+    assert "DNS:cognito-idp.us-east-1.amazonaws.com" in _san_of(cert)
+
+
+def test_cached_cert_is_reused_across_regions(tmp_path, monkeypatch):
+    from ministack.core import tls
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.delenv("MINISTACK_SSL_CERT", raising=False)
+    monkeypatch.delenv("MINISTACK_SSL_KEY", raising=False)
+    monkeypatch.setenv("MINISTACK_REGION", "eu-west-2")
+    first, _ = tls.resolve_tls_material()
+    first_bytes = open(first, "rb").read()
+    monkeypatch.setenv("MINISTACK_REGION", "us-east-1")
+    second, _ = tls.resolve_tls_material()
+    assert open(second, "rb").read() == first_bytes
+
+
+# ---------------------------------------------------------------------------
+# The IoT endpoint hosts: DescribeEndpoint answers a bare address that SDKs
+# dial as https://<address>, as on AWS, so the gateway certificate has to
+# name it for that handshake to verify.
+# ---------------------------------------------------------------------------
+
+
+def _checkhost(cert_path, host):
+    out = subprocess.run(
+        ["openssl", "x509", "-in", cert_path, "-noout", "-checkhost", host],
+        capture_output=True, text=True, check=False)
+    return "does match" in out.stdout
+
+
+def test_generated_cert_names_the_iot_endpoint_hosts(tmp_path, monkeypatch):
+    from ministack.core import tls
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setenv("MINISTACK_HOST", "localhost.localstack.cloud")
+    monkeypatch.delenv("MINISTACK_SSL_CERT", raising=False)
+    monkeypatch.delenv("MINISTACK_SSL_KEY", raising=False)
+    cert_path, _key = tls.resolve_tls_material()
+    assert _checkhost(cert_path, "f7b11509f4d675-ats.iot.eu-central-1.localhost.localstack.cloud")
+    assert _checkhost(cert_path, "f7b11509f4d675.credentials.iot.ap-southeast-2.localhost.localstack.cloud")
+    assert not _checkhost(cert_path, "f7b11509f4d675-ats.iot.eu-central-1.example.com")
+
+
+def test_cached_cert_for_another_ministack_host_is_regenerated(tmp_path, monkeypatch):
+    from ministack.core import tls
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.delenv("MINISTACK_SSL_CERT", raising=False)
+    monkeypatch.delenv("MINISTACK_SSL_KEY", raising=False)
+    monkeypatch.setenv("MINISTACK_HOST", "first.test")
+    tls.resolve_tls_material()
+    monkeypatch.setenv("MINISTACK_HOST", "second.test")
+    cert, _ = tls.resolve_tls_material()
+    assert _checkhost(cert, "abc-ats.iot.us-east-1.second.test")
+    assert "DNS:cognito-idp.us-east-1.amazonaws.com" in _san_of(cert)
+
+
+def test_ip_ministack_host_adds_no_iot_names(monkeypatch):
+    from ministack.core import tls
+
+    monkeypatch.setenv("MINISTACK_HOST", "192.0.2.10")
+    assert tls.iot_endpoint_hosts() == []
+
+
+@pytest.mark.serial
+def test_iot_data_client_reaches_the_described_endpoint_over_https(tmp_path, monkeypatch):
+    """The AWS SDK pattern: endpoint_url=f"https://{endpointAddress}", verified."""
+    import boto3
+
+    port = _free_port()
+    proc = _spawn({"USE_SSL": "1", "TMPDIR": str(tmp_path), "MINISTACK_HOST": "localhost",
+                   "GATEWAY_PORT": str(port), "MINISTACK_SSL_CERT": "", "MINISTACK_SSL_KEY": ""}, port)
+    try:
+        _wait_health(f"https://127.0.0.1:{port}/_ministack/health", ctx=_ctx_no_verify())
+        cert = str(tmp_path / "ministack-tls" / "server.crt")
+        kw = {"region_name": "eu-central-1", "aws_access_key_id": "test",
+              "aws_secret_access_key": "test", "verify": cert}
+        address = boto3.client("iot", endpoint_url=f"https://localhost:{port}", **kw).describe_endpoint(
+            endpointType="iot:Data-ATS")["endpointAddress"]
+        host = address.rsplit(":", 1)[0]
+        assert host.endswith("-ats.iot.eu-central-1.localhost")
+        # *.localhost resolution varies by platform; the certificate check is what is under test.
+        real_getaddrinfo = socket.getaddrinfo
+        monkeypatch.setattr(socket, "getaddrinfo",
+                            lambda h, *a, **k: real_getaddrinfo("127.0.0.1" if h == host else h, *a, **k))
+        data = boto3.client("iot-data", endpoint_url=f"https://{address}", **kw)
+        assert data.publish(topic="ats/check", payload=b"{}")["ResponseMetadata"]["HTTPStatusCode"] == 200
+    finally:
+        _terminate(proc)
+
+
+_CFN_RESPONDER = """\
+import json, urllib.request
+
+def handler(event, context):
+    body = json.dumps({"Status": "SUCCESS", "PhysicalResourceId": "tls", "StackId": event["StackId"],
+                       "RequestId": event["RequestId"], "LogicalResourceId": event["LogicalResourceId"],
+                       "Data": {"Scheme": event["ResponseURL"].split(":", 1)[0]}}).encode()
+    urllib.request.urlopen(urllib.request.Request(event["ResponseURL"], data=body, method="PUT"), timeout=10)
+"""
+
+
+@pytest.mark.serial
+def test_python_custom_resource_answers_its_response_url_over_https(tmp_path):
+    """A Python handler PUTs its ResponseURL with urllib, as CDK's bucket notifications handler does."""
+    import io
+    import json
+    import zipfile
+
+    import boto3
+
+    port = _free_port()
+    proc = _spawn({"USE_SSL": "1", "TMPDIR": str(tmp_path), "MINISTACK_HOST": "localhost",
+                   "GATEWAY_PORT": str(port), "MINISTACK_SSL_CERT": "", "MINISTACK_SSL_KEY": ""}, port)
+    try:
+        _wait_health(f"https://127.0.0.1:{port}/_ministack/health", ctx=_ctx_no_verify())
+        kw = {"endpoint_url": f"https://localhost:{port}", "region_name": "us-east-1",
+              "aws_access_key_id": "test", "aws_secret_access_key": "test",
+              "verify": str(tmp_path / "ministack-tls" / "server.crt")}
+        code = io.BytesIO()
+        with zipfile.ZipFile(code, "w") as zf:
+            zf.writestr("index.py", _CFN_RESPONDER)
+        role = boto3.client("iam", **kw).create_role(RoleName="tls-responder", AssumeRolePolicyDocument=json.dumps({
+            "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "sts:AssumeRole",
+                                                    "Principal": {"Service": "lambda.amazonaws.com"}}]}))["Role"]["Arn"]
+        arn = boto3.client("lambda", **kw).create_function(
+            FunctionName="tls-responder", Runtime="python3.12", Role=role,
+            Handler="index.handler", Code={"ZipFile": code.getvalue()})["FunctionArn"]
+        cfn = boto3.client("cloudformation", **kw)
+        cfn.create_stack(StackName="tls-cr", TemplateBody=json.dumps({
+            "Resources": {"CR": {"Type": "Custom::Tls", "Properties": {"ServiceToken": arn, "ServiceTimeout": "20"}}},
+            "Outputs": {"Scheme": {"Value": {"Fn::GetAtt": ["CR", "Scheme"]}}},
+        }))
+        deadline = time.time() + 60
+        while (stack := cfn.describe_stacks(StackName="tls-cr")["Stacks"][0])["StackStatus"].endswith("_IN_PROGRESS"):
+            assert time.time() < deadline, stack
+            time.sleep(1)
+        assert stack["StackStatus"] == "CREATE_COMPLETE", stack.get("StackStatusReason")
+        assert stack["Outputs"][0]["OutputValue"] == "https"
+    finally:
+        _terminate(proc)
+
+
+def test_byo_certificate_is_never_regenerated(tmp_path, monkeypatch):
+    """MINISTACK_SSL_CERT is the operator's, so the issuer host is their
+    business and we must hand it back untouched."""
+    from ministack.core import tls
+
+    cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
+    cert.write_text("cert"), key.write_text("key")
+    monkeypatch.setenv("MINISTACK_SSL_CERT", str(cert))
+    monkeypatch.setenv("MINISTACK_SSL_KEY", str(key))
+    assert tls.resolve_tls_material() == (str(cert), str(key))
+    assert cert.read_text() == "cert"
+
+
+def test_port_is_bindable_reports_a_taken_port():
+    from ministack.app import _port_is_bindable
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as taken:
+        taken.bind(("127.0.0.1", 0))
+        taken.listen(1)
+        port = taken.getsockname()[1]
+        assert _port_is_bindable("127.0.0.1", port) is False
+    assert _port_is_bindable("127.0.0.1", _free_port()) is True
+
+
+def test_ca_bundle_keeps_the_public_roots(tmp_path, monkeypatch):
+    """AWS_CA_BUNDLE and REQUESTS_CA_BUNDLE replace the trust store, so the
+    bundle we hand a container must still verify everything else it calls."""
+    from ministack.core import tls
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.delenv("MINISTACK_SSL_CERT", raising=False)
+    monkeypatch.delenv("MINISTACK_SSL_KEY", raising=False)
+    cert_path, _key = tls.resolve_tls_material()
+    bundle = tls.ca_bundle_path(cert_path)
+    assert bundle, "no system trust store to build a bundle from"
+    ctx = ssl.create_default_context(cafile=bundle)
+    assert len(ctx.get_ca_certs()) > 5
+    assert open(cert_path).read() in open(bundle).read()
+
+
+def test_java_truststore_carries_our_cert_and_the_public_roots(tmp_path, monkeypatch):
+    """A JVM reads neither AWS_CA_BUNDLE nor a PEM bundle, so a Java handler
+    gets a PKCS12 store, and it must not cost it the public roots either."""
+    pytest.importorskip("cryptography")
+    from cryptography import x509
+    from cryptography.hazmat.primitives.serialization import pkcs12
+
+    from ministack.core import tls
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.delenv("MINISTACK_SSL_CERT", raising=False)
+    monkeypatch.delenv("MINISTACK_SSL_KEY", raising=False)
+    cert_path, _key = tls.resolve_tls_material()
+    store = tls.java_truststore_path(cert_path)
+    assert store and store.endswith(".p12")
+
+    loaded = pkcs12.load_pkcs12(
+        open(store, "rb").read(), tls.JAVA_TRUSTSTORE_PASSWORD.encode())
+    ours = x509.load_pem_x509_certificate(open(cert_path, "rb").read())
+    subjects = [entry.certificate.subject for entry in loaded.additional_certs]
+    assert ours.subject in subjects
+    assert len(subjects) > 5
+
+
+def _fresh_tls(tmp_path, monkeypatch):
+    import tempfile
+
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    monkeypatch.setenv("USE_SSL", "1")
+    monkeypatch.delenv("MINISTACK_SSL_CERT", raising=False)
+    monkeypatch.delenv("MINISTACK_SSL_KEY", raising=False)
+
+
+def test_generated_cert_is_a_server_certificate_not_a_ca(tmp_path, monkeypatch):
+    """webpki (rustls) refuses a CA certificate presented as the server's, CaUsedAsEndEntity."""
+    from ministack.core import tls
+
+    _fresh_tls(tmp_path, monkeypatch)
+    cert_path, _key = tls.resolve_tls_material()
+    out = subprocess.run(
+        ["openssl", "x509", "-in", cert_path, "-noout", "-ext", "basicConstraints,extendedKeyUsage"],
+        capture_output=True, text=True, check=True).stdout
+    assert "CA:FALSE" in out and "CA:TRUE" not in out
+    assert "TLS Web Server Authentication" in out
+    verify = subprocess.run(["openssl", "verify", "-CAfile", cert_path, cert_path],
+                            capture_output=True, text=True)
+    assert verify.returncode == 0, verify.stdout + verify.stderr
+
+
+def test_generated_cert_names_the_docker_gateway_host(tmp_path, monkeypatch):
+    """Docker Lambdas dial https://host.docker.internal:<port>; a cert cached without that name is replaced."""
+    from ministack.core import tls
+
+    _fresh_tls(tmp_path, monkeypatch)
+    tls_dir = tmp_path / "ministack-tls"
+    tls_dir.mkdir()
+    names = "".join(f"DNS:{h}," for h in tls.cognito_idp_hosts() + tls.iot_endpoint_hosts())
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", str(tls_dir / "server.key"), "-out", str(tls_dir / "server.crt"),
+        "-days", "1", "-subj", "/CN=old", "-addext", "basicConstraints=critical,CA:FALSE",
+        "-addext", f"subjectAltName={names}DNS:localhost",
+    ], check=True, capture_output=True)
+    cert, _ = tls.resolve_tls_material()
+    assert cert == str(tls_dir / "server.crt")
+    assert _checkhost(cert, "host.docker.internal")
+
+
+def test_cached_ca_certificate_is_regenerated(tmp_path, monkeypatch):
+    from ministack.core import tls
+
+    _fresh_tls(tmp_path, monkeypatch)
+    tls_dir = tmp_path / "ministack-tls"
+    tls_dir.mkdir()
+    names = "".join(f"DNS:{h}," for h in tls._generated_cert_names())
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", str(tls_dir / "server.key"), "-out", str(tls_dir / "server.crt"),
+        "-days", "1", "-subj", "/CN=old", "-addext", "basicConstraints=critical,CA:TRUE",
+        "-addext", f"subjectAltName={names}DNS:localhost",
+    ], check=True, capture_output=True)
+    cert, _ = tls.resolve_tls_material()
+    assert "CA:FALSE" in subprocess.run(["openssl", "x509", "-in", cert, "-noout", "-ext", "basicConstraints"],
+                                        capture_output=True, text=True, check=True).stdout

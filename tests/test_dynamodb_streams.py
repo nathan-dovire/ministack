@@ -7,6 +7,10 @@ visible through the public Streams API used by boto3.client("dynamodbstreams")
 and by Lambda event-source mappings.
 """
 
+import contextlib
+import time
+import uuid
+
 import pytest
 from botocore.exceptions import ClientError
 
@@ -93,6 +97,17 @@ def test_describe_stream_unknown_arn_raises(ddb_streams):
     bogus = "arn:aws:dynamodb:us-east-1:000000000000:table/NoSuch/stream/1970-01-01T00:00:00.000"
     with pytest.raises(ClientError) as exc:
         ddb_streams.describe_stream(StreamArn=bogus)
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
+@pytest.mark.parametrize("stream_arn", [
+    "arn:aws:dynamodb:us-east-1:000000000000",
+    "arn:aws:sns:us-east-1:000000000000:table/StreamsDescribe/stream/1970-01-01T00:00:00.000",
+    "arn:aws:dynamodb:us-east-1:000000000000:table/StreamsDescribe",
+])
+def test_describe_stream_rejects_invalid_or_wrong_service_arn(ddb_streams, stream_arn):
+    with pytest.raises(ClientError) as exc:
+        ddb_streams.describe_stream(StreamArn=stream_arn)
     assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
 
 
@@ -267,6 +282,21 @@ def test_get_shard_iterator_missing_sequence_number(ddb, ddb_streams):
     assert exc.value.response["Error"]["Code"] == "ValidationException"
 
 
+@pytest.mark.parametrize("stream_arn", [
+    "arn:aws:dynamodb:us-east-1:000000000000",
+    "arn:aws:sns:us-east-1:000000000000:table/StreamsValidateSeq/stream/1970-01-01T00:00:00.000",
+    "arn:aws:dynamodb:us-east-1:000000000000:table/StreamsValidateSeq",
+])
+def test_get_shard_iterator_rejects_invalid_or_wrong_service_arn(ddb_streams, stream_arn):
+    with pytest.raises(ClientError) as exc:
+        ddb_streams.get_shard_iterator(
+            StreamArn=stream_arn,
+            ShardId=_DEFAULT_SHARD_ID,
+            ShardIteratorType="TRIM_HORIZON",
+        )
+    assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+
+
 def test_get_records_rejects_garbage_iterator(ddb_streams):
     with pytest.raises(ClientError) as exc:
         ddb_streams.get_records(ShardIterator="not-a-valid-iterator")
@@ -323,6 +353,10 @@ def test_terraform_update_table_toggles_stream_specification(ddb, ddb_streams):
         after = ddb.describe_table(TableName=tname)["Table"]
         assert after["StreamSpecification"]["StreamEnabled"] is True
         assert after["StreamSpecification"]["StreamViewType"] == "KEYS_ONLY"
+        stream_arn = after["LatestStreamArn"]
+        assert after["LatestStreamLabel"] in stream_arn
+        stream = ddb_streams.describe_stream(StreamArn=stream_arn)["StreamDescription"]
+        assert stream["StreamArn"] == stream_arn
     finally:
         ddb.delete_table(TableName=tname)
 
@@ -338,3 +372,242 @@ def test_terraform_list_streams_filters_by_table(ddb, ddb_streams):
         assert any(s["StreamArn"] == arn and s["TableName"] == tname for s in listed)
     finally:
         ddb.delete_table(TableName=tname)
+
+
+# ---------------------------------------------------------------------------
+# Retention (white-box: records expire by wall-clock age, and the backlog lives
+# in-process, so these drive the service module directly rather than the wire).
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def streams_state():
+    import time
+
+    from ministack.core.responses import set_request_account_id, set_request_region
+    from ministack.services import dynamodb as ddb_service
+    from ministack.services import dynamodb_streams as streams_service
+
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    saved = (
+        dict(ddb_service._tables._data),
+        dict(ddb_service._stream_records._data),
+        dict(ddb_service._stream_trimmed._data),
+    )
+    ddb_service._stream_records._data.clear()
+    ddb_service._stream_trimmed._data.clear()
+    try:
+        yield ddb_service, streams_service, time
+    finally:
+        for store, snapshot in zip(
+            (ddb_service._tables, ddb_service._stream_records, ddb_service._stream_trimmed),
+            saved,
+        ):
+            store._data.clear()
+            store._data.update(snapshot)
+
+
+def _streamed_table(ddb_service, name):
+    arn = f"arn:aws:dynamodb:us-east-1:000000000000:table/{name}/stream/2026-01-01T00:00:00.000"
+    ddb_service._tables[name] = {
+        "TableName": name,
+        "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+        "LatestStreamArn": arn,
+        "LatestStreamLabel": "2026-01-01T00:00:00.000",
+        "StreamSpecification": {"StreamEnabled": True, "StreamViewType": "NEW_AND_OLD_IMAGES"},
+    }
+    return arn
+
+
+def _record(seq, created_at):
+    return {
+        "eventID": str(seq),
+        "eventName": "INSERT",
+        "dynamodb": {
+            "ApproximateCreationDateTime": int(created_at),
+            "Keys": {"pk": {"S": str(seq)}},
+            "SequenceNumber": str(seq),
+        },
+    }
+
+
+def _json(response):
+    import json as _json_mod
+
+    _status, _headers, body = response
+    return _json_mod.loads(body)
+
+
+def _iterator(streams_service, arn, iterator_type, **kwargs):
+    resp = streams_service._get_shard_iterator({
+        "StreamArn": arn,
+        "ShardId": _DEFAULT_SHARD_ID,
+        "ShardIteratorType": iterator_type,
+        **kwargs,
+    })
+    return _json(resp)["ShardIterator"]
+
+
+def _seqs(payload):
+    return [r["dynamodb"]["SequenceNumber"] for r in payload["Records"]]
+
+
+def test_get_records_iterator_position_survives_record_expiry(streams_state):
+    """A shard iterator carries an absolute stream position, so records aging
+    off the front of the stream must not shift what a held iterator reads."""
+    ddb_service, streams_service, time = streams_state
+    name = "streams-retention"
+    arn = _streamed_table(ddb_service, name)
+    now = time.time()
+    ddb_service._stream_records[name] = [_record(i, now) for i in range(3)]
+
+    first = _json(streams_service._get_records({
+        "ShardIterator": _iterator(streams_service, arn, "TRIM_HORIZON"),
+        "Limit": 1,
+    }))
+    assert _seqs(first) == ["0"]
+
+    # Records 0 and 1 age out while the caller holds the iterator it got back.
+    expired = now - ddb_service._STREAM_RETENTION_SECONDS - 60
+    for record in ddb_service._stream_records[name][:2]:
+        record["dynamodb"]["ApproximateCreationDateTime"] = int(expired)
+
+    # The held iterator now points at a trimmed record: TrimmedDataAccessException.
+    trimmed = _json(streams_service._get_records({"ShardIterator": first["NextShardIterator"]}))
+    assert trimmed["__type"].endswith("TrimmedDataAccessException")
+    assert ddb_service.stream_start_position(name) == 2
+    # A fresh TRIM_HORIZON iterator resumes at the surviving record.
+    second = _json(streams_service._get_records({"ShardIterator": _iterator(streams_service, arn, "TRIM_HORIZON")}))
+    assert _seqs(second) == ["2"]
+
+
+def test_shard_iterators_are_absolute_after_a_trim(streams_state):
+    """TRIM_HORIZON, LATEST, and AT/AFTER_SEQUENCE_NUMBER all resolve against
+    the trim horizon rather than an offset into the surviving records."""
+    ddb_service, streams_service, time = streams_state
+    name = "streams-retention-iters"
+    arn = _streamed_table(ddb_service, name)
+    now = time.time()
+    expired = now - ddb_service._STREAM_RETENTION_SECONDS - 60
+    ddb_service._stream_records[name] = [
+        _record(0, expired), _record(1, expired), _record(2, now), _record(3, now),
+    ]
+
+    horizon = _iterator(streams_service, arn, "TRIM_HORIZON")
+    assert _seqs(_json(streams_service._get_records({"ShardIterator": horizon}))) == ["2", "3"]
+    assert ddb_service.stream_start_position(name) == 2
+
+    latest = _iterator(streams_service, arn, "LATEST")
+    assert _seqs(_json(streams_service._get_records({"ShardIterator": latest}))) == []
+    ddb_service._stream_records[name].append(_record(4, now))
+    assert _seqs(_json(streams_service._get_records({"ShardIterator": latest}))) == ["4"]
+
+    at = _iterator(streams_service, arn, "AT_SEQUENCE_NUMBER", SequenceNumber="3")
+    assert _seqs(_json(streams_service._get_records({"ShardIterator": at}))) == ["3", "4"]
+    after = _iterator(streams_service, arn, "AFTER_SEQUENCE_NUMBER", SequenceNumber="3")
+    assert _seqs(_json(streams_service._get_records({"ShardIterator": after}))) == ["4"]
+
+
+def test_expired_sequence_number_is_no_longer_addressable(streams_state):
+    """Once a record expires its sequence number is gone from the stream, as on
+    AWS, so an iterator anchored to it is a TrimmedDataAccessException."""
+    ddb_service, streams_service, time = streams_state
+    name = "streams-retention-seq"
+    arn = _streamed_table(ddb_service, name)
+    now = time.time()
+    ddb_service._stream_records[name] = [
+        _record(0, now - ddb_service._STREAM_RETENTION_SECONDS - 60),
+        _record(1, now),
+    ]
+
+    resp = streams_service._get_shard_iterator({
+        "StreamArn": arn,
+        "ShardId": _DEFAULT_SHARD_ID,
+        "ShardIteratorType": "AT_SEQUENCE_NUMBER",
+        "SequenceNumber": "0",
+    })
+    assert resp[0] == 400
+    assert _json(resp)["__type"].endswith("TrimmedDataAccessException")
+
+
+def test_records_expire_on_read_without_further_writes(streams_state):
+    """Retention is wall-clock, not write-driven: a stream that stopped taking
+    writes still ages out, and DescribeStream's starting sequence follows."""
+    ddb_service, streams_service, time = streams_state
+    name = "streams-retention-idle"
+    arn = _streamed_table(ddb_service, name)
+    now = time.time()
+    ddb_service._stream_records[name] = [
+        _record(0, now - ddb_service._STREAM_RETENTION_SECONDS - 120),
+        _record(1, now),
+    ]
+
+    described = _json(streams_service._describe_stream({"StreamArn": arn}))["StreamDescription"]
+    seq_range = described["Shards"][0]["SequenceNumberRange"]
+    assert seq_range["StartingSequenceNumber"] == "1"
+    assert _seqs(_json(streams_service._get_records({
+        "ShardIterator": _iterator(streams_service, arn, "TRIM_HORIZON"),
+    }))) == ["1"]
+
+
+def test_closed_stream_stays_readable_and_new_stream_starts_empty(ddb, ddb_streams):
+    name = f"closed-stream-{uuid.uuid4().hex[:8]}"
+    _make_table(ddb, name)
+    old_arn = _stream_arn(ddb, name)
+    try:
+        ddb.put_item(TableName=name, Item={"pk": {"S": "a"}})
+        ddb.update_table(TableName=name, StreamSpecification={"StreamEnabled": False})
+        desc = ddb_streams.describe_stream(StreamArn=old_arn)["StreamDescription"]
+        assert desc["StreamStatus"] == "DISABLED"
+        seq = desc["Shards"][0]["SequenceNumberRange"]
+        assert seq["EndingSequenceNumber"] == seq["StartingSequenceNumber"]
+        it = ddb_streams.get_shard_iterator(StreamArn=old_arn, ShardId=desc["Shards"][0]["ShardId"],
+                                            ShardIteratorType="TRIM_HORIZON")["ShardIterator"]
+        resp = ddb_streams.get_records(ShardIterator=it)
+        assert [r["eventName"] for r in resp["Records"]] == ["INSERT"]
+        assert "eventSourceARN" not in resp["Records"][0]
+        assert "NextShardIterator" not in resp
+
+        time.sleep(0.01)
+        ddb.update_table(TableName=name, StreamSpecification={"StreamEnabled": True,
+                                                              "StreamViewType": "NEW_IMAGE"})
+        new_arn = _stream_arn(ddb, name)
+        assert new_arn != old_arn
+        shard = ddb_streams.describe_stream(StreamArn=new_arn)["StreamDescription"]["Shards"][0]["ShardId"]
+        it = ddb_streams.get_shard_iterator(StreamArn=new_arn, ShardId=shard,
+                                            ShardIteratorType="TRIM_HORIZON")["ShardIterator"]
+        assert ddb_streams.get_records(ShardIterator=it)["Records"] == []
+
+        ddb.delete_table(TableName=name)
+        assert ddb_streams.describe_stream(StreamArn=new_arn)["StreamDescription"]["StreamStatus"] == "DISABLED"
+        assert ddb_streams.describe_stream(StreamArn=old_arn)["StreamDescription"]["StreamStatus"] == "DISABLED"
+    finally:
+        with contextlib.suppress(ClientError):
+            ddb.delete_table(TableName=name)
+
+
+def test_shard_iterator_expires_after_15_minutes(streams_state, monkeypatch):
+    ddb_service, streams_service, time = streams_state
+    name = "streams-iterator-ttl"
+    arn = _streamed_table(ddb_service, name)
+    ddb_service._stream_records[name] = [_record(0, time.time())]
+    iterator = _iterator(streams_service, arn, "TRIM_HORIZON")
+    issued = time.time()
+    monkeypatch.setattr(streams_service.time, "time", lambda: issued + 15 * 60 - 1)
+    assert _seqs(_json(streams_service._get_records({"ShardIterator": iterator}))) == ["0"]
+    monkeypatch.setattr(streams_service.time, "time", lambda: issued + 15 * 60)
+    assert _json(streams_service._get_records({"ShardIterator": iterator}))["__type"].endswith(
+        "ExpiredIteratorException")
+
+
+def test_unknown_shard_is_resource_not_found(ddb, ddb_streams):
+    name = f"unknown-shard-{uuid.uuid4().hex[:8]}"
+    _make_table(ddb, name)
+    try:
+        with pytest.raises(ClientError) as exc:
+            ddb_streams.get_shard_iterator(StreamArn=_stream_arn(ddb, name), ShardId="shardId-00000000000000000000-ffffffff",
+                                           ShardIteratorType="TRIM_HORIZON")
+        assert exc.value.response["Error"]["Code"] == "ResourceNotFoundException"
+        assert exc.value.response["Error"]["Message"] == "Requested resource not found: Shard does not exist"
+    finally:
+        ddb.delete_table(TableName=name)

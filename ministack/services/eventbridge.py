@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 EventBridge Service Emulator.
 JSON-based API via X-Amz-Target (AmazonEventBridge / AWSEvents).
@@ -22,29 +24,66 @@ Supports: CreateEventBus, UpdateEventBus, DeleteEventBus, ListEventBuses, Descri
 
 import calendar
 import copy
-import fnmatch
+import functools
 import hashlib
+import ipaddress
 import json
 import logging
+import operator
 import os
+import random
 import re
+import string
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timedelta, timezone
 
+from ministack.core.arn import ArnParseError, parse_arn
+from ministack.core.concurrency import esm_wake
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
     get_region,
     json_response,
     new_uuid,
+    request_scope,
     set_request_account_id,
+    set_request_region,
+    to_output_shape,
 )
 
 logger = logging.getLogger("events")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
+_SUPPORTED_TARGET_SERVICES = {
+    "appsync",
+    "batch",
+    "codebuild",
+    "codepipeline",
+    "ecs",
+    "events",
+    "execute-api",
+    "firehose",
+    "glue",
+    "imagebuilder",
+    "inspector",
+    "kinesis",
+    "lambda",
+    "logs",
+    "redshift",
+    "redshift-serverless",
+    "sagemaker",
+    "sns",
+    "sqs",
+    "ssm",
+    "ssm-incidents",
+    "states",
+}
 
 
 def _now_ts() -> float:
@@ -65,28 +104,27 @@ def _coerce_timestamp(value):
     return value
 
 
-from ministack.core.persistence import PERSIST_STATE, load_state
 
-# Per-account bus registry. The "default" bus is lazily created per account
-# on first access so every tenant has its own default bus with an ARN whose
-# account-id segment matches the caller.
-_event_buses = AccountScopedDict()
-_rules = AccountScopedDict()
-_targets = AccountScopedDict()
-# Per-account event log — AccountScopedDict under "entries" keeps the list
-# semantics while scoping reads to the caller's account.
-_events_log = AccountScopedDict()
-_tags = AccountScopedDict()
-_archives = AccountScopedDict()
-_event_bus_policies = AccountScopedDict()  # bus_name -> {Statement: [...]}
-_connections = AccountScopedDict()         # connection_name -> {...}
-_api_destinations = AccountScopedDict()    # destination_name -> {...}
-_replays = AccountScopedDict()              # replay_name -> replay record
-_endpoints = AccountScopedDict()            # endpoint name -> endpoint record
-# Partner event sources, per-account (key: "account|name" pattern inside each tenant).
-_partner_event_sources = AccountScopedDict()
+# Per-account and per-region registries. The "default" bus is lazily created
+# per account/region on first access so every tenant has its own default bus
+# with ARN account-id and region segments matching the caller.
+_event_buses = AccountRegionScopedDict()
+_rules = AccountRegionScopedDict()
+_targets = AccountRegionScopedDict()
+# AccountRegionScopedDict under "entries" keeps list semantics while scoping
+# reads to the caller's account and region.
+_events_log = AccountRegionScopedDict()
+_tags = AccountRegionScopedDict()
+_archives = AccountRegionScopedDict()
+_event_bus_policies = AccountRegionScopedDict()  # bus_name -> {Statement: [...]}
+_connections = AccountRegionScopedDict()         # connection_name -> {...}
+_api_destinations = AccountRegionScopedDict()    # destination_name -> {...}
+_replays = AccountRegionScopedDict()             # replay_name -> replay record
+_endpoints = AccountRegionScopedDict()           # endpoint name -> endpoint record
+# Partner event sources, per-account/region (key: "account|name" pattern inside each tenant).
+_partner_event_sources = AccountRegionScopedDict()
 
-# Tracks when each scheduled rule last fired: {(account_id, rule_key): timestamp}.
+# Tracks when each scheduled rule last fired: {(account_id, region, rule_key): timestamp}.
 # Plain dict (not AccountScopedDict) because the scheduler thread owns it globally.
 _rule_last_fired: dict = {}
 
@@ -101,6 +139,11 @@ def _ensure_default_bus():
             "CreationTime": _now_ts(),
             "LastModifiedTime": _now_ts(),
         }
+
+
+def _event_bus_exists(name):
+    """Whether the current tenant has bus ``name``; every account has a default bus."""
+    return name == "default" or name in _event_buses
 
 
 def _events_log_list() -> list:
@@ -129,11 +172,15 @@ def get_state():
     }
 
 
-def restore_state(data):
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
     if data:
         _event_buses.update(data.get("buses", {}))
         _rules.update(data.get("rules", {}))
-        _targets.update(data.get("targets", {}))
+        _restore_targets_store(data.get("targets", {}))
         _tags.update(data.get("tags", {}))
         _archives.update(data.get("archives", {}))
         _replays.update(data.get("replays", {}))
@@ -146,17 +193,17 @@ def restore_state(data):
             _partner_event_sources.clear()
             _partner_event_sources.update(pe)
 
-        for bus in _event_buses.values():
+        for bus in _event_buses.all_values():
             if "CreationTime" in bus:
                 bus["CreationTime"] = _coerce_timestamp(bus["CreationTime"])
             if "LastModifiedTime" in bus:
                 bus["LastModifiedTime"] = _coerce_timestamp(bus["LastModifiedTime"])
 
-        for rule in _rules.values():
+        for rule in _rules.all_values():
             if "CreationTime" in rule:
                 rule["CreationTime"] = _coerce_timestamp(rule["CreationTime"])
 
-        for rep in _replays.values():
+        for rep in _replays.all_values():
             for tk in ("ReplayStartTime", "ReplayEndTime", "EventStartTime", "EventEndTime"):
                 if tk in rep and rep[tk] is not None:
                     rep[tk] = _coerce_timestamp(rep[tk])
@@ -169,15 +216,61 @@ def restore_state(data):
                 rep["ReplayEndTime"] = _now_ts()
 
 
-try:
-    _restored = load_state("eventbridge")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
+def _events_record_scope(record: dict | None, default_account_id: str | None = None) -> tuple[str, str]:
+    if isinstance(record, dict):
+        for key in (
+            "Arn",
+            "ArchiveArn",
+            "ReplayArn",
+            "ConnectionArn",
+            "ApiDestinationArn",
+            "EventSourceArn",
+        ):
+            arn = record.get(key)
+            if not isinstance(arn, str) or not arn.startswith("arn:"):
+                continue
+            try:
+                spec = parse_arn(arn)
+            except ArnParseError:
+                continue
+            if spec.service == "events":
+                return spec.account_id or default_account_id or get_account_id(), spec.region or get_region()
+    return default_account_id or get_account_id(), get_region()
+
+
+def _rule_scope(rule_key: str, default_account_id: str | None = None) -> tuple[str, str]:
+    for (account_id, region, key), rule in _rules.all_items():
+        if key != rule_key:
+            continue
+        if default_account_id is not None and account_id != default_account_id:
+            continue
+        scoped_account_id, scoped_region = _events_record_scope(rule, account_id)
+        return scoped_account_id, scoped_region
+    return default_account_id or get_account_id(), get_region()
+
+
+def _restore_targets_store(data) -> None:
+    if isinstance(data, AccountRegionScopedDict):
+        _targets.update(data)
+        return
+    if isinstance(data, AccountScopedDict):
+        for (account_id, rule_key), targets in data._data.items():
+            scoped_account_id, region = _rule_scope(rule_key, account_id)
+            _targets.set_scoped(scoped_account_id, region, rule_key, copy.deepcopy(targets))
+        return
+    if isinstance(data, dict):
+        for key, targets in data.items():
+            if isinstance(key, tuple) and len(key) == 3:
+                account_id, region, rule_key = key
+            elif isinstance(key, tuple) and len(key) == 2:
+                account_id, rule_key = key
+                account_id, region = _rule_scope(rule_key, account_id)
+            else:
+                rule_key = key
+                account_id, region = _rule_scope(rule_key)
+            _targets.set_scoped(account_id, region, rule_key, copy.deepcopy(targets))
+
+
 
 
 async def handle_request(method, path, headers, body, query_params):
@@ -323,9 +416,9 @@ def _list_event_buses(data):
             # than returning an empty string (Java SDK v2 sees a stray empty).
             policy = _event_bus_policies.get(n)
             if policy:
-                entry["Policy"] = json.dumps(policy)
+                entry["Policy"] = json.dumps(policy, separators=(",", ":"))
             buses.append(entry)
-    return json_response({"EventBuses": buses})
+    return _offset_page(data, "EventBuses", buses)
 
 
 def _describe_event_bus(data):
@@ -343,7 +436,7 @@ def _describe_event_bus(data):
     # AWS spec: Policy is optional; omit when no policy is set.
     policy = _event_bus_policies.get(name)
     if policy:
-        out["Policy"] = json.dumps(policy)
+        out["Policy"] = json.dumps(policy, separators=(",", ":"))
     for k in ("LogConfig", "DeadLetterConfig", "KmsKeyIdentifier"):
         if k in bus:
             out[k] = bus[k]
@@ -377,10 +470,11 @@ def _update_event_bus(data):
 
     bus["LastModifiedTime"] = now
 
-    return json_response({
-        "EventBusArn": bus["Arn"],
-        "LastModifiedTime": bus["LastModifiedTime"],
-    })
+    out = {"Arn": bus["Arn"], "Name": bus["Name"]}
+    for k in ("Description", "KmsKeyIdentifier", "DeadLetterConfig", "LogConfig"):
+        if k in bus:
+            out[k] = bus[k]
+    return json_response(out)
 
 
 # ---------------------------------------------------------------------------
@@ -430,15 +524,9 @@ def _put_rule(data):
         )
 
     event_pattern = data.get("EventPattern", "")
-    if event_pattern and isinstance(event_pattern, str):
-        try:
-            json.loads(event_pattern)
-        except json.JSONDecodeError:
-            return error_response_json(
-                "InvalidEventPatternException",
-                "Event pattern is not valid JSON",
-                400,
-            )
+    pattern_error = _event_pattern_error(event_pattern)
+    if pattern_error:
+        return _invalid_event_pattern(pattern_error)
 
     arn = _rule_arn(name, bus)
     key = _rule_key(name, bus)
@@ -495,6 +583,18 @@ def _opaque_offset_decode(token: str) -> int:
         return 0
 
 
+def _offset_page(data, key, items, limit_key="Limit"):
+    start = _opaque_offset_decode(data.get("NextToken", ""))
+    try:
+        limit = int(data.get(limit_key) or len(items) or 1)
+    except (TypeError, ValueError):
+        limit = len(items) or 1
+    resp = {key: items[start:start + max(limit, 1)]}
+    if start + max(limit, 1) < len(items):
+        resp["NextToken"] = _opaque_offset_encode(start + max(limit, 1))
+    return json_response(resp)
+
+
 def _list_rules(data):
     prefix = data.get("NamePrefix", "")
     bus = data.get("EventBusName", "default")
@@ -508,7 +608,7 @@ def _list_rules(data):
             continue
         if prefix and not r["Name"].startswith(prefix):
             continue
-        rules.append(_rule_out(r))
+        rules.append(to_output_shape("events", "Rule", _rule_out(r)))
     rules.sort(key=lambda x: x["Name"])
     start = _opaque_offset_decode(data.get("NextToken", ""))
     page = rules[start:start + limit]
@@ -582,6 +682,14 @@ def _put_targets(data):
     if key not in _rules:
         return error_response_json("ResourceNotFoundException", f"Rule {rule_name} does not exist.", 400)
 
+    for target in targets:
+        error = _validate_target_arn(target)
+        if error:
+            return error
+    error = _validate_event_bus_targets(bus, targets)
+    if error:
+        return error
+
     if key not in _targets:
         _targets[key] = []
     existing_ids = {t["Id"] for t in _targets[key]}
@@ -590,6 +698,69 @@ def _put_targets(data):
             _targets[key] = [x for x in _targets[key] if x["Id"] != t["Id"]]
         _targets[key].append(t)
     return json_response({"FailedEntryCount": 0, "FailedEntries": []})
+
+
+def _validate_target_arn(target):
+    arn = target.get("Arn", "")
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return error_response_json(
+            "ValidationException",
+            f"Parameter {arn} is not valid. Reason: Provided Arn is not in correct format.",
+            400,
+        )
+
+    if spec.service not in _SUPPORTED_TARGET_SERVICES:
+        return error_response_json(
+            "ValidationException",
+            f"{spec.service} is not a supported service for a target.",
+            400,
+        )
+
+    # Any other target in another account needs an execution role, in any region.
+    if spec.service != "events" and spec.account_id and spec.account_id != get_account_id() and not target.get("RoleArn"):
+        return error_response_json("ValidationException", f"RoleArn is required for target {arn}.", 400)
+
+    return None
+
+
+def _event_bus_spec(arn):
+    """The parsed ARN when ``arn`` names an event bus, else None."""
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None
+    return spec if spec.service == "events" and spec.resource.startswith("event-bus/") else None
+
+
+def _validate_event_bus_targets(rule_bus, targets):
+    """AWS's checks on event bus targets, in its order: a cross-account role, then per target the rule's own bus and a RetryPolicy, then a missing RoleArn."""
+    buses = [(target, spec) for target in targets
+             if (spec := _event_bus_spec(target.get("Arn", ""))) is not None]
+    for target, _ in buses:
+        try:
+            role_account = parse_arn(target.get("RoleArn", "")).account_id
+        except ArnParseError:
+            continue
+        if role_account != get_account_id():
+            return error_response_json(
+                "AccessDeniedException",
+                f"Access to the resource {target['RoleArn']} is denied. Reason: Cross-account pass role is not allowed.",
+                400,
+            )
+    for target, spec in buses:
+        if (spec.account_id == get_account_id() and spec.region == get_region()
+                and spec.resource == f"event-bus/{rule_bus}"):
+            return error_response_json(
+                "ValidationException", "Source EventBus and Target EventBus must not be the same.", 400)
+        if "RetryPolicy" in target:
+            return error_response_json(
+                "ValidationException", "Retry policy is not supported for Event bus targets.", 400)
+    for target, _ in buses:
+        if not target.get("RoleArn"):
+            return error_response_json("ValidationException", f"RoleArn is required for target {target['Arn']}.", 400)
+    return None
 
 
 def _remove_targets(data):
@@ -607,7 +778,7 @@ def _list_targets_by_rule(data):
     bus = data.get("EventBusName", "default")
     key = _rule_key(rule_name, bus)
     targets = _targets.get(key, [])
-    return json_response({"Targets": targets})
+    return _offset_page(data, "Targets", list(targets))
 
 
 def _list_rule_names_by_target(data):
@@ -641,23 +812,88 @@ def _list_rule_names_by_target(data):
     return json_response(resp)
 
 
+
+def _event_pattern_error(pattern_str):
+    """The reason AWS would refuse this event pattern, or ``None`` if it accepts
+    it. Shared by every API that takes one, so they cannot disagree."""
+    if not pattern_str:
+        return None
+    if not isinstance(pattern_str, str):
+        return "Invalid JSON"
+    return _parse_pattern_text(pattern_str)[1]
+
+
+def _invalid_event_pattern(reason: str):
+    return error_response_json(
+        "InvalidEventPatternException", f"Event pattern is not valid. Reason: {reason}", 400)
+
+
+@functools.lru_cache(maxsize=1024)
+def _iso_time(epoch_seconds) -> str:
+    """The ISO-8601 rendering of an epoch second, or ``""`` when the number is
+    not a time at all. Memoized: every event in the same second renders alike.
+
+    The guard is not decoration — a ``time`` no platform clock can represent
+    (``1e30``) makes ``fromtimestamp`` raise, and this runs while building the
+    view every pattern is matched against, so it would surface as a 500 out of
+    the enclosing PutEvents."""
+    try:
+        return datetime.fromtimestamp(epoch_seconds, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+
+def _event_time_string(event) -> str:
+    """The event's ``time`` in the form the envelope carries it. ``Time`` is
+    stored as int epoch seconds while a pattern filters on the ISO-8601 string
+    the target receives, so matcher and delivery share this one rendering."""
+    raw = event.get("Time", "")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        return _iso_time(raw)
+    return raw if isinstance(raw, str) else ""
+
+
+# The envelope names ``_event_from_test_payload`` models. Anything else a
+# caller puts at the top level of a ``TestEventPattern`` event is carried
+# through as an extra path rather than dropped: AWS compiles a pattern to a set
+# of paths and has no envelope allow-list, so a pattern naming an unmodelled key
+# must be able to match an event that actually carries it. ``PutEvents`` cannot
+# produce one — its entries are a fixed shape — so this only ever fires here.
+_TEST_PAYLOAD_MODELLED_KEYS = frozenset({
+    "detail", "Detail", "source", "Source", "detail-type", "DetailType",
+    "account", "Account", "region", "Region", "resources", "Resources",
+    "id", "EventId", "time", "Time", "version", "Version",
+    "replay-name", "ReplayName",
+})
+
+
 def _event_from_test_payload(event_obj: dict) -> dict:
     """Map CloudWatch Events-shaped JSON to internal fields used by _matches_pattern."""
     detail = event_obj.get("detail", event_obj.get("Detail", {}))
-    if isinstance(detail, dict):
+    if not isinstance(detail, str):
+        # Re-encoded, not ``str()``: repr would render a null as ``None`` and a
+        # list in Python syntax, and a pattern can ask about either.
         detail = json.dumps(detail)
-    elif detail is None:
-        detail = "{}"
-    else:
-        detail = str(detail)
-    return {
+    synthetic = {
         "Source": event_obj.get("source", event_obj.get("Source", "")),
         "DetailType": event_obj.get("detail-type", event_obj.get("DetailType", "")),
         "Detail": detail,
         "Account": event_obj.get("account", event_obj.get("Account", get_account_id())),
         "Region": event_obj.get("region", event_obj.get("Region", get_region())),
         "Resources": event_obj.get("resources", event_obj.get("Resources", [])),
+        "EventId": event_obj.get("id", event_obj.get("EventId", "")),
+        "Time": event_obj.get("time", event_obj.get("Time", "")),
+        "Version": event_obj.get("version", event_obj.get("Version", "0")),
     }
+    # Absent rather than empty on a normal event; see ``_pattern_event_view``.
+    replay_name = event_obj.get("replay-name", event_obj.get("ReplayName"))
+    if replay_name is not None:
+        synthetic["ReplayName"] = replay_name
+    extra = {key: value for key, value in event_obj.items()
+             if key not in _TEST_PAYLOAD_MODELLED_KEYS}
+    if extra:
+        synthetic["_ExtraEnvelope"] = extra
+    return synthetic
 
 
 def _test_event_pattern(data):
@@ -674,6 +910,10 @@ def _test_event_pattern(data):
     if not isinstance(event_obj, dict):
         return error_response_json("InvalidEventPatternException", "Event must be a JSON object", 400)
 
+    pattern_error = _event_pattern_error(pattern_str)
+    if pattern_error:
+        return _invalid_event_pattern(pattern_error)
+
     synthetic = _event_from_test_payload(event_obj)
     matched = _matches_pattern(pattern_str, synthetic)
     return json_response({"Result": bool(matched)})
@@ -683,13 +923,310 @@ def _test_event_pattern(data):
 # PutEvents + event pattern matching + target dispatch
 # ---------------------------------------------------------------------------
 
-def _normalize_bus_name(name):
-    if name and name.startswith("arn:"):
-        return name.split("/")[-1]
-    return name
+def _events_resource_name_from_ref(value, prefix, label):
+    if not value or not value.startswith("arn:"):
+        return value, None
+    try:
+        spec = parse_arn(value)
+    except ArnParseError:
+        return "", (
+            "ValidationException",
+            f"Parameter {label} is not valid. Reason: Provided Arn is not in correct format.",
+        )
+    if spec.service != "events" or not spec.resource.startswith(prefix):
+        return "", (
+            "ValidationException",
+            f"Parameter {label} is not valid. Reason: Provided Arn is not an EventBridge {label}.",
+        )
+    if spec.account_id != get_account_id() or spec.region != get_region():
+        return "", (
+            "ResourceNotFoundException",
+            f"EventBridge {label} {value} does not exist.",
+        )
+    return spec.resource.split("/", 1)[1], None
 
 
-def _put_events(data):
+def _event_bus_name_from_ref(name):
+    return _events_resource_name_from_ref(name, "event-bus/", "EventBusName")
+
+
+def _archive_name_from_ref(source_arn):
+    if not source_arn or not source_arn.startswith("arn:"):
+        return "", (
+            "ValidationException",
+            "Parameter EventSourceArn is not valid. Reason: Provided Arn is not in correct format.",
+        )
+    return _events_resource_name_from_ref(source_arn, "archive/", "EventSourceArn")
+
+
+def _resolve_taggable_events_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return None, error_response_json(
+            "ValidationException",
+            "Parameter ResourceARN is not valid. Reason: Provided Arn is not in correct format.",
+            400,
+        )
+
+    if spec.partition != "aws" or spec.service != "events":
+        return None, error_response_json(
+            "ValidationException",
+            "Parameter ResourceARN is not valid. Reason: Provided Arn is not an EventBridge ResourceARN.",
+            400,
+        )
+    if spec.region != get_region() or spec.account_id != get_account_id():
+        return None, error_response_json(
+            "ResourceNotFoundException",
+            f"EventBridge resource {arn} does not exist.",
+            400,
+        )
+
+    resource = spec.resource
+    if resource.startswith("event-bus/"):
+        name = resource.split("/", 1)[1]
+        if name == "default":
+            exists = arn == f"arn:aws:events:{get_region()}:{get_account_id()}:event-bus/default"
+        else:
+            record = _event_buses.get(name)
+            exists = bool(record) and record.get("Arn") == arn
+    elif resource.startswith("rule/"):
+        parts = resource.split("/")
+        if len(parts) == 2:
+            bus, rule = "default", parts[1]
+        elif len(parts) == 3:
+            _, bus, rule = parts
+        else:
+            bus, rule = "", ""
+        record = _rules.get(_rule_key(rule, bus)) if rule else None
+        exists = bool(record) and record.get("Arn") == arn
+    elif resource.startswith("archive/"):
+        name = resource.split("/", 1)[1]
+        record = _archives.get(name)
+        exists = bool(record) and record.get("ArchiveArn") == arn
+    elif resource.startswith("replay/"):
+        name = resource.split("/", 1)[1]
+        record = _replays.get(name)
+        exists = bool(record) and record.get("ReplayArn") == arn
+    elif resource.startswith("endpoint/"):
+        name = resource.split("/", 1)[1]
+        record = _endpoints.get(name)
+        exists = bool(record) and record.get("Arn") == arn
+    elif resource.startswith("connection/"):
+        name = resource.split("/", 1)[1]
+        record = _connections.get(name)
+        exists = bool(record) and record.get("ConnectionArn") == arn
+    elif resource.startswith("api-destination/"):
+        name = resource.split("/", 1)[1]
+        record = _api_destinations.get(name)
+        exists = bool(record) and record.get("ApiDestinationArn") == arn
+    else:
+        return None, error_response_json(
+            "ValidationException",
+            "Parameter ResourceARN is not valid. Reason: Provided Arn is not a taggable EventBridge resource.",
+            400,
+        )
+
+    if not exists:
+        return None, error_response_json(
+            "ResourceNotFoundException",
+            f"EventBridge resource {arn} does not exist.",
+            400,
+        )
+    return arn, None
+
+
+def _event_bus_in_other_region(ref):
+    """Whether ``ref`` is an event bus ARN naming a region other than the request's."""
+    if not isinstance(ref, str) or not ref.startswith("arn:"):
+        return False
+    try:
+        spec = parse_arn(ref)
+    except ArnParseError:
+        return False
+    return spec.service == "events" and spec.resource.startswith("event-bus/") and spec.region != get_region()
+
+
+def _foreign_event_bus(ref):
+    """``(owner account, bus name)`` when ``ref`` is the ARN of an event bus
+    another account owns in this region, else None. PutEvents delivers to it."""
+    if not ref or not ref.startswith("arn:"):
+        return None
+    try:
+        spec = parse_arn(ref)
+    except ArnParseError:
+        return None
+    name = spec.resource.split("/", 1)[1] if spec.resource.startswith("event-bus/") else ""
+    # Patterns from the PutEvents model. AWS refuses anything else with a
+    # ValidationException; MiniStack keeps its existing per-entry answer for it.
+    if (spec.partition != "aws" or spec.service != "events" or not re.fullmatch(r"[.\-_A-Za-z0-9]+", name)
+            or spec.region != get_region() or not re.fullmatch(r"[0-9]{12}", spec.account_id or "")
+            or spec.account_id == get_account_id()):
+        return None
+    return spec.account_id, name
+
+
+def _strings(value):
+    """Whether ``value`` is a string or a non-empty list of strings."""
+    return isinstance(value, str) or (isinstance(value, list) and bool(value)
+                                      and all(isinstance(item, str) for item in value))
+
+
+# An AWS principal a bus policy can name: everyone, an account, or an IAM or STS ARN without wildcards.
+_AWS_PRINCIPAL = re.compile(r"\*|[0-9]{12}|arn:aws[a-z-]*:(iam|sts)::[0-9]{12}:[^*?]+")
+
+
+def _known_operator(operator):
+    """Whether the IAM evaluator implements condition ``operator``."""
+    from ministack.core.iam_evaluator import _CONDITION_OPS
+
+    op = operator.lower()
+    if op == "null":
+        return True
+    op = op[:-len("ifexists")] if op.endswith("ifexists") else op
+    op = op.split(":", 1)[1] if op.startswith(("forallvalues:", "foranyvalue:")) else op
+    return op in _CONDITION_OPS
+
+
+def _readable_statement(stmt):
+    """``stmt`` in the form AWS evaluates it, or None when it cannot be read.
+
+    A ``Policy`` document is stored as given; a PutPermission grant keeps its
+    ``Condition`` as the request's Type/Key/Value, which AWS accepts only as
+    StringEquals on aws:PrincipalOrgID with Principal ``*``."""
+    if not isinstance(stmt, dict) or not _strings(stmt.get("Action", stmt.get("NotAction"))):
+        return None
+    if not _strings(stmt.get("Resource", stmt.get("NotResource"))) or "NotPrincipal" in stmt:
+        return None
+    principal, condition = stmt.get("Principal"), stmt.get("Condition")
+    if not (principal == "*" or (isinstance(principal, dict) and principal
+                                 and all(_strings(value) for value in principal.values()))):
+        return None
+    aws = principal.get("AWS", []) if isinstance(principal, dict) else []
+    if not all(_AWS_PRINCIPAL.fullmatch(p) for p in ([aws] if isinstance(aws, str) else aws)):
+        return None
+    stmt = dict(stmt)
+    if isinstance(condition, dict) and {"Type", "Key", "Value"} & set(condition):
+        if not (principal == "*" and condition.get("Type") == "StringEquals"
+                and condition.get("Key") == "aws:PrincipalOrgID" and isinstance(condition.get("Value"), str)):
+            return None
+        stmt["Condition"] = {"StringEquals": {"aws:PrincipalOrgID": condition["Value"]}}
+    elif condition is not None and not (
+            isinstance(condition, dict) and all(
+                _known_operator(operator) and isinstance(keys, dict)
+                and all(_strings(value) for value in keys.values())
+                for operator, keys in condition.items())):
+        return None
+    return stmt
+
+
+def _bus_policy_document(policy):
+    """The bus policy as AWS evaluates it, or None when it holds a Deny this
+    emulator cannot evaluate (unreadable, with ``NotPrincipal``, or with an
+    operator it does not implement), which then refuses every caller. A
+    statement that cannot be read grants nothing."""
+    statements = policy.get("Statement") if isinstance(policy, dict) else None
+    if isinstance(statements, dict):
+        statements = [statements]
+    evaluable = []
+    for stmt in statements if isinstance(statements, list) else []:
+        readable = _readable_statement(stmt)
+        if isinstance(stmt, dict) and stmt.get("Effect") == "Deny" and readable is None:
+            return None
+        if readable is not None:
+            evaluable.append(readable)
+    return {"Version": "2012-10-17", "Statement": evaluable}
+
+
+def _foreign_bus_denial(entries):
+    """The AccessDeniedException that refuses a whole PutEvents request when an
+    entry names another account's bus whose policy does not allow the caller.
+    Only under AUTH=true, like the other resource-policy checks."""
+    from ministack.app import AUTH
+    if not AUTH:
+        return None
+    from ministack.core.iam_evaluator import EvalContext, _principal_type, caller_arn, evaluate_resource_policy
+
+    principal = caller_arn()
+    for entry in entries:
+        bus_ref = entry.get("EventBusName", "default")
+        foreign = _foreign_event_bus(bus_ref)
+        if foreign is None:
+            continue
+        owner, name = foreign
+        with request_scope(owner, get_region()):
+            # A missing bus has no policy, even if a deleted one left its statements behind.
+            policy = _event_bus_policies.get(name) if name in _event_buses else None
+        ctx = EvalContext(
+            principal_arn=principal,
+            principal_type=_principal_type(principal, ""),
+            principal_account=get_account_id(),
+            action="events:PutEvents",
+            resource_arn=bus_ref,
+            region=get_region(),
+            # Conditions on the event are checked per entry; a direct publish is
+            # not an event bus invoking another.
+            service_context={"events:source": entry.get("Source"), "events:detail-type": entry.get("DetailType"),
+                             "events:eventbusinvocation": "false"},
+        )
+        document = _bus_policy_document(policy) if policy else {"Statement": []}
+        decision = "Deny" if document is None else evaluate_resource_policy(document, ctx).decision
+        if decision != "Allow":
+            reason = ("with an explicit deny in a resource-based policy" if decision == "Deny"
+                      else "because no resource-based policy allows the events:PutEvents action")
+            return error_response_json(
+                "AccessDeniedException",
+                f"User: {principal} is not authorized to perform: events:PutEvents on resource: {bus_ref} {reason}",
+                400,
+            )
+    return None
+
+
+def _endpoint_by_id(endpoint_id):
+    """The caller's global endpoint with *endpoint_id*, in whatever region it was created."""
+    return next((ep for (account, _region, _name), ep in _endpoints.all_items()
+                 if account == get_account_id() and ep.get("EndpointId") == endpoint_id), None)
+
+
+def _put_events_through_endpoint(data, endpoint):
+    """PutEvents to a healthy global endpoint: delivered in its primary region with the endpoint in
+    ``resources``, and, with replication enabled, copied to the secondary region's bus of the same name."""
+    primary = parse_arn(endpoint["Arn"]).region
+    now = int(_now_ts())
+    # The replica keeps the event's time, so both regions see one timestamp.
+    entries = [{**e, "Resources": list(e.get("Resources") or []) + [endpoint["Arn"]],
+                "Time": e.get("Time") if e.get("Time") is not None else now}
+               for e in data.get("Entries", [])]
+    with request_scope(get_account_id(), primary):
+        status, headers, body = _put_events({**data, "Entries": entries, "EndpointId": None})
+    secondary = (((endpoint.get("RoutingConfig") or {}).get("FailoverConfig") or {})
+                 .get("Secondary") or {}).get("Route")
+    if (status != 200 or not secondary or secondary == primary
+            or (endpoint.get("ReplicationConfig") or {}).get("State", "ENABLED") != "ENABLED"):
+        return status, headers, body
+    sent = json.loads(body).get("Entries", [])
+    for entry, result in zip(entries, sent):
+        if "EventId" not in result:
+            continue
+        bus_name, _ = _event_bus_name_from_ref(entry.get("EventBusName", "default"))
+        record = {
+            "EventId": new_uuid(), "Source": entry.get("Source", ""), "DetailType": entry.get("DetailType", ""),
+            "Detail": entry.get("Detail", "{}"), "EventBusName": bus_name,
+            "Time": int(_coerce_timestamp(entry["Time"])) if isinstance(_coerce_timestamp(entry["Time"]), (int, float)) else now,
+            "Resources": entry["Resources"], "Account": get_account_id(), "Region": primary,
+        }
+        with request_scope(get_account_id(), secondary):
+            _events_log_list().append(record)
+            view = _pattern_event_view(record)
+            _dispatch_event(record, view)
+            _archive_event(record, view)
+    return status, headers, body
+
+
+def _put_events(data, allow_aws_source=False):
+    """PutEvents; only built-in emitters pass ``allow_aws_source`` to publish ``aws.*`` sources."""
+    if data.get("EndpointId") and (endpoint := _endpoint_by_id(data["EndpointId"])):
+        return _put_events_through_endpoint(data, endpoint)
     entries = data.get("Entries", [])
     # AWS spec: PutEvents.Entries list min=1 max=10. Real AWS rejects with
     # ValidationException; matching that here so SDKs see the same constraint.
@@ -700,14 +1237,38 @@ def _put_events(data):
             "Member must have length less than or equal to 10" % len(entries),
             400,
         )
+    if any(_event_bus_in_other_region(entry.get("EventBusName")) for entry in entries):
+        # Captured on AWS: a bus ARN in another region fails the whole request.
+        return error_response_json("ValidationException", "Cross-region api call is not allowed.", 400)
+    denial = _foreign_bus_denial(entries)
+    if denial:
+        return denial
     results = []
+    failed = 0
     for entry in entries:
         event_id = new_uuid()
-        bus_name = _normalize_bus_name(entry.get("EventBusName", "default"))
+        bus_ref = entry.get("EventBusName", "default")
+        owner, bus_name = _foreign_event_bus(bus_ref) or (get_account_id(), None)
+        if bus_name is None:
+            bus_name, bus_error = _event_bus_name_from_ref(bus_ref)
+            if bus_error:
+                code, message = bus_error
+                results.append({"ErrorCode": code, "ErrorMessage": message})
+                failed += 1
+                continue
+        source = entry.get("Source")
+        if not allow_aws_source and isinstance(source, str) and source.startswith("aws."):
+            results.append({
+                "ErrorCode": "NotAuthorizedForSourceException",
+                "ErrorMessage": "Not authorized for the source.",
+            })
+            failed += 1
+            continue
         # AWS Time is a timestamp shape; ministack convention is int epoch seconds
         # (Java SDK v2 chokes on floats). Persisted in the event_record so
         # archive replay also dispatches the int form.
-        event_time = int(_now_ts())
+        sent_time = _coerce_timestamp(entry.get("Time"))
+        event_time = int(sent_time) if isinstance(sent_time, (int, float)) else int(_now_ts())
 
         event_record = {
             "EventId": event_id,
@@ -720,31 +1281,39 @@ def _put_events(data):
             "Account": get_account_id(),
             "Region": get_region(),
         }
-        _events_log_list().append(event_record)
         results.append({"EventId": event_id})
         logger.debug("EventBridge event: %s / %s", entry.get('Source'), entry.get('DetailType'))
 
-        _dispatch_event(event_record)
-        _archive_event(event_record)
+        # The event keeps the publisher's account and lands on the owner's bus.
+        with request_scope(owner, get_region()):
+            _events_log_list().append(event_record)
+            # One view for both walks; rebuilding it re-parses ``Detail``.
+            view = _pattern_event_view(event_record)
+            _dispatch_event(event_record, view)
+            _archive_event(event_record, view)
 
-    return json_response({"FailedEntryCount": 0, "Entries": results})
+    return json_response({"FailedEntryCount": failed, "Entries": results})
 
 
-def _archive_event(event):
+def _archive_event(event, view=None):
     bus_name = event.get("EventBusName", "default")
     bus_arn = f"arn:aws:events:{get_region()}:{get_account_id()}:event-bus/{bus_name}"
     for archive in _archives.values():
         if archive.get("EventSourceArn") != bus_arn:
             continue
         pattern = archive.get("EventPattern", "")
-        if pattern and not _matches_pattern(pattern, event):
-            continue
+        if pattern:
+            view = view or _pattern_event_view(event)
+            if not _matches_pattern_view(
+                    pattern, view, f"archive {archive.get('ArchiveName', '?')}"):
+                continue
         archive.setdefault("Events", []).append(event)
         archive["EventCount"] = archive.get("EventCount", 0) + 1
 
 
-def _dispatch_event(event):
+def _dispatch_event(event, view=None):
     bus_name = event.get("EventBusName", "default")
+    view = view or _pattern_event_view(event)
 
     for key, rule in _rules.items():
         if rule.get("EventBusName", "default") != bus_name:
@@ -754,224 +1323,1430 @@ def _dispatch_event(event):
         if not rule.get("EventPattern"):
             continue
 
-        if _matches_pattern(rule["EventPattern"], event):
+        if _matches_pattern_view(rule["EventPattern"], view, f"rule {key}"):
             rule_targets = _targets.get(key, [])
             for target in rule_targets:
-                _invoke_target(target, event, rule)
+                _invoke_target(target, event, rule, view)
+
+
+def _reject_json_constant(literal: str):
+    """``json.loads(parse_constant=...)`` hook. Raising here is what turns
+    ``NaN``/``Infinity``/``-Infinity`` — extensions Python's decoder allows and
+    JSON does not define — back into the ``Invalid JSON`` refusal AWS gives."""
+    raise ValueError(f"Invalid JSON literal: {literal}")
+
+
+def _parse_pattern_text(pattern_str: str):
+    """``(alternatives, None)`` for a pattern AWS accepts, ``(None, reason)`` for
+    one it refuses. One parse answers both the validator's question and the
+    matcher's, so the two cannot come to disagree on what counts as a refusal.
+    See ``_reject_json_constant`` for the one place this is stricter than
+    Python's decoder.
+
+    ``ValueError``, not ``JSONDecodeError``: an integer literal of more digits
+    than Python will convert raises the plain parent class. A ``RecursionError``
+    is the same refusal, and it happens before any depth bound of ours applies.
+
+    ``parse_constant`` refuses ``NaN``/``Infinity``/``-Infinity``, which Python's
+    decoder accepts by default and JSON does not define. AWS parses a pattern
+    with Jackson, which rejects them unless it is asked not to, so accepting one
+    here would take a pattern that is a `400` in production and leave it matching
+    nothing locally — the silence this whole entry exists to remove."""
+    if isinstance(pattern_str, str) and not pattern_str.strip():
+        return None, "Filter is not an object"
+    try:
+        pattern = json.loads(pattern_str, parse_constant=_reject_json_constant)
+    except (ValueError, TypeError, RecursionError):
+        return None, "Invalid JSON"
+    try:
+        return _compile_pattern(pattern), None
+    except _InvalidPattern as exc:
+        return None, str(exc)
+    except RecursionError:
+        return None, "Event pattern is nested too deeply"
+
+
+@functools.lru_cache(maxsize=1024)
+def _compiled_pattern(pattern_str: str):
+    """The alternatives a pattern string compiles to, or ``None`` when AWS would
+    refuse it. Cached because rule patterns are stable while events are not, and
+    this runs per rule per event on the dispatch path. The returned lists are
+    shared with every later caller: read them, never mutate them.
+
+    A refusal is cached rather than raised. A pattern only reaches here from a
+    rule restored from persisted state, which is loaded verbatim and never
+    revalidated — and one AWS would have refused matches nothing. So does a
+    pattern whose parse exhausted the stack."""
+    return _parse_pattern_text(pattern_str)[0]
 
 
 def _matches_pattern(pattern_str, event):
-    try:
-        if isinstance(pattern_str, str):
-            pattern = json.loads(pattern_str)
-        else:
-            pattern = pattern_str
-    except (json.JSONDecodeError, TypeError):
+    """Whether ``event`` matches ``pattern_str`` — the single-shot form; dispatch
+    builds the view once and calls ``_matches_pattern_view`` directly."""
+    return _matches_pattern_view(pattern_str, _pattern_event_view(event))
+
+
+def _matches_pattern_view(pattern_str, view, owner="rule"):
+    """Whether ``view`` matches ``pattern_str``, the pattern as the JSON text the
+    API takes it in and the rule and archive stores keep across a restart.
+
+    A stored pattern that is not text belongs to a record this build's validation
+    never saw; it matches nothing, and is logged rather than dropped in silence.
+    ``owner`` names the record in that log line, so the operator can go and fix
+    the one that is skipping. Handing the pattern to the memoized compiler would
+    be worse than skipping it: ``lru_cache`` answers an unhashable key with
+    ``TypeError``, and dispatch runs inside ``PutEvents``, so that is a 500 on the
+    whole batch instead of one skipped rule."""
+    if not isinstance(pattern_str, str):
+        logger.warning("EventBridge: %s has a pattern that is not JSON text (%s); skipped",
+                       owner, type(pattern_str).__name__)
         return False
+    alternatives = _compiled_pattern(pattern_str)
+    if alternatives is None:
+        return False
+    return any(_matches_alternative(view, alternative) for alternative in alternatives)
 
-    if "source" in pattern:
-        if not _matches_field(event.get("Source", ""), pattern["source"]):
-            return False
 
-    if "detail-type" in pattern:
-        if not _matches_field(event.get("DetailType", ""), pattern["detail-type"]):
-            return False
+def _matches_alternative(view, alternative) -> bool:
+    """One compiled alternative against one event, envelope keys before ``detail``,
+    so a rule that fails on ``source`` never decodes the payload. The split is
+    exact because a pattern's top-level keys are independent: ``_matches_detail``
+    ANDs them against the same tree, so asking in two batches asks the same
+    question."""
+    if "detail" not in alternative:
+        return _matches_detail(view.envelope(), alternative)
+    if len(alternative) == 1:
+        return _matches_detail(view.event_with_detail(), alternative)
+    envelope = {key: value for key, value in alternative.items() if key != "detail"}
+    return (_matches_detail(view.envelope(), envelope) and
+            _matches_detail(view.event_with_detail(), {"detail": alternative["detail"]}))
 
-    if "detail" in pattern:
+
+def _decoded_detail(raw):
+    """An event's ``Detail`` as a JSON value. One that is not JSON is the leaf it
+    is: an empty object would answer a question about a field the event does not
+    have. Shared by the matcher's view and the delivered envelope, so the two
+    agree on one reading."""
+    if isinstance(raw, str):
         try:
-            detail = json.loads(event.get("Detail", "{}")) if isinstance(event.get("Detail"), str) else event.get("Detail", {})
-        except (json.JSONDecodeError, TypeError):
-            detail = {}
-        if not _matches_detail(detail, pattern["detail"]):
-            return False
-
-    if "account" in pattern:
-        if not _matches_field(event.get("Account", get_account_id()), pattern["account"]):
-            return False
-
-    if "region" in pattern:
-        if not _matches_field(event.get("Region", get_region()), pattern["region"]):
-            return False
-
-    if "resources" in pattern:
-        event_resources = event.get("Resources", [])
-        for required in pattern["resources"]:
-            if required not in event_resources:
-                return False
-
-    return True
+            return json.loads(raw)
+        except (ValueError, TypeError, RecursionError):
+            return raw
+    return raw
 
 
-def _matches_field(value, pattern_values):
-    if isinstance(pattern_values, list):
-        for item in pattern_values:
-            if isinstance(item, dict):
-                # Content-based filter (wildcard, prefix, suffix, etc.)
-                if _matches_content_filter(value, item):
-                    return True
-            elif value == item:
-                return True
+class _EventView:
+    """The event a pattern is matched against and a target is delivered, with
+    ``detail`` decoded only once, and only for the alternatives that ask about it.
+
+    One object serves both because they are the same tree: a rule must not match
+    on a field whose delivered value differs, and the surest way to guarantee
+    that is to have nothing to keep in step.
+
+    The deferral costs nothing because ``_matches_detail`` reads a key only when
+    the pattern names it — and AWS prunes the same way: Event Ruler skips a field
+    no rule uses rather than parsing into it, so a field nothing asks about is
+    absent from the tree a pattern sees, never present as a null.
+
+    Not a ``dict`` subclass holding a placeholder until first read: CPython reads
+    a subclass's own storage for ``dict(view)``, ``{**view}`` and ``items()``, so
+    the placeholder would reach consumers as a ``detail`` of ``null`` — a leaf a
+    pattern can match on."""
+
+    __slots__ = ("_envelope", "_raw_detail", "_with_detail")
+
+    def __init__(self, envelope, raw_detail):
+        self._envelope = envelope
+        self._raw_detail = raw_detail
+        self._with_detail = None
+
+    def envelope(self) -> dict:
+        """The event without ``detail`` — what a pattern naming no ``detail`` is
+        matched against, and what ``<aws.events.event>`` renders."""
+        return self._envelope
+
+    def event_with_detail(self) -> dict:
+        """The whole event: the tree a target is delivered, and the one an
+        alternative naming ``detail`` is matched against."""
+        if self._with_detail is None:
+            self._with_detail = dict(self._envelope, detail=_decoded_detail(self._raw_detail))
+        return self._with_detail
+
+
+def _pattern_event_view(event):
+    """The event as a pattern sees it, which is exactly the envelope a target is
+    delivered — one builder, because two hand-kept copies drift.
+
+    A pattern is matched against one whole tree rather than field by field
+    because that is what AWS does — it compiles a pattern to a set of *paths* and
+    has no notion of which top-level names are legal. Two consequences fall out
+    of that and out of nothing else: an unrecognized top-level key is simply a
+    path the event does not have, so ``{"nonesuch": ["x"]}`` matches nothing while
+    ``{"nonesuch": [{"exists": false}]}`` matches *everything*; and an envelope
+    field may be written as an object path (``{"source": {"x": ["y"]}}`` is the
+    path ``source.x``) without that being an error."""
+    fields = {
+        "version": str(event.get("Version", "0")),
+        "id": event.get("EventId", ""),
+        "source": event.get("Source", ""),
+        "account": event.get("Account", get_account_id()),
+        "time": _event_time_string(event),
+        "region": event.get("Region", get_region()),
+        "resources": event.get("Resources", []),
+        "detail-type": event.get("DetailType", ""),
+    }
+    if event.get("ReplayName") is not None:
+        # Present only on a replayed event, which is what makes AWS's own
+        # ``{"replay-name": [{"exists": false}]}`` mean "live traffic only".
+        fields["replay-name"] = event["ReplayName"]
+    extra = event.get("_ExtraEnvelope")
+    if extra:
+        # Unmodelled top-level keys, which only ``TestEventPattern`` can supply.
+        # Written under the modelled names so a caller cannot shadow one.
+        fields = dict(extra, **fields)
+    return _EventView(fields, event.get("Detail", "{}"))
+
+# Field names AWS reserves inside a ``$or`` branch: a ``$or`` holding any of them
+# is not the OR operator. Wider than SNS's equivalent — it also reserves the bare
+# comparison symbols and the names of operators AWS has not shipped yet, so
+# adding one later cannot change what an existing pattern means.
+_OR_RESERVED_MEMBER_KEYS = frozenset({
+    "anything-but", "prefix", "suffix", "equals-ignore-case", "numeric",
+    "exists", "cidr", "wildcard", "exactly", "=", "<", "<=", ">", ">=",
+    "regex", "not-wildcard", "not-equals-ignore-case", "date-after",
+    "date-on-or-after", "date-before", "date-on-or-before", "in-date-range",
+    "ip-address-in-range", "ip-address-not-in-range",
+})
+
+
+class _InvalidPattern(Exception):
+    """An event pattern AWS refuses at rule creation.
+
+    The message is the one EventBridge reports, which is the underlying
+    Event Ruler text verbatim — a real service response reads
+    ``Event pattern is not valid. Reason: exists match pattern must be either
+    true or false.`` — so the strings here are deliberately AWS's wording
+    rather than our own."""
+
+
+class _PatternTooComplex(_InvalidPattern):
+    """A limit was reached rather than the pattern being malformed: the ``$or``
+    combination cap, or the nesting guard. Kept distinct because neither is
+    retried against the fallback compiler — re-reading ``$or`` as a field name
+    cannot answer a product over the ``$or`` arrays, and for a depth failure it
+    re-descends the same hundred levels the guard exists to bound."""
+
+
+# AWS's cap on the sub-patterns a ``$or`` may expand to. Its own wording is
+# "over 1000 rule combinations".
+_MAX_OR_COMBINATIONS = 1000
+# A guard on pattern nesting, not an AWS rule — AWS documents no depth limit.
+# Compilation and matching both recurse per level, on a pooled worker thread
+# whose remaining stack is nothing like the interpreter's nominal limit, and a
+# RecursionError there does not stay inside its own request. Set above any real
+# pattern and below where the handler's own JSON parse gives out.
+_MAX_PATTERN_DEPTH = 100
+
+
+# ---------------------------------------------------------------------------
+# Event pattern compilation — $or expansion into flat alternatives
+# ---------------------------------------------------------------------------
+
+
+def _compile_pattern(pattern):
+    """Expand an event pattern into the list of flat alternatives AWS compiles
+    it to, raising ``_InvalidPattern`` for anything it would reject.
+
+    ``$or`` is not evaluated at match time on AWS — it is expanded here, into
+    one alternative per branch, and the rule matches if *any* alternative does.
+    That is not merely a different route to the same answer. Because each branch
+    is built by writing leaves into the alternatives accumulated so far, a leaf
+    constrained both inside and outside a ``$or`` keeps only the LAST value
+    written, in document order. So ``{"a":["1"],"$or":[{"a":["2"]},{"b":["3"]}]}``
+    matches ``{"a":"2"}`` and does not match ``{"a":"1"}`` — and writing the two
+    keys the other way round reverses both answers. A recursive evaluator
+    answers order-independently and gets those cases wrong.
+
+    A ``$or`` that is not the operator falls back to being read as an ordinary
+    field name, which is what EventBridge does: it compiles with its ``$or``-aware
+    compiler and on failure retries with its pre-``$or`` one."""
+    # Outside the retry deliberately: AWS counts the product over the ``$or``
+    # arrays the pattern text holds, so a ``$or`` that turns out not to be the
+    # operator still counts toward the cap.
+    product = _or_combination_product(pattern)
+    if product > _MAX_OR_COMBINATIONS:
+        raise _PatternTooComplex(
+            f"Event pattern contains more than {_MAX_OR_COMBINATIONS} rule combinations")
+    try:
+        return _compile_alternatives(pattern, expand_or=True)
+    except _PatternTooComplex:
+        raise
+    except _InvalidPattern:
+        return _compile_alternatives(pattern, expand_or=False)
+
+
+def _or_combination_product(node, depth: int = 0):
+    """AWS's documented rule-combination count: the product of the lengths of
+    every ``$or`` array. It over-counts what the expansion actually produces for
+    a nested ``$or``, deliberately — counting only the alternatives would accept
+    a pattern AWS refuses, so both are checked."""
+    if not isinstance(node, dict) or depth > _MAX_PATTERN_DEPTH:
+        return 1
+    product = 1
+    for key, value in node.items():
+        if key == "$or" and isinstance(value, list):
+            product *= max(len(value), 1)
+            for member in value:
+                product *= _or_combination_product(member, depth + 1)
+        elif isinstance(value, dict):
+            product *= _or_combination_product(value, depth + 1)
+        if product > _MAX_OR_COMBINATIONS:
+            return product
+    return product
+
+
+def _compile_alternatives(pattern, expand_or: bool):
+    alternatives = []
+    _compile_object(alternatives, [], pattern, expand_or, inside_or=False, depth=0)
+    return alternatives or [{}]
+
+
+def _copy_alternative(alternative):
+    """A copy deep enough to fork on. The value lists are never mutated — a
+    leaf write replaces one wholesale — so only the object spine is copied."""
+    return {key: _copy_alternative(value) if isinstance(value, dict) else value
+            for key, value in alternative.items()}
+
+
+def _compile_object(alternatives, path, obj, expand_or, inside_or, depth):
+    if depth > _MAX_PATTERN_DEPTH:
+        raise _PatternTooComplex("Event pattern is nested too deeply")
+    if not isinstance(obj, dict):
+        raise _InvalidPattern("Filter is not an object")
+    if not obj:
+        raise _InvalidPattern("Empty objects are not allowed")
+    # Document order decides which of two writes to the same leaf survives, so
+    # the keys are walked in the order the JSON carried them and never sorted.
+    for key, value in obj.items():
+        if key == "$or" and expand_or:
+            _compile_or(alternatives, path, value, depth)
+            continue
+        if inside_or and key in _OR_RESERVED_MEMBER_KEYS:
+            raise _InvalidPattern(
+                f"{key} is Ruler reserved fieldName which cannot be used inside $or.")
+        # Event Ruler joins keys with ".": a dotted key is the nested path.
+        segments = key.split(".") if "." in key else (key,)
+        if isinstance(value, dict):
+            _compile_object(alternatives, [*path, *segments], value, expand_or, inside_or,
+                            depth + 1)
+        elif isinstance(value, list):
+            _validate_value_list(value)
+            _write_leaf(alternatives, [*path, *segments], value)
+        else:
+            raise _InvalidPattern(f'"{key}" must be an object or an array')
+
+
+def _compile_or(alternatives, path, members, depth):
+    prefix = [_copy_alternative(a) for a in alternatives]
+    alternatives.clear()
+    if not isinstance(members, list):
+        raise _InvalidPattern("It must be an Array followed with $or.")
+    for member in members:
+        if not isinstance(member, dict):
+            raise _InvalidPattern("Only JSON object is allowed in array of $or relationship.")
+        forked = [_copy_alternative(a) for a in prefix] or [{}]
+        _compile_object(forked, path, member, True, True, depth + 1)
+        alternatives.extend(forked)
+        if len(alternatives) > _MAX_OR_COMBINATIONS:
+            raise _PatternTooComplex(
+                f"Event pattern contains more than {_MAX_OR_COMBINATIONS} rule combinations")
+    if len(members) < 2:
+        raise _InvalidPattern("There must have at least 2 Objects in $or relationship.")
+
+
+# Marks an alternative no event can satisfy. AWS keys its sub-rules by the full
+# dotted path, so a path constrained both as a leaf and as an object keeps BOTH
+# constraints and matches nothing. Alternatives here are trees, which cannot
+# hold the two at once, so the collision is recorded rather than one side
+# dropped; an ``object()`` key cannot collide with a pattern key.
+_UNSATISFIABLE = object()
+
+
+def _write_leaf(alternatives, path, values):
+    """Record one leaf constraint in every alternative built so far. A leaf
+    already constrained at this path is overwritten, which is where
+    last-write-wins comes from — but only when both writes are leaves."""
+    if not alternatives:
+        alternatives.append({})
+    for alternative in alternatives:
+        node = alternative
+        for part in path[:-1]:
+            child = node.get(part)
+            if child is None:
+                child = {}
+                node[part] = child
+            elif not isinstance(child, dict):
+                # An ancestor is already a leaf; see ``_UNSATISFIABLE``.
+                alternative[_UNSATISFIABLE] = True
+                break
+            node = child
+        else:
+            if isinstance(node.get(path[-1]), dict):
+                alternative[_UNSATISFIABLE] = True
+            else:
+                node[path[-1]] = values
+
+
+# The operators ``anything-but`` may negate, and the ones a ``prefix``/``suffix``
+# operand may itself be written as.
+_ANYTHING_BUT_NESTABLE = frozenset({"prefix", "suffix", "equals-ignore-case", "wildcard"})
+_AFFIX_NESTABLE = frozenset({"equals-ignore-case"})
+# The numeric comparison spelled out, for the operand error messages.
+_NUMERIC_OP_NAMES = {"=": "equals", ">": ">", ">=": ">=", "<": "<", "<=": "<="}
+# A range's lower bound may be followed by an upper bound; every other operator
+# terminates the expression.
+_NUMERIC_RANGE_OPENERS = frozenset({">", ">="})
+_NUMERIC_RANGE_CLOSERS = frozenset({"<", "<="})
+
+
+def _require_type(operand, kind, message: str):
+    """The whole of what several operators ask of their operand: that it is one
+    JSON type, refused with AWS's own wording for that operator when it is not."""
+    if not isinstance(operand, kind):
+        raise _InvalidPattern(message)
+
+
+# ---------------------------------------------------------------------------
+# Event pattern validation — AWS's operand grammar, and its wording
+# ---------------------------------------------------------------------------
+
+
+def _validate_value_list(values: list):
+    """Validate one field's list of alternatives. AWS rejects the whole pattern
+    for any of these, so this raises rather than returning a verdict."""
+    if not values:
+        raise _InvalidPattern("Empty arrays are not allowed")
+    for item in values:
+        if isinstance(item, dict):
+            _validate_match_expression(item)
+        elif isinstance(item, list):
+            raise _InvalidPattern("Match value must be String, number, true, false, or null")
+
+
+def _validate_match_expression(expression: dict):
+    if not expression:
+        raise _InvalidPattern("Match expression name not found")
+    operator_name = next(iter(expression))
+    if operator_name not in _MATCH_OPERATORS:
+        raise _InvalidPattern(f"Unrecognized match type {operator_name}")
+    # Operand before arity: AWS's parser dispatches on the first key and consumes
+    # its operand before it sees a second, so a two-key expression whose first
+    # operand is also wrong reports the operand, not the arity.
+    _OPERAND_VALIDATORS[operator_name](expression[operator_name])
+    if len(expression) > 1:
+        # These two reach a different guard on AWS, which reports the arity of
+        # the operand it was already reading.
+        if operator_name in ("numeric", "anything-but"):
+            raise _InvalidPattern("Too many elements in numeric expression")
+        raise _InvalidPattern("Only one key allowed in match expression")
+
+
+def _validate_affix(operator_name: str, operand):
+    """``prefix``/``suffix`` take a string, or a nested ``equals-ignore-case``
+    for a case-insensitive affix.
+
+    An empty operand is accepted in both forms and is not the do-nothing rule it
+    looks like: AWS matches an affix against the *quoted* form of the value, so
+    an empty ``prefix`` compiles to the opening quote alone — which every JSON
+    string carries and no number, boolean or null does. It reads "this field has
+    a string value", and ``_matches_affix`` answers it that way.
+    ``Null prefix/suffix not allowed`` is AWS's rule for ``anything-but``'s
+    nested affix alone, so refusing an empty operand here would reject a pattern
+    real AWS compiles.
+
+    The type complaint names the one operator it read where the nested form says
+    ``prefix/suffix``; both are AWS's own wording."""
+    if isinstance(operand, dict):
+        if not operand:
+            raise _InvalidPattern(f"{operator_name.capitalize()} expression name not found")
+        inner = next(iter(operand))
+        if len(operand) > 1:
+            raise _InvalidPattern("Only one key allowed in match expression")
+        if inner not in _AFFIX_NESTABLE:
+            raise _InvalidPattern(f"Unsupported {operator_name} pattern: {inner}")
+        _require_type(operand[inner], str, "equals-ignore-case match pattern must be a string")
+        return
+    _require_type(operand, str, f"{operator_name} match pattern must be a string")
+
+
+def _wildcard_position(pattern: str, index: int) -> int:
+    """AWS reports a wildcard fault as a 1-based offset into the *quoted* form of
+    the operand, counted in UTF-8 bytes — so the opening quote is position 0 and
+    a multi-byte character before the fault shifts it by its encoded length.
+
+    ``errors="replace"`` is load-bearing: a lone surrogate out of a JSON escape
+    cannot be UTF-8 encoded at all, so encoding strictly raises — and this is
+    reached from the matcher as well as the validator. It is also what AWS
+    counts, its encoder substituting one ``?`` for an unpaired surrogate."""
+    return len(pattern[:index].encode("utf-8", errors="replace")) + 1
+
+
+def _validate_wildcard(operand):
+    _require_type(operand, str, "wildcard match pattern must be a string")
+    index = 0
+    while index < len(operand):
+        char = operand[index]
+        if char == "\\":
+            # A trailing backslash escapes the closing quote AWS appends, which
+            # is why it is an invalid escape rather than a dangling one.
+            if index + 1 >= len(operand) or operand[index + 1] not in ("*", "\\"):
+                raise _InvalidPattern(
+                    f"Invalid escape character at pos {_wildcard_position(operand, index)}")
+            index += 2
+            continue
+        if char == "*" and index + 1 < len(operand) and operand[index + 1] == "*":
+            raise _InvalidPattern(
+                f"Consecutive wildcard characters at pos {_wildcard_position(operand, index)}")
+        index += 1
+
+
+# A pre-filter for ``ipaddress``, on both the operand and the value side: its
+# job is to reject what ``ipaddress`` accepts and AWS does not — a zone id, a
+# dotted IPv4-mapped IPv6 address, anything not plainly one family. The IPv6
+# form is one character class plus a separate colon test, not the two
+# overlapping classes the shape suggests: those go quadratic on a long
+# colon-only string, on the dispatch path ``_wildcard_to_regex`` protects.
+_CIDR_IPV4_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\Z")
+_CIDR_IPV6_RE = re.compile(r"[0-9a-fA-F:]+\Z")
+# What AWS's integer parse of the mask accepts, which is not what Python's
+# ``int()`` accepts: no surrounding space, no underscore separators, no
+# non-ASCII digits, but a leading sign is fine (``/+24`` and ``/-0`` are real).
+_CIDR_MASK_RE = re.compile(r"[+-]?[0-9]+\Z")
+
+
+def _validate_cidr(operand):
+    # The wrong operator in this message is AWS's own copy-paste, kept so the
+    # text a caller sees is the text the service sends.
+    _require_type(operand, str, "prefix match pattern must be a string")
+    address, separator, mask = operand.partition("/")
+    # A trailing slash leaves no mask field at all for AWS's split, so it is the
+    # missing-slash complaint rather than a bad-integer one.
+    if not separator or "/" in mask or not mask:
+        raise _InvalidPattern("Malformed CIDR, one '/' required")
+    if not _CIDR_MASK_RE.match(mask):
+        raise _InvalidPattern("Malformed CIDR, mask bits must be an integer")
+    try:
+        bits = int(mask)
+    except ValueError:
+        raise _InvalidPattern("Malformed CIDR, mask bits must be an integer") from None
+    if not -2 ** 31 <= bits < 2 ** 31:
+        # Outside the width AWS's integer parse accepts, so it never reaches the
+        # mask-width check.
+        raise _InvalidPattern("Malformed CIDR, mask bits must be an integer")
+    if bits < 0:
+        raise _InvalidPattern("Malformed CIDR, mask bits must not be negative")
+    looks_v4 = _CIDR_IPV4_RE.match(address) is not None
+    looks_v6 = ":" in address and _CIDR_IPV6_RE.match(address) is not None
+    if not (looks_v4 or looks_v6):
+        raise _InvalidPattern(f"Nonstandard IP address: {address}")
+    try:
+        parsed = ipaddress.ip_address(_normalized_ipv4(address) if looks_v4 else address)
+    except ValueError:
+        raise _InvalidPattern(f"Invalid IP address: {address}") from None
+    if parsed.version == 4 and bits > 31:
+        raise _InvalidPattern("IPv4 mask bits must be < 32")
+    if parsed.version == 6 and bits > 127:
+        raise _InvalidPattern("IPv6 mask bits must be < 128")
+
+
+def _normalized_ipv4(address: str) -> str:
+    """A dotted quad with its octets read as decimal, which is how AWS reads
+    them: ``0177.0.0.1`` is ``177.0.0.1``, not octal. Python's parser refuses a
+    leading zero outright, so an operand AWS accepts would otherwise be refused."""
+    octets = []
+    for octet in address.split("."):
+        try:
+            value = int(octet)
+        except ValueError:
+            # Only an octet of more digits than Python will convert; not an
+            # address either way.
+            return address
+        if not 0 <= value <= 255:
+            return address
+        octets.append(str(value))
+    return ".".join(octets)
+
+
+def _numeric_token(value) -> str:
+    """How AWS names an offending token in a numeric operand — the raw JSON
+    text, which is what its streaming parser has to hand."""
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if value is None:
+        return "null"
+    if isinstance(value, list):
+        return "["
+    if isinstance(value, dict):
+        return "{"
+    return str(value)
+
+
+def _validate_numeric_threshold(operand_name: str, value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _InvalidPattern(f"Value of {operand_name} must be numeric")
+    try:
+        as_double = float(value)
+    except (OverflowError, ValueError):
+        raise _InvalidPattern(f"Cannot compare number : {value}") from None
+    if as_double in (float("inf"), float("-inf")) or as_double != as_double:
+        raise _InvalidPattern(f"Cannot compare number : {value}")
+    if isinstance(value, int) and int(as_double) != value:
+        # AWS refuses a threshold the double conversion would silently move.
+        # Only checkable for an integer: a fractional literal was already
+        # rounded by the JSON parse, so its original text is gone.
+        raise _InvalidPattern(f"Cannot compare number : {value}")
+    return as_double
+
+
+def _validate_numeric(operand):
+    """``numeric`` is a small grammar, not a list of pairs: a single comparison,
+    or a lower bound followed by an upper bound. ``=``, ``<`` and ``<=``
+    terminate the expression, so a range has to be written lower bound first."""
+    _require_type(operand, list, "Value of numeric must be an array.")
+    if not operand:
+        raise _InvalidPattern("Invalid member in numeric match: ]")
+    first = operand[0]
+    _require_type(first, str, f"Invalid member in numeric match: {_numeric_token(first)}")
+    if first not in _NUMERIC_OP_NAMES:
+        raise _InvalidPattern(f"Unrecognized numeric range operator: {first}")
+    if len(operand) < 2:
+        raise _InvalidPattern(f"Value of {_NUMERIC_OP_NAMES[first]} must be numeric")
+    bottom = _validate_numeric_threshold(_NUMERIC_OP_NAMES[first], operand[1])
+    if len(operand) == 2:
+        return
+    if first not in _NUMERIC_RANGE_OPENERS:
+        raise _InvalidPattern("Too many elements in numeric expression")
+    if len(operand) > 4:
+        raise _InvalidPattern("Too many terms in numeric range expression")
+    second = operand[2]
+    _require_type(second, str, f"Bad value in numeric range: {_numeric_token(second)}")
+    if second not in _NUMERIC_RANGE_CLOSERS:
+        raise _InvalidPattern(f"Bad numeric range operator: {second}")
+    if len(operand) < 4:
+        raise _InvalidPattern(f"Value of {_NUMERIC_OP_NAMES[second]} must be numeric")
+    top = _validate_numeric_threshold(_NUMERIC_OP_NAMES[second], operand[3])
+    if not bottom < top:
+        raise _InvalidPattern("Bottom must be less than top")
+
+
+def _validate_anything_but(operand):
+    if isinstance(operand, dict):
+        if not operand:
+            raise _InvalidPattern("Anything-But expression name not found")
+        inner = next(iter(operand))
+        if len(operand) > 1:
+            raise _InvalidPattern("Only one key allowed in match expression")
+        if inner not in _ANYTHING_BUT_NESTABLE:
+            raise _InvalidPattern(f"Unsupported anything-but pattern: {inner}")
+        _validate_anything_but_nested(inner, operand[inner])
+        return
+    if isinstance(operand, list):
+        # The list is walked in order, as AWS's streaming parser walks it, so an
+        # unsupported element is reported before the type-homogeneity check.
+        for value in operand:
+            if isinstance(value, bool) or value is None or isinstance(value, (list, dict)):
+                raise _InvalidPattern(
+                    "Inside anything but list, start|null|boolean is not supported.")
+        has_number = any(isinstance(v, (int, float)) for v in operand)
+        has_string = any(isinstance(v, str) for v in operand)
+        if not operand or (has_number and has_string):
+            raise _InvalidPattern(
+                "Inside anything but list, either all values are number or string, "
+                "mixed type is not supported")
+        for value in operand:
+            if isinstance(value, (int, float)):
+                _validate_numeric_threshold("anything-but", value)
+        return
+    if isinstance(operand, bool) or operand is None:
+        raise _InvalidPattern(
+            "Value of anything-but must be an array or single string/number value.")
+    if isinstance(operand, (int, float)):
+        _validate_numeric_threshold("anything-but", operand)
+
+
+def _validate_anything_but_nested(inner: str, operand):
+    """The nested form takes one value or a list of them. AWS's outer type guard
+    fires first, so a boolean or null operand is reported against
+    ``anything-but`` rather than against the nested operator."""
+    candidates = operand if isinstance(operand, list) else [operand]
+    if not candidates:
+        # A deliberate divergence: AWS accepts an empty nested list and then
+        # fails evaluating the rule, so there is no behaviour to copy — and an
+        # ``anything-but`` with nothing to exclude inverts into "every event".
+        raise _InvalidPattern("Empty arrays are not allowed")
+    for candidate in candidates:
+        if isinstance(candidate, bool) or candidate is None:
+            raise _InvalidPattern(
+                "Value of anything-but must be an array or single string/number value.")
+    if inner in ("prefix", "suffix"):
+        for candidate in candidates:
+            _require_type(candidate, str, "prefix/suffix match pattern must be a string")
+            if not candidate:
+                # This position only — ``{"prefix": ""}`` is a pattern AWS
+                # compiles, so do not hoist this into ``_validate_affix``.
+                raise _InvalidPattern("Null prefix/suffix not allowed")
+    elif inner == "equals-ignore-case":
+        for candidate in candidates:
+            _require_type(candidate, str, "Inside anything-but/equals-ignore-case list, "
+                                          "number|start|null|boolean is not supported.")
+    elif inner == "wildcard":
+        for candidate in candidates:
+            _validate_wildcard(candidate)
+
+
+# Every operator a match expression may name, with the check its operand has to
+# pass. ``exactly`` is Event Ruler's explicit spelling of a plain equality value;
+# the rest are the documented ones.
+_OPERAND_VALIDATORS = {
+    "exactly": functools.partial(
+        _require_type, kind=str, message="exact match pattern must be a string"),
+    "prefix": functools.partial(_validate_affix, "prefix"),
+    "suffix": functools.partial(_validate_affix, "suffix"),
+    "equals-ignore-case": functools.partial(
+        _require_type, kind=str, message="equals-ignore-case match pattern must be a string"),
+    "wildcard": _validate_wildcard,
+    "cidr": _validate_cidr,
+    "numeric": _validate_numeric,
+    "exists": functools.partial(
+        _require_type, kind=bool, message="exists match pattern must be either true or false."),
+    "anything-but": _validate_anything_but,
+}
+_MATCH_OPERATORS = frozenset(_OPERAND_VALIDATORS)
+
+
+# How deep an event value's arrays are followed when flattening. Generous next to
+# any real event, and small next to the stack a handler has left.
+_MAX_VALUE_DEPTH = 50
+
+
+# ---------------------------------------------------------------------------
+# Event pattern matching — value-level operators
+# ---------------------------------------------------------------------------
+
+
+def _flatten(value, objects: bool, depth: int = 0) -> list:
+    """What a pattern is matched against for this event value: the scalars it
+    offers, or — one level of the tree up, for a nested pattern object — the
+    objects. AWS flattens an array value and offers each element to the matcher
+    on its own, recursively, so the field matches when *any* element does.
+
+    Whatever is not the wanted leaf yields nothing and so matches nothing: an
+    object has no scalar to offer, a scalar has no object, and an empty array
+    has neither — including under ``anything-but``, which needs at least one
+    surviving element rather than the absence of a failing one.
+
+    The depth bound is for the event side: an event may nest arrays as deep as
+    its author likes, and past the bound the nesting yields nothing rather than
+    exhausting the stack."""
+    if isinstance(value, list):
+        if depth >= _MAX_VALUE_DEPTH:
+            return []
+        flat = []
+        for element in value:
+            flat.extend(_flatten(element, objects, depth + 1))
+        return flat
+    return [value] if isinstance(value, dict) == objects else []
+
+
+def _json_equal(left, right) -> bool:
+    """JSON equality, which Python's ``==`` is not. AWS compares as JSON, so a
+    string never equals a number and ``true`` never equals ``1`` — where Python
+    holds ``True == 1``. Numbers of different width do still compare equal."""
+    if isinstance(left, bool) != isinstance(right, bool):
         return False
-    return value == pattern_values
+    return left == right
+
+
+def _matches_alternatives(value, alternatives) -> bool:
+    """Whether one scalar satisfies any alternative in a pattern's value list.
+    ``exists`` is skipped: it is answered from the key's presence, not from the
+    value, and its caller has already dealt with it."""
+    for item in alternatives:
+        if isinstance(item, dict):
+            if "exists" in item:
+                continue
+            if _matches_content_filter(value, item):
+                return True
+        elif _json_equal(value, item):
+            return True
+    return False
 
 
 def _matches_detail(detail, pattern):
-    if not isinstance(pattern, dict):
-        return True
+    """Match one ``$or``-free alternative against an object. Every ``$or`` is
+    gone by the time this runs — ``_compile_pattern`` expanded it — so this is a
+    plain AND over the pattern's keys."""
+    if isinstance(pattern, dict) and _UNSATISFIABLE in pattern:
+        return False
+    if not isinstance(pattern, dict) or not pattern:
+        # Both are refused at rule creation; an empty pattern object constrains
+        # nothing, so matching it would be the fail-open answer.
+        return False
     for key, expected in pattern.items():
         present = isinstance(detail, dict) and key in detail
         actual = detail.get(key) if isinstance(detail, dict) else None
         if isinstance(expected, list):
-            # AWS content-filter: ``[{"exists": true|false}]`` is evaluated
-            # against key presence/absence, NOT against the value, so an
-            # absent key must NOT short-circuit to False before that check.
-            exists_filters = [
-                item for item in expected
-                if isinstance(item, dict) and "exists" in item
-            ]
+            # ``exists`` asks whether the path reaches a LEAF, not whether the
+            # key is there: AWS's operators "only work on leaf nodes", so an
+            # object-valued field, an empty array and an empty object are all
+            # indistinguishable from a missing key, while a null exists — it is
+            # a leaf. ``_flatten`` answers exactly that question. Evaluated
+            # before the value filters, because an absent key must not
+            # short-circuit past it.
+            scalars = _flatten(actual, False) if present else []
+            has_leaf = bool(scalars)
+            exists_filters = [item for item in expected
+                              if isinstance(item, dict) and "exists" in item]
             if exists_filters:
-                if any(item.get("exists") is True for item in exists_filters) and present:
+                # ``is``, not ``==``: a non-bool operand — reachable only from
+                # unrevalidated state — settles nothing and must not be coerced.
+                if any(item["exists"] is has_leaf for item in exists_filters):
                     continue
-                if any(item.get("exists") is False for item in exists_filters) and not present:
-                    continue
-                # No exists branch matched and there are no value-level filters
-                # left to try — treat as no match.
-                if all(isinstance(item, dict) and "exists" in item for item in expected):
+                if len(exists_filters) == len(expected):
                     return False
             if not present:
                 return False
-            if isinstance(actual, (str, int, float, bool)):
-                matched = False
-                for item in expected:
-                    if isinstance(item, dict) and "exists" in item:
-                        continue  # already handled above
-                    if isinstance(item, dict):
-                        matched = matched or _matches_content_filter(actual, item)
-                    elif actual == item or str(actual) == str(item):
-                        matched = True
-                if not matched:
-                    return False
-            elif isinstance(actual, list):
-                if not any(a in expected for a in actual):
-                    return False
+            # Every value shape must be judged: an unjudged key is a matched
+            # key, and a null or object detail used to reach no arm at all, so
+            # a rule guarding on an operator fired on what it excluded.
+            if not any(_matches_alternatives(scalar, expected)
+                       for scalar in scalars):
+                return False
         elif isinstance(expected, dict):
-            if not isinstance(actual, dict):
+            # Two pattern fields must come from the SAME array element: each
+            # element is offered the whole nested pattern.
+            #
+            # A non-object value still gets the pattern evaluated, against
+            # nothing — so ``{"detail": {"state": [{"exists": false}]}}`` is
+            # satisfied by an event whose ``detail`` is a string, as on AWS.
+            candidates = _flatten(actual, True) or [{}]
+            if not any(_matches_detail(candidate, expected)
+                       for candidate in candidates):
                 return False
-            if not _matches_detail(actual, expected):
-                return False
+        else:
+            # A pattern value must be an array of alternatives or a nested
+            # object; a bare scalar is neither, and leaving it unjudged is how a
+            # ``$or`` read as an ordinary field could match every event.
+            return False
     return True
 
 
-def _matches_content_filter(value, filter_rule):
-    if "wildcard" in filter_rule:
-        return isinstance(value, str) and fnmatch.fnmatch(value, filter_rule["wildcard"])
-    if "prefix" in filter_rule:
-        return isinstance(value, str) and value.startswith(filter_rule["prefix"])
-    if "suffix" in filter_rule:
-        return isinstance(value, str) and value.endswith(filter_rule["suffix"])
-    if "anything-but" in filter_rule:
-        excluded = filter_rule["anything-but"]
-        if isinstance(excluded, list):
-            return value not in excluded
-        return value != excluded
-    if "numeric" in filter_rule:
-        ops = filter_rule["numeric"]
-        try:
-            num = float(value)
-        except (ValueError, TypeError):
+def _wildcard_to_regex(pattern: str) -> str:
+    """Translate an AWS EventBridge wildcard pattern to an anchored regex. Only
+    ``*`` is special (any sequence); ``\\`` escapes the next character, so
+    ``\\*`` is a literal asterisk and ``\\\\`` a literal backslash. Unlike
+    fnmatch, ``?`` and ``[seq]`` are literal — matching AWS exactly.
+
+    The literal run after each interior ``*`` is emitted as fnmatch's
+    ``(?=(?P<gN>.*?lit))(?P=gN)`` rather than a plain ``.*lit``. The lookahead
+    plus backreference commits to the leftmost match — glob semantics anyway —
+    and stops the engine backtracking. A naive ``.*a.*a.*b`` chain is
+    exponential against a long non-matching value: ``*/*/*/*/*.json`` over a
+    70-character key that just misses takes seconds, per rule per event.
+
+    Anchoring is ``^``/``\\Z``, not ``$``, which would also match just before a
+    trailing newline."""
+    # One token is an escape pair, a bare ``*``, or a run of ordinary characters.
+    # A trailing lone backslash matches nothing after it, so ``\\[\s\S]?`` leaves
+    # it as the escape of an empty string — the same literal backslash the
+    # character walk produced.
+    segments = [""]
+    for token in re.findall(r"\\[\s\S]?|\*|[^\\*]+", pattern):
+        if token == "*":
+            segments.append("")
+        elif token[0] == "\\":
+            segments[-1] += re.escape(token[1:]) if len(token) > 1 else "\\\\"
+        else:
+            segments[-1] += re.escape(token)
+
+    out = ["^", segments[0]]
+    interior = [s for s in segments[1:-1] if s]
+    for n, seg in enumerate(interior):
+        out.append(f"(?=(?P<g{n}>.*?{seg}))(?P=g{n})")
+    if len(segments) > 1:
+        out.append(".*")
+        out.append(segments[-1])
+    out.append(r"\Z")
+    return "".join(out)
+
+
+@functools.lru_cache(maxsize=1024)
+def _wildcard_regex(pattern: str):
+    """Compiled form of ``pattern``, cached like ``_compiled_pattern``."""
+    return re.compile(_wildcard_to_regex(pattern), re.DOTALL)
+
+
+def _string_operands(operand):
+    """The pattern strings an operand denotes — one, or a list of them, any of
+    which may match — or ``None`` when it is malformed. A malformed operand
+    never matches rather than raising: the matcher runs inside ``PutEvents``, so
+    a raise is a 500 that fails the whole batch, not one skipped rule. An empty
+    list is malformed for this purpose — it has no pattern to match, and
+    answering true would make ``anything-but`` invert it into a rule that fires
+    on every event. The list form is accepted at any depth, where AWS accepts it
+    only under ``anything-but``."""
+    candidates = operand if isinstance(operand, list) else [operand]
+    if not candidates or not all(isinstance(c, str) for c in candidates):
+        return None
+    return candidates
+
+
+def _matches_wildcard(value, pattern) -> bool:
+    """Match ``value`` against an AWS wildcard operand."""
+    if not isinstance(value, str):
+        return False
+    patterns = _string_operands(pattern)
+    return patterns is not None and any(_wildcard_regex(p).match(value) is not None for p in patterns)
+
+
+def _ignore_case_alternatives(char: str) -> tuple:
+    """The forms AWS accepts at one operand position: the character's lower
+    and upper case, deduplicated. Each is taken on the character alone, so a
+    mapping that changes length counts — ``ß`` uppercases to ``SS``."""
+    lower, upper = char.lower(), char.upper()
+    return (lower,) if lower == upper else (lower, upper)
+
+
+def _ignore_case_reach(value: str, operand: str, backwards: bool = False) -> set:
+    """The offsets in ``value`` the operand's alternation can reach — consuming
+    forwards from the start, or backwards from the end when ``backwards``.
+
+    Three questions are the one walk with different anchoring: ``prefix`` asks
+    whether the forward walk reaches anywhere, ``suffix`` whether the backward
+    one does, and ``equals-ignore-case`` whether the forward one reaches the end.
+
+    Carrying the whole reachable set is what keeps it linear: the alternatives at
+    a position differ in length (``ß`` uppercases to ``SS``), so a greedy scan
+    gives the wrong answer and a regex alternation reintroduces the backtracking
+    ``_wildcard_to_regex`` goes out of its way to avoid. The backward walk exists
+    for the same reason — running the forward one from every start offset would
+    be quadratic in the two lengths, on the same dispatch path."""
+    reachable = {len(value) if backwards else 0}
+    for char in reversed(operand) if backwards else operand:
+        moved = set()
+        for alternative in _ignore_case_alternatives(char):
+            width = len(alternative)
+            for offset in reachable:
+                start = offset - width if backwards else offset
+                if start >= 0 and value.startswith(alternative, start):
+                    moved.add(start if backwards else offset + width)
+        if not moved:
+            return set()
+        reachable = moved
+    return reachable
+
+
+def _matches_affix(value, operand, at_start: bool) -> bool:
+    """``prefix`` when ``at_start``, ``suffix`` otherwise. Only a string can
+    match: AWS matches an affix against the quoted form of the value, so
+    ``{"prefix": "5"}`` never reaches the number ``5`` (see ``_validate_affix``
+    for what that makes an empty operand mean). A nested ``equals-ignore-case``
+    is AWS's spelling of a case-insensitive affix."""
+    if not isinstance(value, str):
+        return False
+    ignore_case = isinstance(operand, dict)
+    if ignore_case:
+        if len(operand) != 1 or "equals-ignore-case" not in operand:
             return False
-        i = 0
-        while i < len(ops) - 1:
-            op, threshold = ops[i], float(ops[i + 1])
-            if op == ">" and not (num > threshold):
-                return False
-            if op == ">=" and not (num >= threshold):
-                return False
-            if op == "<" and not (num < threshold):
-                return False
-            if op == "<=" and not (num <= threshold):
-                return False
-            if op == "=" and not (num == threshold):
-                return False
-            i += 2
-        return True
-    if "exists" in filter_rule:
-        return filter_rule["exists"] == (value is not None)
+        operand = operand["equals-ignore-case"]
+    candidates = _string_operands(operand)
+    if candidates is None:
+        return False
+    if ignore_case:
+        return any(_ignore_case_reach(value, c, not at_start) for c in candidates)
+    return any(value.startswith(c) if at_start else value.endswith(c) for c in candidates)
+
+
+def _matches_equals_ignore_case(value, operand) -> bool:
+    """Match an ``equals-ignore-case`` operand against the whole value.
+
+    AWS accepts either case of each operand character independently, which is
+    neither ``value.lower() == operand.lower()`` nor ``casefold`` — the two are
+    wrong in opposite directions. ``lower()`` under-matches where the cases
+    differ in length (it rejects ``straße`` against ``STRASSE``) and
+    over-matches by making the relation symmetric, which AWS's is not: the
+    operand ``ẞ`` matches the value ``ß``, the reverse does not.
+    ``casefold()`` over-matches outright, accepting ``strasse`` for that same
+    operand. So the alternation is walked character by character.
+
+    Only a string value can match. One deliberate divergence: an operand
+    character outside the Basic Multilingual Plane matches itself, where AWS
+    mangles it to ``?`` and so fails to match the very value it was written
+    for."""
+    if not isinstance(value, str):
+        return False
+    operands = _string_operands(operand)
+    # Anchored at both ends: the walk must consume the operand AND land exactly on
+    # the end of the value, which is what makes this equality rather than a prefix.
+    return operands is not None and any(
+        len(value) in _ignore_case_reach(value, o) for o in operands)
+
+
+
+def _cidr_address(text: str):
+    """``text`` as an address, or ``None`` if it is not one AWS would read. The
+    same admission test gates the operand and the value, since two sides spelled
+    alike have to agree."""
+    if _CIDR_IPV4_RE.match(text):
+        text = _normalized_ipv4(text)
+    elif not (":" in text and _CIDR_IPV6_RE.match(text)):
+        return None
+    try:
+        return ipaddress.ip_address(text)
+    except ValueError:
+        return None
+
+
+@functools.lru_cache(maxsize=1024)
+def _cidr_network(operand: str):
+    """The network a ``cidr`` operand denotes, or ``None`` where AWS rejects the
+    operand at rule creation. Cached like ``_compiled_pattern``.
+
+    The grammar is read from ``_validate_cidr`` rather than spelled a second
+    time — the two drifting apart is a rule that fails creation and still
+    matches, or the reverse. ``ipaddress`` cannot stand in for it, being both
+    too permissive (a bare ``10.0.0.1`` read as a ``/32``, a dotted netmask, a
+    zone id) and too strict (it raises on host bits set, which AWS silently
+    floors, so ``10.0.0.5/24`` is the ``10.0.0.0/24`` block)."""
+    try:
+        _validate_cidr(operand)
+    except _InvalidPattern:
+        return None
+    address, _, mask = operand.partition("/")
+    if _CIDR_IPV4_RE.match(address):
+        # Decimal octets, as AWS reads them; see ``_normalized_ipv4``.
+        address = _normalized_ipv4(address)
+    try:
+        return ipaddress.ip_network(f"{address}/{int(mask)}", strict=False)
+    except ValueError:
+        # Unreachable through the validated grammar; a raising matcher fails
+        # the whole batch.
+        return None
+
+
+def _matches_cidr(value, operand) -> bool:
+    """Whether ``value`` is an address inside the ``cidr`` operand's block.
+
+    Both sides must be strings. ``ipaddress`` reads an integer as an address —
+    ``167772161`` is ``10.0.0.1``, and ``True`` is ``0.0.0.1`` — so an
+    unguarded numeric detail value would match a block AWS never matches it
+    against. Only one operand string is read: AWS takes one block per ``cidr``
+    object, several being written as sibling objects in the field's value list.
+
+    An address of the other family does not match. The version is compared
+    before the containment test rather than leaning on ``in`` to answer it,
+    since that behaviour is a property of the stdlib rather than of this
+    matcher's contract."""
+    if not isinstance(value, str) or not isinstance(operand, str):
+        return False
+    network = _cidr_network(operand)
+    if network is None:
+        return False
+    address = _cidr_address(value)
+    if address is None:
+        return False
+    return address.version == network.version and address in network
+
+
+# ``numeric`` comparison operators, in the [op, threshold, ...] operand order.
+_NUMERIC_OPS = {
+    ">": operator.gt,
+    ">=": operator.ge,
+    "<": operator.lt,
+    "<=": operator.le,
+    "=": operator.eq,
+}
+
+
+def _numeric_conditions(ops):
+    """Normalize a ``numeric`` operand into ``[(op, threshold), ...]``, or
+    ``None`` when it is malformed. ``{"numeric": 5}`` and
+    ``{"numeric": [">", "abc"]}`` both used to escape as a 500 InternalError.
+    The operator is type-checked before the lookup because an unhashable one
+    raises from the ``in`` test itself, and the threshold conversion catches
+    OverflowError because that, not ValueError, is what ``float()`` raises for
+    an integer literal too large for a double."""
+    if not isinstance(ops, list) or not ops or len(ops) % 2:
+        return None
+    conditions = []
+    for i in range(0, len(ops), 2):
+        op = ops[i]
+        if not isinstance(op, str) or op not in _NUMERIC_OPS:
+            return None
+        try:
+            conditions.append((op, float(ops[i + 1])))
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return conditions
+
+
+def _matches_numeric(value, operand) -> bool:
+    conditions = _numeric_conditions(operand)
+    if conditions is None:
+        return False
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        # A JSON number and nothing else: the text "50" and ``True`` both
+        # convert happily in Python, so without this the rule over-matched.
+        return False
+    try:
+        num = float(value)
+    except (ValueError, TypeError, OverflowError):
+        # OverflowError: an integer too large for a double. Non-match, not 500.
+        return False
+    return all(_NUMERIC_OPS[op](num, threshold) for op, threshold in conditions)
+
+
+def _matches_exactly(value, operand) -> bool:
+    """``exactly``'s operand is a string and nothing else — AWS refuses any other
+    at rule creation — so a stored ``{"exactly": 5}`` matches nothing rather than
+    standing in for the numeric equality it was not written as."""
+    return isinstance(operand, str) and _json_equal(value, operand)
+
+
+def _matches_anything_but(value, operand) -> bool:
+    """``anything-but`` takes a literal or list of literals, OR one nested
+    content matcher (not ``cidr``; see ``_nested_matcher_ok``). AWS rejects a
+    list mixing literals and nested matchers at rule creation, so only the
+    strict form is matched."""
+    if isinstance(operand, dict):
+        return _nested_matcher_ok(operand) and not _matches_content_filter(value, operand)
+    if isinstance(operand, list):
+        return not any(_json_equal(value, item) for item in operand)
+    return not _json_equal(value, operand)
+
+
+# Every operator answered from the *value*, mapped to its matcher. Dict order is
+# the try order, but only ever consulted for one key: AWS refuses a two-operator
+# expression at rule creation, and a pattern is validated before it is matched.
+#
+# ``exists`` has no entry — it asks about the key, not the value, so
+# ``_matches_detail`` settles it before any value gets here.
+_CONTENT_MATCHERS = {
+    "wildcard": _matches_wildcard,
+    "prefix": functools.partial(_matches_affix, at_start=True),
+    "suffix": functools.partial(_matches_affix, at_start=False),
+    "exactly": _matches_exactly,
+    "equals-ignore-case": _matches_equals_ignore_case,
+    "cidr": _matches_cidr,
+    "anything-but": _matches_anything_but,
+    "numeric": _matches_numeric,
+}
+_CONTENT_MATCHER_KEYS = tuple(_CONTENT_MATCHERS)
+# The invertible subset, derived rather than spelled a second time: a gate
+# approving a key the validator refuses is what reopens the inversion.
+_NESTED_MATCHER_KEYS = tuple(k for k in _CONTENT_MATCHER_KEYS if k in _ANYTHING_BUT_NESTABLE)
+
+
+def _nested_matcher_ok(filter_rule) -> bool:
+    """Whether ``anything-but``'s nested operand is one AWS lets it invert and
+    this emulator can evaluate.
+
+    ``cidr`` and ``numeric`` are the interesting exclusions: both are supported
+    as matchers, but AWS nests only ``prefix``, ``suffix``, ``wildcard`` and
+    ``equals-ignore-case``. Inverting an operand that can only answer "no
+    match" — malformed, or not invertible — would turn a bad rule into one that
+    matches *every* event and fans it out to its targets, so ``anything-but``
+    declines instead. Validation refuses these outright now; this is the
+    backstop for a rule restored from persisted state, which is never
+    revalidated.
+
+    Anything other than exactly one invertible key is declined, so the answer
+    cannot depend on which key the dispatch reaches first. The scan is over
+    ``_matches_content_filter``'s own keys, so the key approved here is the key
+    that answers there — and ``exists``, having no registry entry, is invisible
+    to it: ``{"exists": true, "prefix": "a"}`` is approved on the prefix.
+    Validation is what refuses that, reporting "Only one key allowed in match
+    expression" for any operand dict with more than one key, so the gate never
+    sees one."""
+    if not isinstance(filter_rule, dict):
+        return False
+    present = [k for k in _CONTENT_MATCHER_KEYS if k in filter_rule]
+    if len(present) != 1 or present[0] not in _NESTED_MATCHER_KEYS:
+        return False
+    # All four nestable operators take a pattern string or a list of them, so
+    # one arm covers them.
+    return _string_operands(filter_rule[present[0]]) is not None
+
+
+def _matches_content_filter(value, filter_rule):
+    """Whether one scalar satisfies one match expression — the first operator it
+    names in registry order, since AWS allows it only one."""
+    for key, matcher in _CONTENT_MATCHERS.items():
+        if key in filter_rule:
+            return matcher(value, filter_rule[key])
     return False
 
 
-def _invoke_target(target, event, rule):
+def _invoke_target(target, event, rule, view=None, from_rule=True):
+    """Deliver ``event`` to ``target``; a schedule passes ``from_rule`` False and itself as ``rule``."""
     arn = target.get("Arn", "")
 
-    raw_time = event["Time"]
-    if isinstance(raw_time, (int, float)):
-        iso_time = datetime.fromtimestamp(raw_time, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    else:
-        iso_time = raw_time
+    # The tree the rule matched on, so a rule cannot fire on a field whose
+    # delivered value differs. Decoded once for the whole event.
+    view = view or _pattern_event_view(event)
+    event_payload = json.dumps(view.event_with_detail())
 
-    event_payload = json.dumps({
-        "version": "0",
-        "id": event["EventId"],
-        "source": event["Source"],
-        "account": get_account_id(),
-        "time": iso_time,
-        "region": get_region(),
-        "resources": event.get("Resources", []),
-        "detail-type": event["DetailType"],
-        "detail": json.loads(event["Detail"]) if isinstance(event["Detail"], str) else event["Detail"],
-    })
-
-    input_transformer = target.get("InputTransformer")
-    if input_transformer:
-        event_payload = _apply_input_transformer(input_transformer, event)
+    # An ``InputPath`` that does not resolve leaves the whole event in place.
+    target_input_payload = None
+    if target.get("InputTransformer"):
+        target_input_payload = _apply_input_transformer(target["InputTransformer"], rule, view)
     elif target.get("Input"):
-        event_payload = target["Input"]
+        target_input_payload = target["Input"]
     elif target.get("InputPath"):
         try:
-            full = json.loads(event_payload)
-            parts = target["InputPath"].strip("$.").split(".")
-            val = full
-            for p in parts:
-                if p:
-                    val = val[p]
-            event_payload = json.dumps(val)
+            val = json.loads(event_payload)
+            for part in target["InputPath"].strip("$.").split("."):
+                if part:
+                    val = val[part]
+            target_input_payload = json.dumps(val)
         except Exception:
             pass
+    if target_input_payload is not None:
+        event_payload = target_input_payload
 
     try:
-        if ":lambda:" in arn or ":function:" in arn:
-            _dispatch_to_lambda(arn, event_payload)
-        elif ":sqs:" in arn:
-            _dispatch_to_sqs(arn, event_payload, target.get("SqsParameters") or {})
-        elif ":sns:" in arn:
-            _dispatch_to_sns(arn, event_payload)
-        elif ":states:" in arn:
+        try:
+            spec = parse_arn(arn)
+        except ArnParseError:
+            logger.warning("EventBridge: invalid target ARN %s", arn)
+            return
+
+        if spec.service == "events" and spec.resource.startswith("api-destination/"):
+            http_parameters = _resolve_http_parameters(
+                target.get("HttpParameters") or {}, view.event_with_detail()
+            )
+            _dispatch_to_api_destination(spec, event_payload, {**target, "HttpParameters": http_parameters})
+        elif spec.service == "events":
+            _dispatch_to_event_bus(spec, event, rule, target, target_input_payload, from_rule)
+        elif spec.service == "states":
             _dispatch_to_stepfunctions(arn, event_payload)
+        elif not _target_matches_request_scope(spec, target):
+            # AWS parity: EventBridge accepts cross-region SNS/SQS targets at PutTargets, then records a
+            # FailedInvocations delivery failure without cross-region delivery. MiniStack does not model
+            # that metric or DLQs, so the faithful observable outcome is to accept the target and drop
+            # the invocation here. Confirmed against AWS on 2026-07-13; see
+            # RESEARCH/MINISTACK_CROSSREGION_SNS_TARGET_POLICY.md.
+            logger.warning(
+                "EventBridge: target %s not delivered: cross-region invocation failed "
+                "(FailedInvocation-equivalent)",
+                arn,
+            )
+        elif spec.service == "lambda":
+            _dispatch_to_lambda(arn, event_payload)
+        elif spec.service == "sqs":
+            if _foreign_queue_allows_role(spec, target.get("RoleArn", "")):
+                _dispatch_to_sqs(spec, event_payload, target.get("SqsParameters") or {})
+            else:
+                logger.warning("EventBridge: target %s not delivered: its queue policy does not allow %s",
+                               arn, target.get("RoleArn"))
+        elif spec.service == "sns":
+            _dispatch_to_sns(arn, event_payload)
+        elif spec.service == "logs":
+            _dispatch_to_log_group(spec, event_payload, event, rule)
         else:
             logger.warning("EventBridge: unsupported target type for ARN %s", arn)
     except Exception as e:
         logger.error("EventBridge target dispatch error for %s: %s", arn, e)
 
 
-def _apply_input_transformer(transformer, event):
+def _foreign_queue_allows_role(spec, role_arn: str) -> bool:
+    """Under AUTH=true, another account's queue takes the event only when its policy allows the target's role."""
+    from ministack.app import AUTH
+    if not AUTH or spec.account_id == get_account_id():
+        return True
+    from ministack.core.iam_evaluator import EvalContext, resource_policy_allows
+    from ministack.services import sqs as _sqs
+
+    found = _sqs.queue_policy_for_arn(str(spec))
+    if found is None:
+        return False
+    ctx = EvalContext(
+        principal_arn=role_arn,
+        principal_type="AssumedRole",
+        principal_account=role_arn.split(":")[4] if role_arn.count(":") >= 5 else "",
+        action="sqs:SendMessage",
+        resource_arn=str(spec),
+        region=spec.region,
+    )
+    return resource_policy_allows(found[0], ctx, same_account=False)
+
+
+def _target_matches_request_scope(spec, target=None) -> bool:
+    # Cross-region targets are accepted at PutTargets but fail delivery here for AWS parity.
+    if spec.region != get_region():
+        return False
+    if spec.account_id == get_account_id():
+        return True
+    # Another account's target in the same region is reached through its execution role; modelled for SQS.
+    return spec.service == "sqs" and bool((target or {}).get("RoleArn"))
+
+
+# Hop markers: one same-region bus hop, one region crossing (new id and time), then one more same-region hop.
+_SAME_REGION_HOP = "_SameRegionBusHop"
+_CROSSED_REGION = "_CrossedRegion"
+
+
+def _event_bus_hop_refusal(event, same_region):
+    """The ``ERROR_CODE`` AWS records when a forwarded event may not hop again, or None."""
+    if same_region and event.get(_SAME_REGION_HOP):
+        return "THIRD_ACCOUNT_HOP_DETECTED"
+    if not same_region and event.get(_CROSSED_REGION):
+        return "THIRD_REGION_HOP_DETECTED"
+    return None
+
+
+def _events_may_assume(role, rule):
+    """Whether ``role``'s trust policy lets EventBridge assume it for ``rule`` (aws:SourceAccount/SourceArn are the rule's)."""
+    from ministack.core.iam_evaluator import (
+        EvalContext,
+        _action_matches,
+        _conditions_met,
+        _service_principal_matches,
+    )
+
+    try:
+        statements = json.loads(role.get("AssumeRolePolicyDocument") or "{}").get("Statement", [])
+    except (ValueError, AttributeError):
+        return False
+    ctx = EvalContext(
+        principal_arn="events.amazonaws.com",
+        principal_type="Service",
+        principal_account="",
+        action="sts:AssumeRole",
+        resource_arn=role.get("Arn", ""),
+        region=get_region(),
+        service_context={"aws:sourceaccount": get_account_id(), "aws:sourcearn": rule.get("Arn", "")},
+    )
+    allowed = False
+    for stmt in statements if isinstance(statements, list) else [statements]:
+        if not isinstance(stmt, dict):
+            continue
+        if "NotPrincipal" in stmt:
+            applies = not _service_principal_matches(stmt["NotPrincipal"], "events.amazonaws.com")
+        else:
+            principal = stmt.get("Principal")
+            aws = principal.get("AWS") if isinstance(principal, dict) else None
+            applies = (principal == "*" or _service_principal_matches(principal, "events.amazonaws.com")
+                       or aws == "*" or (isinstance(aws, list) and "*" in aws))
+        actions, not_actions = stmt.get("Action", []), stmt.get("NotAction", [])
+        if not applies or not _action_matches(
+                "sts:AssumeRole", [actions] if isinstance(actions, str) else actions,
+                [not_actions] if isinstance(not_actions, str) else not_actions):
+            continue
+        if not _conditions_met(stmt.get("Condition") or {}, ctx):
+            continue
+        if stmt.get("Effect") == "Deny":
+            return False
+        allowed = allowed or stmt.get("Effect") == "Allow"
+    return allowed
+
+
+def _event_bus_target_denial(spec, event, rule, target):
+    """Under AUTH=true, ``NO_PERMISSIONS`` when the target's role cannot put the event on the bus, or None."""
+    from ministack.app import AUTH
+    if not AUTH:
+        return None
+    from ministack.core.iam_evaluator import (
+        EvalContext,
+        _gather_role_policies,
+        _permissions_boundary,
+        evaluate,
+        evaluate_resource_policy,
+    )
+    from ministack.services import iam as _iam
+
+    role_arn = target.get("RoleArn", "")
+    role_name = role_arn.rsplit("/", 1)[-1]
+    role = _iam._roles.get_scoped(get_account_id(), None, role_name)
+    if role is None or role.get("Arn") != role_arn or not _events_may_assume(role, rule):
+        return "NO_PERMISSIONS"
+    account = get_account_id()
+    ctx = EvalContext(
+        principal_arn=f"arn:aws:sts::{account}:assumed-role/{role_name}/{new_uuid().replace('-', '')}",
+        principal_type="AssumedRole",
+        principal_account=account,
+        action="events:PutEvents",
+        resource_arn=target["Arn"],
+        region=spec.region,
+        service_context={"events:source": event.get("Source"), "events:detail-type": event.get("DetailType"),
+                         "events:eventbusinvocation": "true"},
+    )
+    limits = _permissions_boundary(_iam._roles, role_name, account)
+    if evaluate(ctx, _gather_role_policies(role_name, account), *limits).decision != "Allow":
+        return "NO_PERMISSIONS"
+    name = spec.resource.split("/", 1)[1]
+    with request_scope(spec.account_id, spec.region):
+        policy = _event_bus_policies.get(name) if _event_bus_exists(name) else None
+    same_account = spec.account_id == account
+    if policy is None:
+        return None if same_account else "NO_PERMISSIONS"
+    document = _bus_policy_document(policy)
+    decision = "Deny" if document is None else evaluate_resource_policy(document, ctx).decision
+    if decision == "Deny" or (decision != "Allow" and not same_account):
+        return "NO_PERMISSIONS"
+    return None
+
+
+def _dispatch_to_event_bus(spec, event, rule, target, target_input_payload=None, from_rule=True):
+    """Forward ``event`` to the bus ``spec`` names, in its owner's account and region; a refusal is logged with AWS's ERROR_CODE."""
+    if not spec.resource.startswith("event-bus/"):
+        logger.warning("EventBridge -> Event bus: unsupported event target ARN %s", spec)
+        return
+    bus_name = spec.resource.split("/", 1)[1]
+    same_region = spec.region == get_region()
+    if from_rule:
+        if (spec.account_id == get_account_id() and same_region
+                and bus_name == event.get("EventBusName", "default")):
+            # PutTargets refuses such a target; state saved before it did, or a
+            # CloudFormation update moving a rule onto the bus, can still hold one.
+            logger.warning("EventBridge -> Event bus %s: not delivered: the rule's own bus", target["Arn"])
+            return
+        code = _event_bus_hop_refusal(event, same_region) or _event_bus_target_denial(spec, event, rule, target)
+        if code:
+            logger.warning("EventBridge -> Event bus %s: not delivered from rule %s: %s",
+                           target["Arn"], rule.get("Arn"), code)
+            return
+    elif spec.account_id != get_account_id() or not same_region:
+        logger.warning("EventBridge -> Event bus %s: not found", target["Arn"])
+        return
+    forwarded = dict(event, Account=event.get("Account", get_account_id()), Region=event.get("Region", get_region()))
+    if from_rule and same_region:
+        forwarded[_SAME_REGION_HOP] = True
+    elif from_rule:
+        forwarded.update({"EventId": new_uuid(), "Time": int(_now_ts()),
+                          _SAME_REGION_HOP: False, _CROSSED_REGION: True})
+    if target_input_payload is not None:
+        forwarded["Detail"] = target_input_payload
+    with request_scope(spec.account_id, spec.region):
+        if not _event_bus_exists(bus_name):
+            logger.warning("EventBridge -> Event bus %s: not found", target["Arn"])
+            return
+        forwarded["EventBusName"] = bus_name
+        _dispatch_event(forwarded)
+        _archive_event({k: v for k, v in forwarded.items() if k not in (_SAME_REGION_HOP, _CROSSED_REGION)})
+    logger.info("EventBridge -> Event bus %s: dispatched", target["Arn"])
+
+
+def _apply_input_transformer(transformer, rule, view):
     input_paths = transformer.get("InputPathsMap", {})
     template = transformer.get("InputTemplate", "")
 
-    try:
-        full = json.loads(event.get("Detail", "{}")) if isinstance(event.get("Detail"), str) else event.get("Detail", {})
-    except Exception:
-        full = {}
-
-    event_envelope = {
-        "source": event.get("Source", ""),
-        "detail-type": event.get("DetailType", ""),
-        "detail": full,
-        "account": get_account_id(),
-        "region": get_region(),
-        "time": event.get("Time", ""),
-        "id": event.get("EventId", ""),
-        "resources": event.get("Resources", []),
-    }
+    # The same tree the rule matched on and the target is delivered:
+    # hand-building a third copy here is how ``time`` came to render as a raw
+    # epoch second while the payload alongside it carried the ISO-8601 string.
+    event_envelope = view.event_with_detail()
 
     replacements = {}
     for var_name, jpath in input_paths.items():
@@ -981,41 +2756,96 @@ def _apply_input_transformer(transformer, event):
             for p in parts:
                 if p:
                     val = val[p]
-            replacements[var_name] = val if isinstance(val, str) else json.dumps(val)
+            replacements[var_name] = val
         except (KeyError, TypeError, IndexError):
             replacements[var_name] = ""
 
-    result = template
-    for var_name, val in replacements.items():
-        result = result.replace(f"<{var_name}>", str(val))
+    # AWS generates ingestion-time when the event is received by EventBridge
+    # (always present, ISO-8601) — it is NOT the event's own `time` field and
+    # cannot be overwritten by an InputPathsMap entry.
+    ingestion_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    reserved = {
+        "aws.events.event.json": event_envelope,
+        "aws.events.event": view.envelope(),
+        "aws.events.event.ingestion-time": ingestion_time,
+    }
+    if rule:
+        reserved["aws.events.rule-name"] = rule.get("Name", "")
+        reserved["aws.events.rule-arn"] = rule.get("Arn", "")
+    for k, v in reserved.items():
+        replacements.setdefault(k, v)
+    # ingestion-time is reserved and uneditable, even if InputPathsMap declares it.
+    replacements["aws.events.event.ingestion-time"] = ingestion_time
 
-    return result
+    return _render_input_template(template, replacements)
+
+
+def _render_input_template(template, replacements):
+    """Substitute ``<var>`` placeholders the way EventBridge does.
+
+    Quotes around a variable that resolves to a string are optional: AWS adds
+    them when the placeholder sits in a JSON value position, so
+    ``{"groupId": <groupId>}`` and ``{"groupId": "<groupId>"}`` both render
+    valid JSON. Values are never escaped, and a JSON object or array
+    referenced from inside a string literal has its quotes stripped so the
+    surrounding string stays valid.
+    """
+
+    def in_string(match):
+        return _render_placeholder(match.group(1), match.group(0), replacements, True)
+
+    def render(match):
+        token = match.group(0)
+        if token.startswith('"'):
+            return _PLACEHOLDER_RE.sub(in_string, token)
+        return _render_placeholder(token[1:-1], token, replacements, False)
+
+    # A template with no double quotes at all is plain text rather than JSON,
+    # so every placeholder in it is a string interpolation.
+    if '"' not in template:
+        return _PLACEHOLDER_RE.sub(in_string, template)
+    return _STRING_OR_PLACEHOLDER_RE.sub(render, template)
+
+
+# Matching whole string literals alongside placeholders is what tells a
+# placeholder in a JSON value position from one inside a string; consuming the
+# literal in one bite also skips any escaped quote it contains.
+_STRING_OR_PLACEHOLDER_RE = re.compile(r'"(?:\\.|[^"\\])*"|<[^<>]*>')
+_PLACEHOLDER_RE = re.compile(r"<([^<>]*)>")
+
+
+def _render_placeholder(var_name, token, replacements, in_string):
+    if var_name not in replacements:
+        return token
+    value = replacements[var_name]
+    if isinstance(value, str):
+        return value if in_string else json.dumps(value)
+    rendered = json.dumps(value)
+    # AWS drops the internal quotes of an object or array spliced into a
+    # string so that the result is still a single valid JSON string.
+    return rendered.replace('"', "") if in_string else rendered
 
 
 def _dispatch_to_lambda(arn, payload):
     from ministack.services import lambda_svc
-
-    parts = arn.split(":")
-    func_name = parts[-1].split("/")[-1] if "/" in parts[-1] else parts[-1]
-    if func_name.startswith("function:"):
-        func_name = func_name[len("function:"):]
 
     try:
         event = json.loads(payload)
     except (json.JSONDecodeError, TypeError):
         event = {"body": payload}
 
-    func = lambda_svc._functions.get(func_name)
-    if not func:
+    func, config, func_name = lambda_svc._get_func_record_for_ref(arn)
+    if not func or not config:
         logger.warning("EventBridge → Lambda: function %s not found", func_name)
         return
+    exec_record = lambda_svc._execution_record_for_config(func, config)
     threading.Thread(
-        target=lambda_svc._execute_function, args=(func, event), daemon=True
+        target=lambda_svc._execute_function_with_config_scope, args=(exec_record, event), daemon=True
     ).start()
     logger.info("EventBridge → Lambda %s: dispatched", func_name)
 
 
-def _dispatch_to_sqs(arn, payload, sqs_parameters=None):
+def _dispatch_to_sqs(spec, payload, sqs_parameters=None):
     """Dispatch an EventBridge event to an SQS queue.
 
     ``sqs_parameters`` carries the target's ``SqsParameters`` block from the
@@ -1027,9 +2857,8 @@ def _dispatch_to_sqs(arn, payload, sqs_parameters=None):
     """
     from ministack.services import sqs as _sqs
 
-    queue_name = arn.split(":")[-1]
-    queue_url = _sqs._queue_url(queue_name)
-    queue = _sqs._queues.get(queue_url)
+    queue_name = spec.resource
+    queue = _sqs._queue_by_arn(str(spec))
     if not queue:
         logger.warning("EventBridge → SQS: queue %s not found", queue_name)
         return
@@ -1044,7 +2873,7 @@ def _dispatch_to_sqs(arn, payload, sqs_parameters=None):
         "md5_body": md5,
         "receipt_handle": None,
         "sent_at": now,
-        "visible_at": now,
+        "visible_at": now + _sqs.queue_delay(queue),
         "receive_count": 0,
         "attributes": {},
         "message_attributes": {},
@@ -1073,26 +2902,44 @@ def _dispatch_to_sqs(arn, payload, sqs_parameters=None):
     queue["messages"].append(msg)
     if hasattr(_sqs, "_ensure_msg_fields"):
         _sqs._ensure_msg_fields(queue["messages"][-1])
+    esm_wake.set()
     logger.info("EventBridge → SQS %s", queue_name)
 
 
 def _dispatch_to_sns(arn, payload):
     from ministack.services import sns as _sns
 
-    topic = _sns._topics.get(arn)
-    if not topic:
+    try:
+        result = _sns.publish_internal(arn, payload, "EventBridge Notification")
+    except _sns.SnsPublishError as exc:
+        logger.warning("EventBridge → SNS %s refused: %s", arn, exc)
+        return
+    if result is None:
         logger.warning("EventBridge → SNS: topic %s not found", arn)
         return
-
-    msg_id = new_uuid()
-    topic["messages"].append({
-        "id": msg_id,
-        "message": payload,
-        "subject": "EventBridge Notification",
-        "timestamp": int(time.time()),
-    })
-    _sns._fanout(arn, msg_id, payload, "EventBridge Notification")
     logger.info("EventBridge → SNS %s", arn)
+
+
+def _dispatch_to_log_group(spec, payload, event, rule):
+    """Write one matched event as one line in a new log stream, as EventBridge does for a log group target."""
+    from ministack.services import cloudwatch_logs as _logs
+
+    group = _logs._log_group_name_from_identifier_arn(str(spec))
+    if group is None or group not in _logs._log_groups:
+        logger.warning("EventBridge → Logs: log group %s not found", spec)
+        return
+    stream = new_uuid()
+    if not _logs.log_group_policy_allows(group, stream, "events.amazonaws.com", rule.get("Arn", "")):
+        logger.warning("EventBridge → Logs %s not delivered: no resource policy allows events.amazonaws.com", group)
+        return
+    # Captured on AWS: the line's timestamp is the event's time, to the second.
+    seconds = event.get("Time")
+    if not isinstance(seconds, (int, float)) or isinstance(seconds, bool):
+        seconds = time.time()
+    _logs._create_log_stream({"logGroupName": group, "logStreamName": stream})
+    _logs._put_log_events({"logGroupName": group, "logStreamName": stream,
+                           "logEvents": [{"timestamp": int(seconds) * 1000, "message": payload}]})
+    logger.info("EventBridge → Logs %s", group)
 
 
 def _dispatch_to_stepfunctions(arn, payload):
@@ -1115,11 +2962,431 @@ def _dispatch_to_stepfunctions(arn, payload):
 
 
 # ---------------------------------------------------------------------------
+# API destination dispatch
+# ---------------------------------------------------------------------------
+
+# OAuth access tokens per connection: {(account, region, connection_name): entry}.
+# Plain dict (not AccountRegionScopedDict) because delivery worker threads read
+# it outside a request scope; guarded by _oauth_tokens_lock.
+_oauth_tokens: dict = {}
+_oauth_tokens_lock = threading.Lock()
+
+# Stamped on every API destination request. Real EventBridge documents
+# User-Agent and Range as non-overridable and sends Accept-Encoding /
+# Connection itself; Content-Type defaults below only when no custom value is
+# configured on the connection or target.
+_API_DEST_FIXED_HEADERS = {
+    "User-Agent": "Amazon/EventBridge/ApiDestinations",
+    "Range": "bytes=0-1048575",
+    "Accept-Encoding": "gzip,deflate",
+    "Connection": "close",
+}
+_API_DEST_DEFAULT_CONTENT_TYPE = "application/json; charset=utf-8"
+# Same 1 MiB ceiling the Range header above imposes on a delivery response,
+# applied to the OAuth token response — which this emulator does read.
+_MAX_OAUTH_RESPONSE_BYTES = 1048576
+
+# Real EventBridge removes these headers from API destination requests, so
+# connection/target parameters cannot smuggle them in (transport-owned headers
+# such as Host and Content-Length are set by the HTTP client itself).
+_API_DEST_REMOVED_HEADERS = {
+    "a-im", "accept-charset", "accept-datetime", "accept-encoding",
+    "cache-control", "connection", "content-encoding", "content-length",
+    "content-md5", "date", "expect", "forwarded", "from", "host",
+    "http2-settings", "if-match", "if-modified-since", "if-none-match",
+    "if-range", "if-unmodified-since", "max-forwards", "origin", "pragma",
+    "proxy-authorization", "range", "referer", "te", "trailer",
+    "transfer-encoding", "user-agent", "upgrade", "via", "warning",
+}
+
+
+class _NoFollowRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow HTTP redirects. urllib preserves the Authorization header
+    across a cross-host 3xx hop, which would leak a connection's credentials to
+    the redirect target. Real EventBridge does not follow redirects — a 3xx is
+    a (non-retryable) delivery failure — so declining to redirect lets urllib's
+    default error handler surface the 3xx as an ``HTTPError``, which the
+    delivery path reports as that (non-retryable) status code."""
+
+    def redirect_request(self, *_args, **_kwargs):
+        return None
+
+
+_api_dest_opener = urllib.request.build_opener(_NoFollowRedirect())
+
+
+def _http_open(req: urllib.request.Request, timeout: int = 5):
+    """Open one outbound API-destination / OAuth request without following
+    redirects and without honoring non-HTTP(S) schemes, so a caller-controlled
+    endpoint cannot turn a delivery into a ``file://`` read. A scheme guard, not
+    a network guard: delivering to ``127.0.0.1`` is the normal local case, so
+    private, loopback, and link-local hosts stay reachable over http(s). The
+    5-second default is AWS parity — API destination requests have a maximum
+    client execution timeout of 5 seconds."""
+    scheme = urllib.parse.urlsplit(req.full_url).scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(f"unsupported URL scheme for API destination request: {scheme or '(none)'}")
+    return _api_dest_opener.open(req, timeout=timeout)
+
+
+def _connection_params_map(params) -> dict:
+    """Flatten a ConnectionHttpParameters list (``[{Key, Value, IsValueSecret}]``)
+    into a plain map. Connection-side parameters use the list-of-objects shape,
+    unlike the string maps on target HttpParameters."""
+    out = {}
+    for item in params or []:
+        key = item.get("Key")
+        if key:
+            out[key] = item.get("Value", "")
+    return out
+
+
+_HTTP_JSON_PATH = re.compile(r"\$(?:\.[A-Za-z0-9_/*-]+|\[(?:[0-9]+|\*)\])*")
+_HTTP_JSON_PATH_TOKEN = re.compile(r"\.([A-Za-z0-9_/*-]+)|\[([0-9]+|\*)\]")
+
+
+def _resolve_http_parameter(value, event):
+    """Resolve a whole JSON path; literal strings are not interpolated.
+
+    AWS uses the original event, renders missing matches as an empty string,
+    and strips JSON quotes from structured values in HTTP parameters.
+    """
+    if not _HTTP_JSON_PATH.fullmatch(value):
+        return value
+    nodes = [event]
+    multiple = False
+    for field, index in _HTTP_JSON_PATH_TOKEN.findall(value):
+        selected = []
+        wildcard = field == "*" or index == "*"
+        multiple = multiple or wildcard
+        for node in nodes:
+            if wildcard:
+                if isinstance(node, dict):
+                    selected.extend(node.values())
+                elif isinstance(node, list):
+                    selected.extend(node)
+            elif field and isinstance(node, dict) and field in node:
+                selected.append(node[field])
+            elif index and isinstance(node, list) and int(index) < len(node):
+                selected.append(node[int(index)])
+        nodes = selected
+    if not nodes:
+        return ""
+    result = nodes if multiple else nodes[0]
+    if isinstance(result, str):
+        return result
+    return json.dumps(result, separators=(",", ":"), ensure_ascii=False).replace('"', "")
+
+
+def _resolve_http_parameters(parameters, event):
+    # Construct fresh containers: targets are reused by subsequent events and
+    # concurrent deliveries. Header/query names are always literal.
+    result = dict(parameters)
+    for field in ("HeaderParameters", "QueryStringParameters"):
+        if field in parameters:
+            result[field] = {key: _resolve_http_parameter(value, event)
+                             for key, value in parameters[field].items()}
+    if "PathParameterValues" in parameters:
+        result["PathParameterValues"] = [
+            _resolve_http_parameter(value, event) for value in parameters["PathParameterValues"]
+        ]
+    return result
+
+
+def _apply_path_parameters(url: str, values) -> str:
+    """Populate ``*`` path wildcards in the invocation endpoint from the
+    target's PathParameterValues, in order — the same contract as real
+    EventBridge."""
+    if not values:
+        return url
+    parsed = urllib.parse.urlsplit(url)
+    path = parsed.path
+    for value in values:
+        if "*" not in path:
+            break
+        path = path.replace("*", urllib.parse.quote(str(value), safe=""), 1)
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
+
+
+def _merge_query(url: str, params: dict) -> str:
+    if not params:
+        return url
+    parsed = urllib.parse.urlsplit(url)
+    query = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
+    query.update(params)
+    encoded = urllib.parse.urlencode(query)
+    return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, encoded, parsed.fragment))
+
+
+def _merge_body_parameters(payload: str, body_params: dict) -> str:
+    """Fold connection BodyParameters into a JSON-object body. Real EventBridge
+    documents body parameters as included in every invocation; how they combine
+    with a non-object body is undocumented there, so those bodies are left
+    untouched."""
+    if not body_params:
+        return payload
+    try:
+        parsed = json.loads(payload)
+    except (TypeError, ValueError):
+        return payload
+    if not isinstance(parsed, dict):
+        return payload
+    parsed.update(body_params)
+    return json.dumps(parsed)
+
+
+def _fetch_oauth_token(oauth: dict) -> dict:
+    """client_credentials exchange against the connection's authorization
+    endpoint: ClientID/ClientSecret ride the request body (query for GET),
+    OAuthHttpParameters contribute extra header/query/body parameters, and
+    ``access_token`` / ``token_type`` / ``expires_in`` are read from the JSON
+    response. ``grant_type`` defaults to ``client_credentials`` when
+    OAuthHttpParameters does not set one — AWS's own examples pass it
+    explicitly through body parameters."""
+    method = (oauth.get("HttpMethod") or "POST").upper()
+    client = oauth.get("ClientParameters") or {}
+    http_params = oauth.get("OAuthHttpParameters") or {}
+    headers = _connection_params_map(http_params.get("HeaderParameters"))
+    form = {
+        "grant_type": "client_credentials",
+        "client_id": client.get("ClientID", ""),
+        "client_secret": client.get("ClientSecret", ""),
+    }
+    form.update(_connection_params_map(http_params.get("BodyParameters")))
+    url = _merge_query(
+        oauth.get("AuthorizationEndpoint", ""),
+        _connection_params_map(http_params.get("QueryStringParameters")),
+    )
+    data = None
+    if method == "GET":
+        url = _merge_query(url, form)
+    else:
+        data = urllib.parse.urlencode(form).encode("utf-8")
+        headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with _http_open(req) as resp:
+        # Bounded read: the authorization endpoint is caller-supplied, and an
+        # unbounded read of whatever it returns is a memory hazard on a delivery
+        # thread. 1 MiB is EventBridge's own ceiling for an API destination
+        # response (the fixed "Range: bytes=0-1048575" header); a token document
+        # that large is not one.
+        token = json.loads(resp.read(_MAX_OAUTH_RESPONSE_BYTES).decode("utf-8"))
+    token_type = token.get("token_type") or "Bearer"
+    if token_type.lower() == "bearer":
+        token_type = "Bearer"
+    expires_in = token.get("expires_in")
+    return {
+        "token": token.get("access_token", ""),
+        "type": token_type,
+        "expires_at": time.time() + float(expires_in) if expires_in else None,
+    }
+
+
+def _oauth_authorization_header(conn: dict, token_key, force_refresh: bool = False) -> str:
+    oauth = (conn.get("AuthParameters") or {}).get("OAuthParameters") or {}
+    with _oauth_tokens_lock:
+        cached = _oauth_tokens.get(token_key)
+    # Real EventBridge refreshes proactively when the token expires within 60
+    # seconds of an invocation — synchronously, on the event path.
+    fresh = cached and (cached["expires_at"] is None or cached["expires_at"] - time.time() > 60)
+    if force_refresh or not fresh:
+        cached = _fetch_oauth_token(oauth)
+        with _oauth_tokens_lock:
+            _oauth_tokens[token_key] = cached
+    return f"{cached['type']} {cached['token']}"
+
+
+def _evict_oauth_token(name: str):
+    """Drop a connection's cached access token.
+
+    The cache is keyed by connection NAME, and names are reusable: on real
+    EventBridge the token lives and dies with the connection, so a connection
+    that is deleted (and possibly recreated under the same name), has its auth
+    parameters replaced, or is deauthorized must perform a fresh
+    client_credentials exchange rather than keep serving a token minted from
+    credentials that no longer apply.
+    """
+    with _oauth_tokens_lock:
+        _oauth_tokens.pop((get_account_id(), get_region(), name), None)
+
+
+def _connection_auth_headers(conn: dict, token_key, force_refresh: bool = False) -> dict:
+    """Authorization header(s) for one delivery, mirroring how real EventBridge
+    populates them from the connection secret: BASIC → ``Authorization:
+    Basic``, API_KEY → the configured header, OAUTH_CLIENT_CREDENTIALS → a
+    managed Bearer token."""
+    import base64 as _b64
+
+    auth_type = conn.get("AuthorizationType", "")
+    params = conn.get("AuthParameters") or {}
+    if auth_type == "BASIC":
+        basic = params.get("BasicAuthParameters") or {}
+        raw = f"{basic.get('Username', '')}:{basic.get('Password', '')}".encode("utf-8")
+        return {"Authorization": "Basic " + _b64.b64encode(raw).decode("ascii")}
+    if auth_type == "API_KEY":
+        api_key = params.get("ApiKeyAuthParameters") or {}
+        name = api_key.get("ApiKeyName")
+        return {name: api_key.get("ApiKeyValue", "")} if name else {}
+    if auth_type == "OAUTH_CLIENT_CREDENTIALS":
+        return {"Authorization": _oauth_authorization_header(conn, token_key, force_refresh)}
+    return {}
+
+
+def _finalize_api_dest_headers(headers: dict) -> dict:
+    """Drop the headers real EventBridge strips from API destination requests
+    and stamp its non-overridable ones. Applied after *every* merge — target
+    and connection parameters first, then the connection auth headers — so no
+    configured name can win, e.g. an ApiKeyName of ``User-Agent``/``Host``.
+    Names are matched trimmed, because ``"User-Agent "`` is not in the removed
+    set but is a legal header name to http.client, which only rejects leading
+    whitespace — so the padded spelling would ride out alongside the real one."""
+    out = {k.strip(): v for k, v in headers.items()
+           if k.strip().lower() not in _API_DEST_REMOVED_HEADERS}
+    out.update(_API_DEST_FIXED_HEADERS)
+    return out
+
+
+def _build_api_destination_request(dest: dict, conn: dict, target_http_params: dict, payload: str) -> dict:
+    invocation = (conn.get("AuthParameters") or {}).get("InvocationHttpParameters") or {}
+    conn_headers = _connection_params_map(invocation.get("HeaderParameters"))
+    conn_query = _connection_params_map(invocation.get("QueryStringParameters"))
+    conn_body = _connection_params_map(invocation.get("BodyParameters"))
+
+    # Target HttpParameters are merged with the connection's invocation
+    # parameters, "with any values from the Connection taking precedence"
+    # (EventBridge API reference, HttpParameters).
+    headers = {**(target_http_params.get("HeaderParameters") or {}), **conn_headers}
+    query = {**(target_http_params.get("QueryStringParameters") or {}), **conn_query}
+
+    url = _apply_path_parameters(
+        dest.get("InvocationEndpoint", ""), target_http_params.get("PathParameterValues")
+    )
+    url = _merge_query(url, query)
+    body = _merge_body_parameters(payload, conn_body)
+
+    headers = _finalize_api_dest_headers(headers)
+    if not any(k.lower() == "content-type" for k in headers):
+        headers["Content-Type"] = _API_DEST_DEFAULT_CONTENT_TYPE
+
+    return {
+        "url": url,
+        "method": (dest.get("HttpMethod") or "POST").upper(),
+        "headers": headers,
+        "body": body,
+    }
+
+
+def _api_destination_send_sync(request: dict, auth_headers: dict) -> int:
+    """Blocking HTTP send for one API destination delivery. Runs on a worker
+    thread so the event loop stays unblocked; stdlib only (see the SNS HTTP
+    delivery note — aiohttp is not a declared dependency). ``_http_open``
+    carries the AWS-parity 5-second client execution timeout."""
+    headers = _finalize_api_dest_headers({**request["headers"], **auth_headers})
+    body = request["body"]
+    req = urllib.request.Request(
+        request["url"],
+        data=body.encode("utf-8") if body is not None else None,
+        headers=headers,
+        method=request["method"],
+    )
+    try:
+        with _http_open(req) as resp:
+            return resp.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
+
+
+def _deliver_to_api_destination(name: str, request: dict, conn: dict, token_key):
+    is_oauth = conn.get("AuthorizationType") == "OAUTH_CLIENT_CREDENTIALS"
+    try:
+        status = _api_destination_send_sync(request, _connection_auth_headers(conn, token_key))
+        if status in (401, 407) and is_oauth:
+            # Real EventBridge refreshes the OAuth token when a 401/407 comes
+            # back and retries the delivery.
+            status = _api_destination_send_sync(
+                request, _connection_auth_headers(conn, token_key, force_refresh=True)
+            )
+    except Exception as exc:
+        logger.warning("EventBridge → API destination %s delivery failed: %s", name, exc)
+        return
+    if 200 <= status < 300:
+        logger.info("EventBridge → API destination %s: HTTP %s", name, status)
+    elif status in (401, 407, 409, 429) or status >= 500:
+        # AWS parity: these statuses re-enter the 24h/185-attempt retry pipeline
+        # (DLQ on exhaustion, Retry-After honored). MiniStack does not model
+        # that queue — the same policy as cross-region FailedInvocations — so
+        # the outcome is logged and the event dropped.
+        logger.warning(
+            "EventBridge → API destination %s: retryable HTTP %s (retry pipeline not modeled; dropped)",
+            name,
+            status,
+        )
+    else:
+        logger.warning("EventBridge → API destination %s: HTTP %s (not retryable; dropped)", name, status)
+
+
+def _dispatch_to_api_destination(spec, payload, target):
+    if spec.account_id != get_account_id() or spec.region != get_region():
+        logger.warning(
+            "EventBridge → API destination: %s is outside the current account/region scope", spec
+        )
+        return
+    # Resource is "api-destination/<name>" (real AWS appends "/<uuid>"; tolerate both).
+    name = spec.resource.split("/", 2)[1]
+    dest = _api_destinations.get(name)
+    if not dest:
+        logger.warning("EventBridge → API destination: %s not found", name)
+        return
+    if dest.get("ApiDestinationState") != "ACTIVE":
+        # Real EventBridge does not invoke INACTIVE destinations; the delivery
+        # fails into the retry pipeline instead. Log-and-drop, as above.
+        logger.warning(
+            "EventBridge → API destination %s: state %s; not invoked",
+            name,
+            dest.get("ApiDestinationState"),
+        )
+        return
+    conn_name = (dest.get("ConnectionArn") or "").rsplit("/", 1)[-1]
+    conn = _connections.get(conn_name) if conn_name else None
+    if conn is None:
+        logger.warning(
+            "EventBridge → API destination %s: connection %s not found", name, conn_name or "<unset>"
+        )
+        return
+    if conn.get("ConnectionState") != "AUTHORIZED":
+        # The mirror of the ApiDestinationState check above. DeauthorizeConnection
+        # already clears the stored credentials, but a connection restored from
+        # persisted state can be DEAUTHORIZED with parameters still attached — and
+        # delivering unauthenticated is not a better outcome than not delivering.
+        logger.warning(
+            "EventBridge → API destination %s: connection %s is %s; not invoked",
+            name, conn_name, conn.get("ConnectionState"),
+        )
+        return
+    # InvocationRateLimitPerSecond is accepted at CreateApiDestination but not
+    # enforced here — MiniStack delivers immediately and does not model the
+    # delivery queue that rate limiting implies.
+    request = _build_api_destination_request(dest, conn, target.get("HttpParameters") or {}, payload)
+    token_key = (get_account_id(), get_region(), conn_name)
+    # Deliver on a background daemon thread, mirroring the SNS HTTP(S) path:
+    # PutEvents returns as soon as the event is accepted and must not block on
+    # the destination endpoint.
+    threading.Thread(
+        target=_deliver_to_api_destination,
+        args=(name, request, copy.deepcopy(conn), token_key),
+        daemon=True,
+    ).start()
+
+
+# ---------------------------------------------------------------------------
 # Tags
 # ---------------------------------------------------------------------------
 
 def _tag_resource(data):
     arn = data.get("ResourceARN", "")
+    arn, err = _resolve_taggable_events_arn(arn)
+    if err:
+        return err
     tags = data.get("Tags", [])
     if arn not in _tags:
         _tags[arn] = {}
@@ -1130,6 +3397,9 @@ def _tag_resource(data):
 
 def _untag_resource(data):
     arn = data.get("ResourceARN", "")
+    arn, err = _resolve_taggable_events_arn(arn)
+    if err:
+        return err
     keys = data.get("TagKeys", [])
     if arn in _tags:
         for k in keys:
@@ -1139,6 +3409,9 @@ def _untag_resource(data):
 
 def _list_tags_for_resource(data):
     arn = data.get("ResourceARN", "")
+    arn, err = _resolve_taggable_events_arn(arn)
+    if err:
+        return err
     tag_dict = _tags.get(arn, {})
     tag_list = [{"Key": k, "Value": v} for k, v in tag_dict.items()]
     return json_response({"Tags": tag_list})
@@ -1153,22 +3426,39 @@ def _create_archive(data):
     if not name:
         return error_response_json("ValidationException", "ArchiveName is required", 400)
     if name in _archives:
-        return error_response_json("ResourceAlreadyExistsException", f"Archive {name} already exists", 400)
+        return error_response_json("ResourceAlreadyExistsException", f"Archive {name} already exists.", 400)
 
     source_arn = data.get("EventSourceArn", "")
+    if ":event-bus/" in source_arn:
+        _ensure_default_bus()
+        bus_name = source_arn.split(":event-bus/", 1)[1]
+        if bus_name not in _event_buses:
+            return error_response_json("ResourceNotFoundException", f"Event bus {bus_name} does not exist.", 400)
+
+    pattern_error = _event_pattern_error(data.get("EventPattern", ""))
+    if pattern_error:
+        return _invalid_event_pattern(pattern_error)
+
     arn = f"arn:aws:events:{get_region()}:{get_account_id()}:archive/{name}"
     _archives[name] = {
         "ArchiveName": name,
         "ArchiveArn": arn,
         "EventSourceArn": source_arn,
-        "Description": data.get("Description", ""),
-        "EventPattern": data.get("EventPattern", ""),
         "RetentionDays": data.get("RetentionDays", 0),
         "State": "ENABLED",
         "CreationTime": _now_ts(),
         "EventCount": 0,
         "SizeBytes": 0,
     }
+    # An archive created without a description or a pattern has neither in
+    # DescribeArchive.
+    for key in ("Description", "EventPattern"):
+        if key in data:
+            _archives[name][key] = data[key]
+    # Unlike event buses, an empty identifier is not stored: an archive with no
+    # customer managed key has no KmsKeyIdentifier in DescribeArchive.
+    if data.get("KmsKeyIdentifier"):
+        _archives[name]["KmsKeyIdentifier"] = data["KmsKeyIdentifier"]
     return json_response({"ArchiveArn": arn, "State": "ENABLED", "CreationTime": _archives[name]["CreationTime"]})
 
 
@@ -1185,7 +3475,7 @@ def _describe_archive(data):
     archive = _archives.get(name)
     if not archive:
         return error_response_json("ResourceNotFoundException", f"Archive {name} does not exist.", 400)
-    return json_response(archive)
+    return json_response(to_output_shape("events", "DescribeArchiveResponse", archive))
 
 
 def _update_archive(data):
@@ -1200,18 +3490,18 @@ def _update_archive(data):
         archive["Description"] = data["Description"]
     if "EventPattern" in data:
         ep = data["EventPattern"]
-        if isinstance(ep, str) and ep:
-            try:
-                json.loads(ep)
-            except json.JSONDecodeError:
-                return error_response_json(
-                    "InvalidEventPatternException",
-                    "Event pattern is not valid JSON",
-                    400,
-                )
+        pattern_error = _event_pattern_error(ep)
+        if pattern_error:
+            return _invalid_event_pattern(pattern_error)
         archive["EventPattern"] = ep
     if "RetentionDays" in data:
         archive["RetentionDays"] = int(data["RetentionDays"])
+    if "KmsKeyIdentifier" in data:
+        # An empty identifier clears the stored key.
+        if data["KmsKeyIdentifier"]:
+            archive["KmsKeyIdentifier"] = data["KmsKeyIdentifier"]
+        else:
+            archive.pop("KmsKeyIdentifier", None)
 
     archive["LastUpdatedTime"] = _now_ts()
     return json_response({
@@ -1219,6 +3509,10 @@ def _update_archive(data):
         "State": archive.get("State", "ENABLED"),
         "CreationTime": archive["CreationTime"],
     })
+
+
+_ARCHIVE_SUMMARY_KEYS = ("ArchiveName", "EventSourceArn", "State", "StateReason",
+                         "RetentionDays", "SizeBytes", "EventCount", "CreationTime")
 
 
 def _list_archives(data):
@@ -1233,8 +3527,8 @@ def _list_archives(data):
             continue
         if state and archive.get("State") != state:
             continue
-        results.append(archive)
-    return json_response({"Archives": results})
+        results.append({k: archive[k] for k in _ARCHIVE_SUMMARY_KEYS if k in archive})
+    return _offset_page(data, "Archives", results)
 
 
 # ---------------------------------------------------------------------------
@@ -1260,13 +3554,25 @@ def _start_replay(data):
         )
 
     source_arn = data.get("EventSourceArn", "")
-    # source_arn format: arn:aws:events:{region}:{account}:archive/{name}
-    archive_name = source_arn.split("/")[-1] if "/" in source_arn else ""
+    archive_name, source_error = _archive_name_from_ref(source_arn)
+    if source_error:
+        code, message = source_error
+        return error_response_json(code, message, 400)
     archive = _archives.get(archive_name)
     if not archive:
         return error_response_json(
             "ResourceNotFoundException",
             f"Archive {archive_name} does not exist.",
+            400,
+        )
+    dest_bus_name, dest_error = _event_bus_name_from_ref(dest.get("Arn", ""))
+    if dest_error:
+        code, message = dest_error
+        return error_response_json(code, message, 400)
+    if dest.get("Arn") != archive.get("EventSourceArn"):
+        return error_response_json(
+            "ValidationException",
+            "Destination.Arn must match the archive event source.",
             400,
         )
 
@@ -1286,20 +3592,32 @@ def _start_replay(data):
         "ReplayStartTime": now,
     }
     _replays[name] = replay
-
-    dest_bus_name = _normalize_bus_name(dest.get("Arn", ""))
+    replay_account_id = get_account_id()
+    replay_region = get_region()
 
     def _run():
-        replay["State"] = "RUNNING"
-        for event in list(archive.get("Events", [])):
-            ts = event.get("Time", 0)
-            if not (event_start <= ts <= event_end):
-                continue
-            replayed = dict(event)
-            replayed["EventBusName"] = dest_bus_name
-            _dispatch_event(replayed)
-        replay["State"] = "COMPLETED"
-        replay["ReplayEndTime"] = _now_ts()
+        previous_account = get_account_id()
+        previous_region = get_region()
+        set_request_account_id(replay_account_id)
+        set_request_region(replay_region)
+        try:
+            replay["State"] = "RUNNING"
+            for event in list(archive.get("Events", [])):
+                ts = event.get("Time", 0)
+                if not (event_start <= ts <= event_end):
+                    continue
+                replayed = dict(event)
+                replayed["EventBusName"] = dest_bus_name
+                # AWS stamps a replayed event with the replay's name, which is
+                # how a rule tells replayed traffic from live traffic — either
+                # to act on it or, more often, to filter it out.
+                replayed["ReplayName"] = name
+                _dispatch_event(replayed)
+            replay["State"] = "COMPLETED"
+            replay["ReplayEndTime"] = _now_ts()
+        finally:
+            set_request_account_id(previous_account)
+            set_request_region(previous_region)
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
@@ -1334,12 +3652,11 @@ def _list_replays(data):
             continue
         results.append({
             "ReplayName": rep["ReplayName"],
-            "ReplayArn": rep["ReplayArn"],
             "State": rep["State"],
             "EventSourceArn": rep.get("EventSourceArn", ""),
             "ReplayStartTime": rep.get("ReplayStartTime", ""),
         })
-    return json_response({"Replays": results})
+    return _offset_page(data, "Replays", results)
 
 
 def _cancel_replay(data):
@@ -1366,70 +3683,186 @@ def _cancel_replay(data):
 # Global endpoints + SaaS partner event sources (minimal / stub)
 # ---------------------------------------------------------------------------
 
-def _create_endpoint(data):
+_ENDPOINT_NAME_RE = re.compile(r"[\.\-_A-Za-z0-9]+")
+_HEALTH_CHECK_RE = re.compile(r"^arn:aws([a-z]|\-)*:route53:::healthcheck/[\-a-z0-9]+$")
+_ROUTE_RE = re.compile(r"^[\-a-z0-9]+$")
+_ENDPOINT_BUS_ARN_RE = re.compile(r"^arn:aws[a-z-]*:events:[a-z]+-[a-z-]+-\d+:\d{12}:event-bus/[\w.-]+$")
+_ROLE_ARN_RE = re.compile(r"^arn:aws[a-z-]*:iam::\d{12}:role\/[\w+=,.@/-]+$")
+# An endpoint answers CREATING, then ACTIVE about a second later, as on AWS.
+_ENDPOINT_ACTIVATION_SECONDS = 1
+
+
+def _endpoint_shape_errors(data, create):
+    """The request's constraint violations, worded as EventBridge words them."""
+    errors = []
+
+    def null(path):
+        errors.append(f"Value null at '{path}' failed to satisfy constraint: Member must not be null")
+
+    def bad(value, path, constraint):
+        errors.append(f"Value '{value}' at '{path}' failed to satisfy constraint: {constraint}")
+
+    def string(value, path, lo, hi, pattern=None, pattern_text=None):
+        if len(value) < lo:
+            bad(value, path, f"Member must have length greater than or equal to {lo}")
+        elif len(value) > hi:
+            bad(value, path, f"Member must have length less than or equal to {hi}")
+        elif pattern is not None and not pattern.fullmatch(value):
+            bad(value, path, f"Member must satisfy regular expression pattern: {pattern_text or pattern.pattern}")
+
     name = data.get("Name")
-    if not name:
-        return error_response_json("ValidationException", "Name is required", 400)
-    if name in _endpoints:
-        return error_response_json("ResourceAlreadyExistsException",
-                                   f"Endpoint {name} already exists", 400)
+    if name is None:
+        null("name")
+    else:
+        string(name, "name", 1, 64, _ENDPOINT_NAME_RE)
+    if data.get("Description") is not None and len(data["Description"]) > 512:
+        bad(data["Description"], "description", "Member must have length less than or equal to 512")
+    routing = data.get("RoutingConfig")
+    if routing is None:
+        if create:
+            null("routingConfig")
+    else:
+        failover = routing.get("FailoverConfig")
+        if failover is None:
+            null("routingConfig.failoverConfig")
+        else:
+            primary, secondary = failover.get("Primary"), failover.get("Secondary")
+            if primary is None:
+                null("routingConfig.failoverConfig.primary")
+            elif primary.get("HealthCheck") is None:
+                null("routingConfig.failoverConfig.primary.healthCheck")
+            else:
+                string(primary["HealthCheck"], "routingConfig.failoverConfig.primary.healthCheck", 1, 1600,
+                       _HEALTH_CHECK_RE)
+            if secondary is None:
+                null("routingConfig.failoverConfig.secondary")
+            elif secondary.get("Route") is None:
+                null("routingConfig.failoverConfig.secondary.route")
+            else:
+                string(secondary["Route"], "routingConfig.failoverConfig.secondary.route", 9, 20, _ROUTE_RE)
+    replication = data.get("ReplicationConfig")
+    if replication is not None and replication.get("State") is not None \
+            and replication["State"] not in ("ENABLED", "DISABLED"):
+        bad(replication["State"], "replicationConfig.state", "Member must satisfy enum value set: [ENABLED, DISABLED]")
+    buses = data.get("EventBuses")
+    if buses is None:
+        if create:
+            null("eventBuses")
+    else:
+        if len(buses) != 2:
+            listed = ", ".join(f"EndpointEventBus(eventBusArn={b.get('EventBusArn')})" for b in buses)
+            bad(f"[{listed}]", "eventBuses", "Member must have length greater than or equal to 2" if len(buses) < 2
+                else "Member must have length less than or equal to 2")
+        for i, bus in enumerate(buses, start=1):
+            arn = bus.get("EventBusArn")
+            if arn is None:
+                null(f"eventBuses.{i}.member.eventBusArn")
+            else:
+                string(arn, f"eventBuses.{i}.member.eventBusArn", 1, 512, _ENDPOINT_BUS_ARN_RE)
+    if data.get("RoleArn"):
+        string(data["RoleArn"], "roleArn", 1, 256, _ROLE_ARN_RE)
+    if not errors:
+        return None
+    count = f"{len(errors)} validation error{'s' if len(errors) > 1 else ''} detected: "
+    return error_response_json("ValidationException", count + "; ".join(errors), 400)
+
+
+def _endpoint_config_error(config):
+    """The checks EventBridge makes on a well-formed endpoint configuration."""
+    from ministack.services import iam as _iam
+    from ministack.services import route53 as _route53
+
+    replication = (config.get("ReplicationConfig") or {}).get("State", "ENABLED")
+    role_arn = config.get("RoleArn") or ""
+    if replication == "ENABLED" and not role_arn:
+        return error_response_json("ValidationException", "When replication is enabled, role cannot be empty.", 400)
+    failover = config["RoutingConfig"]["FailoverConfig"]
+    route = failover["Secondary"]["Route"]
+    if route == get_region():
+        return error_response_json("ValidationException", "Parameter Route is not valid. Reason: Provided route "
+                                   "for the secondary region cannot be the same as the primary region.", 400)
+    buses = [parse_arn(b["EventBusArn"]) for b in config["EventBuses"]]
+    if sorted(b.region for b in buses) != sorted([get_region(), route]):
+        return error_response_json("ValidationException", "Parameter EventBuses is not valid. Reason: An event bus "
+                                   "must be provided in both the primary and secondary regions.", 400)
+    if buses[0].resource != buses[1].resource:
+        return error_response_json("ValidationException", "Parameter EventBuses is not valid. Reason: Event bus "
+                                   "names must match in the primary and secondary regions.", 400)
+    health_check = failover["Primary"]["HealthCheck"]
+    if health_check.rsplit("/", 1)[-1] not in _route53._health_checks:
+        return error_response_json("ValidationException", f"A health check with ARN {health_check} does not exist.",
+                                   400)
+    if role_arn:
+        role = _iam._roles.get_scoped(get_account_id(), None, role_arn.rsplit("/", 1)[-1])
+        if role is None or role.get("Arn") != role_arn or not _events_may_assume(role, {"Arn": config["Arn"]}):
+            return error_response_json("ValidationException", f"Provided role '{role_arn}' cannot be assumed by "
+                                       "principal 'events.amazonaws.com'.", 400)
+    return None
+
+
+def _endpoint_view(ep, full=True):
+    """The endpoint as AWS reports it: CREATING first, and its EndpointId and URL only once ACTIVE."""
+    if ep["State"] == "CREATING" and _now_ts() >= ep["_active_at"]:
+        ep["State"], ep["LastModifiedTime"] = "ACTIVE", ep["_active_at"]
+    out = {"Name": ep["Name"]}
+    if ep.get("Description"):
+        out["Description"] = ep["Description"]
+    out.update({"Arn": ep["Arn"], "RoutingConfig": ep["RoutingConfig"], "ReplicationConfig": ep["ReplicationConfig"],
+                "EventBuses": ep["EventBuses"], "RoleArn": ep["RoleArn"]})
+    if ep["State"] != "CREATING":
+        out.update({"EndpointId": ep["EndpointId"], "EndpointUrl": ep["EndpointUrl"]})
+    out["State"] = ep["State"]
+    if full:
+        out.update({"CreationTime": ep["CreationTime"], "LastModifiedTime": ep["LastModifiedTime"]})
+    return out
+
+
+def _endpoint_not_found(name):
+    return error_response_json("ResourceNotFoundException", f"Endpoint {name} does not exist in region {get_region()}.",
+                               400)
+
+
+def _create_endpoint(data):
+    err = _endpoint_shape_errors(data, create=True)
+    if err:
+        return err
+    name = data["Name"]
     arn = f"arn:aws:events:{get_region()}:{get_account_id()}:endpoint/{name}"
+    config = {"RoutingConfig": data["RoutingConfig"], "ReplicationConfig": data.get("ReplicationConfig") or {},
+              "EventBuses": data["EventBuses"], "RoleArn": data.get("RoleArn") or "", "Arn": arn}
+    err = _endpoint_config_error(config)
+    if err:
+        return err
+    if name in _endpoints:
+        return error_response_json("ResourceAlreadyExistsException", f"Endpoint {name} already exists.", 400)
     now = _now_ts()
+    endpoint_id = "".join(random.choices(string.ascii_lowercase + string.digits, k=10)) + "." + \
+        "".join(random.choices(string.ascii_lowercase, k=3))
     _endpoints[name] = {
+        **config,
         "Name": name,
         "Description": data.get("Description", ""),
-        "RoutingConfig": data.get("RoutingConfig", {}),
-        "ReplicationConfig": data.get("ReplicationConfig", {}),
-        "EventBuses": data.get("EventBuses", []),
-        "RoleArn": data.get("RoleArn", ""),
-        "Arn": arn,
-        "EndpointUrl": f"https://{name}.global-events.{get_region()}.amazonaws.com",
-        "State": "ACTIVE",
+        "EndpointId": endpoint_id,
+        "EndpointUrl": f"https://{endpoint_id}.endpoint.events.amazonaws.com",
+        "State": "CREATING",
         "CreationTime": now,
         "LastModifiedTime": now,
+        "_active_at": now + _ENDPOINT_ACTIVATION_SECONDS,
     }
-    ep = _endpoints[name]
-    return json_response({
-        "Name": ep["Name"],
-        "Arn": ep["Arn"],
-        "RoutingConfig": ep["RoutingConfig"],
-        "ReplicationConfig": ep["ReplicationConfig"],
-        "EventBuses": ep["EventBuses"],
-        "RoleArn": ep["RoleArn"],
-        "State": ep["State"],
-    })
+    return json_response(_endpoint_view(_endpoints[name], full=False))
 
 
 def _delete_endpoint(data):
-    name = data.get("Name")
-    if name not in _endpoints:
-        return error_response_json("ResourceNotFoundException",
-                                   f"Endpoint {name} does not exist.", 400)
-    del _endpoints[name]
+    # Deleting an endpoint that does not exist succeeds, as on AWS.
+    _endpoints.pop(data.get("Name"), None)
     return json_response({})
 
 
 def _describe_endpoint(data):
-    name = data.get("Name")
-    ep = _endpoints.get(name)
+    ep = _endpoints.get(data.get("Name"))
     if not ep:
-        return error_response_json("ResourceNotFoundException",
-                                   f"Endpoint {name} does not exist.", 400)
-    return json_response({
-        "Name": ep["Name"],
-        "Description": ep.get("Description", ""),
-        "Arn": ep["Arn"],
-        "RoutingConfig": ep.get("RoutingConfig", {}),
-        "ReplicationConfig": ep.get("ReplicationConfig", {}),
-        "EventBuses": ep.get("EventBuses", []),
-        "RoleArn": ep.get("RoleArn", ""),
-        "EndpointId": ep["Name"],
-        "EndpointUrl": ep["EndpointUrl"],
-        "State": ep["State"],
-        "StateReason": "",
-        "CreationTime": ep["CreationTime"],
-        "LastModifiedTime": ep.get("LastModifiedTime", ep["CreationTime"]),
-    })
+        return _endpoint_not_found(data.get("Name"))
+    return json_response(_endpoint_view(ep))
 
 
 def _list_endpoints(data):
@@ -1437,43 +3870,33 @@ def _list_endpoints(data):
     home = data.get("HomeRegion", "")
     results = []
     for n in sorted(_endpoints.keys()):
-        ep = _endpoints[n]
         if prefix and not n.startswith(prefix):
             continue
         if home and get_region() != home:
             continue
-        results.append({
-            "Name": ep["Name"],
-            "Arn": ep["Arn"],
-            "EndpointUrl": ep["EndpointUrl"],
-            "State": ep["State"],
-            "CreationTime": ep["CreationTime"],
-        })
-    return json_response({"Endpoints": results})
+        results.append(_endpoint_view(_endpoints[n]))
+    return _offset_page(data, "Endpoints", results, "MaxResults")
 
 
 def _update_endpoint(data):
-    name = data.get("Name")
-    if name not in _endpoints:
-        return error_response_json("ResourceNotFoundException",
-                                   f"Endpoint {name} does not exist.", 400)
-    ep = _endpoints[name]
-    now = _now_ts()
-    for key in ("Description", "RoutingConfig", "ReplicationConfig", "EventBuses", "RoleArn"):
-        if key in data:
-            ep[key] = data[key]
-    ep["LastModifiedTime"] = now
-    return json_response({
-        "Name": ep["Name"],
-        "Arn": ep["Arn"],
-        "RoutingConfig": ep["RoutingConfig"],
-        "ReplicationConfig": ep["ReplicationConfig"],
-        "EventBuses": ep["EventBuses"],
-        "RoleArn": ep["RoleArn"],
-        "EndpointId": ep["Name"],
-        "EndpointUrl": ep["EndpointUrl"],
-        "State": ep["State"],
-    })
+    err = _endpoint_shape_errors(data, create=False)
+    if err:
+        return err
+    name = data["Name"]
+    ep = _endpoints.get(name)
+    if not ep:
+        return _endpoint_not_found(name)
+    config = {key: data[key] if key in data else ep[key]
+              for key in ("RoutingConfig", "ReplicationConfig", "EventBuses", "RoleArn")}
+    config["Arn"] = ep["Arn"]
+    err = _endpoint_config_error(config)
+    if err:
+        return err
+    ep.update({k: v for k, v in config.items() if k != "Arn"})
+    if "Description" in data:
+        ep["Description"] = data["Description"]
+    ep["LastModifiedTime"] = _now_ts()
+    return json_response(_endpoint_view(ep, full=False))
 
 
 def _activate_event_source(data):
@@ -1537,7 +3960,6 @@ def _describe_partner_event_source(data):
             return json_response({
                 "Name": rec["Name"],
                 "Arn": rec["EventSourceArn"],
-                "State": "ACTIVE",
             })
     return error_response_json("ResourceNotFoundException",
                                f"Partner event source {name} does not exist.", 400)
@@ -1552,14 +3974,13 @@ def _list_partner_event_sources(data):
         results.append({
             "Name": rec["Name"],
             "Arn": rec["EventSourceArn"],
-            "State": "ACTIVE",
         })
-    return json_response({"PartnerEventSources": results})
+    return _offset_page(data, "PartnerEventSources", results)
 
 
 def _list_partner_event_source_accounts(data):
     _ = data.get("EventSourceName", "")
-    return json_response({"PartnerEventSourceAccounts": [], "NextToken": ""})
+    return json_response({"PartnerEventSourceAccounts": []})
 
 
 def _list_event_sources(data):
@@ -1578,8 +3999,40 @@ def _put_partner_events(data):
 # Permissions (resource policies)
 # ---------------------------------------------------------------------------
 
+def _policy_statement_error(document, bus_arn):
+    """The ValidationException message for a Policy document AWS refuses, or None."""
+    statements = document.get("Statement") if isinstance(document, dict) else None
+    for statement in statements if isinstance(statements, list) else [statements]:
+        resources = statement.get("Resource") if isinstance(statement, dict) else None
+        for resource in resources if isinstance(resources, list) else [resources]:
+            if isinstance(resource, str) and resource != bus_arn and resource.startswith("arn:"):
+                relative = resource.split(":", 5)[5] if resource.count(":") >= 5 else resource
+                return f'The relative-id "{relative}" is invalid for ARN "{resource}"'
+    return None
+
+
 def _put_permission(data):
     bus_name = data.get("EventBusName", "default")
+    bus_arn = f"arn:aws:events:{get_region()}:{get_account_id()}:event-bus/{bus_name}"
+    if "Policy" in data:
+        if any(data.get(k) is not None for k in ("Action", "Principal", "StatementId", "Condition")):
+            return error_response_json(
+                "ValidationException",
+                "Action, Principal, StatementId and Condition could not be combined with Policy parameter.", 400)
+        try:
+            document = json.loads(data["Policy"]) if isinstance(data["Policy"], str) else None
+        except ValueError:
+            document = None
+        if not isinstance(document, dict):
+            return error_response_json("ValidationException", "This policy contains invalid Json", 400)
+        message = _policy_statement_error(document, bus_arn)
+        if message:
+            return error_response_json("ValidationException", message, 400)
+        # A Policy replaces the bus's whole policy.
+        _event_bus_policies[bus_name] = document
+        _touch_bus(bus_name)
+        return json_response({})
+
     statement_id = data.get("StatementId") or new_uuid()
 
     if bus_name not in _event_bus_policies:
@@ -1588,19 +4041,29 @@ def _put_permission(data):
     policy = _event_bus_policies[bus_name]
     policy["Statement"] = [s for s in policy["Statement"] if s.get("Sid") != statement_id]
 
+    principal = data.get("Principal", "*")
+    if isinstance(principal, str) and re.fullmatch(r"\d{12}", principal):
+        principal = {"AWS": f"arn:aws:iam::{principal}:root"}
     statement = {
         "Sid": statement_id,
         "Effect": "Allow",
-        "Principal": data.get("Principal", "*"),
+        "Principal": principal,
         "Action": data.get("Action", "events:PutEvents"),
-        "Resource": f"arn:aws:events:{get_region()}:{get_account_id()}:event-bus/{bus_name}",
+        "Resource": bus_arn,
     }
     condition = data.get("Condition")
     if condition:
         statement["Condition"] = condition
     policy["Statement"].append(statement)
+    _touch_bus(bus_name)
 
     return json_response({})
+
+
+def _touch_bus(bus_name):
+    bus = _event_buses.get(bus_name)
+    if bus:
+        bus["LastModifiedTime"] = _now_ts()
 
 
 def _remove_permission(data):
@@ -1625,10 +4088,92 @@ def _remove_permission(data):
 # Connections
 # ---------------------------------------------------------------------------
 
+# An http(s) URL with a non-empty authority. Schemes are case-insensitive per
+# RFC 3986 — "HTTPS://host" is the same endpoint urllib would dial, so the API
+# must not reject what the outbound opener accepts. Control characters and
+# spaces are rejected separately: urlsplit strips CR/LF/TAB before it reports a
+# hostname (bpo-43882), so the pattern alone would pass them through.
+_HTTP_ENDPOINT_RE = re.compile(r"^https?://[^/?#\s]+", re.IGNORECASE)
+_ENDPOINT_CTL_RE = re.compile(r"[\x00-\x20\x7f]")
+
+# The other two caller-supplied values that ride the outbound request: the
+# method goes on the request line, and the authorization type decides which
+# credentials are attached. Both are enums on the API model, so an unrecognized
+# value is a 400 on AWS — here it used to be stored and then silently mean
+# "send no credentials" or "POST".
+_API_DEST_HTTP_METHODS = ("DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT")
+_CONNECTION_AUTH_TYPES = ("API_KEY", "BASIC", "OAUTH_CLIENT_CREDENTIALS")
+
+
+def _validate_enum(value, allowed, param: str):
+    """Reject a value outside an API-model enum, in the shape AWS's own
+    validator emits. Absent is not invalid — required-ness is checked by the
+    caller that needs it."""
+    if value is None or value in allowed:
+        return None
+    return error_response_json(
+        "ValidationException",
+        f"1 validation error detected: Value '{value}' at '{param}' failed to satisfy "
+        f"constraint: Member must satisfy enum value set: [{', '.join(allowed)}]",
+        400,
+    )
+
+
+def _validate_http_endpoint(endpoint, param: str):
+    """Reject a caller-supplied endpoint that is not a dialable http(s) URL, as
+    real AWS does at CreateApiDestination / CreateConnection. Keeping non-http
+    schemes out of stored state also keeps them off the outbound opener —
+    defense in depth with ``_http_open``'s scheme guard, which is the backstop
+    for records restored from persistence. "Dialable" is the whole point, so a
+    non-empty authority is not sufficient: ``http://@`` and ``http://:80`` carry
+    no host, and ``http://ho\\nst/x`` reaches the connect call as something the
+    caller never wrote."""
+    ok = (
+        isinstance(endpoint, str)
+        and _HTTP_ENDPOINT_RE.match(endpoint) is not None
+        and _ENDPOINT_CTL_RE.search(endpoint) is None
+    )
+    if ok:
+        try:
+            ok = bool(urllib.parse.urlsplit(endpoint).hostname)
+        except ValueError:
+            ok = False   # malformed authority, e.g. an unclosed IPv6 bracket
+    if not ok:
+        return error_response_json(
+            "ValidationException",
+            f"Parameter {param} is not valid. "
+            "Reason: Must be an http:// or https:// endpoint.",
+            400,
+        )
+    return None
+
+
+def _validate_oauth_authorization_endpoint(auth_params):
+    """The OAuth AuthorizationEndpoint is the second caller-controlled URL on
+    this path, and the one the client_id/client_secret are POSTed to — so it
+    gets the same http(s) check as an API destination's InvocationEndpoint
+    rather than only failing (silently, on a delivery thread) at token time.
+
+    ``auth_params`` is raw caller JSON, so it is type-checked rather than
+    dereferenced: CreateConnection stored a non-object AuthParameters verbatim
+    and answered 200, and a validation step must not turn that into a 500."""
+    oauth = auth_params.get("OAuthParameters") if isinstance(auth_params, dict) else None
+    if not isinstance(oauth, dict) or "AuthorizationEndpoint" not in oauth:
+        return None
+    return _validate_http_endpoint(oauth["AuthorizationEndpoint"], "AuthorizationEndpoint")
+
+
 def _create_connection(data):
     name = data.get("Name")
     if not name:
         return error_response_json("ValidationException", "Name is required", 400)
+    auth_type_error = _validate_enum(
+        data.get("AuthorizationType"), _CONNECTION_AUTH_TYPES, "authorizationType")
+    if auth_type_error:
+        return auth_type_error
+    endpoint_error = _validate_oauth_authorization_endpoint(data.get("AuthParameters"))
+    if endpoint_error:
+        return endpoint_error
     if name in _connections:
         return error_response_json("ResourceAlreadyExistsException",
                                    f"Connection {name} already exists", 400)
@@ -1646,11 +4191,28 @@ def _create_connection(data):
         "LastModifiedTime": now,
         "LastAuthorizedTime": now,
     }
+    _apply_connection_extras(_connections[name], data)
     return json_response({
         "ConnectionArn": arn,
         "ConnectionState": "AUTHORIZED",
         "CreationTime": now,
     })
+
+
+def _apply_connection_extras(conn, data):
+    if data.get("KmsKeyIdentifier"):
+        conn["KmsKeyIdentifier"] = data["KmsKeyIdentifier"]
+    connectivity = data.get("InvocationConnectivityParameters")
+    if isinstance(connectivity, dict) and isinstance(connectivity.get("ResourceParameters"), dict):
+        config_arn = connectivity["ResourceParameters"].get("ResourceConfigurationArn")
+        current = (conn.get("InvocationConnectivityParameters") or {}).get("ResourceParameters", {})
+        association = current.get("ResourceAssociationArn") if current.get("ResourceConfigurationArn") == config_arn else None
+        conn["InvocationConnectivityParameters"] = {"ResourceParameters": {
+            "ResourceConfigurationArn": config_arn,
+            "ResourceAssociationArn": association or (
+                f"arn:aws:vpc-lattice:{get_region()}:{get_account_id()}:servicenetworkresourceassociation/"
+                f"snra-{new_uuid().replace('-', '')[:17]}"),
+        }}
 
 
 def _describe_connection(data):
@@ -1659,7 +4221,7 @@ def _describe_connection(data):
     if not conn:
         return error_response_json("ResourceNotFoundException",
                                    f"Connection {name} does not exist.", 400)
-    return json_response(conn)
+    return json_response(to_output_shape("events", "DescribeConnectionResponse", conn))
 
 
 def _delete_connection(data):
@@ -1668,6 +4230,7 @@ def _delete_connection(data):
     if not conn:
         return error_response_json("ResourceNotFoundException",
                                    f"Connection {name} does not exist.", 400)
+    _evict_oauth_token(name)
     return json_response({
         "ConnectionArn": conn["ConnectionArn"],
         "ConnectionState": "DELETING",
@@ -1694,7 +4257,25 @@ def _list_connections(data):
             "LastModifiedTime": conn["LastModifiedTime"],
             "LastAuthorizedTime": conn.get("LastAuthorizedTime", ""),
         })
-    return json_response({"Connections": results})
+    return _offset_page(data, "Connections", results)
+
+
+_AUTH_TYPE_BLOCKS = {
+    "BASIC": "BasicAuthParameters",
+    "API_KEY": "ApiKeyAuthParameters",
+    "OAUTH_CLIENT_CREDENTIALS": "OAuthParameters",
+}
+
+
+def _merge_auth_params(stored, sent):
+    if not isinstance(sent, dict):
+        return sent
+    for key, value in sent.items():
+        if isinstance(value, dict) and isinstance(stored.get(key), dict):
+            stored[key] = _merge_auth_params(stored[key], value)
+        else:
+            stored[key] = copy.deepcopy(value)
+    return stored
 
 
 def _update_connection(data):
@@ -1702,11 +4283,33 @@ def _update_connection(data):
     if name not in _connections:
         return error_response_json("ResourceNotFoundException",
                                    f"Connection {name} does not exist.", 400)
+    if "AuthorizationType" in data:
+        auth_type_error = _validate_enum(
+            data["AuthorizationType"], _CONNECTION_AUTH_TYPES, "authorizationType")
+        if auth_type_error:
+            return auth_type_error
+    if "AuthParameters" in data:
+        endpoint_error = _validate_oauth_authorization_endpoint(data["AuthParameters"])
+        if endpoint_error:
+            return endpoint_error
     conn = _connections[name]
     now = _now_ts()
-    for key in ("AuthorizationType", "AuthParameters", "Description"):
+    if "AuthParameters" in data:
+        stored = copy.deepcopy(conn.get("AuthParameters")) if isinstance(conn.get("AuthParameters"), dict) else {}
+        new_type = data.get("AuthorizationType")
+        if new_type and new_type != conn.get("AuthorizationType"):
+            for block in _AUTH_TYPE_BLOCKS.values():
+                stored.pop(block, None)
+        conn["AuthParameters"] = _merge_auth_params(stored, data["AuthParameters"])
+    for key in ("AuthorizationType", "Description"):
         if key in data:
             conn[key] = data[key]
+    _apply_connection_extras(conn, data)
+    if "AuthParameters" in data or "AuthorizationType" in data:
+        # Re-authorization: the new credentials, not the cached token, decide
+        # what the next invocation carries. A description-only update does not
+        # re-authorize, so it keeps the token.
+        _evict_oauth_token(name)
     conn["LastModifiedTime"] = now
     conn["ConnectionState"] = "AUTHORIZED"
     conn["LastAuthorizedTime"] = now
@@ -1719,6 +4322,12 @@ def _update_connection(data):
 
 
 def _deauthorize_connection(data):
+    """Per the API reference this "removes all authorization parameters from the
+    connection … so you can reuse it without having to create a new connection",
+    so the stored credentials go with the state flip. Keeping them meant a
+    deauthorized connection carried on presenting its Basic/API-key credentials
+    on every delivery, and evicting the OAuth token achieved nothing because the
+    next delivery simply fetched a fresh one."""
     name = data.get("Name")
     if not name:
         return error_response_json("ValidationException", "Name is required", 400)
@@ -1730,6 +4339,8 @@ def _deauthorize_connection(data):
     conn["ConnectionState"] = "DEAUTHORIZED"
     conn["LastModifiedTime"] = now
     conn.pop("LastAuthorizedTime", None)
+    conn["AuthParameters"] = {}
+    _evict_oauth_token(name)
     return json_response({
         "ConnectionArn": conn["ConnectionArn"],
         "ConnectionState": conn["ConnectionState"],
@@ -1745,6 +4356,12 @@ def _create_api_destination(data):
     name = data.get("Name")
     if not name:
         return error_response_json("ValidationException", "Name is required", 400)
+    endpoint_error = _validate_http_endpoint(data.get("InvocationEndpoint", ""), "InvocationEndpoint")
+    if endpoint_error:
+        return endpoint_error
+    method_error = _validate_enum(data.get("HttpMethod"), _API_DEST_HTTP_METHODS, "httpMethod")
+    if method_error:
+        return method_error
     if name in _api_destinations:
         return error_response_json("ResourceAlreadyExistsException",
                                    f"ApiDestination {name} already exists", 400)
@@ -1809,7 +4426,7 @@ def _list_api_destinations(data):
             "CreationTime": dest["CreationTime"],
             "LastModifiedTime": dest["LastModifiedTime"],
         })
-    return json_response({"ApiDestinations": results})
+    return _offset_page(data, "ApiDestinations", results)
 
 
 def _update_api_destination(data):
@@ -1817,6 +4434,14 @@ def _update_api_destination(data):
     if name not in _api_destinations:
         return error_response_json("ResourceNotFoundException",
                                    f"ApiDestination {name} does not exist.", 400)
+    if "InvocationEndpoint" in data:
+        endpoint_error = _validate_http_endpoint(data["InvocationEndpoint"], "InvocationEndpoint")
+        if endpoint_error:
+            return endpoint_error
+    if "HttpMethod" in data:
+        method_error = _validate_enum(data["HttpMethod"], _API_DEST_HTTP_METHODS, "httpMethod")
+        if method_error:
+            return method_error
     dest = _api_destinations[name]
     now = _now_ts()
     for key in ("ConnectionArn", "InvocationEndpoint", "HttpMethod",
@@ -2117,13 +4742,13 @@ def _tick_scheduled_rules():
     """Fire any enabled scheduled rule whose interval has elapsed."""
     now = _now_ts()
     now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
-    # Iterate _rules._data directly so we see every account, not just the
-    # ContextVar default.  Keys are (account_id, rule_key) tuples.
-    for (account_id, rule_key), rule in list(_rules._data.items()):
+    # Iterate _rules._data directly so we see every account/region, not just
+    # the ContextVar default. Keys are (account_id, region, rule_key) tuples.
+    for (account_id, region, rule_key), rule in list(_rules._data.items()):
         if rule.get("State") != "ENABLED":
             continue
         schedule = rule.get("ScheduleExpression", "")
-        state_key = (account_id, rule_key)
+        state_key = (account_id, region, rule_key)
 
         interval = _parse_rate_seconds(schedule)
         if interval is not None:
@@ -2151,31 +4776,59 @@ def _tick_scheduled_rules():
                 continue
 
         _rule_last_fired[state_key] = now
-        targets = _targets._data.get((account_id, rule_key), [])
+        targets = _targets._data.get((account_id, region, rule_key), [])
         if not targets:
             continue
-        # Set the account context so ARN-building and Lambda dispatch use the
-        # correct account for this rule's tenant.
+        try:
+            rule_arn = parse_arn(rule.get("Arn", ""))
+        except ArnParseError:
+            logger.warning(
+                "EventBridge scheduler: skipping rule %s with malformed ARN %s",
+                rule_key,
+                rule.get("Arn", ""),
+            )
+            continue
+        if (
+            rule_arn.service != "events"
+            or not rule_arn.region
+            or rule_arn.account_id != account_id
+            or rule_arn.region != region
+            or not rule_arn.resource.startswith("rule/")
+        ):
+            logger.warning(
+                "EventBridge scheduler: skipping rule %s with out-of-scope ARN %s",
+                rule_key,
+                rule.get("Arn", ""),
+            )
+            continue
+        previous_account = get_account_id()
+        previous_region = get_region()
         set_request_account_id(account_id)
-        event = {
-            "EventId": new_uuid(),
-            "Source": "aws.events",
-            "DetailType": "Scheduled Event",
-            "Detail": "{}",
-            "EventBusName": rule.get("EventBusName", "default"),
-            "Time": now,
-            "Resources": [rule.get("Arn", "")],
-            "Account": account_id,
-            "Region": get_region(),
-        }
-        for target in targets:
-            try:
-                _invoke_target(target, event, rule)
-            except Exception:
-                logger.exception(
-                    "EventBridge scheduler: dispatch error for rule %s account %s",
-                    rule_key, account_id,
-                )
+        set_request_region(region)
+        try:
+            event = {
+                "EventId": new_uuid(),
+                "Source": "aws.events",
+                "DetailType": "Scheduled Event",
+                "Detail": "{}",
+                "EventBusName": rule.get("EventBusName", "default"),
+                "Time": now,
+                "Resources": [rule.get("Arn", "")],
+                "Account": account_id,
+                "Region": get_region(),
+            }
+            view = _pattern_event_view(event)
+            for target in targets:
+                try:
+                    _invoke_target(target, event, rule, view)
+                except Exception:
+                    logger.exception(
+                        "EventBridge scheduler: dispatch error for rule %s account %s",
+                        rule_key, account_id,
+                    )
+        finally:
+            set_request_account_id(previous_account)
+            set_request_region(previous_region)
 
 
 def _scheduler_loop():
@@ -2217,5 +4870,17 @@ def reset():
     _partner_event_sources.clear()
     _event_buses.clear()
     _rule_last_fired.clear()
+    with _oauth_tokens_lock:
+        _oauth_tokens.clear()
+    # These memoize on text a caller sent — a pattern, a wildcard operand, a cidr
+    # block — and on the epoch second an event carries, and nothing else evicts an
+    # entry below the 1024-entry cap, so a reset that skipped them would keep
+    # hundreds of megabytes of compiled regexes and expanded ``$or``s for rules it
+    # just deleted. Clearing cannot change an answer: each is a pure function of
+    # its key.
+    _compiled_pattern.cache_clear()
+    _wildcard_regex.cache_clear()
+    _cidr_network.cache_clear()
+    _iso_time.cache_clear()
     # The "default" bus is lazily recreated per-account on next access via
     # _ensure_default_bus(), so nothing to re-seed here.

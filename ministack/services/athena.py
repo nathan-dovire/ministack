@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 Athena Service Emulator.
 JSON-based API via X-Amz-Target (AmazonAthena).
@@ -20,20 +22,25 @@ import json
 import logging
 import os
 import re
-import threading
+import shutil
 import time
 import xml.etree.ElementTree as ET
-from datetime import date
+from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
-from ministack.core.persistence import PERSIST_STATE, load_state
+from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
+    AccountRegionScopedDict,
     AccountScopedDict,
     error_response_json,
     get_account_id,
     get_region,
-    json_response,
     new_uuid,
+    set_request_region,
+    to_output_shape,
+)
+from ministack.core.responses import (
+    json_response as _core_json_response,
 )
 
 logger = logging.getLogger("athena")
@@ -42,6 +49,19 @@ REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 S3_DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")
 ATHENA_ENGINE = os.environ.get("ATHENA_ENGINE", "auto")  # "auto" | "duckdb" | "mock"
 ATHENA_DATA_DIR = S3_DATA_DIR
+
+
+def _drop_none(value):
+    """AWS omits unset members; it never sends null."""
+    if isinstance(value, dict):
+        return {k: _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
+def json_response(data, status=200, **kwargs):
+    return _core_json_response(_drop_none(data), status, **kwargs)
 
 
 def get_athena_engine():
@@ -54,14 +74,13 @@ def get_athena_engine():
     return engine
 
 
-_executions = AccountScopedDict()
-# Per-account workgroups / data catalogs. AWS's "primary" workgroup and
-# "AwsDataCatalog" exist in every account — we lazily seed them per-tenant
-# on first access so two accounts never share the same workgroup or catalog
-# state (creation times, configs, etc.).
-_workgroups = AccountScopedDict()
-_named_queries = AccountScopedDict()
-_data_catalogs = AccountScopedDict()
+_executions = AccountRegionScopedDict()
+# Per-account-and-region workgroups / data catalogs. AWS's "primary" workgroup
+# and "AwsDataCatalog" exist in every region — we lazily seed them per scope on
+# first access so requests never share workgroup or catalog state.
+_workgroups = AccountRegionScopedDict()
+_named_queries = AccountRegionScopedDict()
+_data_catalogs = AccountRegionScopedDict()
 
 
 def _ensure_default_workgroup():
@@ -71,8 +90,14 @@ def _ensure_default_workgroup():
             "State": "ENABLED",
             "Description": "Primary workgroup",
             "CreationTime": int(time.time()),
+            # Like AWS's primary workgroup, no query result location until one is set.
             "Configuration": {
-                "ResultConfiguration": {"OutputLocation": "s3://athena-results/"}
+                # AUTO is the default selection; the effective version is what Athena resolved it to.
+                # https://docs.aws.amazon.com/athena/latest/APIReference/API_EngineVersion.html
+                "EngineVersion": {
+                    "SelectedEngineVersion": "AUTO",
+                    "EffectiveEngineVersion": "Athena engine version 3",
+                },
             },
         }
 
@@ -85,7 +110,7 @@ def _ensure_default_data_catalog():
             "Type": "GLUE",
             "Parameters": {},
         }
-_prepared_statements = AccountScopedDict()  # "workgroup/name" -> statement dict
+_prepared_statements = AccountRegionScopedDict()  # "workgroup/name" -> statement dict
 _tags = AccountScopedDict()  # arn -> {key: value, ...}
 
 
@@ -102,34 +127,102 @@ def get_state():
     )
 
 
-def restore_state(data):
-    # AccountScopedDicts are mutated in-place — no module-level reassignment.
+def load_persisted_state(data):
+    return _restore_state(data)
+
+
+def _restore_state(data):
+    # Scoped dicts are mutated in-place — no module-level reassignment.
     _executions.clear()
-    _executions.update(data.get("_executions", {}))
     _workgroups.clear()
-    _workgroups.update(data.get("_workgroups", {}))
     _named_queries.clear()
-    _named_queries.update(data.get("_named_queries", {}))
     _data_catalogs.clear()
-    _data_catalogs.update(data.get("_data_catalogs", {}))
     _prepared_statements.clear()
-    _prepared_statements.update(data.get("_prepared_statements", {}))
     _tags.clear()
+
+    legacy_workgroup_regions = _restore_regional_store(
+        _workgroups, data.get("_workgroups", {})
+    )
+    for store, key, workgroup_fields in (
+        (_executions, "_executions", ("WorkGroup",)),
+        (_named_queries, "_named_queries", ("WorkGroup",)),
+        (
+            _prepared_statements,
+            "_prepared_statements",
+            ("WorkGroupName", "WorkGroup"),
+        ),
+    ):
+        _restore_workgroup_child_store(
+            store,
+            data.get(key, {}),
+            legacy_workgroup_regions,
+            workgroup_fields,
+        )
+    _restore_regional_store(_data_catalogs, data.get("_data_catalogs", {}))
     _tags.update(data.get("_tags", {}))
 
 
-try:
-    _restored = load_state("athena")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
-    )
+def _legacy_region_for_value(store, key, value):
+    """Infer an ARN region, falling back to Athena's configured boot region."""
+    request_region = get_region()
+    try:
+        set_request_region(REGION)
+        return store._region_for_legacy_value(key, value)
+    finally:
+        set_request_region(request_region)
+
+
+def _restore_regional_store(store, restored):
+    """Restore current state verbatim and legacy state deterministically."""
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return {}
+
+    restored_regions = {}
+    if isinstance(restored, AccountScopedDict):
+        items = restored._data.items()
+    else:
+        account_id = get_account_id()
+        items = (((account_id, key), value) for key, value in restored.items())
+
+    for (account_id, key), value in items:
+        region = _legacy_region_for_value(store, key, value)
+        store.set_scoped(account_id, region, key, value)
+        restored_regions[(account_id, key)] = region
+    return restored_regions
+
+
+def _restore_workgroup_child_store(
+    store, restored, workgroup_regions, workgroup_fields
+):
+    """Place legacy child records beside their referenced workgroup."""
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return
+
+    if isinstance(restored, AccountScopedDict):
+        items = restored._data.items()
+    else:
+        account_id = get_account_id()
+        items = (((account_id, key), value) for key, value in restored.items())
+
+    for (account_id, key), value in items:
+        workgroup = next(
+            (value.get(field) for field in workgroup_fields if value.get(field)),
+            None,
+        )
+        if not workgroup and store is _prepared_statements:
+            workgroup = str(key).partition("/")[0]
+        workgroup = workgroup or "primary"
+        region = workgroup_regions.get((account_id, workgroup))
+        if region is None:
+            region = _legacy_region_for_value(store, key, value)
+        store.set_scoped(account_id, region, key, value)
+
+
 
 try:
-    import duckdb
+    import duckdb  # noqa: F401 — the import is the availability probe
 
     _duckdb_available = True
 except ImportError:
@@ -168,6 +261,38 @@ def _arn_workgroup(name):
 
 def _arn_datacatalog(name):
     return f"arn:aws:athena:{get_region()}:{get_account_id()}:datacatalog/{name}"
+
+
+def _is_taggable_athena_resource(resource):
+    for prefix in ("workgroup/", "datacatalog/"):
+        if resource.startswith(prefix):
+            name = resource[len(prefix):]
+            return bool(name) and "/" not in name
+    return False
+
+
+def _validate_tag_resource_arn(arn):
+    try:
+        spec = parse_arn(arn)
+    except ArnParseError:
+        return error_response_json(
+            "InvalidRequestException",
+            f"Invalid ResourceARN: {arn}",
+            400,
+        )
+    if (
+        spec.partition != "aws"
+        or spec.service != "athena"
+        or spec.region != get_region()
+        or spec.account_id != get_account_id()
+        or not _is_taggable_athena_resource(spec.resource)
+    ):
+        return error_response_json(
+            "InvalidRequestException",
+            f"Invalid ResourceARN: {arn}",
+            400,
+        )
+    return None
 
 
 async def handle_request(method, path, headers, body, query_params):
@@ -212,7 +337,9 @@ async def handle_request(method, path, headers, body, query_params):
         "GetPreparedStatement": _get_prepared_statement,
         "DeletePreparedStatement": _delete_prepared_statement,
         "ListPreparedStatements": _list_prepared_statements,
-        # Table Metadata
+        # Databases and Table Metadata (Glue Data Catalog)
+        "GetDatabase": _get_database,
+        "ListDatabases": _list_databases,
         "GetTableMetadata": _get_table_metadata,
         "ListTableMetadata": _list_table_metadata,
         # Tags
@@ -229,6 +356,478 @@ async def handle_request(method, path, headers, body, query_params):
     return handler(data)
 
 
+# ---- SQL scanning ----
+
+_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_NUMBER_RE = re.compile(r"[0-9]+")
+
+
+def _sql_tokens(sql):
+    """``(kind, text, start, end)`` per token: ``name`` (lower-cased), ``qname``, ``str``, ``number``, ``punct``."""
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if ch.isspace():
+            i += 1
+        elif sql.startswith("--", i):
+            j = sql.find("\n", i)
+            i = n if j < 0 else j + 1
+        elif sql.startswith("/*", i):
+            j = sql.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+        elif ch in "'\"`":
+            j = i + 1
+            while j < n and not (sql[j] == ch and sql[j + 1:j + 2] != ch):
+                j += 2 if sql[j] == ch else 1
+            end = min(j + 1, n)
+            if ch == "'":
+                yield "str", sql[i:end], i, end
+            else:
+                yield "qname", sql[i + 1:j].replace(ch * 2, ch), i, end
+            i = end
+        elif m := _NAME_RE.match(sql, i):
+            yield "name", m.group(0).lower(), i, m.end()
+            i = m.end()
+        elif m := _NUMBER_RE.match(sql, i):
+            yield "number", m.group(0), i, m.end()
+            i = m.end()
+        else:
+            yield "punct", ch, i, i + 1
+            i += 1
+
+
+class _Cursor:
+    def __init__(self, text):
+        self.text = text
+        self.tokens = list(_sql_tokens(text))
+        self.i = 0
+
+    def reset(self):
+        self.i = 0
+
+    def at_end(self):
+        return self.i >= len(self.tokens)
+
+    def peek(self):
+        return self.tokens[self.i] if self.i < len(self.tokens) else (None, None, None, None)
+
+    def advance(self):
+        self.i += 1
+
+    def keywords(self, *words):
+        """Consume the bare-name keyword run ``words`` if it is next; else leave the cursor."""
+        for offset, word in enumerate(words):
+            if self.i + offset >= len(self.tokens) or self.tokens[self.i + offset][:2] != ("name", word):
+                return False
+        self.i += len(words)
+        return True
+
+    def punct(self, char):
+        if self.peek()[:2] == ("punct", char):
+            self.advance()
+            return True
+        return False
+
+    def skip_group(self):
+        """After ``punct("(")``: consume through the matching ``)``."""
+        depth = 1
+        while not self.at_end() and depth > 0:
+            if self.punct("("):
+                depth += 1
+            elif self.punct(")"):
+                depth -= 1
+            else:
+                self.advance()
+
+    def name(self):
+        kind, text = self.peek()[:2]
+        if kind == "name":
+            self.advance()
+            return text
+        return None
+
+    def identifier(self):
+        """A bare (lower-cased) or quoted (verbatim) identifier."""
+        kind, text = self.peek()[:2]
+        if kind in ("name", "qname"):
+            self.advance()
+            return text
+        return None
+
+    def number(self):
+        kind, text = self.peek()[:2]
+        if kind == "number":
+            self.advance()
+            return int(text)
+        return None
+
+    def string(self):
+        """A ``'...'`` literal's value: ``''`` is a quote, and Hive's ``\\t``, ``\\n`` and ``\\\\`` are unescaped."""
+        kind, text = self.peek()[:2]
+        if kind != "str" or len(text) < 2 or not text.endswith("'"):
+            return None
+        self.advance()
+        value = text[1:-1].replace("''", "'")
+        return re.sub(r"\\(.)", lambda m: {"t": "\t", "n": "\n"}.get(m.group(1), m.group(1)), value)
+
+    def dotted_name(self, max_parts):
+        """The next dotted name, right-aligned in a ``max_parts`` tuple (``t`` → ``(None, None, "t")``)."""
+        parts = []
+        while True:
+            part = self.identifier()
+            if part is None:
+                return None
+            parts.append(part)
+            if not self.punct("."):
+                break
+        if len(parts) > max_parts:
+            return None
+        return (None,) * (max_parts - len(parts)) + tuple(parts)
+
+
+@dataclass(frozen=True)
+class _TableReference:
+    """One ``FROM``/``JOIN`` target and where its text sits in the query."""
+
+    database: str | None  # None when the reference names only the table
+    table: str
+    start: int
+    end: int
+    aliased: bool
+    catalog: str | None = None
+
+
+# After a table reference, these keywords start the next clause; anything else is an alias.
+_CLAUSE_KEYWORDS = frozenset(
+    "where on join inner left right full cross natural using group order limit offset having "
+    "union except intersect window qualify fetch with".split()
+)
+
+
+def _table_references(query):
+    """The ``FROM``/``JOIN`` targets of ``query``, in order; CTE names shadow tables."""
+    cursor = _Cursor(query)
+    ctes = _cte_names(cursor)
+    cursor.reset()
+    references = []
+    while not cursor.at_end():
+        if not (cursor.keywords("from") or cursor.keywords("join")):
+            cursor.advance()
+            continue
+        start = cursor.peek()[2]
+        name = cursor.dotted_name(3)
+        if name is None:
+            continue
+        catalog, database, table = name
+        if database is None and table in ctes:
+            continue
+        end = cursor.tokens[cursor.i - 1][3]
+        next_kind, next_text = cursor.peek()[:2]
+        aliased = next_kind == "qname" or (next_kind == "name" and next_text not in _CLAUSE_KEYWORDS)
+        references.append(_TableReference(database, table, start, end, aliased, catalog))
+    return references
+
+
+def _cte_names(cursor):
+    """Names bound by a top-level ``WITH name AS (...)``."""
+    names = set()
+    if not cursor.keywords("with"):
+        return names
+    while True:
+        name = cursor.identifier()
+        if name is None or not cursor.keywords("as") or not cursor.punct("("):
+            return names
+        names.add(name)
+        cursor.skip_group()
+        if not cursor.punct(","):
+            return names
+
+
+# ---- Table DDL ----
+
+_TEXT_INPUT_FORMAT = "org.apache.hadoop.mapred.TextInputFormat"
+_LAZY_SIMPLE_SERDE = "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe"
+# STORED AS <format> → (InputFormat, OutputFormat, SerDe), as Athena writes them to Glue.
+_STORED_AS = {
+    "textfile": (_TEXT_INPUT_FORMAT, "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat", _LAZY_SIMPLE_SERDE),
+    "parquet": (
+        "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat",
+        "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat",
+        "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
+    ),
+    "orc": (
+        "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat",
+        "org.apache.hadoop.hive.ql.io.orc.OrcOutputFormat",
+        "org.apache.hadoop.hive.ql.io.orc.OrcSerde",
+    ),
+    "avro": (
+        "org.apache.hadoop.hive.ql.io.avro.AvroContainerInputFormat",
+        "org.apache.hadoop.hive.ql.io.avro.AvroContainerOutputFormat",
+        "org.apache.hadoop.hive.serde2.avro.AvroSerDe",
+    ),
+}
+# A ROW FORMAT SERDE table with no STORED AS is text written through IgnoreKeyTextOutputFormat.
+_SERDE_TEXT_OUTPUT_FORMAT = "org.apache.hadoop.hive.ql.io.IgnoreKeyTextOutputFormat"
+# ROW FORMAT DELIMITED <clause> TERMINATED BY / DEFINED AS 'c' → SerDe parameter.
+_DELIMITED = {
+    ("fields", "terminated", "by"): "field.delim",
+    ("escaped", "by"): "escape.delim",
+    ("collection", "items", "terminated", "by"): "collection.delim",
+    ("map", "keys", "terminated", "by"): "mapkey.delim",
+    ("lines", "terminated", "by"): "line.delim",
+    ("null", "defined", "as"): "serialization.null.format",
+}
+
+
+@dataclass(frozen=True)
+class _CreateTable:
+    database: str | None  # None when the statement names only the table
+    table: str
+    external: bool
+    columns: list = field(default_factory=list)  # Glue column dicts: Name, Type, optional Comment
+    partition_keys: list = field(default_factory=list)
+    comment: str | None = None
+    location: str | None = None
+    input_format: str = _TEXT_INPUT_FORMAT
+    output_format: str = _STORED_AS["textfile"][1]
+    serde: str = _LAZY_SIMPLE_SERDE
+    serde_parameters: dict = field(default_factory=lambda: {"serialization.format": "1"})
+    table_properties: dict = field(default_factory=dict)
+    bucket_columns: list = field(default_factory=list)
+    number_of_buckets: int = -1
+    if_not_exists: bool = False
+
+    @property
+    def iceberg(self):
+        return self.table_properties.get("table_type", "").lower() == "iceberg"
+
+
+@dataclass(frozen=True)
+class _DropTable:
+    database: str | None
+    table: str
+    if_exists: bool = False
+
+
+def _parse_ddl(query):
+    """The ``_CreateTable`` or ``_DropTable`` a statement is; None sends it to the query engine."""
+    cursor = _Cursor(query)
+    if cursor.tokens and cursor.tokens[-1][:2] == ("punct", ";"):
+        cursor.tokens.pop()
+    if any(token[:2] == ("punct", ";") for token in cursor.tokens):
+        return None
+    if cursor.keywords("drop", "table"):
+        if_exists = cursor.keywords("if", "exists")
+        name = cursor.dotted_name(2)
+        if name is None or not cursor.at_end():
+            return None
+        return _DropTable(*name, if_exists=if_exists)
+    if not cursor.keywords("create"):
+        return None
+    external = cursor.keywords("external")
+    if not cursor.keywords("table"):
+        return None
+    if_not_exists = cursor.keywords("if", "not", "exists")
+    name = cursor.dotted_name(2)
+    columns = _column_list(cursor) if name else []
+    if not columns:
+        return None
+    clauses = {}
+    stored_as = row_format_serde = None
+    serde_parameters = {"serialization.format": "1"}
+    while not cursor.at_end():
+        if cursor.keywords("comment"):
+            clauses["comment"] = cursor.string()
+        elif cursor.keywords("partitioned", "by"):
+            clauses["partition_keys"] = _column_list(cursor) or None
+        elif cursor.keywords("clustered", "by"):
+            bucket_columns = _name_list(cursor)
+            buckets = cursor.number() if bucket_columns and cursor.keywords("into") else None
+            if buckets is None or not cursor.keywords("buckets"):
+                return None
+            clauses["bucket_columns"], clauses["number_of_buckets"] = bucket_columns, buckets
+        elif cursor.keywords("row", "format", "delimited"):
+            delimited = _delimited(cursor)
+            if delimited is None:
+                return None
+            serde_parameters.update(delimited)
+        elif cursor.keywords("row", "format", "serde"):
+            row_format_serde = cursor.string()
+            if row_format_serde is None:
+                return None
+            if cursor.keywords("with", "serdeproperties"):
+                properties = _property_list(cursor)
+                if properties is None:
+                    return None
+                serde_parameters.update(properties)
+        elif cursor.keywords("with", "serdeproperties"):
+            properties = _property_list(cursor)
+            if properties is None:
+                return None
+            serde_parameters.update(properties)
+        elif cursor.keywords("stored", "as", "inputformat"):
+            input_format = cursor.string()
+            output_format = cursor.string() if cursor.keywords("outputformat") else None
+            if input_format is None or output_format is None:
+                return None
+            stored_as = (input_format, output_format, None)
+        elif cursor.keywords("stored", "as"):
+            stored_as = _STORED_AS.get(cursor.name() or "")
+            if stored_as is None:
+                return None
+        elif cursor.keywords("location"):
+            clauses["location"] = cursor.string()
+        elif cursor.keywords("tblproperties"):
+            clauses["table_properties"] = _property_list(cursor)
+        else:
+            return None
+        if any(value is None for value in clauses.values()):
+            return None
+    if stored_as is None:
+        input_format, output_format, serde = _STORED_AS["textfile"]
+        if row_format_serde:
+            output_format = _SERDE_TEXT_OUTPUT_FORMAT
+    else:
+        input_format, output_format, serde = stored_as
+    return _CreateTable(
+        *name, external=external, columns=columns, input_format=input_format, output_format=output_format,
+        serde=row_format_serde or serde or _LAZY_SIMPLE_SERDE, serde_parameters=serde_parameters,
+        if_not_exists=if_not_exists, **clauses,
+    )
+
+
+def _column_list(cursor):
+    """``( name type [COMMENT 'text'] , … )`` → Glue column dicts; [] when malformed."""
+    if not cursor.punct("("):
+        return []
+    columns = []
+    while True:
+        name = cursor.identifier()
+        if name is None:
+            return []
+        type_start = type_end = None
+        comment = None
+        depth = 0
+        while not cursor.at_end():
+            kind, text, start, end = cursor.peek()
+            if depth == 0 and kind == "punct" and text in ",)":
+                break
+            if depth == 0 and kind == "name" and text == "comment":
+                cursor.advance()
+                comment = cursor.string()
+                if comment is None:
+                    return []
+                continue
+            if kind == "punct" and text in "(<":
+                depth += 1
+            elif kind == "punct" and text in ")>":
+                depth -= 1
+            if type_start is None:
+                type_start = start
+            type_end = end
+            cursor.advance()
+        if type_start is None:
+            return []
+        column = {"Name": name, "Type": cursor.text[type_start:type_end].lower()}
+        if comment is not None:
+            column["Comment"] = comment
+        columns.append(column)
+        if cursor.punct(","):
+            continue
+        if cursor.punct(")"):
+            return columns
+        return []
+
+
+def _name_list(cursor):
+    """``( a , b )`` → ``["a", "b"]``; [] when malformed."""
+    if not cursor.punct("("):
+        return []
+    names = []
+    while (name := cursor.identifier()) is not None:
+        names.append(name)
+        if cursor.punct(")"):
+            return names
+        if not cursor.punct(","):
+            return []
+    return []
+
+
+def _property_list(cursor):
+    """``( 'k' = 'v' , … )`` → dict; None when malformed."""
+    if not cursor.punct("("):
+        return None
+    properties = {}
+    while True:
+        key = cursor.string()
+        value = cursor.string() if key is not None and cursor.punct("=") else None
+        if value is None:
+            return None
+        properties[key] = value
+        if cursor.punct(")"):
+            return properties
+        if not cursor.punct(","):
+            return None
+
+
+def _delimited(cursor):
+    """The SerDe parameters a ``ROW FORMAT DELIMITED`` clause sets; None when malformed."""
+    parameters = {}
+    while True:
+        for words, parameter in _DELIMITED.items():
+            if cursor.keywords(*words):
+                value = cursor.string()
+                if value is None:
+                    return None
+                parameters[parameter] = value
+                break
+        else:
+            break
+    if "field.delim" in parameters:
+        parameters["serialization.format"] = parameters["field.delim"]
+    return parameters
+
+
+def _create_table_input(ddl):
+    """The Glue ``TableInput`` Athena writes for ``ddl``."""
+    parameters = {"EXTERNAL": "TRUE", "transient_lastDdlTime": str(int(time.time())), **ddl.table_properties}
+    if ddl.comment is not None:
+        parameters["comment"] = ddl.comment
+    storage = {
+        "Columns": ddl.columns,
+        "InputFormat": ddl.input_format,
+        "OutputFormat": ddl.output_format,
+        "Compressed": False,
+        "NumberOfBuckets": ddl.number_of_buckets,
+        "SerdeInfo": {"SerializationLibrary": ddl.serde, "Parameters": ddl.serde_parameters},
+        "BucketColumns": ddl.bucket_columns,
+        "SortColumns": [],
+        "Parameters": {},
+        "SkewedInfo": {"SkewedColumnNames": [], "SkewedColumnValues": [], "SkewedColumnValueLocationMaps": {}},
+        "StoredAsSubDirectories": False,
+    }
+    if ddl.location:
+        storage["Location"] = ddl.location.rstrip("/")
+    return {
+        "Name": ddl.table,
+        "Owner": "hadoop",
+        "TableType": "EXTERNAL_TABLE",
+        "Parameters": parameters,
+        "StorageDescriptor": storage,
+        "PartitionKeys": ddl.partition_keys,
+    }
+
+
+def _data_format(table_data):
+    """``classification`` when set, else the format its InputFormat or SerDe names, else ``csv``."""
+    classification = (table_data.get("Parameters") or {}).get("classification")
+    if classification:
+        return classification
+    storage = table_data.get("StorageDescriptor") or {}
+    classes = f"{storage.get('InputFormat', '')} {(storage.get('SerdeInfo') or {}).get('SerializationLibrary', '')}".lower()
+    return next((fmt for fmt in ("parquet", "orc", "avro", "json") if fmt in classes), "csv")
+
+
 # ---- Query Execution ----
 
 
@@ -236,19 +835,47 @@ def _start_query_execution(data):
     query = data.get("QueryString", "")
     query_id = new_uuid()
     workgroup = data.get("WorkGroup", "primary")
-    output_location = data.get("ResultConfiguration", {}).get(
-        "OutputLocation"
-    ) or _workgroups.get(workgroup, {}).get("Configuration", {}).get(
-        "ResultConfiguration", {}
-    ).get("OutputLocation", "s3://athena-results/")
+    wg_config = _workgroups.get(workgroup, {}).get("Configuration", {})
+    wg_output = wg_config.get("ResultConfiguration", {}).get("OutputLocation")
+    client_output = data.get("ResultConfiguration", {}).get("OutputLocation")
+    # An enforced workgroup overrides the client-side result location
+    if wg_config.get("EnforceWorkGroupConfiguration"):
+        output_location = wg_output or client_output
+    else:
+        output_location = client_output or wg_output
+    if not output_location:
+        return error_response_json(
+            "InvalidRequestException",
+            "No output location provided. An output location is required either through the "
+            "Workgroup result configuration setting or as an API input.", 400,
+        )
     db = data.get("QueryExecutionContext", {}).get("Database", "default")
     catalog = data.get("QueryExecutionContext", {}).get("Catalog", "AwsDataCatalog")
+    # Athena rejects any malformed statement here; with no Trino parser, only this DDL rule is
+    # checked at submission and other errors fail the execution instead.
+    ddl = _parse_ddl(query)
+    if isinstance(ddl, _CreateTable) and not ddl.external and not ddl.iceberg:
+        return error_response_json(
+            "InvalidRequestException", "External keyword required for table type HIVE", 400,
+            extra={"AthenaErrorCode": "MALFORMED_QUERY"},
+        )
+
+    wg_rc = wg_config.get("ResultConfiguration", {})
+    client_rc = data.get("ResultConfiguration", {})
+    result_config = {"OutputLocation": f"{output_location}{query_id}.csv"}
+    for key in ("EncryptionConfiguration", "ExpectedBucketOwner", "AclConfiguration"):
+        if wg_config.get("EnforceWorkGroupConfiguration"):
+            value = wg_rc.get(key, client_rc.get(key))
+        else:
+            value = client_rc.get(key, wg_rc.get(key))
+        if value is not None:
+            result_config[key] = value
 
     execution = {
         "QueryExecutionId": query_id,
         "Query": query,
         "StatementType": _detect_statement_type(query),
-        "ResultConfiguration": {"OutputLocation": f"{output_location}{query_id}.csv"},
+        "ResultConfiguration": result_config,
         "QueryExecutionContext": {"Database": db, "Catalog": catalog},
         "Status": {
             "State": "QUEUED",
@@ -274,14 +901,18 @@ def _start_query_execution(data):
         "_column_types": None,
         "_error": None,
     }
+    if data.get("ResultReuseConfiguration"):
+        execution["ResultReuseConfiguration"] = data["ResultReuseConfiguration"]
+    if data.get("ExecutionParameters"):
+        execution["ExecutionParameters"] = data["ExecutionParameters"]
     _executions[query_id] = execution
 
-    asyncio.create_task(_execute_query(query_id, query, db))
+    asyncio.create_task(_execute_query(query_id, query, db, ddl, catalog))
 
     return json_response({"QueryExecutionId": query_id})
 
 
-async def _execute_query(query_id, query, database):
+async def _execute_query(query_id, query, database, ddl, catalog=None):
     execution = _executions.get(query_id)
     if not execution:
         return
@@ -292,8 +923,10 @@ async def _execute_query(query_id, query, database):
     try:
         engine = get_athena_engine()
 
-        if engine == "duckdb":
-            results = await _run_duckdb(query, database)
+        if ddl is not None:
+            results = _run_ddl(ddl, database)
+        elif engine == "duckdb":
+            results = await _run_duckdb(query, database, catalog)
         else:
             results = _mock_query_results(query)
 
@@ -321,7 +954,7 @@ async def _execute_query(query_id, query, database):
     execution["Status"]["CompletionDateTime"] = int(time.time())
 
 
-async def _run_duckdb(query, database):
+async def _run_duckdb(query, database, catalog=None):
     """Run a DuckDB query off the event loop.
 
     DuckDB's ``conn.execute()`` is a blocking C-extension call — running it
@@ -332,11 +965,20 @@ async def _run_duckdb(query, database):
     """
     import duckdb
 
-    rewritten = await _rewrite_data_paths(query, database)
+    rewritten, s3_table_buckets, workdirs = await _rewrite_data_paths(query, database, catalog)
 
     def _execute_blocking():
         conn = duckdb.connect(":memory:")
         try:
+            # DuckDB 2.0's type_pushdown makes the CSV reader's TRY_CAST strict; 1.x has no such optimizer.
+            try:
+                conn.execute("SET disabled_optimizers = 'type_pushdown'")
+            except duckdb.Error:
+                pass
+            if s3_table_buckets:
+                _attach_s3_table_buckets(conn, s3_table_buckets)
+            if "read_avro(" in rewritten:
+                conn.execute("INSTALL avro; LOAD avro;")
             result = conn.execute(rewritten)
             columns = []
             column_types = []
@@ -358,50 +1000,276 @@ async def _run_duckdb(query, database):
             }
         finally:
             conn.close()
+            for workdir in workdirs:
+                shutil.rmtree(workdir, ignore_errors=True)
 
     return await asyncio.to_thread(_execute_blocking)
 
 
-async def _rewrite_data_paths(query, database):
+async def _rewrite_data_paths(query, database, catalog=None):
+    """Replace each Glue table reference with a DuckDB relation over its local S3 data,
+    and each ``s3tablescatalog/<bucket>`` reference with that bucket's attached Iceberg
+    catalog. Returns the query and the table bucket ARNs to attach, by alias."""
     from ministack.services import glue as glue_svc
 
-    # Skip identifiers that look like function calls (read_csv('s3://...'))
-    # or already contain a path separator. Restrict to bare table references
-    # — optional database qualifier, then table name — letters/digits/dots/
-    # underscores/hyphens. Quoted identifiers (e.g. "my-db"."my-table") are
-    # left to a future pass.
-    pattern = r'(?:FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?)\b'
-    tables_to_resolve = re.findall(pattern, query, re.IGNORECASE)
-
-    for full_name in tables_to_resolve:
-        parts = full_name.split(".")
-        db_name, table_name = (parts[0], parts[1]) if len(parts) > 1 else (database or "default", parts[0])
+    account_id = get_account_id()
+    edits = []
+    s3_table_buckets = {}
+    workdirs = []
+    for ref in _table_references(query):
+        db_name = ref.database or database or "default"
+        ref_catalog = ref.catalog or catalog or ""
+        if ref_catalog.lower().startswith(_S3_TABLES_CATALOG_PREFIX):
+            bucket = ref_catalog[len(_S3_TABLES_CATALOG_PREFIX):]
+            bucket_arn = f"arn:aws:s3tables:{get_region()}:{account_id}:bucket/{bucket}"
+            alias = s3_table_buckets.setdefault(bucket_arn, f"__s3t{len(s3_table_buckets)}")
+            relation = f'{alias}."{db_name.replace(chr(34), chr(34) * 2)}"."{ref.table.replace(chr(34), chr(34) * 2)}"'
+            edits.append((ref.start, ref.end, relation + ("" if ref.aliased else f' AS "{ref.table}"')))
+            continue
 
         # Read directly from glue's internal store rather than going through
         # the HTTP handler. The store is account-scoped via AccountScopedDict
         # and reads the current request's contextvar, so multi-tenancy is
         # preserved without crafting synthetic Authorization headers.
-        table_data = glue_svc._tables.get(f"{db_name}/{table_name}")
+        table_data = glue_svc._tables.get(f"{db_name}/{ref.table}")
         if not table_data:
             continue
-
-        sd = table_data.get("StorageDescriptor", {})
-        s3_location = sd.get("Location")
+        s3_location = (table_data.get("StorageDescriptor") or {}).get("Location")
         if not s3_location:
             continue
+        files = _materialize_table_files(s3_location, workdirs)
+        relation = _table_relation(table_data, files) if files else _empty_relation(table_data)
+        alias = "" if ref.aliased else f' AS "{ref.table}"'
+        edits.append((ref.start, ref.end, relation + alias))
+        if not ref.aliased:
+            edits.extend(_qualified_column_prefixes(query, db_name, ref.table, edits[-1]))
 
-        account_id = get_account_id()
-        p = urlparse(s3_location)
-        stripped = f"{p.netloc}{p.path}".rstrip("/")
-        classification = table_data.get("Parameters", {}).get("classification", "csv")
+    edits = sorted(set(edits))  # a table named twice yields its column-prefix edits twice
+    for span_start, span_end, replacement in reversed(edits):
+        query = query[:span_start] + replacement + query[span_end:]
+    return _rewrite_s3_paths(query), {alias: arn for arn, alias in s3_table_buckets.items()}, workdirs
 
-        local_path = f"{ATHENA_DATA_DIR}/{account_id}/{stripped}"
-        duck_path = f"{local_path}/**/*.{classification}"
 
-        query = re.sub(rf"\b{re.escape(full_name)}\b", f"'{duck_path}'", query)
+def _hidden(relative_key):
+    # Trino's Hive reader skips files and directories whose name starts with "_" or ".".
+    return any(part.startswith(("_", ".")) for part in relative_key.split("/"))
 
-    query = _rewrite_s3_paths(query)
-    return query
+
+def _materialize_table_files(location, workdirs):
+    """Copy every object under the table LOCATION out of the S3 store into a
+    per-query directory, keeping relative paths for Hive partition folders.
+    Athena reads all data under the location, whatever the object names."""
+    import tempfile
+
+    from ministack.services import s3 as s3_svc
+
+    parsed = urlparse(location)
+    bucket_name, prefix = parsed.netloc, parsed.path.lstrip("/")
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
+    bucket = s3_svc._buckets.get(bucket_name)
+    if bucket is None:
+        return []
+    keys = sorted(k for k in list(bucket["objects"].keys())
+                  if k.startswith(prefix) and not k.endswith("/") and not _hidden(k[len(prefix):]))
+    if not keys:
+        return []
+    root = tempfile.mkdtemp(prefix="ministack-athena-")
+    workdirs.append(root)
+    files = []
+    for key in keys:
+        data = s3_svc._get_object_data(bucket_name, key)
+        if data is None:
+            continue
+        path = os.path.join(root, key[len(prefix):])
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(data)
+        files.append(path)
+    return files
+
+
+def _datum_text(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _sql_list(paths):
+    return "[" + ", ".join("'" + p.replace("'", "''") + "'" for p in paths) + "]"
+
+
+def _table_relation(table_data, files):
+    """A DuckDB relation over the table's files, columns as the table defines them."""
+    fmt = _data_format(table_data)
+    storage = table_data.get("StorageDescriptor") or {}
+    columns = storage.get("Columns") or []
+    partitions = _path_partition_keys(table_data, files)
+    hive = _hive_options(partitions)
+    if fmt == "parquet":
+        return f"read_parquet({_sql_list(files)}, union_by_name = true, {hive})"
+    if fmt == "json":
+        return f"read_json_auto({_sql_list(files)}, union_by_name = true, {hive})"
+    if fmt == "avro":
+        return f"read_avro({_sql_list(files)})"
+    if fmt != "csv" or not columns:
+        return f"read_csv_auto({_sql_list(files)}, {hive})"
+    serde = storage.get("SerdeInfo") or {}
+    params = serde.get("Parameters") or {}
+    library = serde.get("SerializationLibrary") or ""
+    if "OpenCSVSerde" in library:
+        delim, quote = params.get("separatorChar", ","), params.get("quoteChar", '"')
+    elif "LazySimpleSerDe" in library:
+        # Hive's LazySimpleSerDe splits on Ctrl-A unless field.delim is set, and does not unquote.
+        delim, quote = params.get("field.delim", params.get("serialization.format", "\x01")), ""
+        delim = "\x01" if delim == "1" else delim
+    else:
+        delim, quote = params.get("field.delim", ","), '"'
+    try:
+        skip = int((table_data.get("Parameters") or {}).get("skip.header.line.count", 0))
+    except (TypeError, ValueError):
+        skip = 0
+    names = [str(c.get("Name", "")) for c in columns]
+    raw = ", ".join(f"'c{i}': 'VARCHAR'" for i in range(len(names)))
+    def lit(value):
+        return "'" + value.replace("'", "''") + "'"
+    reader = (f"read_csv({_sql_list(files)}, auto_detect = false, header = false, skip = {skip}, delim = {lit(delim)}, "
+              f"quote = {lit(quote)}, escape = {lit(quote)}, columns = {{{raw}}}, null_padding = true, "
+              f"strict_mode = false, {hive})")
+    projected = []
+    for i, column in enumerate(columns):
+        base = str(column.get("Type", "string")).lower().split("(")[0].strip()
+        duck_type = "DECIMAL(38,9)" if base == "decimal" else _DUCKDB_TYPE_BY_ATHENA.get(base, "VARCHAR")
+        name = names[i].replace('"', '""')
+        projected.append(f'TRY_CAST("c{i}" AS {duck_type}) AS "{name}"')
+    in_paths = {str(key.get("Name", "")) for key in partitions}
+    for key in table_data.get("PartitionKeys") or []:
+        name = str(key.get("Name", "")).replace('"', '""')
+        value = f'"{name}"' if key.get("Name") in in_paths else f"CAST(NULL AS {_duckdb_type(key)})"
+        projected.append(f'{value} AS "{name}"')
+    return f"(SELECT {', '.join(projected)} FROM {reader})"
+
+
+def _path_partition_keys(table_data, files):
+    """The Glue partition keys every file's path carries as a ``key=value`` folder."""
+    def folders(path):
+        return {part.split("=", 1)[0] for part in path.split("/")[:-1] if "=" in part}
+    present = set.intersection(*(folders(f) for f in files)) if files else set()
+    return [key for key in table_data.get("PartitionKeys") or [] if key.get("Name") in present]
+
+
+def _hive_options(partitions):
+    """Hive partitioning typed from Glue; DuckDB refuses a type for a key no path carries."""
+    if not partitions:
+        return "hive_partitioning = false"
+    types = ", ".join("'{}': {}".format(str(key["Name"]).replace("'", "''"), _duckdb_type(key)) for key in partitions)
+    return f"hive_partitioning = true, hive_types = {{{types}}}"
+
+
+# Athena names each S3 table bucket's catalog "s3tablescatalog/<bucket>".
+_S3_TABLES_CATALOG_PREFIX = "s3tablescatalog/"
+
+
+def _attach_s3_table_buckets(conn, buckets):
+    """Attach each table bucket through MiniStack's own Iceberg REST catalog, as
+    Firehose's Iceberg delivery does; runs on the query's worker thread."""
+    port = os.environ.get("GATEWAY_PORT", "4566")
+    conn.execute("INSTALL iceberg; LOAD iceberg; INSTALL httpfs; LOAD httpfs;")
+    from ministack.services.s3tables import _vended_access_key
+
+    # The access key names the caller's account, so the loopback calls stay in its scope.
+    key = _vended_access_key()
+    conn.execute(
+        f"CREATE SECRET __ms_athena (TYPE S3, KEY_ID '{key}', SECRET 'test', "
+        f"ENDPOINT 'localhost:{port}', URL_STYLE 'path', USE_SSL false, REGION '{get_region()}')"
+    )
+    credential = f"AWS4-HMAC-SHA256 Credential={key}/19700101/{get_region()}/s3tables/aws4_request"
+    conn.execute(
+        f"CREATE SECRET __ms_athena_catalog (TYPE HTTP, SCOPE 'http://localhost:{port}/iceberg', "
+        f"EXTRA_HTTP_HEADERS MAP {{'Authorization': '{credential}'}})"
+    )
+    for alias, bucket_arn in buckets.items():
+        conn.execute(
+            f"ATTACH '{bucket_arn}' AS {alias} (TYPE ICEBERG, READ_ONLY, "
+            f"ENDPOINT 'http://localhost:{port}/iceberg', AUTHORIZATION_TYPE 'none')"
+        )
+
+
+_DUCKDB_TYPE_BY_ATHENA = {
+    "boolean": "BOOLEAN", "tinyint": "TINYINT", "smallint": "SMALLINT", "int": "INTEGER", "integer": "INTEGER",
+    "bigint": "BIGINT", "float": "FLOAT", "real": "FLOAT", "double": "DOUBLE", "date": "DATE",
+    "timestamp": "TIMESTAMP", "binary": "BLOB", "varbinary": "BLOB",
+}
+
+
+def _duckdb_type(column):
+    base = str(column.get("Type", "string")).lower().split("(")[0].strip()
+    return "DECIMAL" if base == "decimal" else _DUCKDB_TYPE_BY_ATHENA.get(base, "VARCHAR")
+
+
+def _qualified_column_prefixes(query, database, table, table_edit):
+    """Edits turning ``database.table.column`` (optionally catalog-qualified) into ``"table".column``.
+
+    The table itself is replaced by a relation aliased ``"table"``, so DuckDB cannot
+    resolve column references qualified with the database name.
+    """
+    tokens = list(_sql_tokens(query))
+    edits = []
+    for i in range(len(tokens) - 4):
+        if table_edit[0] <= tokens[i][2] < table_edit[1]:
+            continue  # the FROM/JOIN reference itself
+        if i and tokens[i - 1][:2] == ("punct", "."):
+            continue
+        names, j = [], i
+        while j < len(tokens) and tokens[j][0] in ("name", "qname"):
+            names.append(tokens[j])
+            if j + 1 < len(tokens) and tokens[j + 1][:2] == ("punct", "."):
+                j += 2
+            else:
+                break
+        if len(names) not in (3, 4):
+            continue
+        db_token, table_token = names[-3], names[-2]
+        if db_token[1] == database and table_token[1] == table:
+            edits.append((names[0][2], table_token[3], '"{}"'.format(table.replace('"', '""'))))
+    return edits
+
+
+def _empty_relation(table_data):
+    """Zero rows with the table's Glue columns and partition keys; complex types read as VARCHAR."""
+    columns = ((table_data.get("StorageDescriptor") or {}).get("Columns") or []) + (table_data.get("PartitionKeys") or [])
+    if not columns:
+        return "(SELECT 1 WHERE FALSE)"
+    projected = []
+    for column in columns:
+        name = str(column.get("Name", "")).replace('"', '""')
+        projected.append(f'CAST(NULL AS {_duckdb_type(column)}) AS "{name}"')
+    return f"(SELECT {', '.join(projected)} WHERE FALSE)"
+
+
+def _run_ddl(ddl, database):
+    from ministack.services import glue as glue_svc
+
+    db_name = ddl.database or database or "default"
+    if isinstance(ddl, _DropTable):
+        if f"{db_name}/{ddl.table}" not in glue_svc._tables:
+            if ddl.if_exists:
+                return {"columns": [], "rows": [], "column_types": []}
+            raise ValueError(f"Table '{db_name}.{ddl.table}' does not exist")
+        glue_svc._delete_table({"DatabaseName": db_name, "Name": ddl.table})
+        return {"columns": [], "rows": [], "column_types": []}
+    if ddl.iceberg:
+        raise ValueError("NOT_SUPPORTED: Iceberg tables are not supported")
+    if db_name not in glue_svc._databases:
+        raise ValueError(f"Schema '{db_name}' does not exist")
+    if f"{db_name}/{ddl.table}" in glue_svc._tables:
+        if ddl.if_not_exists:
+            return {"columns": [], "rows": [], "column_types": []}
+        raise ValueError(f"Table '{db_name}.{ddl.table}' already exists")
+    status, _, body = glue_svc._create_table({"DatabaseName": db_name, "TableInput": _create_table_input(ddl)})
+    if status >= 300:
+        raise ValueError(json.loads(body).get("message", "Glue CreateTable failed"))
+    return {"columns": [], "rows": [], "column_types": []}
 
 
 def _rewrite_s3_paths(query):
@@ -461,11 +1329,8 @@ async def _save_query_results(query_id):
     output_location = execution["ResultConfiguration"]["OutputLocation"]
     p = urlparse(output_location)
     bucket_name = p.netloc
-    key_prefix = p.path.lstrip("/").rstrip("/")
-    # Athena writes <id>.csv and <id>.csv.metadata under the OutputLocation
-    # prefix. If the prefix is empty (output_location == "s3://bucket/"),
-    # the files land at bucket root.
-    csv_key = f"{key_prefix}/{query_id}.csv" if key_prefix else f"{query_id}.csv"
+    # OutputLocation already ends in <id>.csv
+    csv_key = p.path.lstrip("/")
     meta_key = f"{csv_key}.metadata"
 
     # Write directly to the S3 service's in-memory store via the public
@@ -526,13 +1391,11 @@ def _mock_query_results(query):
 
 
 def _detect_statement_type(query):
-    q = query.strip().upper()
-    if q.startswith("SELECT") or q.startswith("WITH"):
+    first = next((text for kind, text, _, _ in _sql_tokens(query) if kind != "punct" or text != "("), "")
+    if first in ("select", "with", "insert", "delete", "update", "merge"):
         return "DML"
-    if q.startswith(("CREATE", "DROP", "ALTER")):
+    if first in ("create", "drop", "alter"):
         return "DDL"
-    if q.startswith(("INSERT", "DELETE", "UPDATE", "MERGE")):
-        return "DML"
     return "UTILITY"
 
 
@@ -583,10 +1446,13 @@ def _get_query_results(data):
     page_rows = rows[start_idx : start_idx + max_results]
 
     result_rows = []
-    result_rows.append({"Data": [{"VarCharValue": col} for col in columns]})
+    # Only a DML result's first page carries Athena's header row of column names.
+    if execution.get("StatementType") == "DML" and start_idx == 0:
+        result_rows.append({"Data": [{"VarCharValue": col} for col in columns]})
     for row in page_rows:
         result_rows.append(
-            {"Data": [{"VarCharValue": str(v) if v is not None else ""} for v in row]}
+            # A NULL is a Datum with no VarCharValue.
+            {"Data": [{} if v is None else {"VarCharValue": _datum_text(v)} for v in row]}
         )
 
     column_info = []
@@ -700,9 +1566,7 @@ def _get_workgroup(data):
         return error_response_json(
             "InvalidRequestException", f"WorkGroup {name} not found", 400
         )
-    out = dict(wg)
-    out.setdefault("WorkGroupConfiguration", out.get("Configuration", {}))
-    return json_response({"WorkGroup": out})
+    return json_response({"WorkGroup": to_output_shape("athena", "WorkGroup", wg)})
 
 
 def _list_workgroups(data):
@@ -973,30 +1837,85 @@ def _list_prepared_statements(data):
     return json_response({"PreparedStatements": stmts})
 
 
-# ---- Table Metadata (stubs) ----
+# ---- Databases and Table Metadata (Glue Data Catalog) ----
+
+
+def _athena_database(db):
+    database = {"Name": db["Name"], "Parameters": db.get("Parameters") or {}}
+    if db.get("Description"):
+        database["Description"] = db["Description"]
+    return database
+
+
+def _get_database(data):
+    from ministack.services import glue as glue_svc
+    if data.get("CatalogName", "AwsDataCatalog") not in _data_catalogs:
+        return error_response_json("MetadataException", f"Catalog {data.get('CatalogName')} not found", 400)
+    db = glue_svc._databases.get(data.get("DatabaseName", ""))
+    if not db:
+        return error_response_json("MetadataException", f"Database {data.get('DatabaseName')} not found", 400)
+    return json_response({"Database": _athena_database(db)})
+
+
+def _list_databases(data):
+    from ministack.services import glue as glue_svc
+    if data.get("CatalogName", "AwsDataCatalog") not in _data_catalogs:
+        return error_response_json("MetadataException", f"Catalog {data.get('CatalogName')} not found", 400)
+    databases = [_athena_database(db) for db in glue_svc._databases.values()]
+    token = data.get("NextToken") or "0"
+    if not token.isdigit():
+        return error_response_json("InvalidRequestException", "Invalid NextToken", 400)
+    start = int(token)
+    end = start + int(data.get("MaxResults") or 50)
+    response = {"DatabaseList": databases[start:end]}
+    if end < len(databases):
+        response["NextToken"] = str(end)
+    return json_response(response)
+
+
+def _glue_col(c):
+    col = {"Name": c.get("Name", ""), "Type": c.get("Type", "string")}
+    if c.get("Comment"):
+        col["Comment"] = c["Comment"]
+    return col
+
+
+def _glue_table_to_metadata(t):
+    # Athena tables are Glue Data Catalog tables; surface the real columns and
+    # partition keys rather than empty lists.
+    sd = t.get("StorageDescriptor", {}) or {}
+    return {
+        "Name": t.get("Name", ""),
+        "CreateTime": int(time.time()),
+        "LastAccessTime": int(time.time()),
+        "TableType": t.get("TableType", "EXTERNAL_TABLE"),
+        "Columns": [_glue_col(c) for c in sd.get("Columns", [])],
+        "PartitionKeys": [_glue_col(c) for c in t.get("PartitionKeys", [])],
+        "Parameters": t.get("Parameters", {}) or {"classification": "csv"},
+    }
 
 
 def _get_table_metadata(data):
-    catalog = data.get("CatalogName", "AwsDataCatalog")
+    from ministack.services import glue as glue_svc
     db = data.get("DatabaseName", "default")
     table = data.get("TableName", "")
-    return json_response(
-        {
-            "TableMetadata": {
-                "Name": table,
-                "CreateTime": int(time.time()),
-                "LastAccessTime": int(time.time()),
-                "TableType": "EXTERNAL_TABLE",
-                "Columns": [],
-                "PartitionKeys": [],
-                "Parameters": {"classification": "csv"},
-            }
-        }
-    )
+    t = glue_svc._tables.get(f"{db}/{table}")
+    if t:
+        return json_response({"TableMetadata": _glue_table_to_metadata(t)})
+    # Unknown table — keep the prior lenient empty shape.
+    return json_response({"TableMetadata": {
+        "Name": table, "CreateTime": int(time.time()),
+        "LastAccessTime": int(time.time()), "TableType": "EXTERNAL_TABLE",
+        "Columns": [], "PartitionKeys": [], "Parameters": {"classification": "csv"},
+    }})
 
 
 def _list_table_metadata(data):
-    return json_response({"TableMetadataList": []})
+    from ministack.services import glue as glue_svc
+    db = data.get("DatabaseName", "default")
+    tables = [_glue_table_to_metadata(t) for k, t in glue_svc._tables.items()
+              if k.startswith(f"{db}/")]
+    return json_response({"TableMetadataList": tables})
 
 
 # ---- Tags ----
@@ -1004,6 +1923,9 @@ def _list_table_metadata(data):
 
 def _tag_resource(data):
     arn = data.get("ResourceARN", "")
+    validation_error = _validate_tag_resource_arn(arn)
+    if validation_error:
+        return validation_error
     tags = data.get("Tags", [])
     tag_dict = _tags.setdefault(arn, {})
     for t in tags:
@@ -1013,6 +1935,9 @@ def _tag_resource(data):
 
 def _untag_resource(data):
     arn = data.get("ResourceARN", "")
+    validation_error = _validate_tag_resource_arn(arn)
+    if validation_error:
+        return validation_error
     keys = data.get("TagKeys", [])
     tag_dict = _tags.get(arn, {})
     for k in keys:
@@ -1022,6 +1947,9 @@ def _untag_resource(data):
 
 def _list_tags_for_resource(data):
     arn = data.get("ResourceARN", "")
+    validation_error = _validate_tag_resource_arn(arn)
+    if validation_error:
+        return validation_error
     tag_dict = _tags.get(arn, {})
     tags = [{"Key": k, "Value": v} for k, v in tag_dict.items()]
     return json_response({"Tags": tags})

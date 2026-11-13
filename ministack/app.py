@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 MiniStack — Local AWS Service Emulator.
 Single-port ASGI application on port 4566 (configurable via GATEWAY_PORT).
@@ -8,6 +10,7 @@ Compatible with AWS CLI, boto3, and any AWS SDK via --endpoint-url.
 import argparse
 import asyncio
 import base64
+import gzip
 import json
 import logging
 import math
@@ -19,27 +22,47 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
-from urllib.parse import parse_qs, unquote
+from email.utils import formatdate
+from urllib.parse import parse_qs, quote, unquote, urlencode
 
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 _MINISTACK_PORT = os.environ.get("GATEWAY_PORT", "4566")
+AUTH = os.environ.get("AUTH", "false").lower() == "true"
 
-_VERSION = os.environ.get("MINISTACK_VERSION") or "dev"
-if _VERSION == "dev":
-    try:
-        from importlib.metadata import version as _pkg_version
+_VERSION = os.environ.get("MINISTACK_VERSION") or ""
 
-        _VERSION = _pkg_version("ministack")
-    except Exception:
-        pass
+
+def _version() -> str:
+    """The reported version, resolved on first ask and cached."""
+    global _VERSION
+    if not _VERSION:
+        try:
+            from importlib.metadata import version as _pkg_version
+
+            _VERSION = _pkg_version("ministack")
+        except Exception:
+            _VERSION = "dev"
+    return _VERSION
 
 # Matches host headers like "{apiId}.execute-api.<host>" or "{apiId}.execute-api.<host>:4566"
-_EXECUTE_API_RE = re.compile(
-    r"^([a-f0-9]{8})\.execute-api\." + re.escape(_MINISTACK_HOST) + r"(?::\d+)?$"
+_EXECUTE_API_RE = re.compile(r"^([a-f0-9]{8})\.execute-api\." + re.escape(_MINISTACK_HOST) + r"(?::\d+)?$")
+# A distribution's DomainName: <label>.cloudfront.net, or <label>.cloudfront.<MINISTACK_HOST>.
+_CLOUDFRONT_HOST_RE = re.compile(
+    r"^([a-z0-9]+)\.cloudfront\.(?:net|" + re.escape(_MINISTACK_HOST) + r")(?::\d+)?$"
 )
+# Lambda Function URL: {urlId}.lambda-url.{region}.<anything>[:port]. The stored
+# FunctionUrl carries AWS's own `.on.aws` suffix, so we match any suffix rather
+# than only _MINISTACK_HOST — pointing a proxy or an /etc/hosts entry at the
+# AWS-shaped hostname is the whole point of addressing a function this way.
+_LAMBDA_URL_RE = re.compile(r"^([a-z0-9]{32}|[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})\.lambda-url\.[a-z0-9-]+\.")
+# OpenSearch Serverless collection endpoint: {collectionId}.{region}.aoss.<anything>[:port].
+_AOSS_COLLECTION_HOST_RE = re.compile(r"^[a-z0-9]{3,40}\.[a-z0-9-]+\.aoss\.", re.IGNORECASE)
 # AppSync Events realtime WebSocket: {apiId}.appsync-realtime-api.<anything>[:port].
 _APPSYNC_REALTIME_RE = re.compile(r"^([a-z0-9]+)\.appsync-realtime-api\.")
+# AppSync GraphQL data plane: POST /v1/apis/{apiId}/graphql.
+_APPSYNC_GRAPHQL_RE = re.compile(r"^/v1/apis/[^/]+/graphql$")
 # IoT data plane WebSocket: anything containing ".iot." in the host header.
 # Match AWS-shaped IoT hosts only — `iot.<region>.<host>`,
 # `data-ats.iot.<region>.<host>`, `data.iot.<region>.<host>`, and the
@@ -71,7 +94,7 @@ def _ws_resolve_iot_account_id(scope: dict, ws_headers: dict) -> str:
     3. Fall back to ``MINISTACK_ACCOUNT_ID`` / ``000000000000``.
 
     SigV4 signature *verification* is intentionally lax (any
-    well-formed credential is accepted); IoT policy enforcement is not yet
+    well-formed credential is accepted) unless AUTH=true; IoT policy enforcement is not yet
     feature. The point here is multi-tenancy isolation, not auth.
     """
     qs = scope.get("query_string", b"").decode("utf-8", errors="replace")
@@ -91,6 +114,8 @@ def _ws_resolve_iot_account_id(scope: dict, ws_headers: dict) -> str:
     if access_key and re.match(r"^\d{12}$", access_key):
         return access_key
     return os.environ.get("MINISTACK_ACCOUNT_ID", "000000000000")
+
+
 # Virtual-hosted S3 bucket extraction. AWS-aligned per
 # docs.aws.amazon.com/AmazonS3/latest/userguide/VirtualHosting.html and
 # bucketnamingrules.html (HTTP vhost — ministack is HTTP). Works for any
@@ -135,37 +160,137 @@ def _extract_s3_vhost_bucket(host: str):
     if first_tail_segment == "s3" or first_tail_segment.startswith(("s3-", "s3express-")):
         return candidate
     return None
-_S3_VHOST_EXCLUDE_RE = re.compile(r"\.(execute-api|alb|emr|efs|elasticache|s3-control|appsync-api|appsync-realtime-api|iot)\.")
+
+
+_S3_VHOST_EXCLUDE_RE = re.compile(
+    r"\.(execute-api|lambda-url|alb|emr|efs|elasticache|s3-control|appsync-api|appsync-realtime-api|iot|cloudfront)\."
+    r"|^(docdb|documentdb)\."
+)
 _HEALTH_PATHS = ("/_ministack/health", "/_localstack/health", "/health")
 _BODY_METHODS = ("POST", "PUT", "PATCH")
 _COGNITO_USERINFO_PATHS = ("/oauth2/userInfo", "/oauth2/userinfo")
 _RDS_DATA_PATHS = ("/Execute", "/BeginTransaction", "/CommitTransaction", "/RollbackTransaction", "/BatchExecute")
 _S3_CONTROL_PREFIX = "/v20180820/"
+# S3 Control tagging calls on a bucket ARN; older SDKs send TagResource as PUT.
+_S3_CONTROL_TAG_ACTIONS = {
+    "GET": "s3:ListTagsForResource", "POST": "s3:TagResource", "PUT": "s3:TagResource", "DELETE": "s3:UntagResource",
+}
 _SES_V2_PREFIX = "/v2/email"
 _ALB_PATH_PREFIX = "/_alb/"
-_NON_S3_VHOST_NAMES = frozenset({
-    "s3", "s3-control", "sqs", "sns", "dynamodb", "lambda", "iam", "sts",
-    "secretsmanager", "logs", "ssm", "events", "kinesis", "monitoring", "ses",
-    "states", "ecs", "rds", "rds-data", "elasticache", "glue", "athena", "airflow",
-    "apigateway", "cloudformation", "autoscaling", "codebuild", "transfer", "cur",
-    "cloudfront-kvs",
-    "appsync-api", "appsync-realtime-api",
-})
+_NON_S3_VHOST_NAMES = frozenset(
+    {
+        "s3",
+        "s3-control",
+        "sqs",
+        "sns",
+        "dynamodb",
+        "lambda",
+        "iam",
+        "sts",
+        "secretsmanager",
+        "logs",
+        "ssm",
+        "events",
+        "kinesis",
+        "monitoring",
+        "ses",
+        "states",
+        "ecs",
+        "rds",
+        "rds-data",
+        "docdb",
+        "documentdb",
+        "elasticache",
+        "glue",
+        "athena",
+        "airflow",
+        "apigateway",
+        "cloudformation",
+        "autoscaling",
+        "codebuild",
+        "transfer",
+        "cur",
+        "budgets",
+        "kinesisanalytics",
+        "cloudfront-kvs",
+        "appsync-api",
+        "appsync-realtime-api",
+        "inspector2",
+        "dsql",
+    }
+)
 
+from ministack.core import container_reaper
+from ministack.core.concurrency import spawn_background
 from ministack.core.hypercorn_compat import install as _install_hypercorn_compat
+from ministack.core.iam_evaluator import (
+    AmbiguousAccessKeyError,
+    find_iam_access_key_account,
+    pin_request_origin,
+    pin_signed_body,
+    pin_signed_request,
+)
 from ministack.core.persistence import PERSIST_STATE, load_state, save_all
-from ministack.core.responses import _12_DIGIT_RE, set_request_account_id, set_request_region
+from ministack.core.responses import (
+    _12_DIGIT_RE,
+    _request_account_id,
+    fix_error_content_type,
+    fix_success_content_type,
+    set_request_account_id,
+    set_request_client_ip,
+    set_request_region,
+)
 from ministack.core.router import detect_service, extract_access_key_id, extract_region
+from ministack.core.sigv4 import decode_header_value
 
 # Must run before hypercorn emits its first Expect: 100-continue reply.
 # See ministack/core/hypercorn_compat.py for the rationale (issue #389).
 _install_hypercorn_compat()
+
+# AWS endpoints never answer with Hypercorn's Server header; a service that sends one sets its own.
+# Set on the class so every start path (ministack, ministack -d, python -m hypercorn) gets it.
+from hypercorn.config import Config as _HypercornConfig
+
+_HypercornConfig.include_server_header = False
+# Hypercorn appends its own Date even when the response has one; the app adds one when it is missing.
+_HypercornConfig.include_date_header = False
+
+import h11 as _h11
+from hypercorn.protocol.events import EndBody as _EndBody
+from hypercorn.protocol.events import Response as _StreamResponse
+from hypercorn.protocol.h11 import H11Protocol as _H11Protocol
+from hypercorn.protocol.ws_stream import WSStream as _WSStream
+
+
+async def _send_error_response(self, status_code: int) -> None:
+    """Hypercorn's own error response (a malformed request's 400), with the Date its config no longer adds."""
+    await self._send_h11_event(_h11.Response(status_code=status_code, headers=[
+        (b"content-length", b"0"), (b"connection", b"close"),
+        (b"date", formatdate(usegmt=True).encode()), *self.config.response_headers("h11")]))
+    await self._send_h11_event(_h11.EndOfMessage())
+
+
+async def _send_ws_error_response(self, status_code: int) -> None:
+    """Hypercorn's own WebSocket handshake refusal (websocket.close before accept), with its Date."""
+    await self.send(_StreamResponse(stream_id=self.stream_id, status_code=status_code, headers=[
+        (b"content-length", b"0"), (b"connection", b"close"), (b"date", formatdate(usegmt=True).encode())]))
+    await self.send(_EndBody(stream_id=self.stream_id))
+    await self.config.log.access(self.scope, {"status": status_code, "headers": []}, time.time() - self.start_time)
+
+
+_H11Protocol._send_error_response = _send_error_response
+_WSStream._send_error_response = _send_ws_error_response
 
 # ---------------------------------------------------------------------------
 # Lazy service loader — modules are imported on first request, not at startup.
 # This saves ~20 MB of idle RAM and speeds up boot.
 # ---------------------------------------------------------------------------
 _loaded_modules: dict = {}
+
+
+def _request_account_scope(access_key_id: str) -> str:
+    """Return the tenant selector for an AWS access key."""
+    return find_iam_access_key_account(access_key_id) or access_key_id
 
 # Execution state of ready.d scripts — surfaced via /_ministack/health and /_ministack/ready.
 # status: "pending" (not started) | "running" | "completed" (all scripts finished, errors included)
@@ -197,9 +322,12 @@ class _ErrorModule:
         )
 
     def get_state(self):
-        return {}
+        # None, not {}. This module never loaded, so it has no state — and
+        # writing an empty dict here would overwrite whatever the last working
+        # run persisted, losing every resource the service held.
+        return None
 
-    def restore_state(self, data):
+    def _restore_state(self, data):
         pass
 
     def load_persisted_state(self, data):
@@ -220,6 +348,46 @@ def _get_module(name: str):
             mod = _ErrorModule(name, str(e))
         _loaded_modules[name] = mod
     return mod
+
+
+# The loop serving HTTP requests, captured at lifespan startup. Worker threads
+# (Step Functions executions, CloudFormation provisioners) need it to call a
+# service handler, because a handler may genuinely await now.
+_MAIN_LOOP = None
+
+
+def call_service_handler_sync(handler, method, path, headers, body, query_params, timeout: float | None = None):
+    """Call an async service handler from a worker thread and return its result.
+
+    In-process callers used to drive handlers with ``coro.send(None)``, relying
+    on an unwritten invariant that service handlers never actually await. That
+    held only while every handler was synchronous underneath. The moment one
+    awaits — offloading Docker work, for instance — the first step runs with no
+    running event loop and raises ``RuntimeError: no running event loop``, which
+    escapes past the caller's ``except StopIteration``.
+
+    So the coroutine is scheduled on the loop that is actually running and this
+    thread waits for the result. Callers must be on a worker thread: waiting on
+    the loop from the loop itself would deadlock, so that is refused loudly
+    rather than hanging.
+    """
+    loop = _MAIN_LOOP
+    if loop is None or loop.is_closed():
+        # No server running (unit tests, CLI use): drive it on a private loop.
+        return asyncio.run(handler(method, path, headers, body, query_params))
+
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if running is loop:
+        raise RuntimeError(
+            "call_service_handler_sync must be called from a worker thread, "
+            "not from the event loop — await the handler directly instead"
+        )
+
+    future = asyncio.run_coroutine_threadsafe(handler(method, path, headers, body, query_params), loop)
+    return future.result(timeout)
 
 
 def _lazy_handler(module_name: str):
@@ -246,7 +414,11 @@ SERVICE_REGISTRY = {
     "acm": {"module": "acm"},
     "backup": {"module": "backup"},
     "batch": {"module": "batch"},
-    "apigateway": {"module": "apigateway", "aliases": ("execute-api", "apigatewayv2")},
+    "apigateway": {
+        "module": "apigateway",
+        "aliases": ("execute-api", "apigatewayv2"),
+        "sub_modules": ("apigateway_v1",),
+    },
     "appconfig": {"module": "appconfig"},
     "appconfigdata": {"module": "appconfig"},
     "appsync": {"module": "appsync"},
@@ -254,18 +426,22 @@ SERVICE_REGISTRY = {
     "athena": {"module": "athena"},
     "autoscaling": {"module": "autoscaling"},
     "cloudformation": {"module": "cloudformation"},
+    "cloudcontrol": {"module": "cloudcontrol"},
     "cloudfront": {"module": "cloudfront"},
     "cloudfront-keyvaluestore": {"module": "cloudfront_keyvaluestore"},
     "codebuild": {"module": "codebuild"},
     "cognito-identity": {"module": "cognito"},
     "cognito-idp": {"module": "cognito"},
+    "config": {"module": "config"},
     "dynamodb": {"module": "dynamodb"},
     "dynamodbstreams": {"module": "dynamodb_streams"},
+    "dsql": {"module": "dsql"},
     "ec2": {"module": "ec2"},
     "ecr": {"module": "ecr"},
     "ecs": {"module": "ecs"},
     "ecs-metadata": {"module": "ecs_metadata"},
     "eks": {"module": "eks"},
+    "documentdb": {"module": "documentdb"},
     "elasticache": {"module": "elasticache"},
     "elasticfilesystem": {"module": "efs"},
     "elasticloadbalancing": {"module": "alb", "aliases": ("elbv2", "elb")},
@@ -278,13 +454,28 @@ SERVICE_REGISTRY = {
     "imds": {"module": "imds"},
     "iot": {"module": "iot"},
     "iot-data": {"module": "iot_data"},
+    "iot-jobs-data": {"module": "iot_jobs_data"},
+    "iotwireless": {"module": "iotwireless"},
     "kinesis": {"module": "kinesis"},
     "kms": {"module": "kms"},
-    "lambda": {"module": "lambda_svc"},
+    # ``lambda`` is a Python keyword, so the implementation module is named
+    # ``lambda_svc``. Keep ``lambda`` as the persistence key to preserve the
+    # long-standing ``lambda.json`` state-file contract across warm boots.
+    "lambda": {
+        "module": "lambda_svc",
+        "state_key": "lambda",
+        "sub_modules": ("lambda_durable",),
+    },
+    "lambda-core": {"module": "lambda_core"},
+    "lambda-microvms": {"module": "lambda_microvms"},
+    "location": {"module": "location"},
     "logs": {"module": "cloudwatch_logs", "aliases": ("cloudwatch-logs",)},
+    "mediaconnect": {"module": "mediaconnect"},
     "opensearch": {"module": "opensearch", "aliases": ("es", "elasticsearch")},
+    "opensearchserverless": {"module": "opensearchserverless", "aliases": ("aoss",)},
     "organizations": {"module": "organizations"},
     "monitoring": {"module": "cloudwatch", "aliases": ("cloudwatch",)},
+    "pipes": {"module": "pipes"},
     "rds-data": {"module": "rds_data"},
     "rds": {"module": "rds"},
     "resource-groups": {"module": "resource_groups"},
@@ -294,55 +485,66 @@ SERVICE_REGISTRY = {
     "scheduler": {"module": "scheduler"},
     "secretsmanager": {"module": "secretsmanager"},
     "servicediscovery": {"module": "servicediscovery"},
-    "ses": {"module": "ses"},
+    "ses": {"module": "ses", "sub_modules": ("ses_v2",)},
+    "signer": {"module": "signer"},
     "sns": {"module": "sns"},
     "sqs": {"module": "sqs"},
     "ssm": {"module": "ssm"},
     "states": {"module": "stepfunctions", "aliases": ("step-functions", "stepfunctions")},
     "sts": {"module": "sts"},
     "tagging": {"module": "tagging"},
+    "transcribe": {"module": "transcribe"},
+    "translate": {"module": "translate"},
     "transfer": {"module": "transfer"},
     "waf": {"module": "waf_v1"},
     "waf-regional": {"module": "waf_v1"},
     "wafv2": {"module": "waf"},
     "cloudtrail": {"module": "cloudtrail"},
     "cur": {"module": "cur"},
+    "budgets": {"module": "budgets"},
+    "kinesisanalyticsv2": {"module": "kinesisanalyticsv2"},
+    "inspector2": {"module": "inspector2"},
+    "mq": {"module": "mq"},
+    "s3tables": {"module": "s3tables"},
+    "bedrock": {"module": "bedrock"},
+    "bedrock-runtime": {"module": "bedrock_runtime"},
+    "bedrock-agent": {"module": "bedrock_agent"},
+    "bedrock-agent-runtime": {"module": "bedrock_agent_runtime"},
+    "bedrock-agentcore": {"module": "bedrock_agentcore"},
+    "kafka": {"module": "msk"},
 }
 
 SERVICE_HANDLERS = {
     service_name: _lazy_handler(service_config["module"]) for service_name, service_config in SERVICE_REGISTRY.items()
 }
 
-# Maps the on-disk persistence key to the service module name. `save_all`
-# (lifespan.shutdown) consumes this. Restore happens at module import time
-# in each service via its own `load_state()` call (see e.g. services/sqs.py);
-# a small allow-list is also restored centrally by `_load_persisted_state`
-# below. Symmetry between save and restore is enforced by
-# tests/test_persistence_symmetry.py.
-_state_map = {
-    "apigateway": "apigateway", "apigateway_v1": "apigateway_v1",
-    "sqs": "sqs", "sns": "sns", "ssm": "ssm",
-    "secretsmanager": "secretsmanager", "iam": "iam",
-    "dynamodb": "dynamodb", "kms": "kms", "eventbridge": "eventbridge",
-    "cloudwatch_logs": "cloudwatch_logs", "kinesis": "kinesis",
-    "ec2": "ec2", "route53": "route53", "cognito": "cognito",
-    "ecr": "ecr", "cloudwatch": "cloudwatch", "s3": "s3",
-    "lambda": "lambda_svc", "rds": "rds", "ecs": "ecs",
-    "elasticache": "elasticache", "appsync": "appsync",
-    "appsync_events": "appsync_events",
-    "stepfunctions": "stepfunctions", "alb": "alb",
-    "glue": "glue", "mwaa": "mwaa", "efs": "efs", "waf": "waf",
-    "athena": "athena", "emr": "emr", "cloudfront": "cloudfront",
-    "codebuild": "codebuild", "acm": "acm", "firehose": "firehose",
-    "ses": "ses", "ses_v2": "ses_v2",
-    "servicediscovery": "servicediscovery", "s3files": "s3files",
-    "appconfig": "appconfig", "transfer": "transfer",
-    "scheduler": "scheduler", "autoscaling": "autoscaling",
-    "eks": "eks", "backup": "backup", "pipes": "pipes",
-    "cloudfront_keyvaluestore": "cloudfront_keyvaluestore",
-    "resource_groups": "resource_groups",
-    "cloudtrail": "cloudtrail", "iot": "iot",
-}
+def _registry_module_names():
+    """Return every primary and dispatched module declared by the registry."""
+    return {
+        module
+        for config in SERVICE_REGISTRY.values()
+        for module in (config["module"], *config.get("sub_modules", ()))
+    }
+
+
+def _registry_state_map():
+    """Map persistence-file keys to modules declared by ``SERVICE_REGISTRY``.
+
+    A primary module normally uses its module name for the filename. Lambda
+    retains its long-standing ``lambda.json`` filename through ``state_key``;
+    sub-modules always use their own names.
+    """
+    state_map = {}
+    for config in SERVICE_REGISTRY.values():
+        module = config["module"]
+        state_map[config.get("state_key", module)] = module
+        state_map.update({sub_module: sub_module for sub_module in config.get("sub_modules", ())})
+    return state_map
+
+
+# Maps on-disk persistence keys to service modules. The registry is the sole
+# declaration point, including modules reached through a service's dispatcher.
+_state_map = _registry_state_map()
 
 SERVICE_NAME_ALIASES = {
     alias: service_name
@@ -354,6 +556,19 @@ SERVICE_NAME_ALIASES = {
 def _resolve_port():
     """Resolve gateway port: GATEWAY_PORT > EDGE_PORT > 4566."""
     return os.environ.get("GATEWAY_PORT") or os.environ.get("EDGE_PORT") or "4566"
+
+
+def _port_is_bindable(host: str, port: int) -> bool:
+    """Whether `port` can be opened here: free, and permitted to this process."""
+    import socket as _socket
+
+    with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as probe:
+        probe.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind(("" if host == "0.0.0.0" else host, port))
+        except OSError:
+            return False
+    return True
 
 
 if os.environ.get("LOCALSTACK_PERSISTENCE") == "1" and os.environ.get("S3_PERSIST") != "1":
@@ -381,12 +596,12 @@ BANNER = r"""
  |_|  |_|_|_| |_|_|____/ \__\__,_|\___|_|\_\
 
  Local AWS Service Emulator — Port {port}
- Services: S3, SQS, SNS, DynamoDB, Lambda, IAM, STS, SecretsManager, CloudWatch Logs,
-          SSM, EventBridge, Kinesis, CloudWatch, SES, SES v2, ACM, WAF v2, Step Functions,
-          ECS, RDS, ElastiCache, Glue, Athena, API Gateway, Firehose, Route53,
-          Cognito, EC2, EMR, EBS, EFS, ALB/ELBv2, CloudFormation, KMS, ECR, CloudFront,
-          AppSync, Cloud Map, S3 Files, RDS Data API, CodeBuild, AppConfig, Transfer, EKS,
-          IoT Core
+  Services: S3, SQS, SNS, DynamoDB, Lambda, IAM, STS, SecretsManager, CloudWatch Logs,
+           SSM, EventBridge, Kinesis, CloudWatch, SES, SES v2, ACM, WAF v2, Step Functions,
+           ECS, RDS, ElastiCache, Glue, Athena, API Gateway, Firehose, Route53,
+           Cognito, EC2, EMR, EBS, EFS, ALB/ELBv2, CloudFormation, KMS, ECR, CloudFront,
+           AppSync, Cloud Map, S3 Files, RDS Data API, CodeBuild, AppConfig, Transfer, EKS,
+           Inspector2, IoT Core, Aurora DSQL
 """
 
 
@@ -405,6 +620,16 @@ def _get_reset_lock() -> asyncio.Lock:
 # ---------------------------------------------------------------------------
 
 
+class _IncompleteRequestBody(Exception):
+    """The request body ended before its declared framing was complete."""
+
+    body = b""
+
+
+class _RequestBodyDisconnected(Exception):
+    """The client disconnected before the request body was complete."""
+
+
 def _decode_aws_chunked_body(body: bytes, headers: dict) -> bytes:
     """Decode AWS chunked request bodies and normalize content-encoding headers."""
     sha256_header = headers.get("x-amz-content-sha256", "")
@@ -416,23 +641,82 @@ def _decode_aws_chunked_body(body: bytes, headers: dict) -> bytes:
     ):
         return body
 
-    decoded = b""
-    remaining = body
-    while remaining:
-        crlf = remaining.find(b"\r\n")
+    # Walked by index with the chunks collected for one join. Both the
+    # decoded += chunk append and re-slicing the unparsed tail copy an
+    # amount proportional to the whole body on every chunk, which made this
+    # decode quadratic twice over -- and aws-chunked is what the AWS CLI
+    # sends for a large streaming PutObject.
+    chunks = []
+    pos = 0
+    trailer = None
+    while pos < len(body):
+        crlf = body.find(b"\r\n", pos)
         if crlf == -1:
-            break
-        chunk_header = remaining[:crlf].decode("ascii", errors="replace")
-        size_hex = chunk_header.split(";")[0].strip()
+            raise _IncompleteRequestBody("Truncated aws-chunked frame header")
         try:
-            chunk_size = int(size_hex, 16)
-        except ValueError:
-            break
+            chunk_header = body[pos:crlf].decode("ascii")
+        except UnicodeDecodeError as e:
+            raise _IncompleteRequestBody("Invalid aws-chunked frame header") from e
+        size_hex = chunk_header.split(";")[0].strip()
+        if not re.fullmatch(r"[0-9A-Fa-f]+", size_hex):
+            raise _IncompleteRequestBody("Invalid aws-chunked frame size")
+        chunk_size = int(size_hex, 16)
         if chunk_size == 0:
+            # Whatever follows the final chunk is the trailing header
+            # section the request announced in x-amz-trailer.
+            trailer = body[crlf + 2 :]
             break
         data_start = crlf + 2
-        decoded += remaining[data_start : data_start + chunk_size]
-        remaining = remaining[data_start + chunk_size + 2 :]  # skip trailing \r\n
+        data_end = data_start + chunk_size
+        if data_end + 2 > len(body) or body[data_end : data_end + 2] != b"\r\n":
+            raise _IncompleteRequestBody("Truncated aws-chunked frame data")
+        chunks.append(body[data_start:data_end])
+        pos = data_end + 2  # skip trailing \r\n
+    if trailer is None:
+        raise _IncompleteRequestBody("Missing aws-chunked terminating frame")
+
+    trailer_values = {}
+    if trailer == b"\r\n":
+        trailer_lines = []
+    elif trailer.endswith(b"\r\n\r\n"):
+        trailer_lines = trailer[:-4].split(b"\r\n")
+    else:
+        raise _IncompleteRequestBody("Incomplete aws-chunked trailer section")
+    for line in trailer_lines:
+        name, sep, value = line.partition(b":")
+        if not sep or not name:
+            raise _IncompleteRequestBody("Invalid aws-chunked trailer")
+        try:
+            name = name.decode("ascii").strip().lower()
+        except UnicodeDecodeError as e:
+            raise _IncompleteRequestBody("Invalid aws-chunked trailer name") from e
+        if not name:
+            raise _IncompleteRequestBody("Invalid aws-chunked trailer name")
+        trailer_values.setdefault(name, value.decode("utf-8", errors="replace").strip())
+
+    announced_trailers = {
+        name.strip().lower()
+        for name in headers.get("x-amz-trailer", "").split(",")
+        if name.strip()
+    }
+    if not announced_trailers.issubset(trailer_values):
+        raise _IncompleteRequestBody("Missing announced aws-chunked trailer")
+
+    decoded = b"".join(chunks)
+    decoded_length = headers.get("x-amz-decoded-content-length")
+    if decoded_length is not None:
+        if not re.fullmatch(r"[0-9]+", decoded_length.strip()):
+            raise _IncompleteRequestBody("Invalid X-Amz-Decoded-Content-Length")
+        if len(decoded) != int(decoded_length):
+            raise _IncompleteRequestBody("Decoded aws-chunked length mismatch")
+
+    # A checksum computed while the body streamed arrives here rather than
+    # among the request headers, and the rest of the request has no way to
+    # tell the two apart -- so lift it into the headers, where every
+    # checksum reader already looks.  An explicit header wins: the trailer
+    # is the late copy of the same field, not an override.
+    for name, value in trailer_values.items():
+        headers.setdefault(name, value)
 
     body = decoded
     if "aws-chunked" in content_encoding:
@@ -444,36 +728,116 @@ def _decode_aws_chunked_body(body: bytes, headers: dict) -> bytes:
     return body
 
 
+def _decompress_request_body(body: bytes, headers: dict) -> bytes:
+    """Inflate a gzip-compressed request body and drop the gzip token.
+
+    Smithy's ``@requestCompression`` trait makes AWS SDKs gzip a request body
+    once it passes ``REQUEST_MIN_COMPRESSION_SIZE_BYTES`` (default 10240) and
+    send ``Content-Encoding: gzip``. CloudWatch ``PutMetricData`` carries the
+    trait today; any client may compress a body it is allowed to compress.
+    Returns ``body`` unchanged when the header does not ask for gzip.
+    """
+    content_encoding = headers.get("content-encoding", "")
+    if "gzip" not in content_encoding.lower():
+        return body
+    try:
+        inflated = gzip.decompress(body)
+    except (OSError, EOFError) as e:
+        # A body flagged gzip that will not inflate is a real bug. Log it and
+        # pass the raw bytes on, so the handler's own error surfaces.
+        logger.warning("gzip request body failed to inflate: %s", e)
+        return body
+    encodings = [p.strip() for p in content_encoding.split(",") if p.strip().lower() != "gzip"]
+    if encodings:
+        headers["content-encoding"] = ", ".join(encodings)
+    else:
+        headers.pop("content-encoding", None)
+    return inflated
+
+
 async def _read_request_body(receive, method: str, headers: dict) -> bytes:
     """Read and decode the request body only for methods or headers that can carry one."""
     body = b""
     if headers.get("content-length") or headers.get("transfer-encoding") or method in _BODY_METHODS:
+        # Chunks are collected and joined once. Appending to a bytes object
+        # re-copies everything received so far on every 64 KB chunk, which made
+        # assembling a 95 MB PutObject copy ~76 GB of memory.
+        chunks = []
         while True:
             message = await receive()
-            body += message.get("body", b"")
+            if message.get("type") == "http.disconnect":
+                raise _RequestBodyDisconnected
+            if message.get("type") != "http.request":
+                raise _IncompleteRequestBody("Unexpected ASGI message while reading request body")
+            chunk = message.get("body", b"")
+            if chunk:
+                chunks.append(chunk)
             if not message.get("more_body", False):
                 break
-    return _decode_aws_chunked_body(body, headers)
+        body = b"".join(chunks)
+    pin_signed_body(body)
+    content_length = headers.get("content-length")
+    if content_length is not None:
+        content_length = content_length.strip()
+        if not re.fullmatch(r"[0-9]+", content_length) or len(body) != int(content_length):
+            exc = _IncompleteRequestBody("Content-Length does not match request body")
+            exc.body = body
+            raise exc
+    try:
+        return _decode_aws_chunked_body(body, headers)
+    except _IncompleteRequestBody as exc:
+        exc.body = body
+        raise
 
 
-async def _send_response(send, status, headers, body):
+def _incomplete_request_body_response(method: str, path: str, headers: dict, query_params: dict):
+    """S3's IncompleteBody; None for other services, which have no such error."""
+    if detect_service(method, path, headers, query_params) != "s3":
+        return None
+    return _get_module("s3")._error(
+        "IncompleteBody",
+        "You did not provide the number of bytes specified by the Content-Length HTTP header.",
+        400,
+    )
+
+
+def _encode_header_value(v: str) -> bytes:
+    try:
+        return v.encode("latin-1")
+    except UnicodeEncodeError:
+        return v.encode("utf-8")
+
+
+def _asgi_header_list(headers: dict) -> list:
+    # A list/tuple header value expands to one header line per item. This is
+    # required for Set-Cookie, which RFC 6265 §3 forbids folding into a single
+    # comma-joined header; APIGW Lambda-proxy responses surface multiple
+    # cookies this way. Scalar values keep their existing single-line behavior.
+    header_list = []
+    for k, v in headers.items():
+        if isinstance(v, (list, tuple)):
+            for item in v:
+                header_list.append((k.encode("latin-1"), _encode_header_value(str(item))))
+        else:
+            header_list.append((k.encode("latin-1"), _encode_header_value(str(v))))
+    return header_list
+
+
+async def _send_response(send, status, headers, body, *, head=False):
     """Send ASGI HTTP response."""
+    from ministack.core.responses import StreamingResponse
 
-    def _encode_header_value(v: str) -> bytes:
-        try:
-            return v.encode("latin-1")
-        except UnicodeEncodeError:
-            return v.encode("utf-8")
+    if isinstance(body, StreamingResponse):
+        raise TypeError("StreamingResponse requires _send_streaming_response(send, receive, ...)")
 
     body_bytes = body if isinstance(body, bytes) else body.encode("utf-8")
-    if "content-length" not in {k.lower() for k in headers}:
+    if not head and "content-length" not in {k.lower() for k in headers}:
         headers["Content-Length"] = str(len(body_bytes))
-    header_list = [(k.encode("latin-1"), _encode_header_value(str(v))) for k, v in headers.items()]
     await send(
         {
             "type": "http.response.start",
             "status": status,
-            "headers": header_list,
+            "headers": _asgi_header_list(headers),
         }
     )
     await send(
@@ -485,11 +849,44 @@ async def _send_response(send, status, headers, body):
     )
 
 
-async def _send_if_handled(send, response) -> bool:
+async def _send_streaming_response(send, receive, status, headers, streaming):
+    """Hold an HTTP response open and stream body chunks until the runner ends.
+
+    Used by CloudWatch Logs ``StartLiveTail`` and by the ALB data plane. A
+    handler that knows the length keeps ``Content-Length``, so a proxied
+    response keeps the framing its target chose; long-lived eventstreams set
+    none and the ASGI server chunks those.
+    """
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status,
+            "headers": _asgi_header_list(headers),
+        }
+    )
+    try:
+        await streaming.runner(send, receive)
+    except Exception:
+        logger.exception("Streaming response failed")
+        try:
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+        except Exception:
+            pass
+
+
+async def _send_if_handled(send, response, receive=None, *, head=False) -> bool:
     """Send a response tuple and report whether the request was handled."""
     if response is None:
         return False
-    await _send_response(send, *response)
+    from ministack.core.responses import StreamingResponse
+
+    status, headers, body = response
+    if isinstance(body, StreamingResponse):
+        if receive is None:
+            raise TypeError("StreamingResponse requires the ASGI receive channel")
+        await _send_streaming_response(send, receive, status, headers, body)
+    else:
+        await _send_response(send, status, headers, body, head=head)
     return True
 
 
@@ -498,10 +895,15 @@ async def _send_if_handled(send, response) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _handle_options_request(method: str, request_id: str):
-    """Return the standard CORS preflight response when applicable."""
+def _handle_options_request(method: str, path: str, headers: dict, query_params: dict, request_id: str):
+    """Return the CORS preflight response when applicable."""
     if method != "OPTIONS":
         return None
+    target = _s3_cors_target(headers.get("host", ""), path) if AUTH else None
+    if target and detect_service(method, path, headers, query_params) == "s3":
+        # Under AUTH a bucket's CORS configuration answers the preflight.
+        status, resp_headers, body = _get_module("s3").cors_preflight(*target, headers)
+        return status, {**resp_headers, "x-amzn-requestid": request_id, "x-amz-request-id": request_id}, body
     return (
         200,
         {
@@ -530,8 +932,10 @@ def _handle_health_request(path: str, request_id: str):
         json.dumps(
             {
                 "services": {s: "available" for s in SERVICE_HANDLERS},
+                "auth": "enabled" if AUTH else "disabled",
                 "edition": os.environ.get("MINISTACK_EDITION", "light"),
-                "version": _VERSION,
+                "version": _version(),
+                "iot_mtls": _iot_mtls_state,
                 "ready_scripts": dict(_ready_scripts_state),
             }
         ).encode(),
@@ -542,15 +946,20 @@ def _handle_ready_request(path: str, request_id: str):
     """Return readiness state once ready.d scripts have completed."""
     if path != "/_ministack/ready":
         return None
-    ready = _ready_scripts_state["status"] == "completed"
+    # The mTLS listener binds after the HTTP port, so readiness covers it: a
+    # consumer polling one endpoint does not race the MQTT port.
+    ready = (_ready_scripts_state["status"] == "completed"
+             and _iot_mtls_state != "starting")
     status = 200 if ready else 503
+    body = dict(_ready_scripts_state)
+    body["iot_mtls"] = _iot_mtls_state
     return (
         status,
         {
             "Content-Type": "application/json",
             "x-amzn-requestid": request_id,
         },
-        json.dumps(dict(_ready_scripts_state)).encode(),
+        json.dumps(body).encode(),
     )
 
 
@@ -585,11 +994,24 @@ def _handle_lambda_download_request(path: str, method: str):
     """Serve MiniStack's Lambda layer and function-code download endpoints."""
     if path.startswith("/_ministack/lambda-layers/") and method == "GET":
         path_parts = path.split("/")
+        if len(path_parts) >= 8 and path_parts[7] == "content" and path_parts[6].isdigit():
+            return _get_module("lambda_svc").serve_layer_content(
+                path_parts[5],
+                int(path_parts[6]),
+                account_id=path_parts[3],
+                region=path_parts[4],
+            )
         if len(path_parts) >= 6 and path_parts[5] == "content" and path_parts[4].isdigit():
             return _get_module("lambda_svc").serve_layer_content(path_parts[3], int(path_parts[4]))
 
     if path.startswith("/_ministack/lambda-code/") and method == "GET":
         path_parts = path.split("/")
+        if len(path_parts) >= 6:
+            return _get_module("lambda_svc").serve_function_code(
+                path_parts[5],
+                account_id=path_parts[3],
+                region=path_parts[4],
+            )
         if len(path_parts) >= 4:
             return _get_module("lambda_svc").serve_function_code(path_parts[3])
     return None
@@ -598,16 +1020,26 @@ def _handle_lambda_download_request(path: str, method: str):
 async def _handle_cognito_get_request(method: str, path: str, headers: dict, query_params: dict):
     """Handle Cognito GET endpoints that do not require request body parsing."""
     if "/.well-known/" in path and method == "GET":
+        # Real AWS serves /<poolId>/.well-known/jwks.json only for actual user
+        # pools — any other pool prefix errors. Fall through to S3 when the
+        # pool isn't registered so an S3 object stored under a .well-known/
+        # key isn't shadowed by a fake Cognito JWKS body.
         if path.endswith("/.well-known/jwks.json"):
             pool_id = path.rsplit("/.well-known/jwks.json", 1)[0].lstrip("/")
             if pool_id:
-                return _get_module("cognito").well_known_jwks(pool_id)
+                cognito = _get_module("cognito")
+                if cognito._get_pool_unscoped(pool_id) is not None:
+                    return cognito.well_known_jwks(pool_id)
         elif path.endswith("/.well-known/openid-configuration"):
             pool_id = path.rsplit("/.well-known/openid-configuration", 1)[0].lstrip("/")
             if pool_id:
-                region = extract_region(headers) or "us-east-1"
-                host = headers.get("host") or headers.get("Host")
-                return _get_module("cognito").well_known_openid_configuration(pool_id, region, host)
+                cognito = _get_module("cognito")
+                if cognito._get_pool_unscoped(pool_id) is not None:
+                    region = extract_region(headers) or "us-east-1"
+                    host = headers.get("host") or headers.get("Host")
+                    scheme = headers.get("x-forwarded-proto") or "http"
+                    return cognito.well_known_openid_configuration(
+                        pool_id, region, host, scheme)
 
     if path == "/oauth2/authorize" and method == "GET":
         return _get_module("cognito").handle_oauth2_authorize(method, path, headers, query_params)
@@ -615,6 +1047,8 @@ async def _handle_cognito_get_request(method: str, path: str, headers: dict, que
         return _get_module("cognito").handle_oauth2_userinfo(method, path, headers, b"", query_params)
     if path == "/logout" and method == "GET":
         return _get_module("cognito").handle_logout(method, path, headers, query_params)
+    if path == "/forgotPassword" and method == "GET":
+        return _get_module("cognito").handle_forgot_password_page(method, path, headers, query_params)
     return None
 
 
@@ -638,8 +1072,7 @@ async def _handle_ses_messages_request(method: str, path: str, headers: dict, qu
     """Handle SES messages inspection endpoint.
 
     Supports filtering by account via the 'account' query parameter. When provided,
-    sets the request context to that account so emails are retrieved from the correct
-    AccountScopedDict._sent_emails_list.
+    returns messages grouped by account across the service's regional stores.
     """
     if path != "/_ministack/ses/messages" or method != "GET":
         return None
@@ -665,9 +1098,15 @@ async def _handle_ses_messages_request(method: str, path: str, headers: dict, qu
         sent_emails_dict = {}
         try:
             all_data = mod._sent_emails.to_dict()
-            for (acct, key), val in all_data.items():
+            for scoped_key, val in all_data.items():
+                if len(scoped_key) == 2:
+                    acct, key = scoped_key
+                elif len(scoped_key) == 3:
+                    acct, _region, key = scoped_key
+                else:
+                    continue
                 if key == "entries" and isinstance(val, list):
-                    sent_emails_dict[acct] = val
+                    sent_emails_dict.setdefault(acct, []).extend(val)
         except Exception:
             # Fallback: empty dict on any unexpected shape
             sent_emails_dict = {}
@@ -700,15 +1139,205 @@ async def _handle_ses_messages_request(method: str, path: str, headers: dict, qu
     return 200, {"Content-Type": "application/json"}, json.dumps(response).encode()
 
 
+async def _handle_sqs_messages_request(method: str, path: str, headers: dict, query_params: dict):
+    """Handle the SQS messages peek endpoint.
+
+    Pure introspection over `_queues[*].messages`. Does not touch
+    `visible_at`, `receive_count`, or any field the real SQS API mutates —
+    so calling this endpoint cannot affect a concurrent ReceiveMessage.
+
+    Filters:
+      ?account=<12-digit-id>   restrict to one account
+      ?region=<aws-region>     restrict to one region
+      ?QueueUrl=<url>          restrict to one queue (within whatever
+                               accounts/regions pass the filters)
+    """
+    if path != "/_ministack/sqs/messages" or method != "GET":
+        return None
+
+    account_id = None
+    if "account" in query_params:
+        raw_account = query_params["account"]
+        account_id = raw_account[0] if isinstance(raw_account, (list, tuple)) else raw_account
+        if not _12_DIGIT_RE.match(account_id):
+            return (
+                400,
+                {"Content-Type": "application/json"},
+                json.dumps(
+                    {
+                        "__type": "InvalidAccountID",
+                        "message": f"Account ID must be 12 digits, got: {account_id}",
+                    }
+                ).encode(),
+            )
+
+    queue_url_filter = None
+    if "QueueUrl" in query_params:
+        raw_qurl = query_params["QueueUrl"]
+        queue_url_filter = raw_qurl[0] if isinstance(raw_qurl, (list, tuple)) else raw_qurl
+    region_filter = None
+    if "region" in query_params:
+        raw_region = query_params["region"]
+        region_filter = raw_region[0] if isinstance(raw_region, (list, tuple)) else raw_region
+
+    try:
+        mod = _get_module("sqs")
+        now = time.time()
+        queue_name_filter = None
+        queue_account_filter = None
+        if queue_url_filter is not None:
+            queue_account_filter, queue_name_filter = mod._queue_ref_from_urlish(queue_url_filter)
+
+        # Legacy AccountScopedDict state is keyed by (account_id, queue_url);
+        # AccountRegionScopedDict state is keyed by (account_id, region, queue_url).
+        per_account: dict[str, dict[str, dict[str, list]]] = {}
+        try:
+            all_data = mod._queues.to_dict()
+        except Exception:
+            all_data = {}
+
+        for scoped_key, queue in all_data.items():
+            if len(scoped_key) == 3:
+                acct, region, qurl = scoped_key
+            elif len(scoped_key) == 2:
+                acct, qurl = scoped_key
+                region = os.environ.get("MINISTACK_REGION", "us-east-1")
+            else:
+                continue
+            if account_id is not None and acct != account_id:
+                continue
+            if region_filter is not None and region != region_filter:
+                continue
+            if not isinstance(queue, dict):
+                continue
+            if queue_url_filter is not None:
+                if queue.get("name") != queue_name_filter:
+                    continue
+                if queue_account_filter and acct != queue_account_filter:
+                    continue
+            msgs = queue.get("messages") or []
+            rendered = []
+            for m in msgs:
+                rendered.append(
+                    {
+                        "MessageId": m.get("id"),
+                        "Body": m.get("body", ""),
+                        "MD5OfBody": m.get("md5_body"),
+                        "MD5OfMessageAttributes": m.get("md5_attrs"),
+                        "SentTimestamp": int(m.get("sent_at", 0)),
+                        "VisibleAt": int(m.get("visible_at", 0)),
+                        "IsVisible": m.get("visible_at", 0) <= now,
+                        "ReceiveCount": m.get("receive_count", 0),
+                        "FirstReceiveTimestamp": (int(m["first_receive_at"]) if m.get("first_receive_at") else None),
+                        "MessageAttributes": m.get("message_attributes") or {},
+                        "Attributes": m.get("sys") or {},
+                        "MessageGroupId": m.get("group_id"),
+                        "MessageDeduplicationId": m.get("dedup_id"),
+                        "SequenceNumber": m.get("seq"),
+                    }
+                )
+            display_qurl = queue_url_filter if queue_url_filter is not None else qurl
+            per_account.setdefault(acct, {}).setdefault(region, {})[display_qurl] = rendered
+
+        response = {"messages": per_account}
+    except Exception as e:
+        logger.exception("Error retrieving SQS messages: %s", e)
+        return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
+
+    return 200, {"Content-Type": "application/json"}, json.dumps(response).encode()
+
+
+_SNS_SMS_PATH = "/_ministack/sns/sms-messages"
+
+
+async def _handle_sns_sms_messages_request(method: str, path: str, headers: dict, query_params: dict):
+    """Serve direct-to-phone SNS publishes, filtered by ?account, ?region and ?phoneNumber."""
+    if path != _SNS_SMS_PATH or method != "GET":
+        return None
+
+    account_id = None
+    if "account" in query_params:
+        raw_account = query_params["account"]
+        account_id = raw_account[0] if isinstance(raw_account, (list, tuple)) else raw_account
+        if not _12_DIGIT_RE.match(account_id):
+            return (
+                400,
+                {"Content-Type": "application/json"},
+                json.dumps(
+                    {
+                        "__type": "InvalidAccountID",
+                        "message": f"Account ID must be 12 digits, got: {account_id}",
+                    }
+                ).encode(),
+            )
+
+    default_region = os.environ.get("MINISTACK_REGION", "us-east-1")
+    region_filter = None
+    if "region" in query_params:
+        raw_region = query_params["region"]
+        region_filter = raw_region[0] if isinstance(raw_region, (list, tuple)) else raw_region
+    phone_filter = None
+    if "phoneNumber" in query_params:
+        raw_phone = query_params["phoneNumber"]
+        phone_filter = raw_phone[0] if isinstance(raw_phone, (list, tuple)) else raw_phone
+
+    try:
+        mod = _get_module("sns")
+        try:
+            all_data = mod._sms_messages.to_dict()
+        except Exception:
+            all_data = {}
+
+        sms_messages: dict[str, list] = {}
+        for scoped_key, records in all_data.items():
+            if len(scoped_key) == 3:
+                acct, region, phone = scoped_key
+            elif len(scoped_key) == 2:
+                acct, phone = scoped_key
+                region = default_region
+            else:
+                continue
+            if account_id is not None and acct != account_id:
+                continue
+            if region_filter is not None and region != region_filter:
+                continue
+            if phone_filter is not None and phone != phone_filter:
+                continue
+            if isinstance(records, list):
+                sms_messages.setdefault(phone, []).extend(records)
+
+        # A filtered recipient is present even with nothing sent to it.
+        if phone_filter is not None:
+            sms_messages.setdefault(phone_filter, [])
+
+        response = {
+            "sms_messages": sms_messages,
+            "region": region_filter or default_region,
+        }
+    except Exception as e:
+        logger.exception("Error retrieving SNS SMS messages: %s", e)
+        return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
+
+    return 200, {"Content-Type": "application/json"}, json.dumps(response).encode()
+
+
 async def _handle_pre_body_request(method: str, path: str, headers: dict, query_params: dict, request_id: str):
     """Handle fast-path routes that do not require request body parsing."""
     # OPTIONS on an execute-api host / path MUST flow through apigateway.handle_execute
-    # so the API's own corsConfiguration is applied (#406). Skip the generic wildcard
-    # preflight in that case.
+    # so the API's own corsConfiguration is applied (#406). A Function URL owns its
+    # CORS config the same way, as does a registered custom domain. An OPTIONS
+    # request to a load balancer goes on to its target. Skip the generic wildcard preflight for each.
     host = headers.get("host", "")
-    is_execute_api = _parse_execute_api_url(host, path) is not None
+    owns_cors = (
+        _parse_execute_api_url(host, path) is not None
+        or _parse_lambda_url(host, path) is not None
+        or _resolve_custom_domain_request(host, path) is not None
+        or _parse_cloudfront_dataplane_host(host) is not None
+        or _resolve_cloudfront_alias_request(host) is not None
+        or _is_potential_alb_request(host, path)
+    )
     for response in (
-        None if is_execute_api else _handle_options_request(method, request_id),
+        None if owns_cors else _handle_options_request(method, path, headers, query_params, request_id),
         _handle_health_request(path, request_id),
         _handle_ready_request(path, request_id),
         _handle_unknown_localstack_request(path, request_id),
@@ -729,6 +1358,14 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
     if response is not None:
         return response
 
+    response = await _handle_sqs_messages_request(method, path, headers, query_params)
+    if response is not None:
+        return response
+
+    response = await _handle_sns_sms_messages_request(method, path, headers, query_params)
+    if response is not None:
+        return response
+
     response = _handle_transfer_sftp_ports_request(method, path)
     if response is not None:
         return response
@@ -737,7 +1374,87 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
     if response is not None:
         return response
 
+    response = _handle_rds_ca_request(method, path)
+    if response is not None:
+        return response
+
+    response = _handle_elasticache_ca_request(method, path)
+    if response is not None:
+        return response
+
+    response = _handle_elb_public_key_request(method, path, host)
+    if response is not None:
+        return response
+
     return await _handle_admin_reset(path, method, query_params)
+
+
+def _handle_elasticache_ca_request(method: str, path: str):
+    """`GET /_ministack/elasticache/ca.pem` returns the CA that signs serverless
+    cache certificates; a client trusts it to connect with TLS."""
+    if path != "/_ministack/elasticache/ca.pem" or method != "GET":
+        return None
+    try:
+        from ministack.services import elasticache
+
+        cert_pem = elasticache.serverless_ca_cert_pem()
+    except Exception as e:
+        return (
+            503,
+            {"Content-Type": "application/json"},
+            json.dumps({"message": str(e)}).encode(),
+        )
+    return (200, {"Content-Type": "application/x-pem-file"}, cert_pem.encode())
+
+
+_ELB_PUBLIC_KEYS_PREFIX = "/_ministack/elb/public-keys/"
+_ELB_PUBLIC_KEYS_HOST_RE = re.compile(r"^public-keys\.auth\.elb\.[a-z0-9-]+\.amazonaws\.com(?::\d+)?$", re.IGNORECASE)
+
+
+def _handle_elb_public_key_request(method: str, path: str, host: str):
+    """`GET public-keys.auth.elb.<region>.amazonaws.com/<kid>` (or
+    `/_ministack/elb/public-keys/<kid>`) returns the PEM key that verifies
+    x-amzn-oidc-data; an unknown kid gets AWS's S3 AccessDenied."""
+    if method != "GET":
+        return None
+    if _ELB_PUBLIC_KEYS_HOST_RE.match(host):
+        kid = path[1:]
+    elif path.startswith(_ELB_PUBLIC_KEYS_PREFIX):
+        kid = path[len(_ELB_PUBLIC_KEYS_PREFIX):]
+    else:
+        return None
+    from ministack.services import alb
+
+    public_key_pem = alb.oidc_public_key_pem(kid)
+    if public_key_pem is None:
+        return (
+            403,
+            {"Content-Type": "application/xml"},
+            b'<?xml version="1.0" encoding="UTF-8"?>\n<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>',
+        )
+    return (200, {"Content-Type": "application/x-pem-file"}, public_key_pem.encode())
+
+
+def _handle_rds_ca_request(method: str, path: str):
+    """`GET /_ministack/rds/ca.pem` returns the CA that signs DB server
+    certificates, the local stand-in for AWS's certificate bundle."""
+    if path != "/_ministack/rds/ca.pem" or method != "GET":
+        return None
+    try:
+        from ministack.services import rds
+
+        cert_pem = rds.pg_ca_cert_pem()
+    except Exception as e:
+        return (
+            503,
+            {"Content-Type": "application/json"},
+            json.dumps({"message": str(e)}).encode(),
+        )
+    return (
+        200,
+        {"Content-Type": "application/x-pem-file"},
+        cert_pem.encode(),
+    )
 
 
 def _handle_iot_ca_request(method: str, path: str):
@@ -768,7 +1485,7 @@ def _handle_iot_ca_request(method: str, path: str):
         200,
         {
             "Content-Type": "application/x-pem-file",
-            "Content-Disposition": "attachment; filename=\"ministack-iot-ca.pem\"",
+            "Content-Disposition": 'attachment; filename="ministack-iot-ca.pem"',
         },
         cert_pem.encode("utf-8"),
     )
@@ -809,7 +1526,7 @@ async def _handle_cognito_body_request(method: str, path: str, headers: dict, bo
     if path in ("/oauth2/login", "/login") and method == "POST":
         return _get_module("cognito").handle_login_submit(method, path, headers, body, query_params)
     if path == "/oauth2/token" and method == "POST":
-        return _get_module("cognito").handle_oauth2_token(method, path, headers, body, query_params)
+        return await _get_module("cognito").handle_oauth2_token(method, path, headers, body, query_params)
     if path in _COGNITO_USERINFO_PATHS and method == "POST":
         return _get_module("cognito").handle_oauth2_userinfo(method, path, headers, body, query_params)
     return None
@@ -825,8 +1542,12 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
         "athena.ATHENA_DATA_DIR",
         "stepfunctions._sfn_mock_config",
         "stepfunctions._SFN_WAIT_SCALE",
+        "translate._JOB_RUN_SECONDS",
+        "transcribe._JOB_RUN_SECONDS",
         "lambda_svc.LAMBDA_EXECUTOR",
         "cloudtrail._recording_enabled",
+        "alb.TARGET_CONNECT_TIMEOUT",
+        "alb.TARGET_IDLE_TIMEOUT",
     }
     try:
         config = json.loads(body) if body else {}
@@ -844,14 +1565,20 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
         mod_name, var_name = key.rsplit(".", 1)
         try:
             mod = __import__(f"ministack.services.{mod_name}", fromlist=[var_name])
-            if key == "stepfunctions._SFN_WAIT_SCALE":
+            # Registered so request hooks such as CloudTrail recording see the module.
+            _loaded_modules.setdefault(mod_name, mod)
+            if key in (
+                "stepfunctions._SFN_WAIT_SCALE",
+                "translate._JOB_RUN_SECONDS",
+                "transcribe._JOB_RUN_SECONDS",
+            ):
                 try:
                     float_value = float(value)
                 except (ValueError, TypeError):
-                    logger.warning("/_ministack/config: invalid SFN_WAIT_SCALE=%r", value)
+                    logger.warning("/_ministack/config: invalid %s=%r", var_name, value)
                     continue
                 if not math.isfinite(float_value) or float_value < 0:
-                    logger.warning("/_ministack/config: invalid SFN_WAIT_SCALE=%r", value)
+                    logger.warning("/_ministack/config: invalid %s=%r", var_name, value)
                     continue
                 value = float_value
             elif key == "cloudtrail._recording_enabled":
@@ -863,20 +1590,44 @@ async def _handle_admin_config_request(path: str, method: str, body: bytes):
     return 200, {"Content-Type": "application/json"}, json.dumps({"applied": applied}).encode()
 
 
-async def _handle_post_body_shortcuts(method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str):
+async def _handle_post_body_shortcuts(
+    method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str
+):
     """Handle body-dependent routes before the generic service router."""
     # CloudFormation custom resource ResponseURL intercept
     if method == "PUT" and path.startswith("/_ministack/cfn-response/"):
-        token = path[len("/_ministack/cfn-response/"):]
+        token = path[len("/_ministack/cfn-response/") :]
         try:
             payload = json.loads(body) if body else {}
         except (json.JSONDecodeError, ValueError):
             payload = {}
         from ministack.services.cloudformation import custom_resource as _cfn_cr
+
         if not _cfn_cr.deliver_response(token, payload):
-            logging.getLogger("cloudformation").warning(
-                "CFN ResponseURL PUT for unknown token %r — ignoring", token
-            )
+            logging.getLogger("cloudformation").warning("CFN ResponseURL PUT for unknown token %r — ignoring", token)
+        return 200, {}, b""
+
+    # CloudFormation WaitConditionHandle signal URL (the presigned S3 URL on AWS).
+    # The literal keeps the import behind the check; above it, the first request
+    # to any service pulled in the whole CloudFormation package.
+    if method == "PUT" and path.startswith("/_ministack/cfn-signal/"):
+        from ministack.services.cloudformation import wait_conditions as _cfn_wc
+
+        token = path[len(_cfn_wc.SIGNAL_PATH) :]
+        if not _cfn_wc.has_handle(token):
+            logging.getLogger("cloudformation").warning("CFN wait condition signal for unknown token %r", token)
+            return 404, {"Content-Type": "application/json"}, b'{"message": "unknown wait condition handle"}'
+        if headers.get("content-type"):
+            # The user guide, "To send a signal", step 3: the request method must
+            # be PUT and the Content-Type header must be an empty string or omitted.
+            return 403, {"Content-Type": "application/json"}, json.dumps(
+                {"message": "the Content-Type header must be an empty string or omitted"}
+            ).encode()
+        try:
+            payload = json.loads(body) if body else {}
+            _cfn_wc.deliver_signal(token, payload)
+        except (json.JSONDecodeError, ValueError) as exc:
+            return 400, {"Content-Type": "application/json"}, json.dumps({"message": str(exc)}).encode()
         return 200, {}, b""
 
     response = await _handle_cognito_body_request(method, path, headers, body, query_params)
@@ -891,19 +1642,110 @@ async def _handle_post_body_shortcuts(method: str, path: str, headers: dict, bod
 # ---------------------------------------------------------------------------
 
 
-async def _handle_s3_control_request(path: str, method: str, body: bytes, query_params: dict, request_id: str):
+_S3_CONTROL_MRAP_PREFIXES = ("/v20180820/mrap/", "/v20180820/async-requests/mrap/")
+
+
+def _s3control_mrap_arn(s3, path: str) -> str:
+    """IAM resource for an MRAP request: ``arn:aws:s3::<account>:accesspoint/<alias>``
+    for an existing MRAP named in the path, else the account's wildcard."""
+    from ministack.core.responses import get_account_id
+
+    account = get_account_id()
+    route = None if path.startswith("/v20180820/async-requests/") else s3.mrap_control_route(path)
+    record = s3.find_mrap(route[0]) if route and route[0] else None
+    return f"arn:aws:s3::{account}:accesspoint/{record['Alias'] if record else '*'}"
+
+
+def _s3control_access_point_arn(s3, path: str) -> str:
+    """IAM resource for an access point request: its regional ARN, or the
+    account's wildcard for ListAccessPoints."""
+    return s3.access_point_arn(s3.access_point_control_route(path)[0] or "*")
+
+
+def _s3control_object_lambda_arn(s3, path: str) -> str:
+    """IAM resource for an Object Lambda Access Point request."""
+    return s3.object_lambda_arn(s3.object_lambda_control_route(path)[0] or "*")
+
+
+async def _handle_s3_control_request(path: str, method: str, body: bytes, query_params: dict, request_id: str,
+                                     headers: dict | None = None):
     """Handle S3 Control operations addressed via the /v20180820 path prefix."""
     if not path.startswith(_S3_CONTROL_PREFIX):
         return None
+
+    is_mrap = path.startswith(_S3_CONTROL_MRAP_PREFIXES) or path.rstrip("/") == "/v20180820/mrap/instances"
+    s3 = _get_module("s3")
+    is_object_lambda = s3.is_object_lambda_control_path(path)
+    if is_mrap or is_object_lambda or s3.is_access_point_control_path(path):
+        headers = headers or {}
+        if AUTH:
+            from ministack.core.iam_actions import s3control_action
+
+            action = s3control_action(method, path)
+            if action:
+                if is_mrap:
+                    resource = _s3control_mrap_arn(s3, path)
+                elif is_object_lambda:
+                    resource = _s3control_object_lambda_arn(s3, path)
+                else:
+                    resource = _s3control_access_point_arn(s3, path)
+                denied = _enforce_data_plane("s3", action, headers, query_params, request_id,
+                                             resource_arn=resource)
+                if denied:
+                    return denied
+            elif failure := _authenticate_only("s3", headers, query_params, request_id):
+                return failure
+        if is_mrap:
+            handler = s3.handle_mrap_control
+        elif is_object_lambda:
+            handler = s3.handle_object_lambda_control
+        else:
+            handler = s3.handle_access_point_control
+        status, resp_headers, resp_body = (
+            (AUTH and s3.s3control_account_error(headers))
+            or handler(method, path, headers, body, query_params)
+        )
+        return status, {**resp_headers, "x-amzn-requestid": request_id}, resp_body
+
+    if s3.is_account_public_access_block_path(path):
+        headers = headers or {}
+        if AUTH:
+            action = s3._ACCOUNT_PAB_ACTIONS.get(method)
+            if action:
+                denied = _enforce_data_plane("s3", action, headers, query_params, request_id)
+                if denied:
+                    return denied
+            elif failure := _authenticate_only("s3", headers, query_params, request_id):
+                return failure
+        status, resp_headers, resp_body = (
+            (AUTH and s3.s3control_account_error(headers))
+            or s3.handle_account_public_access_block(method, path, body)
+        )
+        return status, {**resp_headers, "x-amzn-requestid": request_id}, resp_body
+
+    if failure := _authenticate_only("s3", headers, query_params, request_id):
+        return failure
 
     if path.startswith("/v20180820/tags/"):
         raw_arn = path[len("/v20180820/tags/") :]
         arn = unquote(raw_arn)
         bucket_name = arn.split(":::")[-1].split("/")[0] if ":::" in arn else arn.split("/")[0]
+        resource_arn = arn if arn.startswith("arn:") else f"arn:aws:s3:::{bucket_name}"
+        iam_action = _S3_CONTROL_TAG_ACTIONS.get(method)
+        if iam_action and (denied := _enforce_data_plane("s3", iam_action, headers, query_params, request_id,
+                                                         resource_arn=resource_arn,
+                                                         named_resource=f'"{resource_arn}"')):
+            return denied
+        if not iam_action and (failure := _authenticate_only("s3", headers, query_params, request_id)):
+            return failure
 
         if method == "GET":
             tags = _get_module("s3")._bucket_tags.get(bucket_name, {})
-            tag_members = "".join(f"<member><Key>{k}</Key><Value>{v}</Value></member>" for k, v in tags.items())
+            # s3control's TagList declares locationName "Tag", so each entry is
+            # <Tag>, not the <member> the query protocol uses elsewhere. boto3
+            # tolerates <member>; aws-sdk-go-v2 — and therefore Terraform —
+            # parses an empty list from it and reports the resource as untagged.
+            tag_members = "".join(f"<Tag><Key>{k}</Key><Value>{v}</Value></Tag>" for k, v in tags.items())
             xml_body = (
                 '<?xml version="1.0" encoding="UTF-8"?>'
                 '<ListTagsForResourceResult xmlns="https://awss3control.amazonaws.com/doc/2018-08-20/">'
@@ -976,27 +1818,65 @@ async def _handle_s3_control_request(path: str, method: str, body: bytes, query_
             b"{}",
         )
 
+    if failure := _authenticate_only("s3", headers, query_params, request_id):
+        return failure
+    # An undefined /v20180820 path answers 400 InvalidURI inside an
+    # <ErrorResponse> wrapper, with <URI> echoing the bad segment (measured eu-north-1 2026-09-19).
+    from xml.sax.saxutils import escape as _xml_esc
+
+    bad_uri = path.split("/v20180820/", 1)[-1] if "/v20180820/" in path else path.lstrip("/")
+    unsupported = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<ErrorResponse><Error>"
+        "<Code>InvalidURI</Code>"
+        "<Message>Couldn't parse the specified URI.</Message>"
+        f"<URI>{_xml_esc(bad_uri)}</URI>"
+        "</Error>"
+        f"<RequestId>{request_id}</RequestId>"
+        f"<HostId>{uuid.uuid4().hex}</HostId>"
+        "</ErrorResponse>"
+    ).encode()
     return (
-        200,
+        400,
         {
-            "Content-Type": "application/json",
+            "Content-Type": "application/xml",
             "x-amzn-requestid": request_id,
         },
-        b"{}",
+        unsupported,
     )
 
 
-async def _handle_rds_data_request(method: str, path: str, headers: dict, body: bytes, query_params: dict):
+async def _handle_rds_data_request(
+    method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str
+):
     """Handle RDS Data API operations before generic routing."""
     if path not in _RDS_DATA_PATHS:
         return None
+    if AUTH and (denied := _enforce_rds_data(method, path, headers, body, query_params, request_id)):
+        return denied
     return await _get_module("rds_data").handle_request(method, path, headers, body, query_params)
 
 
-async def _handle_ses_v2_request(method: str, path: str, headers: dict, body: bytes, query_params: dict):
+def _enforce_rds_data(method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str):
+    """Authorize an RDS Data call as rds-data:<operation> on the cluster its body names."""
+    from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
+
+    iam_action = extract_iam_action("rds-data", method, path, headers, body, query_params)
+    if iam_action is None:
+        return _authenticate_only("rds-data", headers, query_params, request_id)
+    resource_arn = extract_resource_arn("rds-data", method, path, headers, body, query_params, "", "")
+    return _enforce_data_plane("rds-data", iam_action, headers, query_params, request_id,
+                               resource_arn=resource_arn, named_resource=resource_arn)
+
+
+async def _handle_ses_v2_request(
+    method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str
+):
     """Handle SES v2 REST API operations before generic routing."""
     if not path.startswith(_SES_V2_PREFIX):
         return None
+    if denied := _enforce_ses_v2(method, path, headers, body, query_params, request_id):
+        return denied
     return await _get_module("ses_v2").handle_request(method, path, headers, body, query_params)
 
 
@@ -1025,9 +1905,7 @@ async def _handle_ecr_registry_request(method: str, path: str, headers: dict, bo
     """
     if not _is_ecr_registry_path(path):
         return None
-    return await _get_module("ecr").handle_registry_request(
-        method, path, headers, body, query_params
-    )
+    return await _get_module("ecr").handle_registry_request(method, path, headers, body, query_params)
 
 
 def _parse_execute_api_url(host: str, path: str) -> tuple[str, str, str] | None:
@@ -1072,6 +1950,70 @@ def _parse_execute_api_url(host: str, path: str) -> tuple[str, str, str] | None:
     return None
 
 
+def _execute_api_authorization_type(api_id: str, stage: str, method: str, execute_path: str) -> str | None:
+    """The authorization type of the REST method or HTTP API route an execute-api call reaches, or None."""
+    return (_get_module("apigateway_v1").method_authorization_type(api_id, stage, method, execute_path)
+            or _get_module("apigateway").route_authorization_type(api_id, stage, method, execute_path))
+
+
+def _enforce_execute_api(api_id: str, stage: str, method: str, execute_path: str,
+                         headers: dict, query_params: dict,
+                         iam_action: str = "execute-api:Invoke",
+                         caller_account: str | None = None):
+    """Authorize an execute-api call against its own ARN.
+
+    ``arn:aws:execute-api:<region>:<account>:<api-id>/<stage>/<METHOD>/<path>``,
+    the shape AWS documents. Without it every invoke was authorized against
+    ``*``, so a policy scoped to one API and stage — which is what the CDK's
+    ``grantExecute`` and every hand-written service-to-service grant produce —
+    never matched and the call was denied.
+
+    Built by the same helper the Lambda authorizer's method ARN uses, because
+    a policy has to match both.
+
+    ``iam_action`` is ``execute-api:Invoke`` for a normal request and
+    ``execute-api:ManageConnections`` for the WebSocket ``@connections`` API,
+    which AWS authorizes under that separate action.
+    """
+    from ministack.core.arn import execute_api_arn
+    from ministack.core.iam_evaluator import AuthError
+    from ministack.core.responses import get_account_id
+    from ministack.core.sigv4 import foreign_authorization_failure
+
+    authorization = _execute_api_authorization_type(
+        api_id, stage, method, execute_path) if AUTH and iam_action == "execute-api:Invoke" else None
+    # Only an AWS_IAM method reads the caller's signature and policies.
+    if authorization not in (None, "AWS_IAM"):
+        return None
+    header = headers.get("authorization", "")
+    if authorization == "AWS_IAM" and header and not header.startswith("AWS4-HMAC-SHA256"):
+        # A REST method with AWS_IAM refuses an Authorization header that is not SigV4.
+        apigw_v1 = _get_module("apigateway_v1")
+        refused = foreign_authorization_failure(headers) if apigw_v1.find_api_scope(api_id) is not None else None
+        if refused:
+            return apigw_v1.authentication_error_response(api_id, stage, AuthError(*refused), headers, query_params)
+    # The ARN names the API's owner; the caller is authenticated in its own account.
+    resource_arn = execute_api_arn(
+        extract_region(headers, query_params), get_account_id(),
+        api_id, stage, method, execute_path,
+    )
+    owner_scope = _get_module("apigateway_v1").find_api_scope(api_id) if caller_account else None
+    token = _request_account_id.set(caller_account) if caller_account else None
+    try:
+        return _enforce_data_plane(
+            "apigateway", iam_action, headers, query_params, "",
+            resource_arn=resource_arn,
+            auth_error_response=lambda error: _get_module("apigateway_v1").authentication_error_response(
+                api_id, stage, error, headers, query_params),
+            denied_response=(lambda denied: _get_module("apigateway_v1").cross_account_denial_response(
+                api_id, stage, denied, headers, query_params, owner_scope))
+            if owner_scope else None,
+        )
+    finally:
+        if token is not None:
+            _request_account_id.reset(token)
+
+
 def _resolve_stage_and_path(api_id: str, tentative_stage: str, execute_path: str) -> tuple[str, str]:
     """Pick (stage, execute_path) based on the API's configured stages.
 
@@ -1088,10 +2030,10 @@ def _resolve_stage_and_path(api_id: str, tentative_stage: str, execute_path: str
       - Else fall through (``handle_execute`` will return "Stage not found").
     """
     apigw_v1 = _get_module("apigateway_v1")
-    if api_id in apigw_v1._rest_apis:
-        stages_map = apigw_v1._stages_v1.get(api_id, {})
+    if apigw_v1.find_api_scope(api_id) is not None:
+        stages_map = apigw_v1.stages_for_api(api_id)
     else:
-        stages_map = _get_module("apigateway")._stages.get(api_id, {})
+        stages_map = _get_module("apigateway").stages_for_api(api_id)
 
     if tentative_stage in stages_map:
         return tentative_stage, execute_path
@@ -1105,30 +2047,175 @@ def _resolve_stage_and_path(api_id: str, tentative_stage: str, execute_path: str
     return tentative_stage, execute_path
 
 
-async def _handle_execute_api_request(
-    host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict
+def _resolve_custom_domain_request(host: str, path: str):
+    """Resolve a request addressed by a registered API Gateway custom domain.
+
+    Returns ``(api_id, stage, execute_path)`` or ``None``. Runs before any
+    host-pattern service guessing, so a registered domain wins even when its
+    name happens to contain a service token (a domain with ``iot.`` in it
+    would otherwise land in the IoT service). Unregistered dotted hosts cost
+    a linear scan over the registered domain names (a local stack holds a
+    handful at most) and fall through unchanged."""
+    hostname = host.split(":")[0].lower()
+    if not hostname or "." not in hostname:
+        # localhost / in-network single-label hosts can never be custom domains
+        return None
+    apigw_v1 = _get_module("apigateway_v1")
+    return apigw_v1.resolve_base_path_mapping(hostname, path)
+
+
+def _parse_cloudfront_dataplane_host(host: str) -> str | None:
+    """The distribution label addressed by ``host``, or None."""
+    m = _CLOUDFRONT_HOST_RE.match(host.split(":")[0].lower())
+    return m.group(1) if m else None
+
+
+def _resolve_cloudfront_alias_request(host: str):
+    """The distribution that claims ``host`` as an alternate domain name, or None."""
+    hostname = host.split(":")[0].lower()
+    if not hostname or "." not in hostname:
+        return None
+    return _get_module("cloudfront").find_distribution_for_alias(hostname)
+
+
+async def _serve_cloudfront_distribution(
+    dist, path: str, raw_path: str, raw_query_string: str, method: str,
+    headers: dict, body: bytes, query_params: dict, client_ip: str, http_version: str = "1.1",
 ):
-    """Handle API Gateway execute-api data plane requests (Host-based + path-based)."""
+    try:
+        return await _get_module("cloudfront").handle_viewer_request(
+            dist, method, path, raw_path, raw_query_string, headers, body, query_params, client_ip,
+            http_version=http_version,
+        )
+    except Exception as e:
+        logger.exception("Error in CloudFront data-plane dispatch: %s", e)
+        return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
+
+
+async def _handle_cloudfront_dataplane_request(
+    host: str, path: str, raw_path: str, raw_query_string: str, method: str,
+    headers: dict, body: bytes, query_params: dict, client_ip: str, http_version: str = "1.1",
+):
+    """Serve a CloudFront distribution's viewer traffic, matched by its ``<label>.cloudfront.net`` Host."""
+    label = _parse_cloudfront_dataplane_host(host)
+    dist = _get_module("cloudfront").find_distribution_for_label(label) if label is not None else None
+    if dist is None:
+        return None
+    return await _serve_cloudfront_distribution(
+        dist, path, raw_path, raw_query_string, method, headers, body, query_params, client_ip, http_version)
+
+
+async def _handle_cloudfront_alias_request(
+    host: str, path: str, raw_path: str, raw_query_string: str, method: str,
+    headers: dict, body: bytes, query_params: dict, client_ip: str, http_version: str = "1.1",
+):
+    """Serve a request whose Host is a distribution's alternate domain name. Runs after every other Host-claiming
+    handler: on AWS DNS sends those hosts to their own service, here the Host is the only signal."""
+    # A signed AWS API call is never viewer traffic, even when an alias covers the host clients reach MiniStack by.
+    if (headers.get("authorization", "").startswith("AWS4-HMAC-SHA256")
+            or any(k.lower() == "x-amz-credential" for k in (query_params or {}))):
+        return None
+    dist = _resolve_cloudfront_alias_request(host)
+    if dist is None:
+        return None
+    return await _serve_cloudfront_distribution(
+        dist, path, raw_path, raw_query_string, method, headers, body, query_params, client_ip, http_version)
+
+
+def _invoke_as_api_owner(api_id: str) -> str | None:
+    """Run an API another account owns as its owner; returns the caller's account, or None."""
+    apigw_v1 = _get_module("apigateway_v1")
+    apigw_v2 = _get_module("apigateway")
+    if apigw_v1.find_api_scope(api_id) is not None or apigw_v2.find_api_scope(api_id) is not None:
+        return None
+    owner = apigw_v1.find_api_owner(api_id) or apigw_v2.find_api_owner(api_id)
+    if not owner:
+        return None
+    caller_account = _request_account_id.get()
+    _request_account_id.set(owner)
+    return caller_account
+
+
+async def _handle_execute_api_request(
+    host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict,
+    raw_path: str | None = None, raw_query_string: str | None = None,
+):
+    """Handle API Gateway execute-api data plane requests (Host-based,
+    path-based, and registered custom domains)."""
     parsed = _parse_execute_api_url(host, path)
+    stage_from_mapping = False
+    if parsed is None:
+        resolved = _resolve_custom_domain_request(host, path)
+        if resolved is not None:
+            api_id, mapped_stage, rest = resolved
+            if mapped_stage:
+                parsed = resolved
+                stage_from_mapping = True
+            else:
+                # A stage-less mapping leaves the stage to the request path:
+                # the first remaining segment is the tentative stage, exactly
+                # like a plain execute-api URL.
+                tentative, _, remainder = rest.lstrip("/").partition("/")
+                parsed = (api_id, tentative, "/" + remainder if remainder else "/")
     if parsed is None:
         return None
     api_id, tentative_stage, execute_path = parsed
+    caller_account = _invoke_as_api_owner(api_id)
+
+    # WebSocket @connections management API — /{stage}/@connections/{id}.
+    # The @connections prefix is authoritative; skip $default resolution.
+    connections = execute_path.startswith("/@connections/")
+    if connections or stage_from_mapping:
+        # A base-path mapping names its stage; the whole remainder is API path.
+        stage = tentative_stage
+    else:
+        # Resolved before authorizing, so the ARN names the stage the request
+        # actually reaches: a v2 API on $default serves from the root, so the
+        # first path segment is not a stage there and naming it one would
+        # authorize against a resource that does not exist. The call only reads
+        # the API's configured stages, and it answers a caller who is not
+        # authorized yet, so it reports nothing about why it failed.
+        try:
+            stage, execute_path = _resolve_stage_and_path(api_id, tentative_stage, execute_path)
+        except Exception as e:
+            logger.exception("Error resolving the execute-api stage: %s", e)
+            return 500, {"Content-Type": "application/json"}, json.dumps({"message": "Internal Server Error"}).encode()
+
+    # AWS authorizes the @connections API under execute-api:ManageConnections,
+    # a separate action that execute-api:Invoke does not carry.
+    denied = _enforce_execute_api(
+        api_id, stage, method, execute_path, headers, query_params,
+        iam_action="execute-api:ManageConnections" if connections else "execute-api:Invoke",
+        caller_account=caller_account,
+    )
+    if denied:
+        return denied
+
     try:
-        # WebSocket @connections management API — /{stage}/@connections/{id}.
-        # The @connections prefix is authoritative; skip $default resolution.
-        if execute_path.startswith("/@connections/"):
+        if connections:
             connection_id = execute_path[len("/@connections/") :].split("/", 1)[0]
             return await _get_module("apigateway").handle_connections_api(
-                method, api_id, tentative_stage, connection_id, body, headers
+                method, api_id, stage, connection_id, body, headers
             )
-        stage, execute_path = _resolve_stage_and_path(api_id, tentative_stage, execute_path)
-        if api_id in _get_module("apigateway_v1")._rest_apis:
-            return await _get_module("apigateway_v1").handle_execute(
-                api_id, stage, method, execute_path, headers, body, query_params
-            )
-        return await _get_module("apigateway").handle_execute(
-            api_id, stage, execute_path, method, headers, body, query_params
+        apigw_v1 = _get_module("apigateway_v1")
+        if apigw_v1.find_api_scope(api_id) is not None:
+            return await apigw_v1.handle_execute(api_id, stage, method, execute_path, headers, body, query_params)
+        apigw_v2 = _get_module("apigateway")
+        if apigw_v2.find_api_scope(api_id) is None:
+            return 404, {"Content-Type": "application/json"}, json.dumps({"message": "Not Found"}).encode()
+        if raw_path is not None and path.endswith(execute_path):
+            # `path` is the server's full decode, which also turns %25 into "%";
+            # an HTTP API keeps that one escape in rawPath.
+            prefix = path[: len(path) - len(execute_path)]
+            http_api_path = apigw_v2.decode_http_api_path(raw_path)
+            if http_api_path.startswith(prefix):
+                execute_path = http_api_path[len(prefix):]
+        status, resp_headers, resp_body = await apigw_v2.handle_execute(
+            api_id, stage, execute_path, method, headers, body, query_params, raw_query_string=raw_query_string,
         )
+        # An HTTP API names its request id apigw-requestid (16 base64 characters); x-amzn-requestid is a REST API's.
+        resp_headers.setdefault("apigw-requestid", base64.b64encode(os.urandom(11)).decode())
+        return status, resp_headers, resp_body
     except Exception as e:
         logger.exception("Error in execute-api dispatch: %s", e)
         return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
@@ -1144,21 +2231,114 @@ def _is_potential_alb_request(host: str, path: str) -> bool:
     )
 
 
-async def _handle_alb_request(host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict):
+def _parse_lambda_url(host: str, path: str) -> tuple[str, str] | None:
+    """Resolve a Function URL request into ``(url_id, function_path)``.
+
+    Two addressing modes, mirroring execute-api:
+      1. Host-based (AWS-native): ``{urlId}.lambda-url.{region}.<host>[:port]/{path}``
+      2. Path-based:              ``<host>[:port]/_aws/lambda-url/{urlId}/{path}``
+
+    The path-based form exists for the same reason as its execute-api
+    counterpart: browsers on macOS don't resolve ``*.localhost``, and many HTTP
+    clients can't override the ``Host`` header.
+    """
+    m = _LAMBDA_URL_RE.match(host)
+    if m:
+        return m.group(1), path or "/"
+
+    if path.startswith("/_aws/lambda-url/"):
+        rest = path[len("/_aws/lambda-url/") :]
+        url_id, _, remainder = rest.partition("/")
+        if url_id:
+            return url_id, "/" + remainder
+    return None
+
+
+def _function_url_auth_target(url_id: str) -> tuple[str, dict, tuple | None]:
+    """Resolve a Function URL id to what its invoke is authorized against.
+
+    Returns the resource ARN, the request's condition keys, and the raw
+    resolution (``None`` if the id did not resolve), which the handler reuses
+    to serve the request.
+
+    AWS evaluates ``lambda:InvokeFunctionUrl`` on the function ARN, qualifier
+    included, which is the resource the CDK's ``grantInvokeUrl`` names. Without
+    this the invoke was checked against ``*`` and no scoped grant could match.
+
+    ``lambda:FunctionUrlAuthType`` is the URL's own ``AuthType``, and the same
+    method conditions its grant on it, so the resource alone is not enough: an
+    unresolved key makes a condition false and the statement still would not
+    match. ``lambda:InvokedViaFunctionUrl`` is deliberately not supplied. It
+    restricts ``lambda:InvokeFunction`` only, and AWS denies an
+    ``InvokeFunctionUrl`` grant conditioned on it even when the invoke did come
+    through a Function URL.
+
+    An id that resolves to nothing keeps ``*`` and no keys. The lookup runs
+    before the caller is authorized, so it must report nothing about which URLs
+    exist.
+    """
+    resolved = _get_module("lambda_svc").resolve_function_url(url_id)
+    if resolved is None:
+        return "*", {}, None
+    account_id, region, func_name, qualifier, cfg = resolved
+    function_arn = f"arn:aws:lambda:{region}:{account_id}:function:{func_name}"
+    if qualifier:
+        function_arn = f"{function_arn}:{qualifier}"
+    return function_arn, {"lambda:FunctionUrlAuthType": cfg.get("AuthType", "AWS_IAM")}, resolved
+
+
+async def _handle_lambda_url_request(host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict,
+                                     source_ip: str | None = None):
+    """Handle Lambda Function URL data plane requests (Host-based + path-based)."""
+    parsed = _parse_lambda_url(host, path)
+    if parsed is None:
+        return None
+    url_id, function_path = parsed
+
+    resource_arn, service_context, resolved = _function_url_auth_target(url_id)
+    denied = _enforce_data_plane(
+        "lambda", "lambda:InvokeFunctionUrl", headers, query_params, "",
+        resource_arn=resource_arn, service_context=service_context,
+    )
+    if denied:
+        return denied
+
+    try:
+        # The handler reuses the lookup above; None makes it resolve again.
+        return await _get_module("lambda_svc").handle_function_url_request(
+            url_id, method, function_path, headers, body, query_params, resolved=resolved, source_ip=source_ip,
+        )
+    except Exception as e:
+        logger.exception("Error in Lambda Function URL dispatch: %s", e)
+        return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
+
+
+async def _handle_alb_request(
+    host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict, raw_query_string: str | None = None,
+    raw_path: str | None = None,
+):
     """Handle ALB data-plane requests for host-based and /_alb-prefixed addressing."""
     if not _is_potential_alb_request(host, path):
         return None
 
     alb_module = _get_module("alb")
-    load_balancer = alb_module.find_lb_for_host(host)
+    load_balancer = None
     dispatch_path = path
+    # Instance and IP targets get the path as the client sent it, percent-encoding included.
+    raw_dispatch_path = raw_path
 
-    if load_balancer is None and path.startswith(_ALB_PATH_PREFIX):
+    # /_alb/<name>/ names the load balancer dialed; Host then only feeds its listener rules.
+    if path.startswith(_ALB_PATH_PREFIX):
         path_parts = path[len(_ALB_PATH_PREFIX) :].split("/", 1)
         load_balancer = alb_module._find_lb_by_name(path_parts[0])
         if load_balancer:
             dispatch_path = "/" + path_parts[1] if len(path_parts) > 1 else "/"
+            if raw_path is not None and raw_path.startswith(_ALB_PATH_PREFIX):
+                raw_parts = raw_path[len(_ALB_PATH_PREFIX) :].split("/", 1)
+                raw_dispatch_path = "/" + raw_parts[1] if len(raw_parts) > 1 else "/"
 
+    if load_balancer is None:
+        load_balancer = alb_module.find_lb_for_host(host)
     if load_balancer is None:
         return None
 
@@ -1171,18 +2351,135 @@ async def _handle_alb_request(host: str, path: str, method: str, headers: dict, 
 
     try:
         return await alb_module.dispatch_request(
-            load_balancer, method, dispatch_path, headers, body, query_params, alb_port
+            load_balancer, method, dispatch_path, headers, body, query_params, alb_port,
+            raw_query_string=raw_query_string, raw_path=raw_dispatch_path,
         )
     except Exception as e:
         logger.exception("Error in ALB data-plane dispatch: %s", e)
         return 500, {"Content-Type": "application/json"}, json.dumps({"message": str(e)}).encode()
 
 
+_ACCESS_POINT_HOST_RE = re.compile(r"^(?P<name>[a-z0-9-]+)-(?P<account>\d{12})$")
+_MRAP_HOST_RE = re.compile(
+    r"^([a-z0-9]+\.mrap)\.accesspoint\.s3-global\.amazonaws\.com$", re.IGNORECASE
+)
+
+
+def _resolve_mrap_host(host: str):
+    """The member bucket for a Multi-Region Access Point host, or None.
+
+    An MRAP is addressed as `<alias>.mrap.accesspoint.s3-global.amazonaws.com`,
+    which is not a bucket name and so never matches the virtual-hosted rules.
+    Resolving it to a member bucket lets the whole existing S3 vhost path —
+    rewrite to path-style, IAM enforcement, the handler — apply unchanged.
+    """
+    match = _MRAP_HOST_RE.match(host.split(":")[0].strip())
+    if not match:
+        return None
+    try:
+        return _get_module("s3").resolve_mrap_bucket(match.group(1).lower())
+    except Exception:
+        return None
+
+
+def _enforce_mrap_request(host: str, bucket: str, method: str, mrap_path: str, headers: dict, body: bytes,
+                          query_params: dict):
+    """Under AUTH=true, authorize an MRAP request on its member bucket and then on the MRAP itself."""
+    from ministack.core.iam_actions import _s3_action, extract_resource_arn, s3_additional_checks, s3_service_context
+    from ministack.core.responses import get_account_id
+
+    s3_action = _s3_action(method, mrap_path, query_params)
+    if not AUTH or not s3_action:
+        return None
+    s3 = _get_module("s3")
+    s3_headers = s3._merge_hoisted_amz_headers(headers, query_params)
+    bucket_arn = extract_resource_arn("s3", method, mrap_path, s3_headers, body, query_params, "", "")
+    key = bucket_arn[len(f"arn:aws:s3:::{bucket}"):]
+    mrap_arn = f"arn:aws:s3::{get_account_id()}:accesspoint/{_MRAP_HOST_RE.match(host).group(1).lower()}"
+    service_context = s3_service_context(f"s3:{s3_action}", query_params, mrap_path, s3_headers)
+    for resource in (bucket_arn, mrap_arn + (f"/object{key}" if key else "")):
+        denied = _enforce_data_plane("s3", f"s3:{s3_action}", headers, query_params, "", resource_arn=resource,
+                                     service_context=service_context, named_resource=f'"{resource}"')
+        if denied:
+            return denied
+    for extra_action, extra_arn in s3_additional_checks(method, mrap_path, s3_headers, body, query_params):
+        denied = _enforce_data_plane("s3", extra_action, headers, query_params, "", resource_arn=extra_arn)
+        if denied:
+            return denied
+    return None
+
+
 async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: dict, body: bytes, query_params: dict):
     """Handle virtual-hosted S3 requests before generic routing."""
+    if _MRAP_HOST_RE.match(host.split(":")[0].strip()):
+        # Alias lookup is account-scoped and precedes the S3 handler. Verify
+        # a SigV4 presign first so lookup uses its credential owner's account.
+        error = _get_module("s3")._verify_presigned_sigv4(method, path, headers, query_params)
+        if error:
+            return error
+    mrap_bucket = _resolve_mrap_host(host)
+    if mrap_bucket:
+        # SigV4A (`AWS4-ECDSA-P256-SHA256`) is what S3 requires for an MRAP.
+        # Under AUTH=true its signature is verified with the request's other
+        # credentials. Otherwise the presign parameters are dropped and the
+        # request is served unverified, as header-signed requests are. A plain
+        # SigV4 presign is left alone and still verifies.
+        algorithm = (query_params.get("X-Amz-Algorithm") or [""])[0]
+        if "ECDSA" in str(algorithm).upper() and not AUTH:
+            query_params = {
+                k: v for k, v in query_params.items()
+                if not k.lower().startswith("x-amz-")
+            }
+        mrap_path = "/" + mrap_bucket + (path if path != "/" else "/")
+        # The MRAP and its bucket both have to allow the request.
+        denied = _enforce_mrap_request(host.split(":")[0].strip(), mrap_bucket, method, mrap_path, headers, body,
+                                       query_params)
+        if denied:
+            return denied
+        return await _get_module("s3").handle_request(
+            method, mrap_path, headers, body, query_params, signed_path=path,
+            enforce_bucket_region=False,
+        )
+
     bucket = _extract_s3_vhost_bucket(host)
     if not bucket or _S3_VHOST_EXCLUDE_RE.search(host) or bucket in _NON_S3_VHOST_NAMES:
         return None
+    # An access point ARN is addressed as `<name>-<account>.<host>`, signed `s3` or unsigned.
+    access_point_region = access_point_alias = None
+    ap_match = _ACCESS_POINT_HOST_RE.match(bucket)
+    s3 = _get_module("s3")
+    if ap_match and s3.signed_service(headers, query_params) == "s3-object-lambda":
+        # An Object Lambda Access Point ARN, same host shape, signed for Object Lambda.
+        from ministack.services import s3_object_lambda
+
+        record, olap_region, olap_error = s3_object_lambda.resolve_host(
+            ap_match.group("name"), ap_match.group("account"), headers, query_params)
+        if olap_error:
+            return olap_error
+        if AUTH:
+            from ministack.core.iam_actions import s3_object_lambda_action
+
+            action = s3_object_lambda_action(method, path.lstrip("/"), query_params)
+            if action:
+                denied = _enforce_data_plane("s3-object-lambda", action, headers, query_params, "",
+                                             resource_arn=s3.object_lambda_arn(record["Name"], region=olap_region))
+                if denied:
+                    return denied
+        query = urlencode(query_params, doseq=True)
+        url = f"http://{host}{path}" + (f"?{query}" if query else "")
+        return await s3_object_lambda.handle_request(record, olap_region, method, path.lstrip("/"), headers, body,
+                                                     query_params, url)
+    if ap_match and s3.signed_service(headers, query_params) in ("s3", None):
+        target = s3.resolve_access_point_host(
+            ap_match.group("name"), ap_match.group("account"), s3._signed_region(headers, query_params),
+            allow_foreign=s3.is_foreign_access_point_put(method, path.lstrip("/"), headers, query_params))
+        if target is not None:
+            ap_bucket, ap_region, ap_error = target
+            if ap_error:
+                return ap_error
+            bucket, access_point_region = ap_bucket, ap_region
+            access_point_alias = s3.resolve_access_point(ap_match.group("name"), ap_match.group("account"),
+                                                         ap_region)["Alias"]
     # CloudFront KVS data-plane clients (boto3 cloudfront-keyvaluestore with
     # inject_host_prefix=False) hit ministack with host=localhost and path
     # prefixed by /key-value-stores/. Host-name exclusion above doesn't fire,
@@ -1206,8 +2503,62 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
         return None
 
     vhost_path = "/" + bucket + path if path != "/" else "/" + bucket + "/"
+
+    # IAM enforcement for S3 virtual-hosted requests
+    if AUTH:
+        object_error = (None if method in {"HEAD", "DELETE"} and access_point_region is not None else
+                        _get_module("s3").validate_object_request(method, vhost_path, headers, query_params))
+        if object_error is None:
+            # An access point ARN host is validated as its alias, which names another account's access point.
+            write_path = (vhost_path if access_point_alias is None
+                          else f"/{access_point_alias}{vhost_path[len(bucket) + 1:]}")
+            object_error = _get_module("s3").validate_write_request(method, write_path, headers, query_params)
+        if object_error is not None:
+            return object_error
+        from ministack.core.iam_actions import (
+            _s3_action,
+            extract_resource_arn,
+            s3_access_point_resources,
+            s3_additional_checks,
+            s3_service_context,
+        )
+
+        # An access point ARN host is authorized as its alias.
+        iam_path = vhost_path if access_point_alias is None else f"/{access_point_alias}{vhost_path[len(bucket) + 1:]}"
+        s3_action = _s3_action(method, iam_path, query_params)
+        # x-amz-* headers hoisted into the query string count as the headers they stand for.
+        s3_headers = s3._merge_hoisted_amz_headers(headers, query_params)
+        if s3_action:
+            s3_resource = extract_resource_arn("s3", method, iam_path, s3_headers, body, query_params, "", "")
+            service_context = s3_service_context(f"s3:{s3_action}", query_params, iam_path, s3_headers)
+            for resource, keys in s3_access_point_resources(s3_resource, f"s3:{s3_action}"):
+                denied = _enforce_data_plane(
+                    "s3", f"s3:{s3_action}", headers, query_params, "", resource_arn=resource,
+                    service_context={**service_context, **keys},
+                    denied_response=(lambda result, keys=keys, resource=resource: _s3_foreign_denied(
+                        keys, f"s3:{s3_action}", result, resource, headers, query_params)),
+                )
+                if denied:
+                    return denied
+            # A copy also reads its source, a batch delete is one check per
+            # key, an attributes call is a pair, a governance bypass its own action.
+            for extra_action, extra_arn in s3_additional_checks(method, iam_path, s3_headers, body, query_params):
+                for resource, keys in s3_access_point_resources(extra_arn):
+                    denied = _enforce_data_plane("s3", extra_action, headers, query_params, "", resource_arn=resource,
+                                                 service_context=keys)
+                    if denied:
+                        return denied
+
     try:
-        return await _get_module("s3").handle_request(method, vhost_path, headers, body, query_params)
+        # The access point an ARN host names, for its Block Public Access settings.
+        access_point = (s3.resolve_access_point(ap_match.group("name"), ap_match.group("account"), access_point_region)
+                        if access_point_region else None)
+        # Pass the original (pre-rewrite) URI as signed_path so a presigned
+        # virtual-hosted URL, which signed the canonical URI without the bucket,
+        # verifies against what the client actually signed.
+        return await _get_module("s3").handle_request(method, vhost_path, headers, body, query_params, signed_path=path,
+                                                      access_point_region=access_point_region,
+                                                      access_point=access_point)
     except Exception as e:
         logger.exception("Error handling virtual-hosted S3 request: %s", e)
         from xml.sax.saxutils import escape as _xml_esc
@@ -1217,6 +2568,20 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
             {"Content-Type": "application/xml"},
             (f"<Error><Code>InternalError</Code><Message>{_xml_esc(str(e))}</Message></Error>".encode()),
         )
+
+
+def _s3_cors_target(host: str, path: str, path_style: bool = True) -> tuple[str, str] | None:
+    """``(bucket, key)`` of an existing bucket a request addresses by virtual host or path, for its CORS answer."""
+    bucket = _extract_s3_vhost_bucket(host)
+    if bucket and not _S3_VHOST_EXCLUDE_RE.search(host) and bucket not in _NON_S3_VHOST_NAMES:
+        key = path.lstrip("/")
+    elif path_style:
+        bucket, _, key = path.lstrip("/").partition("/")
+    else:
+        return None
+    if not bucket or _get_module("s3")._bucket_owner_account(bucket) is None:
+        return None
+    return bucket, key
 
 
 def _with_data_plane_headers(response, request_id: str, include_s3_id: bool = False, wildcard_cors: bool = True):
@@ -1232,11 +2597,168 @@ def _with_data_plane_headers(response, request_id: str, include_s3_id: bool = Fa
     status, headers, body = response
     if wildcard_cors and "Access-Control-Allow-Origin" not in headers:
         headers["Access-Control-Allow-Origin"] = "*"
-    headers["x-amzn-requestid"] = request_id
-    headers["x-amz-request-id"] = request_id
+    if "apigw-requestid" in headers:
+        return status, headers, body
+    # An API Gateway gateway response already carries the id it rendered.
+    request_id = headers.setdefault("x-amzn-requestid", request_id)
     if include_s3_id:
-        headers["x-amz-id-2"] = base64.b64encode(os.urandom(48)).decode()
+        headers.setdefault("x-amz-request-id", request_id)
+        headers.setdefault("x-amz-id-2", base64.b64encode(os.urandom(48)).decode())
+    else:
+        headers["x-amz-request-id"] = request_id
     return status, headers, body
+
+
+def _credential_failure(service: str, iam_action: str, request_id: str, denied, headers: dict):
+    """A failed authentication in the service's protocol, with the Content-Type AWS sends."""
+    from ministack.core.iam_actions import access_denied_response
+
+    status, resp_headers, body = access_denied_response(
+        service, iam_action, "", request_id, error_code=denied.code, message=denied.message, headers=headers
+    )
+    fix_error_content_type(service, status, resp_headers)
+    return status, resp_headers, body
+
+
+def _authenticate_only(service: str, headers: dict, query_params: dict, request_id: str):
+    """Under AUTH, refuse a request no IAM action covers when its credentials fail."""
+    if not AUTH:
+        return None
+    from ministack.core.iam_evaluator import check_credentials
+
+    failure = check_credentials(extract_access_key_id(headers, query_params), service)
+    return _credential_failure(service, "", request_id, failure, headers) if failure else None
+
+
+def _enforce_data_plane(
+    service: str, iam_action: str, headers: dict, query_params: dict, request_id: str, resource_arn: str = "*",
+    service_context: dict | None = None, auth_error_response=None, named_resource: str = "",
+    denied_response=None,
+):
+    """Enforce IAM auth on a data-plane path. Returns error tuple or None.
+
+    ``service_context`` carries the request's own condition keys, for a path
+    that has them. The generic router resolves those itself; a data-plane
+    handler has to pass them, because it knows the resource the router does not.
+    ``named_resource`` is the resource an identity-policy denial names, in the
+    error Content-Type of the service, for the services that word it so.
+    ``denied_response(result)`` may word a policy denial; None keeps the default.
+    """
+    if not AUTH:
+        return None
+    from ministack.core.iam_actions import access_denied_response, identity_denial_message
+    from ministack.core.iam_evaluator import AuthError, enforce
+
+    access_key = extract_access_key_id(headers, query_params)
+    denied = enforce(access_key, iam_action, service, extract_region(headers, query_params),
+                     resource_arn=resource_arn, service_context=service_context)
+    if denied:
+        if isinstance(denied, AuthError):
+            response = auth_error_response(denied) if auth_error_response else None
+            return response or _credential_failure(service, iam_action, request_id, denied, headers)
+        response = denied_response(denied) if denied_response else None
+        if response:
+            return response
+        explicit = denied.decision == "Deny"
+        message = ""
+        if named_resource and not (explicit and denied.resource_policy_arn):
+            message = identity_denial_message(iam_action, denied.principal_arn, named_resource, explicit)
+        response = access_denied_response(service, iam_action, denied.principal_arn, request_id, headers=headers,
+                                          message=message, explicit_deny=explicit,
+                                          resource_policy_arn=denied.resource_policy_arn)
+        if named_resource:
+            fix_error_content_type(service, response[0], response[1])
+        return response
+    return None
+
+
+def _s3_foreign_denied(keys: dict, iam_action: str, denied, resource: str, headers: dict, query_params: dict):
+    """The answer to a denial in a step of a PutObject through another account's access point, or None."""
+    from ministack.core.iam_actions import access_denied_response, s3_foreign_denial_message
+
+    message = s3_foreign_denial_message(keys, iam_action, denied.principal_arn, denied, resource)
+    if not message:
+        return None
+    return access_denied_response("s3", iam_action, denied.principal_arn, "", headers=headers, message=message,
+                                  explicit_deny=denied.decision == "Deny")
+
+
+def _enforce_ses_v2(method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str):
+    """Authorize an SES v2 call as ses:<operation> on the resource it names, which its denial names too."""
+    if not AUTH:
+        return None
+    from ministack.core.iam_actions import extract_iam_action, extract_resource_arn
+    from ministack.core.responses import get_account_id
+
+    iam_action = extract_iam_action("ses", method, path, headers, body, query_params)
+    if iam_action is None:
+        return _authenticate_only("sesv2", headers, query_params, request_id)
+    resource_arn = extract_resource_arn("ses", method, path, headers, body, query_params,
+                                        extract_region(headers, query_params), get_account_id())
+    return _enforce_data_plane("sesv2", iam_action, headers, query_params, request_id, resource_arn=resource_arn,
+                               named_resource=resource_arn)
+
+
+def _iceberg_json_failure(failure):
+    """A credential failure as both Iceberg REST catalogs send it, in application/json."""
+    status, resp_headers, resp_body = failure
+    return status, {**resp_headers, "Content-Type": "application/json"}, resp_body
+
+
+def _enforce_iceberg(method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str):
+    """Authorize an Iceberg REST call for the catalog the router serves it from, whatever it is signed for."""
+    from ministack.core.iam_actions import identity_denial_message
+    from ministack.core.iam_evaluator import AuthError, enforce
+
+    glue = _iceberg_targets_glue_catalog(path, query_params)
+    service = "glue" if glue else "s3tables"
+    catalog = _get_module(service)
+    # A route without the table bucket prefix answers 404 before any credential check.
+    if not glue and catalog.iceberg_lacks_prefix(method, path):
+        return None
+    checks = catalog.iceberg_iam_checks(method, path, body, query_params)
+    if not checks:
+        if failure := _authenticate_only(service, headers, query_params, request_id):
+            return _iceberg_json_failure(failure)
+        return None if glue else catalog.iceberg_prefix_error(method, path)
+    access_key, region = extract_access_key_id(headers, query_params), extract_region(headers, query_params)
+    for position, (iam_action, resource_arn) in enumerate(checks):
+        denied = enforce(access_key, iam_action, service, region, resource_arn=resource_arn)
+        if isinstance(denied, AuthError):
+            return _iceberg_json_failure(_credential_failure(service, iam_action, request_id, denied, headers))
+        if not denied:
+            continue
+        resp_headers = {"Content-Type": "application/json",
+                        "x-amzn-errortype": "ForbiddenResponse" if glue else "IrcForbiddenResponse"}
+        if method == "HEAD":
+            return 403, resp_headers, b""
+        # S3 Tables names only the first action's denial; a later one answers "Access Denied".
+        message = identity_denial_message(iam_action, denied.principal_arn, resource_arn,
+                                          denied.decision == "Deny") if glue or position == 0 else "Access Denied"
+        error = {"message": message, "type": "AccessDeniedException" if glue else "forbidden", "code": 403}
+        return 403, resp_headers, json.dumps({"error": error}).encode()
+    return None
+
+
+def _iceberg_targets_glue_catalog(path, query_params):
+    """Decide whether an ``/iceberg`` REST request belongs to the Glue Data
+    Catalog (Glue jobs + Firehose lakehouse) or to S3 Tables.
+
+    Glue catalog paths carry a ``catalogs/`` segment (from the prefix its
+    ``/config`` hands back). The initial config call has no prefix yet, so it is
+    routed by the ``warehouse`` query value: S3 Tables uses an
+    ``arn:aws:s3tables:`` ARN or an ``s3tablescatalog`` warehouse; anything else
+    (a Glue catalog ARN) is the Glue Data Catalog. A bare config call with no
+    warehouse keeps the historical default of S3 Tables.
+    """
+    if "/catalogs/" in path:
+        return True
+    warehouse = query_params.get("warehouse", "") if query_params else ""
+    if isinstance(warehouse, list):
+        warehouse = warehouse[0] if warehouse else ""
+    if not warehouse:
+        return False
+    return "s3tablescatalog" not in warehouse and not warehouse.startswith("arn:aws:s3tables:")
 
 
 async def _handle_special_data_plane_request(
@@ -1246,25 +2768,91 @@ async def _handle_special_data_plane_request(
     body: bytes,
     query_params: dict,
     request_id: str,
+    raw_path: str | None = None,
+    raw_query_string: str = "",
+    client_ip: str = "127.0.0.1",
+    http_version: str = "1.1",
 ):
     """Handle special-case service entrypoints before the generic router."""
-    if response := await _handle_s3_control_request(path, method, body, query_params, request_id):
+    # S3 Object Lambda's WriteGetObjectResponse, on any host: its modeled host
+    # prefix `<route>.<host>` doesn't resolve locally, so the route header decides.
+    if method == "POST" and path == "/WriteGetObjectResponse" and headers.get("x-amz-request-route"):
+        from ministack.services import s3_object_lambda
+
+        denied = _enforce_data_plane("s3-object-lambda", "s3-object-lambda:WriteGetObjectResponse",
+                                     headers, query_params, request_id)
+        if denied:
+            return denied
+        return s3_object_lambda.write_get_object_response(headers, body)
+    # Iceberg REST catalog — /iceberg/* is served by two catalogs that share the
+    # prefix: the Glue Data Catalog (the lakehouse a Glue job and Firehose both
+    # write) and S3 Tables. Dispatch between them so a table one writer commits,
+    # the other reads. Must not fall through to S3 (which reads "iceberg" as a
+    # bucket name).
+    if path.startswith("/iceberg"):
+        if AUTH and (denied := _enforce_iceberg(method, path, headers, body, query_params, request_id)):
+            return denied
+        try:
+            if _iceberg_targets_glue_catalog(path, query_params):
+                result = _get_module("glue")._handle_iceberg_rest(method, path, query_params, body=body)
+            else:
+                result = await _get_module("s3tables").handle_request(method, path, headers, body, query_params)
+            if result is not None:
+                return result
+            # Neither catalog matched the path: a proper Iceberg REST error,
+            # not an empty 200 a client would read as success.
+            return 404, {"Content-Type": "application/json"}, json.dumps(
+                {"error": {"message": f"Unknown Iceberg REST path: {path}",
+                           "type": "NotFoundException", "code": 404}}
+            ).encode()
+        except Exception as e:
+            logger.exception("Error in Iceberg REST catalog: %s", e)
+            return 500, {"Content-Type": "application/json"}, json.dumps({"error": str(e)}).encode()
+    if response := await _handle_s3_control_request(path, method, body, query_params, request_id, headers):
         return response
-    if response := await _handle_rds_data_request(method, path, headers, body, query_params):
+    if response := await _handle_rds_data_request(method, path, headers, body, query_params, request_id):
         return response
-    if response := await _handle_ses_v2_request(method, path, headers, body, query_params):
+    if response := await _handle_ses_v2_request(method, path, headers, body, query_params, request_id):
         return response
     if response := await _handle_ecr_registry_request(method, path, headers, body, query_params):
         return _with_data_plane_headers(response, request_id)
 
     host = headers.get("host", "")
-    if response := await _handle_execute_api_request(host, path, method, headers, body, query_params):
-        return _with_data_plane_headers(response, request_id, wildcard_cors=False)
-    if response := await _handle_s3_vhost_request(host, path, method, headers, body, query_params):
-        return _with_data_plane_headers(response, request_id, include_s3_id=True)
-    if response := await _handle_alb_request(host, path, method, headers, body, query_params):
+    if response := await _handle_cloudfront_dataplane_request(
+        host, path, raw_path if raw_path is not None else path, raw_query_string, method,
+        headers, body, query_params, client_ip, http_version,
+    ):
+        # A distribution adds its own headers (Via, X-Amz-Cf-Id, X-Amz-Cf-Pop, X-Cache), not an API's request ids.
+        return response
+    # Before S3 virtual hosting, which would read the collection id as a bucket.
+    if _AOSS_COLLECTION_HOST_RE.match(host) and (
+        response := await _get_module("opensearchserverless").handle_dataplane(
+            method, host, raw_path or path, raw_query_string, headers, body, query_params
+        )
+    ):
         return _with_data_plane_headers(response, request_id)
-    return None
+    if response := await _handle_execute_api_request(
+        host, path, method, headers, body, query_params, raw_path=raw_path, raw_query_string=raw_query_string
+    ):
+        return _with_data_plane_headers(response, request_id, wildcard_cors=False)
+    if response := await _handle_lambda_url_request(host, path, method, headers, body, query_params):
+        # A Function URL names its own x-amzn-RequestId and X-Amzn-Trace-Id; it sends no other request ids.
+        status, resp_headers, resp_body = response
+        if not any(k.lower() == "x-amzn-requestid" for k in resp_headers):
+            resp_headers["x-amzn-RequestId"] = request_id
+        return status, resp_headers, resp_body
+    if response := await _handle_s3_vhost_request(host, path, method, headers, body, query_params):
+        if AUTH and (target := _s3_cors_target(host, path, path_style=False)):
+            response[1].update(_get_module("s3").cors_response_headers(target[0], method, headers))
+        return _with_data_plane_headers(response, request_id, include_s3_id=True, wildcard_cors=not AUTH)
+    if response := await _handle_alb_request(host, path, method, headers, body, query_params, raw_query_string, raw_path):
+        # A load balancer passes its target's headers through; CORS and request ids are the application's.
+        return response
+    # A distribution's alternate domain name yields to every service that claims the Host.
+    return await _handle_cloudfront_alias_request(
+        host, path, raw_path if raw_path is not None else path, raw_query_string, method,
+        headers, body, query_params, client_ip, http_version,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1332,9 +2920,7 @@ def _ct_resources(service: str, method: str, path: str, body: bytes) -> list:
             return []
         resources = [{"ResourceName": parts[0], "ResourceType": "AWS::S3::Bucket"}]
         if len(parts) >= 2:
-            resources.append(
-                {"ResourceName": "/".join(parts[1:]), "ResourceType": "AWS::S3::Object"}
-            )
+            resources.append({"ResourceName": "/".join(parts[1:]), "ResourceType": "AWS::S3::Object"})
         return resources
 
     if service in ("dynamodb", "lambda", "sqs", "sns", "kinesis"):
@@ -1387,6 +2973,7 @@ def _ct_request_params(headers: dict, body: bytes, query_params: dict) -> dict:
     if "form" in ct:
         try:
             from urllib.parse import parse_qs as _pqs
+
             raw = {k: v[0] if len(v) == 1 else v for k, v in _pqs(body.decode("utf-8", errors="replace")).items()}
             return raw
         except Exception:
@@ -1428,7 +3015,7 @@ def _maybe_record_cloudtrail(
     try:
         event_name = _ct_event_name(service, method, path, headers, query_params)
         resources = _ct_resources(service, method, path, body)
-        access_key_id = extract_access_key_id(headers) or "test"
+        access_key_id = extract_access_key_id(headers, query_params) or "test"
         user_agent = headers.get("user-agent", "")
         request_params = _ct_request_params(headers, body, query_params)
         ct_mod.record_event(
@@ -1453,26 +3040,282 @@ def _maybe_record_cloudtrail(
 
 
 def _routing_params(method: str, path: str, headers: dict, body: bytes, query_params: dict) -> dict:
-    """Augment routing params for unsigned form-encoded requests whose Action lives in the body."""
-    routing_params = query_params
-    if not query_params.get("Action") and headers.get("content-type", "").startswith(
+    """Augment routing params with a query-protocol request's form-encoded body.
+
+    The query-protocol services (EC2, CloudFormation, CloudWatch, Auto Scaling,
+    ElastiCache) put every parameter in the body when the SDK POSTs, which
+    botocore does. An unsigned request's ``Action`` lives there, and so does the
+    resource the caller named: this dict is what ``extract_resource_arn``
+    receives, so without the rest of the body it resolves nothing and a
+    resource-scoped policy can never match.
+
+    Merged underneath the query string, which still wins, and only for the one
+    content type that carries it.
+    """
+    if not body or not headers.get("content-type", "").startswith(
         "application/x-www-form-urlencoded"
     ):
-        body_params = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
-        if body_params.get("Action"):
-            routing_params = {**query_params, "Action": body_params["Action"]}
-    return routing_params
+        return query_params
+    body_params = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
+    if not body_params:
+        return query_params
+    return {**body_params, **query_params}
+
+
+def _unknown_query_error(body: bytes, request_id: str):
+    """A form-encoded (Query-protocol) request reached the router for a service
+    MiniStack does not implement (redshift, elasticbeanstalk, cloudsearch, sdb,
+    importexport, ...). Real AWS answers with the Query ``<ErrorResponse>``
+    envelope at HTTP 400 (``<Type>Sender</Type>``, code ``InvalidAction``);
+    falling through to S3 returns a 405 ``<Error>`` root that botocore's query
+    parser can't read, raising a bare ``KeyError('Error')`` instead of a
+    ``ClientError``."""
+    action = ""
+    try:
+        from urllib.parse import parse_qs
+
+        action = (parse_qs(body.decode("utf-8", "replace")).get("Action") or [""])[0]
+    except Exception:
+        pass
+    msg = (
+        f"The action {action} is not valid for this web service."
+        if action
+        else "The requested action is not valid for this web service."
+    )
+    msg = msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # Query error envelopes carry no <?xml?> declaration (AWS captures).
+    xml = (
+        '<ErrorResponse xmlns="http://webservices.amazon.com/doc/2010-05-08/">'
+        f"<Error><Type>Sender</Type><Code>InvalidAction</Code><Message>{msg}</Message></Error>"
+        f"<RequestId>{request_id}</RequestId></ErrorResponse>"
+    )
+    return 400, {"Content-Type": "text/xml"}, xml.encode()
 
 
 async def _dispatch_service_request(
     method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str
 ):
-    """Dispatch a request through the generic service router."""
+    """Dispatch AWS service requests and Kubernetes TokenReviews."""
+    if method == "POST" and path.startswith("/_ministack/eks-auth/"):
+        # TokenReview carries its own credentials; EKS authenticates the token.
+        return await _get_module("eks").handle_request(
+            method, path, headers, body, query_params
+        )
+
+    # Generic AWS service routing and IAM enforcement
     routing_params = _routing_params(method, path, headers, body, query_params)
     service = detect_service(method, path, headers, routing_params)
+
+    # S3 is the exception: there Content-Encoding is object metadata, and the
+    # body must reach the handler exactly as sent. Everywhere else the header
+    # means the request body itself is compressed.
+    if service != "s3":
+        inflated = _decompress_request_body(body, headers)
+        if inflated is not body:
+            body = inflated
+            routing_params = _routing_params(method, path, headers, body, query_params)
+
     region = extract_region(headers)
 
     logger.debug("%s %s -> service=%s region=%s", method, path, service, region)
+
+    if service == "unknown_query":
+        return _unknown_query_error(body, request_id)
+
+    if AUTH and service == "s3":
+        object_error = _get_module("s3").validate_object_request(method, path, headers, query_params)
+        if object_error is None:
+            object_error = _get_module("s3").validate_write_request(method, path, headers, query_params)
+        if object_error is not None:
+            return object_error
+
+    # AppSync authorizes a GraphQL request by the API's own authorization types.
+    appsync_graphql = service == "appsync" and method == "POST" and (
+        _APPSYNC_GRAPHQL_RE.match(path)
+        or (path == "/graphql" and re.search(r"\.appsync-api\.", headers.get("host", ""))))
+    if AUTH and not appsync_graphql:
+        from ministack.core.iam_actions import (
+            access_denied_response,
+            agentcore_endpoint_arn,
+            dynamodb_resource_arns,
+            dynamodb_service_context,
+            dynamodb_transaction_checks,
+            eventbridge_resource_arns,
+            extract_iam_action,
+            extract_resource_arn,
+            iot_resource_arns,
+            logs_service_context,
+            request_field_context,
+            request_tag_context,
+            s3_access_point_resources,
+            s3_foreign_denial_message,
+            s3_service_context,
+            verified_access_resource_arns,
+        )
+        from ministack.core.iam_evaluator import AuthError, enforce, pin_request_caller
+        from ministack.core.responses import get_account_id
+
+        pin_request_caller(headers, query_params)
+        iam_action = extract_iam_action(service, method, path, headers, body, routing_params)
+        denial_message = ""
+        if service == "ses" and (path.startswith("/v2/") or "sesv2" in headers.get("x-amz-target", "").lower()):
+            # SES v2 also answers on paths without /v2/email when the target header names it: authorize the call
+            # as the /v2/email operation it performs, never as an action the target header names.
+            v2_path = path if path.startswith(_SES_V2_PREFIX) else f"{_SES_V2_PREFIX}/{path.lstrip('/')}"
+            if denied := _enforce_ses_v2(method, v2_path, headers, body, query_params, request_id):
+                return denied
+            iam_action = None
+        elif iam_action is None and (failure := _authenticate_only(service, headers, query_params, request_id)):
+            return failure
+        if iam_action is not None:
+            access_key = extract_access_key_id(headers, query_params)
+            resource_arn = extract_resource_arn(
+                service, method, path, headers, body, routing_params, region, get_account_id()
+            )
+            service_context = (
+                dynamodb_service_context(body) if service == "dynamodb"
+                else s3_service_context(iam_action, query_params, path,
+                                        _get_module("s3")._merge_hoisted_amz_headers(headers, query_params))
+                if service == "s3"
+                else None
+            )
+            if service == "logs":
+                from ministack.services import cloudwatch_logs
+
+                logs_validation_error = None
+                if iam_action in {"logs:TagResource", "logs:UntagResource", "logs:ListTagsForResource"}:
+                    try:
+                        logs_payload = json.loads(body or b"{}")
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        logs_payload = None
+                    if isinstance(logs_payload, dict):
+                        logs_validation_error = cloudwatch_logs.validate_tag_resource_arn(
+                            logs_payload.get("resourceArn", ""), account_id=get_account_id(), region=region,
+                        )
+                service_context = logs_service_context(
+                    iam_action.split(":", 1)[1], body, resource_arn, region, get_account_id()
+                )
+            service_context = {**request_tag_context(service, iam_action, body, routing_params),
+                               **request_field_context(service, iam_action, body, routing_params, region),
+                               **(service_context or {})}
+            # A DynamoDB transaction is not itself an IAM action: each item is
+            # authorized as the single-item action it performs, on its table.
+            transaction_checks = (
+                dynamodb_transaction_checks(iam_action, body, region, get_account_id())
+                if service == "dynamodb" else []
+            )
+            if transaction_checks:
+                denied = None
+                item_context = {**(service_context or {}),
+                                "dynamodb:EnclosingOperation": [iam_action.split(":", 1)[1]]}
+                for item_action, item_arn in transaction_checks:
+                    denied = enforce(
+                        access_key, item_action, service, region,
+                        resource_arn=item_arn, service_context=item_context,
+                    )
+                    if denied:
+                        iam_action = item_action  # named in the AccessDenied message
+                        break
+            else:
+                # Through an S3 access point alias the check is made on the access point and on its bucket.
+                for checked_arn, keys in (s3_access_point_resources(resource_arn, iam_action) if service == "s3"
+                                          else [(resource_arn, {})]):
+                    denied = enforce(
+                        access_key, iam_action, service, region,
+                        resource_arn=checked_arn, service_context={**service_context, **keys},
+                    )
+                    if denied:
+                        denial_message = (s3_foreign_denial_message(keys, iam_action, denied.principal_arn, denied,
+                                                                    checked_arn)
+                                          if service == "s3" and not isinstance(denied, AuthError) else "")
+                        break
+            # A malformed Logs tagging ARN fails validation ahead of a policy denial.
+            if service == "logs" and logs_validation_error is not None and not isinstance(denied, AuthError):
+                return logs_validation_error
+            # A copy also reads its source, a batch delete is one check per
+            # key, an attributes call is a pair, a governance bypass its own action.
+            if service == "s3" and not denied:
+                from ministack.core.iam_actions import s3_additional_checks
+
+                s3_headers = _get_module("s3")._merge_hoisted_amz_headers(headers, query_params)
+                extra_checks = [(extra_action, checked_arn, keys)
+                                for extra_action, extra_arn in s3_additional_checks(method, path, s3_headers, body,
+                                                                                    routing_params)
+                                for checked_arn, keys in s3_access_point_resources(extra_arn)]
+                for extra_action, checked_arn, keys in extra_checks:
+                    denied = enforce(access_key, extra_action, service, region, resource_arn=checked_arn,
+                                     service_context=keys)
+                    if denied:
+                        iam_action = extra_action
+                        break
+            if service == "dynamodb" and not denied and not transaction_checks:
+                resources = dynamodb_resource_arns(body, region, get_account_id())
+                for extra_arn in resources[1:]:
+                    denied = enforce(
+                        access_key,
+                        iam_action,
+                        service,
+                        region,
+                        resource_arn=extra_arn,
+                        service_context=service_context,
+                    )
+                    if denied:
+                        break
+            # PutEvents carries one entry per event, and entries may name
+            # different buses: AWS authorizes each against its own bus.
+            if service == "bedrock-agentcore" and method == "POST" and not denied:
+                endpoint_arn = agentcore_endpoint_arn(path, routing_params)
+                if endpoint_arn:
+                    denied = enforce(access_key, iam_action, service, region, resource_arn=endpoint_arn)
+            if service == "events" and not denied:
+                for extra_arn in eventbridge_resource_arns(
+                        body, region, get_account_id())[1:]:
+                    denied = enforce(
+                        access_key, iam_action, service, region,
+                        resource_arn=extra_arn,
+                    )
+                    if denied:
+                        break
+            # A thing-group membership call is also checked on the thing it names.
+            if service == "iot" and not denied:
+                for extra_arn in iot_resource_arns(method, path, body, region, get_account_id())[1:]:
+                    denied = enforce(
+                        access_key, iam_action, service, region,
+                        resource_arn=extra_arn, service_context=service_context,
+                    )
+                    if denied:
+                        resource_arn = extra_arn  # named in the AccessDenied message
+                        break
+            # A Verified Access call is also checked on every other resource it names.
+            if service == "ec2" and not denied:
+                for extra_arn in verified_access_resource_arns(routing_params, region, get_account_id())[1:]:
+                    denied = enforce(
+                        access_key, iam_action, service, region,
+                        resource_arn=extra_arn, service_context=service_context,
+                    )
+                    if denied:
+                        resource_arn = extra_arn
+                        break
+            if (
+                denied
+                and service == "bedrock-agentcore"
+                and iam_action == "bedrock-agentcore:InvokeAgentRuntime"
+                and not isinstance(denied, AuthError)
+            ):
+                from ministack.services import bedrock_agentcore
+
+                if bedrock_agentcore.resource_policy_allows_without_identity(
+                    path, query_params
+                ):
+                    denied = None
+            if denied:
+                if isinstance(denied, AuthError):
+                    return _credential_failure(service, iam_action, request_id, denied, headers)
+                return access_denied_response(
+                    service, iam_action, denied.principal_arn, request_id, headers=headers,
+                    resource_arn=resource_arn, explicit_deny=denied.decision == "Deny",
+                    resource_policy_arn=denied.resource_policy_arn, message=denial_message,
+                )
 
     handler = SERVICE_HANDLERS.get(service)
     if not handler:
@@ -1492,19 +3335,37 @@ async def _dispatch_service_request(
             json.dumps({"__type": "InternalError", "message": str(e)}).encode(),
         )
 
+    # Real AWS picks a response envelope's Content-Type from the service's
+    # protocol — normalize any generic envelope the service emitted to the
+    # wire value (evidence: diffs against committed real-AWS wire captures;
+    # multi-region for the success path).
+    fix_error_content_type(service, status, resp_headers)
+    fix_success_content_type(service, status, resp_headers)
+
     _maybe_record_cloudtrail(service, method, path, headers, body, query_params, request_id, region)
 
+    cors = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, HEAD, OPTIONS, PATCH",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Expose-Headers": "*",
+    }
+    if AUTH and service == "s3":
+        # Under AUTH only the bucket's CORS configuration adds CORS headers.
+        target = _s3_cors_target(headers.get("host", ""), path)
+        cors = _get_module("s3").cors_response_headers(target[0], method, headers) if target else {}
     resp_headers.update(
         {
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, HEAD, OPTIONS, PATCH",
-            "Access-Control-Allow-Headers": "*",
-            "Access-Control-Expose-Headers": "*",
+            **cors,
             "x-amzn-requestid": request_id,
-            "x-amz-request-id": request_id,
-            "x-amz-id-2": base64.b64encode(os.urandom(48)).decode(),
         }
     )
+    if service == "s3":
+        resp_headers.setdefault("x-amz-request-id", request_id)
+        resp_headers.setdefault("x-amz-id-2", base64.b64encode(os.urandom(48)).decode())
+    else:
+        resp_headers["x-amz-request-id"] = request_id
+        resp_headers["x-amz-id-2"] = base64.b64encode(os.urandom(48)).decode()
     return status, resp_headers, resp_body
 
 
@@ -1513,8 +3374,25 @@ async def _dispatch_service_request(
 # ---------------------------------------------------------------------------
 
 
+_RESPONSE_START_MESSAGES = ("http.response.start", "websocket.accept", "websocket.http.response.start")
+
+
+def _with_date_header(send):
+    """AWS sends one Date per response: a proxied target's, or the endpoint's own when there is none."""
+    async def send_with_date(message):
+        if message["type"] in _RESPONSE_START_MESSAGES and not any(
+            name.lower() == b"date" for name, _ in message.get("headers", [])
+        ):
+            message = {**message, "headers": [*message.get("headers", []), (b"date", formatdate(usegmt=True).encode("ascii"))]}
+        await send(message)
+
+    return send_with_date
+
+
 async def app(scope, receive, send):
     """ASGI application entry point."""
+    if scope["type"] in ("http", "websocket"):
+        send = _with_date_header(send)
     if scope["type"] == "lifespan":
         await _handle_lifespan(scope, receive, send)
         return
@@ -1529,6 +3407,19 @@ async def app(scope, receive, send):
                 ws_headers[name.decode("latin-1").lower()] = value.decode("utf-8")
             except UnicodeDecodeError:
                 ws_headers[name.decode("latin-1").lower()] = value.decode("latin-1")
+        # WebSocket connect URLs are SigV4-presigned (credentials in query
+        # params, not the header). Set the request's tenant scope so
+        # account/region-scoped lookups resolve under the caller rather than the
+        # default — the WS entry path never did this before.
+        ws_query = parse_qs(
+            scope.get("query_string", b"").decode("utf-8", errors="replace"),
+            keep_blank_values=True,
+        )
+        _ws_key = extract_access_key_id(ws_headers, ws_query)
+        if _ws_key:
+            set_request_account_id(_ws_key)
+        ws_region = extract_region(ws_headers, ws_query)
+        set_request_region(ws_region)
         ws_host = ws_headers.get("host", "")
         ws_path = scope.get("path", "")
         parsed = _parse_execute_api_url(ws_host, ws_path)
@@ -1541,21 +3432,21 @@ async def app(scope, receive, send):
             return
         try:
             if parsed:
-                ws_api_id, _stage, _execute_path = parsed
+                ws_api_id, ws_stage, ws_execute_path = parsed
                 await _get_module("apigateway").handle_websocket(
-                    scope, receive, send, ws_api_id, path_override=_execute_path,
+                    scope,
+                    receive,
+                    send,
+                    ws_api_id,
+                    path_override=f"/{ws_stage}{ws_execute_path}",
                 )
             elif appsync_rt_m:
-                await _get_module("appsync_events").handle_websocket(
-                    scope, receive, send, appsync_rt_m.group(1)
-                )
+                await _get_module("appsync_events").handle_websocket(scope, receive, send, appsync_rt_m.group(1))
             else:
                 # IoT MQTT-over-WS — resolve account_id from SigV4 query
                 # params or Authorization header, fall back to default.
                 account_id = _ws_resolve_iot_account_id(scope, ws_headers)
-                await _get_module("iot").handle_websocket(
-                    scope, receive, send, account_id
-                )
+                await _get_module("iot").handle_websocket(scope, receive, send, account_id, ws_region)
         except Exception:
             logger.exception("Error in WebSocket dispatch")
             try:
@@ -1567,6 +3458,14 @@ async def app(scope, receive, send):
     if scope["type"] != "http":
         return
 
+    # Credential-bearing broker requests bypass generic body decoding, routing
+    # and tenant inference. The capability, not a client claim, selects RDS.
+    if scope["path"] == "/_ministack/rds/iam-auth":
+        from ministack.core import rds_iam
+
+        await rds_iam.handle(scope, receive, send, auth_enabled=AUTH)
+        return
+
     method = scope["method"]
     path = scope["path"]
     query_string = scope.get("query_string", b"").decode("utf-8")
@@ -1574,10 +3473,26 @@ async def app(scope, receive, send):
 
     headers = {}
     for name, value in scope.get("headers", []):
-        try:
-            headers[name.decode("latin-1").lower()] = value.decode("utf-8")
-        except UnicodeDecodeError:
-            headers[name.decode("latin-1").lower()] = value.decode("latin-1")
+        key = name.decode("latin-1").lower()
+        decoded = decode_header_value(value)
+        if key in headers:
+            # A field repeated across lines carries the same meaning as one
+            # comma-joined value (RFC 9110 5.2), and dropping either line
+            # loses data: the AWS SDK for Java v2 sends the caller's
+            # Content-Encoding and aws-chunked on separate lines, so keeping
+            # only the last one strips the caller's encoding along with the
+            # chunking marker. Cookie rejoins with "; " (RFC 9113 8.2.3).
+            headers[key] += ("; " if key == "cookie" else ", ") + decoded
+        else:
+            headers[key] = decoded
+
+    # USE_SSL terminates TLS here, so no proxy sets the header; fill it in.
+    if scope.get("scheme") == "https":
+        headers.setdefault("x-forwarded-proto", "https")
+    set_request_client_ip((scope.get("client") or ("127.0.0.1",))[0])
+    if AUTH:
+        pin_request_origin((scope.get("client") or ("127.0.0.1",))[0],
+                           headers.get("x-forwarded-proto", "").split(",")[0].strip().lower() == "https")
 
     request_id = str(uuid.uuid4())
 
@@ -1591,29 +3506,100 @@ async def app(scope, receive, send):
 
     # Set per-request account ID from credentials (multi-tenancy support).
     # If the access key is a 12-digit number, it becomes the account ID.
-    _access_key = extract_access_key_id(headers)
+    _access_key = extract_access_key_id(headers, query_params)
     if _access_key:
-        set_request_account_id(_access_key)
+        try:
+            set_request_account_id(_request_account_scope(_access_key) if AUTH else _access_key)
+        except AmbiguousAccessKeyError:
+            await _send_response(
+                send,
+                403,
+                {
+                    "Content-Type": "application/json",
+                    "x-amzn-requestid": request_id,
+                    "x-amz-request-id": request_id,
+                },
+                json.dumps(
+                    {
+                        "__type": "InvalidClientTokenId",
+                        "message": "The security token included in the request is invalid.",
+                    }
+                ).encode(),
+            )
+            return
 
     # Set per-request region from SigV4 Credential scope so CFN's AWS::Region
     # pseudo-param and ARN-building use the caller's region, not MINISTACK_REGION
-    # (issue #398). Falls back to MINISTACK_REGION env.
-    set_request_region(extract_region(headers))
-
-    if await _send_if_handled(send, await _handle_pre_body_request(method, path, headers, query_params, request_id)):
-        return
-
-    body = await _read_request_body(receive, method, headers)
-
-    if await _send_if_handled(send, await _handle_post_body_shortcuts(method, path, headers, body, query_params, request_id)):
-        return
+    # (issue #398). Falls back to MINISTACK_REGION env. Presigned (SigV4 query)
+    # requests carry the credential in query params, not the header.
+    set_request_region(extract_region(headers, query_params))
 
     if await _send_if_handled(
-        send, await _handle_special_data_plane_request(method, path, headers, body, query_params, request_id)
+        send, await _handle_pre_body_request(method, path, headers, query_params, request_id), receive
     ):
         return
 
-    await _send_response(send, *await _dispatch_service_request(method, path, headers, body, query_params, request_id))
+    if AUTH:
+        raw_path = scope.get("raw_path") or quote(path).encode()
+        pin_signed_request(method, raw_path.decode("latin-1"), query_params, scope.get("headers", []))
+    try:
+        body = await _read_request_body(receive, method, headers)
+    except _RequestBodyDisconnected:
+        return
+    except _IncompleteRequestBody as exc:
+        response = _incomplete_request_body_response(method, path, headers, query_params)
+        if response is not None:
+            await _send_if_handled(send, response, receive)
+            return
+        body = exc.body
+
+    if await _send_if_handled(
+        send, await _handle_post_body_shortcuts(method, path, headers, body, query_params, request_id), receive
+    ):
+        return
+
+    # Finalize ordinary S3 HEAD responses after both routing paths, including
+    # IAM denials. Presigns, access points and subresources keep their handlers.
+    head_path = None
+    # Iceberg routes are selected before S3, even when signed with scope s3.
+    if (method == "HEAD" and not path.startswith("/iceberg")
+            and detect_service(method, path, headers, query_params) == "s3"):
+        host = headers.get("host", "")
+        bucket = _extract_s3_vhost_bucket(host)
+        candidate = f"/{bucket}{path}" if bucket else path
+        ap_match = _ACCESS_POINT_HOST_RE.match(bucket) if bucket else None
+        has_access_point = ap_match is not None and _get_module("s3").resolve_access_point_host(
+            ap_match.group("name"), ap_match.group("account"), extract_region(headers)) is not None
+        if (not _MRAP_HOST_RE.match(host.split(":")[0].strip())
+                and not (bucket and (_S3_VHOST_EXCLUDE_RE.search(host) or has_access_point
+                             or bucket in _NON_S3_VHOST_NAMES))
+                and _get_module("s3").is_standard_object_request(method, candidate, headers, query_params)):
+            head_path = candidate
+
+    response = await _handle_special_data_plane_request(
+        method, path, headers, body, query_params, request_id,
+        raw_path=scope["raw_path"].decode("ascii") if scope.get("raw_path") else None,
+        raw_query_string=query_string,
+        client_ip=(scope.get("client") or ("127.0.0.1",))[0],
+        http_version=scope.get("http_version", "1.1"),
+    )
+    if response is not None and head_path is not None:
+        response = _get_module("s3").format_head_response(head_path, headers, response)
+    if await _send_if_handled(send, response, receive, head=head_path is not None):
+        return
+
+    status, resp_headers, resp_body = await _dispatch_service_request(
+        method, path, headers, body, query_params, request_id
+    )
+    if head_path is not None:
+        status, resp_headers, resp_body = _get_module("s3").format_head_response(
+            head_path, headers, (status, resp_headers, resp_body))
+    from ministack.core.responses import StreamingResponse
+
+    if isinstance(resp_body, StreamingResponse):
+        await _send_streaming_response(send, receive, status, resp_headers, resp_body)
+    else:
+        await _send_response(send, status, resp_headers, resp_body, head=head_path is not None)
 
 
 # ---------------------------------------------------------------------------
@@ -1621,8 +3607,34 @@ async def app(scope, receive, send):
 # ---------------------------------------------------------------------------
 
 
+# The boot task that imports iot and binds the mTLS listener, and the state
+# /_ministack/health and /_ministack/ready report for it.
+_iot_mtls_task = None
+_iot_mtls_state = "disabled"
+
+
+async def _start_iot_mtls():
+    """Import the iot module and bind the mTLS MQTT listener."""
+    global _iot_mtls_state
+    try:
+        from ministack.services import iot as _iot_svc
+
+        await _iot_svc.mtls_start()
+        if _iot_svc.mtls_is_listening():
+            _iot_mtls_state = "listening"
+        else:
+            # mtls_start returns without binding when the listener is off
+            # (cryptography missing, or IOT_MTLS_ENABLED=0), which is not a
+            # failure and must not report a healthy MiniStack as degraded.
+            _iot_mtls_state = "degraded" if _iot_svc.mtls_enabled() else "disabled"
+    except Exception as e:
+        _iot_mtls_state = "degraded"
+        logger.warning("IoT mTLS listener startup failed: %s", e)
+
+
 async def _handle_lifespan(scope, receive, send):
     """Handle ASGI lifespan events."""
+    global _iot_mtls_task, _iot_mtls_state
     while True:
         message = await receive()
         if message["type"] == "lifespan.startup":
@@ -1638,6 +3650,8 @@ async def _handle_lifespan(scope, receive, send):
             import concurrent.futures
 
             _max_workers = int(os.environ.get("MINISTACK_WORKER_THREADS", "64"))
+            global _MAIN_LOOP
+            _MAIN_LOOP = asyncio.get_running_loop()
             asyncio.get_running_loop().set_default_executor(
                 concurrent.futures.ThreadPoolExecutor(
                     max_workers=_max_workers,
@@ -1645,12 +3659,37 @@ async def _handle_lifespan(scope, receive, send):
                 )
             )
             logger.info("Worker thread pool: %d threads", _max_workers)
+            if _docker_socket_present():
+                from ministack.core.responses import install_docker_hub_fallback
+
+                install_docker_hub_fallback()
             _run_init_scripts()
             # Reap any container that survived a hard kill of the previous
             # process. Persistence strips container ids from snapshots, so any
             # ministack-labelled container alive at boot is by definition an
             # orphan whose name will collide on next create.
-            _stop_docker_containers()
+            #
+            # Bounded: the sweep normally finishes in well under a second and we
+            # wait for it, so a create right after boot still sees a clean slate.
+            # But it talks to the Docker daemon, and a slow or wedged daemon must
+            # never stop MiniStack from binding its port — that presents as a
+            # silent hang with an empty log. Past the deadline it finishes in the
+            # background while the server comes up.
+            # Periodic reclamation for the whole process lifetime, not just at
+            # boot: without it, containers (and their anonymous volumes) pile up
+            # for as long as MiniStack runs.
+            container_reaper.start(_reaper_docker_client)
+            # Boot only: also reclaim ownerless leftovers from a MiniStack that
+            # predates the instance labels. Holding the gateway port means any
+            # such container is ours. Shutdown deliberately does not do this —
+            # another instance may be live on this daemon.
+            _reap = spawn_background(_stop_docker_containers, True, thread_name="ministack-boot-reap")
+            _reap.join(timeout=_DOCKER_REAP_BOOT_DEADLINE)
+            if _reap.is_alive():
+                logger.warning(
+                    "Docker orphan reap still running after %ss; continuing " "startup without it",
+                    _DOCKER_REAP_BOOT_DEADLINE,
+                )
             if PERSIST_STATE:
                 _load_persisted_state()
             # Start the Transfer Family SFTP listener after persistence is
@@ -1660,24 +3699,67 @@ async def _handle_lifespan(scope, receive, send):
             # — its top-level `import asyncssh` pulls cryptography+OpenSSL
             # (~2–4 MiB of heap, plus C-level SSL contexts) which is pure
             # overhead for callers that aren't using Transfer Family.
+            # Only bind at boot for servers restored from persistence, which a
+            # client can connect to without calling CreateServer first. A fresh
+            # boot binds lazily on CreateServer instead — nobody can connect to
+            # a server that does not exist yet — which keeps asyncssh (and the
+            # cryptography + OpenSSL it drags in, ~26 MB of heap, measured
+            # 39.7 -> 27.9 MiB idle RSS) out of every MiniStack that never
+            # touches Transfer Family. Guarded on the module already being
+            # loaded, mirroring dsql below, so we never import it just to ask.
             _sftp_env = os.environ.get("SFTP_ENABLED", "").strip().lower()
+            _transfer_mod = _loaded_modules.get("transfer")
             if _sftp_env in ("0", "false", "no", "off"):
                 logger.debug("SFTP_ENABLED=%s — skipping transfer module import.", _sftp_env)
-            else:
+            elif _transfer_mod is not None and _transfer_mod.has_servers():
                 try:
-                    from ministack.services import transfer
-
-                    await transfer.sftp_start()
+                    await _transfer_mod.sftp_start()
                 except Exception as e:
                     logger.warning("Transfer SFTP startup failed: %s", e)
+            # Start the IoT mTLS MQTT listener, for the same reason and in the
+            # same place: it mints its server certificate from the Local CA and
+            # attributes devices via the certificate registry, both of which
+            # come out of persistence. On by default (port 8883) when
+            # cryptography is available, like the SFTP listener;
+            # IOT_MTLS_ENABLED=0 turns it off and IOT_MTLS_PORT moves it. The
+            # opt-out skips the iot import for the same reason SFTP's does:
+            # nothing else this boot may need the module, and importing it
+            # costs heap.
+            _iot_mtls_env = os.environ.get("IOT_MTLS_ENABLED", "").strip().lower()
+            if _iot_mtls_env in ("0", "false", "no", "off"):
+                logger.debug("IOT_MTLS_ENABLED=%s — skipping iot module import.", _iot_mtls_env)
+            else:
+                # Off the startup sequence: importing iot and minting the
+                # broker certificate is the bulk of a boot. The listener comes
+                # up after the HTTP port; /_ministack/ready waits for it and
+                # shutdown joins the task before stopping the listener.
+                _iot_mtls_state = "starting"
+                _iot_mtls_task = asyncio.create_task(_start_iot_mtls())
+            # Start DSQL wire proxies for clusters restored from persistence.
+            # Guarded on the module already being loaded (i.e. it had state
+            # or was used this boot) so we never import dsql just for this.
+            _dsql_mod = _loaded_modules.get("dsql")
+            if _dsql_mod is not None:
+                try:
+                    await _dsql_mod.start_restored_proxies()
+                except Exception as e:
+                    logger.warning("DSQL proxy startup failed: %s", e)
             # Start the EventBridge scheduler daemon explicitly. Module-import
             # autostart is gated by MINISTACK_TEST_NO_AUTOSTART so unit tests
             # don't race; lifespan.startup is the canonical place to spin it up.
             try:
                 from ministack.services import eventbridge as _eb_mod
+
                 _eb_mod.start_scheduler()
             except Exception as e:
                 logger.warning("EventBridge scheduler startup failed: %s", e)
+            # EventBridge Scheduler standalone schedules also need a firing loop (#958).
+            try:
+                from ministack.services import scheduler as _sched_mod
+
+                _sched_mod.start_scheduler()
+            except Exception as e:
+                logger.warning("Scheduler startup failed: %s", e)
             await send({"type": "lifespan.startup.complete"})
             logger.info("Ready — %d services available on port %s.", len(SERVICE_HANDLERS), port)
             # Per-service "init completed" lines are logged at DEBUG only — at
@@ -1689,78 +3771,112 @@ async def _handle_lifespan(scope, receive, send):
         elif message["type"] == "lifespan.shutdown":
             logger.info("MiniStack shutting down...")
             if PERSIST_STATE:
-                # Only save state for modules that were actually loaded
-                save_dict = {}
-                for key, mod_name in _state_map.items():
-                    if mod_name in _loaded_modules:
-                        save_dict[key] = _loaded_modules[mod_name].get_state
-                save_all(save_dict)
+                save_all(_build_persistence_save_dict())
             try:
                 from ministack.services import transfer
 
                 await transfer.sftp_stop()
             except Exception as e:
                 logger.debug("Transfer SFTP shutdown error: %s", e)
+            if _iot_mtls_task is not None:
+                try:
+                    await _iot_mtls_task
+                except Exception as e:
+                    logger.debug("IoT mTLS startup error: %s", e)
+            _iot_mod = sys.modules.get("ministack.services.iot")
+            if _iot_mod is not None:
+                try:
+                    await _iot_mod.mtls_stop()
+                except Exception as e:
+                    logger.debug("IoT mTLS shutdown error: %s", e)
             _stop_docker_containers()
             await send({"type": "lifespan.shutdown.complete"})
             return
 
 
-def _stop_docker_containers():
-    """Stop all Docker containers managed by MiniStack (RDS, ECS, ElastiCache).
-    Uses container labels to find them — does not touch service state.
+# Docker orphan reap bounds. The client timeout caps any single daemon call;
+# the boot deadline caps how long startup will wait for the whole sweep before
+# letting the server bind and finishing the reap in the background.
+_DOCKER_REAP_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
+_DOCKER_REAP_BOOT_DEADLINE = 10.0
 
-    Skip entirely if no Docker socket is available: importing the docker
-    SDK (and its requests/urllib3/idna transitive deps) costs ~1 MiB of
-    Python heap before we even know whether there's anything to clean.
-    """
+
+def _docker_socket_present() -> bool:
+    """False when DOCKER_HOST (or the default) names a unix socket that does not
+    exist, so the docker SDK is never imported on a host without a daemon."""
     sock = os.environ.get("DOCKER_HOST") or "unix:///var/run/docker.sock"
-    if sock.startswith("unix://"):
-        sock_path = sock[len("unix://"):]
-        if not os.path.exists(sock_path):
-            return
+    return not (sock.startswith("unix://") and not os.path.exists(sock[len("unix://") :]))
+
+
+def _reaper_docker_client():
+    """Docker client for the periodic reaper, or None when there is no daemon."""
+    if not _docker_socket_present():
+        return None
     try:
         import docker
 
-        client = docker.from_env()
+        return docker.from_env(timeout=_DOCKER_REAP_TIMEOUT)
     except Exception:
+        return None
+
+
+def _stop_docker_containers(include_unlabelled: bool = False):
+    """Remove every MiniStack container. Boot and shutdown only.
+
+    The reclamation rules live in ``core.container_reaper``: this is the
+    process-boundary phase (everything goes), while the periodic pass while the
+    server is live is ownership-aware and much more conservative. Keeping both
+    in one module means one label list and one place to reason about which
+    containers are ours.
+
+    Skips entirely when there is no Docker socket: importing the docker SDK
+    (and its requests/urllib3/idna transitive deps) costs ~1 MiB of Python heap
+    before we even know whether there is anything to clean.
+    """
+    client = _reaper_docker_client()
+    if client is None:
         return
-    for label in ("ministack=rds", "ministack=ecs", "ministack=elasticache", "ministack=eks", "ministack=lambda"):
-        try:
-            # all=True so exited-but-not-removed orphans get cleaned at boot.
-            for c in client.containers.list(all=True, filters={"label": label}):
-                try:
-                    c.stop(timeout=5)
-                    c.remove(v=True)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+    container_reaper.reap_all(client, include_unlabelled=include_unlabelled)
+    # *_PERSIST=0 keeps no data across a restart, so that service's named volumes go too.
+    for service, flag in (("rds", "RDS_PERSIST"), ("mwaa", "MWAA_PERSIST"), ("dsql", "DSQL_PERSIST")):
+        if os.environ.get(flag, "0").lower() not in ("1", "true", "yes"):
+            container_reaper.reap_volumes(client, service)
+
+
+def _build_persistence_save_dict():
+    """Build the {state_key: get_state} mapping that `save_all` consumes
+    at shutdown. Primary source is `_loaded_modules`, populated by
+    `_get_module()` on every routed request. Falls back to `sys.modules`
+    so modules reached only via sibling imports from other services
+    (e.g. `appsync` -> `appsync_events`, `apigateway` -> `apigateway_v1`,
+    `lambda` -> `cloudwatch_logs` for auto-created log groups, S3
+    notifications -> `eventbridge`) are still persisted. Without this
+    fallback, state created exclusively through cross-service code paths
+    is silently dropped at shutdown (#704 and class)."""
+    save_dict = {}
+    for key, mod_name in _state_map.items():
+        mod = _loaded_modules.get(mod_name)
+        if mod is None:
+            mod = sys.modules.get(f"ministack.services.{mod_name}")
+            if mod is None or not hasattr(mod, "get_state"):
+                continue
+        save_dict[key] = mod.get_state
+    return save_dict
 
 
 def _load_persisted_state():
-    """Load persisted state for services that support it."""
-    for svc_key in ("apigateway", "apigateway_v1", "servicediscovery"):
-        data = load_state(svc_key)
+    """Restore every saved service through the registry's uniform contract."""
+    for state_key, module_name in _state_map.items():
+        data = load_state(state_key)
         if data:
-            _get_module(svc_key).load_persisted_state(data)
-            logger.info("Loaded persisted state for %s", svc_key)
-
-    # Eagerly import persisted services whose restore path depends on
-    # a module-level `load_state()` side-effect, but which would not
-    # otherwise be imported during startup. These are NOT covered by
-    # the explicit central-restore loop above (no
-    # `load_persisted_state` method), and the lazy router will not
-    # pull them in early enough — for example, `ses_v2` is reached
-    # via the `/v2/email/*` path-prefix shortcut and `pipes` via
-    # CloudFormation, neither of which fires at lifespan startup.
-    # Importing here triggers the restore (and, for `pipes`, also
-    # restarts the background poller for any RUNNING pipe). Keep this
-    # list narrow — every entry costs a cold-start import. Enforced
-    # by `tests/test_persistence_symmetry.py::test_state_map_
-    # services_without_endpoint_are_eagerly_imported`.
-    for svc_key in ("pipes", "ses_v2"):
-        _get_module(svc_key)
+            try:
+                _get_module(module_name).load_persisted_state(data)
+                logger.info("Loaded persisted state for %s", state_key)
+            except Exception:
+                logger.exception(
+                    "Failed to restore persisted state for %s; continuing fresh",
+                    state_key,
+                )
 
 
 async def _wait_for_port(port, timeout=30):
@@ -1906,22 +4022,23 @@ def _reset_all_state():
 
     from ministack.core.persistence import PERSIST_STATE, STATE_DIR
 
-    # Stateful modules that don't have a routing entry in SERVICE_REGISTRY but
-    # still need reset() — REST API v1 (served via the apigateway module),
-    # SES v2 (served via the ses module), and EventBridge Pipes (CFN-only
-    # provisioner with a background poller thread that reset() must stop).
-    _extra_reset_modules = ("apigateway_v1", "ses_v2", "pipes")
-
-    module_names = {cfg["module"] for cfg in SERVICE_REGISTRY.values()}
-    module_names.update(_extra_reset_modules)
+    module_names = _registry_module_names()
 
     for mod_name in module_names:
-        if mod_name in _loaded_modules:
-            mod = _loaded_modules[mod_name]
-            try:
-                mod.reset()
-            except Exception as e:
-                logger.warning("reset() failed for %s: %s", mod_name, e)
+        # Same class fix as the shutdown save loop: a module reached only via
+        # sibling import from another service (e.g. `appsync` -> `appsync_events`,
+        # `apigateway` -> `apigateway_v1`, `lambda` -> `cloudwatch_logs`) is
+        # imported into `sys.modules` but never registered in `_loaded_modules`.
+        # Without the `sys.modules` fallback, those modules silently skip reset
+        # — leaving state across `/_ministack/reset` calls and breaking test
+        # isolation.
+        mod = _loaded_modules.get(mod_name) or sys.modules.get(f"ministack.services.{mod_name}")
+        if mod is None or not hasattr(mod, "reset"):
+            continue
+        try:
+            mod.reset()
+        except Exception as e:
+            logger.warning("reset() failed for %s: %s", mod_name, e)
 
     S3_DATA_DIR = os.environ.get("S3_DATA_DIR", "/tmp/ministack-data/s3")
     S3_PERSIST = os.environ.get("S3_PERSIST", "0") == "1"
@@ -2052,9 +4169,21 @@ def main():
 
         logging.getLogger("hypercorn.access").addFilter(_HealthLogFilter())
 
+        # Raise the soft fd limit to the hard one so connection bursts don't hit 1024.
+        try:
+            import resource
+
+            _soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+            if _soft < _hard:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (_hard, _hard))
+        except (ImportError, ValueError, OSError):
+            pass
+
         config = HypercornConfig()
         config.bind = [f"{bind_host}:{port}"]
         config.keep_alive_timeout = 75
+        # AWS closes client connections by time, not request count
+        config.keep_alive_max_requests = 10_000_000
         config.loglevel = LOG_LEVEL.upper()
 
         # USE_SSL=1 enables HTTPS — matches the behaviour previously provided
@@ -2062,10 +4191,22 @@ def main():
         # hypercorn CLI. Self-signed cert auto-generated under TMPDIR, or BYO
         # via MINISTACK_SSL_CERT + MINISTACK_SSL_KEY.
         from ministack.core import tls as _tls
+
         if _tls.use_ssl_enabled():
             config.certfile, config.keyfile = _tls.resolve_tls_material()
+            # A Cognito token's `iss` is https with no port, so clients ask 443.
+            if port != "443" and _port_is_bindable(bind_host, 443):
+                config.bind.append(f"{bind_host}:443")
 
-        asyncio.run(hypercorn_serve(app, config))
+        try:
+            asyncio.run(hypercorn_serve(app, config))
+        except OSError:
+            if len(config.bind) == 1:
+                raise
+            config.bind = config.bind[:1]
+            logger.warning("Port 443 became unavailable; serving on %s only",
+                           config.bind[0])
+            asyncio.run(hypercorn_serve(app, config))
     finally:
         _cleanup()
 

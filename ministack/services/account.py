@@ -1,3 +1,5 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
 AWS Account service stub (rest-json).
 
@@ -28,9 +30,8 @@ def _json(status, body):
     return status, {"Content-Type": "application/json"}, json.dumps(body).encode()
 
 
-# Single fixed creation timestamp per process — AWS returns the original
-# account creation time, which doesn't change. int epoch seconds per memory.
-_CREATED_AT = int(time.time()) - (365 * 24 * 3600)
+# Fixed per process; botocore marks AccountCreatedDate timestampFormat iso8601.
+_CREATED_AT = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 365 * 24 * 3600))
 
 
 def _get_account_information(_payload):
@@ -77,6 +78,19 @@ _OPT_IN_REQUIRED = {
 }
 
 
+def _page(items, limit, token):
+    try:
+        start = max(int(token), 0) if token else 0
+    except (TypeError, ValueError):
+        start = 0
+    try:
+        limit = int(limit) if limit else 0
+    except (TypeError, ValueError):
+        limit = 0
+    end = start + limit if limit > 0 else len(items)
+    return items[start:end], (str(end) if end < len(items) else None)
+
+
 def _list_regions(payload):
     filter_status = payload.get("RegionOptStatusContains") or []
     out = []
@@ -85,7 +99,11 @@ def _list_regions(payload):
         if filter_status and status not in filter_status:
             continue
         out.append({"RegionName": r, "RegionOptStatus": status})
-    return _json(200, {"Regions": out})
+    page, nxt = _page(out, payload.get("MaxResults"), payload.get("NextToken"))
+    resp = {"Regions": page}
+    if nxt:
+        resp["NextToken"] = nxt
+    return _json(200, resp)
 
 
 def _get_region_opt_status(payload):
@@ -107,7 +125,7 @@ _DISPATCH = {
 
 async def handle_request(method, path, headers, body, query_params):
     if method != "POST":
-        return error_response_json("InvalidRequest",
+        return error_response_json("ValidationException",
                                    f"Unsupported method {method}", 400)
     fn = _DISPATCH.get(path.rstrip("/"))
     if fn is None:
@@ -122,4 +140,12 @@ async def handle_request(method, path, headers, body, query_params):
 
 
 def reset():
+    pass
+
+
+def get_state() -> dict:
+    return {}
+
+
+def load_persisted_state(data: dict) -> None:
     pass

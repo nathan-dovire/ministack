@@ -1,5 +1,13 @@
-FROM python:3.12-alpine AS builder
+# Non-release builds intentionally use the maintainer-requested fallback of the latest
+# published full image. Release builds override this in docker-publish.yml with the
+# same-release full-image digest; plugin-source PRs build and consume a head-matched
+# full-preview digest in docker-publish-on-pr.yml.
+ARG PLUGIN_DONOR_IMAGE=ghcr.io/ministackorg/ministack:full
 
+FROM python:3.13-alpine AS builder
+
+# awscli 1.45.x pins botocore exactly and 1.46 bundles its own copy (~120 MB),
+# so the CLI is installed without deps and runs on the botocore pinned here.
 RUN pip install --no-cache-dir --no-compile \
         hypercorn==0.18.0 \
         "cbor2>=5.4.0" \
@@ -10,28 +18,44 @@ RUN pip install --no-cache-dir --no-compile \
         "pymysql>=1.1" \
         "asyncssh>=2.14" \
         "boto3>=1.34" \
-        "awscli"
+        "jsonata-python>=0.7.0" \
+        "graphql-core==3.2.12" \
+        "botocore==1.43.124" \
+        "docutils>=0.18.1,<=0.19" \
+        "colorama>=0.2.5,<0.4.7" \
+        "rsa>=3.1.2,<4.8" \
+    && pip install --no-cache-dir --no-compile --no-deps awscli==1.45.63
 
 # Strip awscli help examples (~25 MB) and Python cache files (~15 MB).
-RUN rm -rf /usr/local/lib/python3.12/site-packages/awscli/examples \
-    && find /usr/local/lib/python3.12/site-packages -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null \
-    && rm -rf /usr/local/lib/python3.12/site-packages/pip*.dist-info \
-    && rm -rf /usr/local/lib/python3.12/site-packages/pip*
+RUN rm -rf /usr/local/lib/python3.13/site-packages/awscli/examples \
+    && find /usr/local/lib/python3.13/site-packages -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null \
+    && rm -rf /usr/local/lib/python3.13/site-packages/pip*.dist-info \
+    && rm -rf /usr/local/lib/python3.13/site-packages/pip*
 
-FROM python:3.12-alpine
+# Plugin artifacts are release-stable; release builds pin this donor by digest.
+FROM ${PLUGIN_DONOR_IMAGE} AS plugin-donor
+
+FROM python:3.13-alpine AS runtime
+
+# Upgrade base packages to pick up latest security patches.
+RUN apk upgrade --no-cache && apk add --no-cache nodejs bash openssl && rm -f /usr/bin/wget /bin/wget \
+    && rm -rf /usr/local/lib/python3.13/site-packages/pip* /usr/local/bin/pip* \
+              /usr/local/lib/python3.13/idlelib \
+              /usr/local/lib/python3.13/pydoc_data /usr/local/lib/python3.13/tkinter \
+              /usr/local/lib/python3.13/turtledemo
+
+# Flatten so upgraded and deleted base files do not also ship in a lower layer.
+FROM scratch
+COPY --from=runtime / /
+ENV PATH=/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 LABEL maintainer="MiniStack" \
       description="Local AWS Service Emulator — drop-in LocalStack replacement"
 
-# Upgrade base packages to pick up latest security patches.
-RUN apk upgrade --no-cache && apk add --no-cache nodejs bash openssl && rm -f /usr/bin/wget /bin/wget \
-    && rm -rf /usr/local/lib/python3.12/site-packages/pip* \
-              /usr/local/bin/pip*
-
 WORKDIR /opt/ministack
 
 # Copy cleaned Python packages and CLI entrypoints from builder.
-COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
 COPY --from=builder /usr/local/bin/aws /usr/local/bin/aws
 COPY --from=builder /usr/local/bin/aws_completer /usr/local/bin/aws_completer
 COPY --from=builder /usr/local/bin/hypercorn /usr/local/bin/hypercorn
@@ -40,6 +64,7 @@ COPY bin/awslocal /usr/local/bin/awslocal
 RUN chmod +x /usr/local/bin/awslocal
 
 COPY ministack/ ministack/
+COPY --from=plugin-donor /opt/ministack/mysql-plugins /opt/ministack/mysql-plugins
 
 RUN addgroup -S ministack && adduser -S ministack -G ministack
 RUN mkdir -p /tmp/ministack-data/s3 && chown -R ministack:ministack /tmp/ministack-data
@@ -60,6 +85,9 @@ ENV MINISTACK_VERSION=${MINISTACK_VERSION} \
     REDIS_PORT=6379 \
     RDS_BASE_PORT=15432 \
     RDS_PERSIST=0 \
+    DSQL_BASE_PORT=25432 \
+    DSQL_PERSIST=0 \
+    DSQL_STRICT=0 \
     ELASTICACHE_BASE_PORT=16379 \
     LAMBDA_EXECUTOR=local \
     USE_SSL=0 \
@@ -71,6 +99,6 @@ EXPOSE 4566 2222
 
 # Pure Python healthcheck — no curl dependency; USE_SSL for HTTP/HTTPS.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-    CMD python -c "import os,ssl,urllib.request as r; t=os.environ.get('USE_SSL','').strip().lower() in ('1','true','yes'); r.urlopen(('https' if t else 'http')+'://localhost:4566/_ministack/health',context=ssl._create_unverified_context() if t else None)" || exit 1
+    CMD python -c "import os,ssl,urllib.request as r; t=os.environ.get('USE_SSL','').strip().lower() in ('1','true','yes'); p=os.environ.get('GATEWAY_PORT') or os.environ.get('EDGE_PORT') or '4566'; r.urlopen(('https' if t else 'http')+'://localhost:'+p+'/_ministack/health',context=ssl._create_unverified_context() if t else None)" || exit 1
 
 ENTRYPOINT ["python", "-m", "ministack"]

@@ -1,15 +1,19 @@
 """Ministack admin/core tests — health, config, persistence, hypercorn compat."""
 
-import io
+import asyncio
 import json
 import os
-import time
-import uuid as _uuid_mod
-import zipfile
+import urllib.error
+import urllib.request
+import xml.etree.ElementTree as ET
 from urllib.parse import urlparse
 
 import pytest
 from botocore.exceptions import ClientError
+
+from ministack import app as app_module
+
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
 
 # ========== from test_ministack.py ==========
 
@@ -37,7 +41,7 @@ def test_ministack_config_invalid_key_ignored():
     import json as _json
     import urllib.request
 
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     req = urllib.request.Request(
         f"{endpoint}/_ministack/config",
         data=_json.dumps(
@@ -56,18 +60,20 @@ def test_ministack_config_invalid_key_ignored():
 def test_ministack_health_endpoints():
     import urllib.request
 
-    resp_health = urllib.request.urlopen("http://localhost:4566/health")
+    resp_health = urllib.request.urlopen(f"{ENDPOINT}/health")
     assert resp_health.status == 200
     data_health = json.loads(resp_health.read())
     assert "services" in data_health
+    assert data_health["auth"] in {"enabled", "disabled"}
+    assert "auth_enabled" not in data_health
     assert "s3" in data_health["services"]
     assert data_health["edition"] == "light"
 
-    resp_ministack = urllib.request.urlopen("http://localhost:4566/_ministack/health")
+    resp_ministack = urllib.request.urlopen(f"{ENDPOINT}/_ministack/health")
     data_ministack = json.loads(resp_ministack.read())
     assert data_health == data_ministack
 
-    resp_localstack = urllib.request.urlopen("http://localhost:4566/_localstack/health")
+    resp_localstack = urllib.request.urlopen(f"{ENDPOINT}/_localstack/health")
     data_localstack = json.loads(resp_localstack.read())
     assert data_health == data_localstack
 
@@ -76,7 +82,7 @@ def test_localstack_unknown_paths_return_json_404():
     import urllib.error
     import urllib.request
 
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     for subpath in ("info", "plugins", "init"):
         url = f"{endpoint}/_localstack/{subpath}"
         try:
@@ -93,11 +99,69 @@ def test_localstack_unknown_paths_return_json_404():
             )
 
 
+def test_responses_do_not_advertise_the_emulator_server():
+    """No AWS endpoint answers with Hypercorn's Server value."""
+    import urllib.request
+
+    resp = urllib.request.urlopen(f"{ENDPOINT}/_ministack/health")
+    assert not (resp.headers.get("Server") or "").startswith("hypercorn")
+
+
+def test_http_and_websocket_responses_carry_one_date_header():
+    """Regression guard: with Hypercorn's own Date off, an http response and a WebSocket handshake
+    response each still carry exactly one."""
+    import asyncio
+    import urllib.request
+    from urllib.parse import urlparse
+
+    websockets = pytest.importorskip("websockets")
+    parsed = urlparse(ENDPOINT)
+
+    async def handshake():
+        url = f"ws://prefix-ats.iot.us-east-1.{parsed.hostname}:{parsed.port}/mqtt"
+        async with websockets.connect(url, subprotocols=["mqtt"]) as ws:
+            return ws.response.headers.get_all("Date")
+
+    assert len(urllib.request.urlopen(f"{ENDPOINT}/_ministack/health").headers.get_all("Date")) == 1
+    assert len(asyncio.run(handshake())) == 1
+
+
+def test_a_malformed_request_is_answered_with_one_date():
+    import socket
+    from urllib.parse import urlparse
+
+    parsed = urlparse(ENDPOINT)
+    with socket.create_connection((parsed.hostname, parsed.port), timeout=5) as sock:
+        sock.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\nContent-Length: abc\r\n\r\n")
+        head = sock.recv(65536).split(b"\r\n\r\n")[0].lower().split(b"\r\n")
+    assert head[0].startswith(b"http/1.1 400")
+    assert sum(line.startswith(b"date:") for line in head) == 1
+
+
+def test_a_refused_websocket_handshake_carries_one_date():
+    import asyncio
+    from urllib.parse import urlparse
+
+    websockets = pytest.importorskip("websockets")
+    parsed = urlparse(ENDPOINT)
+
+    async def refused():
+        url = f"ws://{parsed.hostname}:{parsed.port}/_aws/execute-api/nosuchapi/stage"
+        with pytest.raises(websockets.exceptions.InvalidStatus) as exc:
+            async with websockets.connect(url):
+                pass
+        return exc.value.response
+
+    response = asyncio.run(refused())
+    assert response.status_code == 403
+    assert len(response.headers.get_all("Date")) == 1
+
+
 def test_localstack_health_still_returns_200():
     """/_localstack/health must still return 200 after the interceptor is wired in."""
     import urllib.request
 
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     resp = urllib.request.urlopen(f"{endpoint}/_localstack/health", timeout=5)
     assert resp.status == 200
     data = json.loads(resp.read())
@@ -109,9 +173,8 @@ def test_localstack_health_still_returns_200():
 def test_ministack_package_core_importable():
     """ministack.core modules must all be importable."""
     from ministack.core.lambda_runtime import get_or_create_worker
-    from ministack.core.lambda_runtime import reset as lr_reset
-    from ministack.core.persistence import load_state, save_all
-    from ministack.core.responses import error_response_json, json_response, new_uuid
+    from ministack.core.persistence import save_all
+    from ministack.core.responses import json_response
     from ministack.core.router import detect_service
 
     assert callable(json_response)
@@ -124,7 +187,6 @@ def test_ministack_package_services_importable():
     """All core ministack.services modules must be importable and expose handle_request."""
     from ministack.services import (
         apigateway,
-        apigateway_v1,
         appsync_events,
         athena,
         cloudwatch,
@@ -191,7 +253,7 @@ def test_ministack_persist_sqs_roundtrip():
     saved_queues = dict(_sqs._queues)
     _sqs._queues.clear()
     _sqs._queue_name_to_url.clear()
-    _sqs.restore_state(state)
+    _sqs.load_persisted_state(state)
     assert "http://localhost:4566/000000000000/persist-q" in _sqs._queues
     _sqs._queues.update(saved_queues)
 
@@ -201,7 +263,7 @@ def test_ministack_persist_sns_roundtrip():
     state = _sns.get_state()
     assert "topics" in state
     _sns._topics.pop("arn:aws:sns:us-east-1:000000000000:persist-topic", None)
-    _sns.restore_state(state)
+    _sns.load_persisted_state(state)
     assert "arn:aws:sns:us-east-1:000000000000:persist-topic" in _sns._topics
     _sns._topics.pop("arn:aws:sns:us-east-1:000000000000:persist-topic", None)
 
@@ -211,7 +273,7 @@ def test_ministack_persist_ssm_roundtrip():
     state = _ssm.get_state()
     assert "parameters" in state
     _ssm._parameters.pop("/persist/key")
-    _ssm.restore_state(state)
+    _ssm.load_persisted_state(state)
     assert "/persist/key" in _ssm._parameters
     _ssm._parameters.pop("/persist/key")
 
@@ -221,7 +283,7 @@ def test_ministack_persist_secretsmanager_roundtrip():
     state = _sm.get_state()
     assert "secrets" in state
     _sm._secrets.pop("persist-secret")
-    _sm.restore_state(state)
+    _sm.load_persisted_state(state)
     assert "persist-secret" in _sm._secrets
     _sm._secrets.pop("persist-secret")
 
@@ -231,7 +293,7 @@ def test_ministack_persist_dynamodb_roundtrip():
     state = _ddb.get_state()
     assert "tables" in state
     _ddb._tables.pop("persist-tbl")
-    _ddb.restore_state(state)
+    _ddb.load_persisted_state(state)
     assert "persist-tbl" in _ddb._tables
     _ddb._tables.pop("persist-tbl")
 
@@ -241,7 +303,7 @@ def test_ministack_persist_eventbridge_roundtrip():
     state = _eb.get_state()
     assert "rules" in state
     _eb._rules.pop("default|persist-rule")
-    _eb.restore_state(state)
+    _eb.load_persisted_state(state)
     assert "default|persist-rule" in _eb._rules
     _eb._rules.pop("default|persist-rule")
 
@@ -251,7 +313,7 @@ def test_ministack_persist_kinesis_roundtrip():
     state = _kin.get_state()
     assert "streams" in state
     _kin._streams.pop("persist-stream")
-    _kin.restore_state(state)
+    _kin.load_persisted_state(state)
     assert "persist-stream" in _kin._streams
     _kin._streams.pop("persist-stream")
 
@@ -262,7 +324,7 @@ def test_ministack_persist_kms_roundtrip():
     state = _kms.get_state()
     assert "keys" in state
     _kms._keys.pop(key_id)
-    _kms.restore_state(state)
+    _kms.load_persisted_state(state)
     assert key_id in _kms._keys
     assert _kms._keys[key_id]["Description"] == "persist-key"
     _kms._keys.pop(key_id)
@@ -273,7 +335,7 @@ def test_ministack_persist_ec2_roundtrip():
     state = _ec2.get_state()
     assert "instances" in state
     _ec2._instances.pop("i-persist01")
-    _ec2.restore_state(state)
+    _ec2.load_persisted_state(state)
     assert "i-persist01" in _ec2._instances
     _ec2._instances.pop("i-persist01")
 
@@ -283,7 +345,7 @@ def test_ministack_persist_route53_roundtrip():
     state = _r53.get_state()
     assert "zones" in state
     _r53._zones.pop("Z00PERSIST")
-    _r53.restore_state(state)
+    _r53.load_persisted_state(state)
     assert "Z00PERSIST" in _r53._zones
     _r53._zones.pop("Z00PERSIST")
 
@@ -293,7 +355,7 @@ def test_ministack_persist_cognito_roundtrip():
     state = _cog.get_state()
     assert "user_pools" in state
     _cog._user_pools.pop("us-east-1_PERSIST")
-    _cog.restore_state(state)
+    _cog.load_persisted_state(state)
     assert "us-east-1_PERSIST" in _cog._user_pools
     _cog._user_pools.pop("us-east-1_PERSIST")
 
@@ -303,7 +365,7 @@ def test_ministack_persist_ecr_roundtrip():
     state = _ecr.get_state()
     assert "repositories" in state
     _ecr._repositories.pop("persist-repo")
-    _ecr.restore_state(state)
+    _ecr.load_persisted_state(state)
     assert "persist-repo" in _ecr._repositories
     _ecr._repositories.pop("persist-repo")
 
@@ -313,7 +375,7 @@ def test_ministack_persist_cloudwatch_roundtrip():
     state = _cw.get_state()
     assert "alarms" in state
     _cw._alarms.pop("persist-alarm")
-    _cw.restore_state(state)
+    _cw.load_persisted_state(state)
     assert "persist-alarm" in _cw._alarms
     _cw._alarms.pop("persist-alarm")
 
@@ -328,7 +390,7 @@ def test_ministack_persist_s3_metadata_roundtrip():
     assert "bucket_versioning" in state
     _s3._buckets.pop("persist-bkt")
     _s3._bucket_versioning.pop("persist-bkt")
-    _s3.restore_state(state)
+    _s3.load_persisted_state(state)
     assert "persist-bkt" in _s3._buckets
     assert _s3._buckets["persist-bkt"]["objects"] == {}  # objects not restored
     assert _s3._bucket_versioning["persist-bkt"] == "Enabled"
@@ -354,7 +416,7 @@ def test_ministack_persist_s3_logging_accelerate_request_payment_roundtrip():
     _s3._bucket_logging_config.pop("persist-log-bkt")
     _s3._bucket_accelerate_config.pop("persist-log-bkt")
     _s3._bucket_request_payment_config.pop("persist-log-bkt")
-    _s3.restore_state(state)
+    _s3.load_persisted_state(state)
     assert "TargetBucket>tgt" in _s3._bucket_logging_config["persist-log-bkt"]
     assert "Enabled" in _s3._bucket_accelerate_config["persist-log-bkt"]
     assert "Requester" in _s3._bucket_request_payment_config["persist-log-bkt"]
@@ -364,23 +426,36 @@ def test_ministack_persist_s3_logging_accelerate_request_payment_roundtrip():
     _s3._bucket_request_payment_config.pop("persist-log-bkt")
 
 def test_ministack_persist_lambda_roundtrip():
+    import hashlib
+    import os
+
     from ministack.services import lambda_svc as _lam
+    code = b"fake-zip-bytes"
+    sha = hashlib.sha256(code).hexdigest()
     _lam._functions["persist-fn"] = {
         "config": {"FunctionName": "persist-fn", "Runtime": "python3.11"},
-        "code_zip": b"fake-zip-bytes",
+        "code_zip": code,
         "versions": {},
         "next_version": 1,
     }
-    state = _lam.get_state()
-    assert "functions" in state
-    # code_zip should be base64-encoded in state
-    assert isinstance(state["functions"]["persist-fn"]["code_zip"], str)
-    _lam._functions.pop("persist-fn")
-    _lam.restore_state(state)
-    assert "persist-fn" in _lam._functions
-    # code_zip should be decoded back to bytes
-    assert _lam._functions["persist-fn"]["code_zip"] == b"fake-zip-bytes"
-    _lam._functions.pop("persist-fn")
+    try:
+        state = _lam.get_state()
+        assert "functions" in state
+        # code_zip is replaced with a content-addressed blob reference in state;
+        # the bytes themselves live under ${STATE_DIR}/lambda-blobs/{sha}.zip.
+        assert state["functions"]["persist-fn"]["code_zip"] == {"code_blob_ref": sha}
+        _lam._functions.pop("persist-fn")
+        _lam.load_persisted_state(state)
+        assert "persist-fn" in _lam._functions
+        # code_zip is restored back to bytes.
+        assert _lam._functions["persist-fn"]["code_zip"] == code
+    finally:
+        _lam._functions.pop("persist-fn", None)
+        # Clean up the blob file written as a side effect of get_state.
+        try:
+            os.remove(os.path.join(_lam.CODE_BLOB_DIR, f"{sha}.zip"))
+        except OSError:
+            pass
 
 def test_ministack_persist_rds_roundtrip():
     from ministack.services import rds as _rds
@@ -394,7 +469,7 @@ def test_ministack_persist_rds_roundtrip():
     assert "instances" in state
     assert "_docker_container_id" not in state["instances"]["persist-db"]
     _rds._instances.pop("persist-db")
-    _rds.restore_state(state)
+    _rds.load_persisted_state(state)
     assert "persist-db" in _rds._instances
     assert _rds._instances["persist-db"]["Engine"] == "postgres"
     _rds._instances.pop("persist-db")
@@ -413,7 +488,7 @@ def test_ministack_persist_ecs_roundtrip():
     assert "_docker_ids" not in state["tasks"]["arn:persist-task"]
     _ecs._clusters.pop("persist-cluster")
     _ecs._tasks.pop("arn:persist-task")
-    _ecs.restore_state(state)
+    _ecs.load_persisted_state(state)
     assert "persist-cluster" in _ecs._clusters
     assert "arn:persist-task" in _ecs._tasks
     assert _ecs._tasks["arn:persist-task"]["lastStatus"] == "STOPPED"
@@ -432,7 +507,7 @@ def test_ministack_persist_elasticache_roundtrip():
     assert "clusters" in state
     assert "_docker_container_id" not in state["clusters"]["persist-cache"]
     _ec._clusters.pop("persist-cache")
-    _ec.restore_state(state)
+    _ec.load_persisted_state(state)
     assert "persist-cache" in _ec._clusters
     assert _ec._clusters["persist-cache"]["Engine"] == "redis"
     _ec._clusters.pop("persist-cache")
@@ -452,7 +527,7 @@ def test_ministack_persist_stepfunctions_roundtrip():
     assert "state_machines" in state
     assert sm_arn in state["state_machines"]
     _sfn._state_machines.pop(sm_arn)
-    _sfn.restore_state(state)
+    _sfn.load_persisted_state(state)
     assert sm_arn in _sfn._state_machines
     assert _sfn._state_machines[sm_arn]["name"] == "persist-sm"
     _sfn._state_machines.pop(sm_arn)
@@ -478,7 +553,7 @@ def test_ministack_persist_stepfunctions_running_marked_failed():
     state = _sfn.get_state()
     _sfn._executions.pop(run_arn)
     _sfn._executions.pop(done_arn)
-    _sfn.restore_state(state)
+    _sfn.load_persisted_state(state)
     # RUNNING execution should be marked FAILED
     restored_run = _sfn._executions[run_arn]
     assert restored_run["status"] == "FAILED"
@@ -532,10 +607,23 @@ def test_unit_h11_informational_has_reason_phrase():
         f"expected canonical reason phrase, got: {out!r}"
 
 
+def test_unit_h11_response_has_reason_phrase():
+    """A final response carries its standard reason phrase too: AWS endpoints answer 'HTTP/1.1 404 Not Found'."""
+    import h11
+
+    import ministack.app  # noqa: F401
+
+    conn = h11.Connection(our_role=h11.SERVER)
+    conn.receive_data(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+    conn.next_event()
+    out = conn.send(h11.Response(status_code=404, headers=[]))
+    assert out.startswith(b"HTTP/1.1 404 Not Found\r\n"), f"expected canonical reason phrase, got: {out!r}"
+
+
 def test_wire_expect_100_continue_returns_canonical_status_line():
     """End-to-end: a raw PUT with Expect: 100-continue against ministack must
     receive a 100 Continue with the reason phrase intact (issue #389)."""
-    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+    endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566").rstrip("/")
     parsed = urlparse(endpoint)
     host = parsed.hostname or "localhost"
     port = parsed.port or 4566
@@ -593,7 +681,7 @@ def test_lambda_svc_restore_does_not_forward_reference_ensure_poller():
         "function_urls": {},
     }
     # Must not raise NameError
-    lam_mod.restore_state(fake_state)
+    lam_mod.load_persisted_state(fake_state)
     assert "fake-uuid" in [e["UUID"] for e in lam_mod._esms.values()] or True
 
 
@@ -631,7 +719,10 @@ def test_persistence_s3_writes_state_after_ownership_and_public_access_block(tmp
     saved = tmp_path / "s3.json"
     assert saved.exists(), "s3.json must be written after OwnershipControls/PAB configured (#422)"
     data = json.loads(saved.read_text())
-    assert "buckets_meta" in data
+    # State is wrapped in a versioned envelope ({"__ministack_format__": N,
+    # "payload": {...}}); the service state lives under "payload".
+    payload = data.get("payload", data)
+    assert "buckets_meta" in payload
 
     # Bytes-safe fallback: even if a raw-bytes value sneaks back in, it round-trips.
     state_with_bytes = {"blob": b"\x00\x01\xff\xfe"}
@@ -716,3 +807,992 @@ class TestExtractS3VhostBucket:
 
     def test_bare_s3_without_region(self):
         assert _extract_s3_vhost_bucket("s3.localhost") is None
+
+
+# ---------------------------------------------------------------------------
+# Container reaping is scoped to this MiniStack instance
+# ---------------------------------------------------------------------------
+
+def _exited_container(daemon, reaper, name, **extra):
+    c = daemon.containers.run(name=name, labels=reaper.own_labels("rds", **extra))
+    c.status = "exited"
+    c.attrs["State"] = {"FinishedAt": ""}
+    return c
+
+
+@pytest.mark.serial
+def test_reaper_never_touches_another_instances_container(fake_docker, monkeypatch):
+    """A second gateway on the same daemon must not reclaim the first's work.
+
+    The reaper reclaimed any exited ministack-labelled container absent from
+    *this* process's records. With several instances on one Docker daemon that
+    is wrong: `StopDBCluster` leaves an exited container on purpose, expecting a
+    later start, and a second gateway has no record of it — so it was reaped
+    after the grace period, destroying state its owner meant to keep. Observed
+    live by @Areson, one instance removing another's container ~3 minutes after
+    it was stopped.
+    """
+    from ministack.core import container_reaper
+
+    monkeypatch.setattr(container_reaper, "EXITED_GRACE", 0)
+    monkeypatch.setenv("GATEWAY_PORT", "4566")
+    _exited_container(fake_docker, container_reaper, "owned-by-A", db_id="a")
+
+    monkeypatch.setenv("GATEWAY_PORT", "4599")            # a different instance
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "nonce-B")
+    container_reaper.register_live_ids("rds", lambda: [])
+
+    assert container_reaper.reap_abandoned(fake_docker) == 0
+    assert "owned-by-A" in fake_docker.live(), "instance B destroyed instance A's container"
+
+
+@pytest.mark.serial
+def test_reaper_still_reclaims_its_own_abandoned_container(fake_docker, monkeypatch):
+    """Instance scoping must not cost the reclamation it was added for."""
+    from ministack.core import container_reaper
+
+    monkeypatch.setattr(container_reaper, "EXITED_GRACE", 0)
+    monkeypatch.setenv("GATEWAY_PORT", "4566")
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "nonce-mine")
+    _exited_container(fake_docker, container_reaper, "owned-by-me", db_id="mine")
+    container_reaper.register_live_ids("rds", lambda: [])
+
+    assert container_reaper.reap_abandoned(fake_docker) == 1
+    assert fake_docker.live() == []
+
+
+@pytest.mark.serial
+def test_boot_sweep_takes_our_predecessor_but_spares_other_instances(fake_docker, monkeypatch):
+    """Boot reclaims the previous run on our port, never another instance.
+
+    Holding the gateway port proves the previous owner of that address is gone,
+    so its leftovers are ours to clean; a container labelled for a different
+    address belongs to a MiniStack that may still be running.
+    """
+    from ministack.core import container_reaper
+
+    monkeypatch.setenv("GATEWAY_PORT", "4566")
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "run-1")
+    _exited_container(fake_docker, container_reaper, "ours-previous-run", db_id="old")
+
+    monkeypatch.setenv("GATEWAY_PORT", "4777")
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "other")
+    _exited_container(fake_docker, container_reaper, "another-instance", db_id="theirs")
+
+    monkeypatch.setenv("GATEWAY_PORT", "4566")            # we restart on our port
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "run-2")
+    container_reaper.reap_all(fake_docker, include_unlabelled=True)
+
+    assert "ours-previous-run" not in fake_docker.live(), "boot sweep left our own orphan"
+    assert "another-instance" in fake_docker.live(), "boot sweep destroyed another instance's container"
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("service,labels", [
+    ("opensearch", {"com.ministack.service": "opensearch"}),
+    ("opensearchserverless", {"com.ministack.service": "opensearchserverless"}),
+    ("dsql", {}),
+    ("ecs", {}),
+    ("eks", {}),
+])
+def test_service_reset_spares_other_instances_containers(fake_docker, monkeypatch, service, labels):
+    """A reset clears this instance's containers; another MiniStack on the daemon keeps its own."""
+    import importlib
+
+    from ministack.core import container_reaper
+    from ministack.services import rds
+
+    mod = importlib.import_module(f"ministack.services.{service}")
+    for name, port in (("theirs", "4777"), ("ours", "4566")):
+        monkeypatch.setenv("GATEWAY_PORT", port)
+        fake_docker.containers.run(name=name, labels={**container_reaper.own_labels(service), **labels})
+    monkeypatch.setattr(rds if service == "dsql" else mod, "_get_docker", lambda: fake_docker)
+    if service == "dsql":
+        monkeypatch.setattr(mod, "_docker_available", lambda: True)
+
+    mod.reset()
+
+    assert fake_docker.live() == ["theirs"], f"{service} reset removed another instance's container"
+
+
+@pytest.mark.serial
+def test_boot_sweep_survives_one_container_whose_inspect_fails(fake_docker, monkeypatch):
+    """A full listing inspects every container, so one failed inspect used to cost the whole sweep."""
+    from ministack.core import container_reaper
+
+    monkeypatch.setenv("GATEWAY_PORT", "4566")
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "run-1")
+    for name in ("left-1", "left-2", "left-3"):
+        _exited_container(fake_docker, container_reaper, name, db_id=name)
+    full_list = fake_docker.containers.list
+
+    def listing(all=False, filters=None, sparse=False):
+        if not sparse:
+            raise RuntimeError("inspect of left-2 failed")
+        return full_list(all=all, filters=filters, sparse=sparse)
+
+    monkeypatch.setattr(fake_docker.containers, "list", listing)
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "run-2")
+    assert container_reaper.reap_all(fake_docker, include_unlabelled=True) == 3
+    assert fake_docker.live() == []
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("label,module,mark_live", [
+    ("glue", "glue", lambda m, cid: m._live_job_containers.add(cid)),
+    ("codebuild", "codebuild", lambda m, cid: m._live_build_containers.add(cid)),
+    ("dsql", "dsql", lambda m, cid: m._backend_containers.__setitem__("cl", cid)),
+    ("agentcore", "bedrock_agentcore", lambda m, cid: m._containers.__setitem__(("a", "r", "rt", "1"),
+                                                                                type("C", (), {"id": cid})())),
+])
+def test_reaper_reclaims_each_services_abandoned_containers(fake_docker, monkeypatch, label, module, mark_live):
+    """Glue, CodeBuild, DSQL and AgentCore report what they still own, so the reaper reclaims the rest."""
+    import importlib
+
+    from ministack.core import container_reaper
+
+    svc = importlib.import_module(f"ministack.services.{module}")
+    monkeypatch.setattr(container_reaper, "EXITED_GRACE", 0)
+    monkeypatch.setenv("GATEWAY_PORT", "4566")
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "nonce-mine")
+    for store in ("_live_job_containers", "_live_build_containers", "_backend_containers", "_containers"):
+        if hasattr(svc, store):
+            monkeypatch.setattr(svc, store, type(getattr(svc, store))())
+    kept, leaked = (fake_docker.containers.run(name=n, labels=container_reaper.own_labels(label))
+                    for n in ("kept", "leaked"))
+    for c in (kept, leaked):
+        c.status = "exited"
+        c.attrs["State"] = {"FinishedAt": ""}
+    mark_live(svc, kept.id)
+
+    assert container_reaper.reap_abandoned(fake_docker) == 1
+    assert "kept" in fake_docker.live() and "leaked" not in fake_docker.live()
+
+
+@pytest.mark.serial
+def test_spawned_containers_carry_the_testcontainers_session_labels(monkeypatch):
+    """In a Testcontainers-run MiniStack, spawned containers carry its session labels, so Ryuk removes them when the
+    test process dies; never the reuse hash (Testcontainers would take a spawned container for MiniStack)."""
+    import docker
+
+    from ministack.core import container_reaper
+
+    own = {"org.testcontainers": "true", "org.testcontainers.sessionId": "s-java",
+           "org.testcontainers.resource-reaper-session": "s-dotnet", "org.testcontainers.golang": "true",
+           "org.testcontainers.golang.sessionId": "s-go", "org.testcontainers.hash": "reuse",
+           "org.testcontainers.lang": "java", "ministack": "spoofed", "other": "x"}
+    client = type("C", (), {"containers": type("Cs", (), {
+        "get": staticmethod(lambda name: type("Me", (), {"labels": own})() if name == "ms-host" else None)})()})()
+    monkeypatch.setattr(container_reaper, "_testcontainers_labels", None)
+    monkeypatch.setattr(container_reaper.os.path, "exists", lambda path: path == "/.dockerenv")
+    monkeypatch.setenv("HOSTNAME", "ms-host")
+    monkeypatch.setattr(docker, "from_env", lambda **_kw: client)
+    try:
+        labels = container_reaper.own_labels("lambda")
+        assert {k: v for k, v in labels.items() if k.startswith("org.testcontainers")} == {
+            "org.testcontainers": "true", "org.testcontainers.sessionId": "s-java",
+            "org.testcontainers.resource-reaper-session": "s-dotnet", "org.testcontainers.golang": "true",
+            "org.testcontainers.golang.sessionId": "s-go"}
+        assert labels["ministack"] == "lambda" and "other" not in labels
+    finally:
+        container_reaper._testcontainers_labels = None
+
+    monkeypatch.setattr(container_reaper.os.path, "exists", lambda path: False)
+    try:
+        assert not any(k.startswith("org.testcontainers") for k in container_reaper.own_labels("rds"))
+    finally:
+        container_reaper._testcontainers_labels = None
+
+
+@pytest.mark.serial
+def test_reaper_reclaims_stopped_lambda_containers_the_pool_no_longer_holds(fake_docker, monkeypatch):
+    """A Lambda container whose removal failed (a slow daemon) is reclaimed once stopped; pooled ones are kept."""
+    from ministack.core import container_reaper
+    from ministack.services import lambda_svc
+
+    monkeypatch.setattr(container_reaper, "EXITED_GRACE", 0)
+    monkeypatch.setenv("GATEWAY_PORT", "4566")
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "nonce-mine")
+    pooled, leaked = (fake_docker.containers.run(name=n, labels=container_reaper.own_labels("lambda"))
+                      for n in ("pooled", "leaked"))
+    for c in (pooled, leaked):
+        c.status = "exited"
+        c.attrs["State"] = {"FinishedAt": ""}
+    monkeypatch.setattr(lambda_svc, "_warm_pool", {"fn": [{"container": pooled}]})
+
+    assert container_reaper.reap_abandoned(fake_docker) == 1
+    assert "pooled" in fake_docker.live() and "leaked" not in fake_docker.live()
+
+
+@pytest.mark.serial
+def test_periodic_reaper_skips_only_the_container_it_cannot_inspect(fake_docker, monkeypatch):
+    from ministack.core import container_reaper
+
+    monkeypatch.setattr(container_reaper, "EXITED_GRACE", 0)
+    monkeypatch.setenv("GATEWAY_PORT", "4566")
+    monkeypatch.setattr(container_reaper, "_boot_nonce", "nonce-mine")
+    for name in ("gone-1", "broken", "gone-2"):
+        _exited_container(fake_docker, container_reaper, name, db_id=name)
+
+    def failing_reload():
+        raise RuntimeError("inspect failed")
+
+    monkeypatch.setattr(fake_docker.containers.get("broken"), "reload", failing_reload)
+    container_reaper.register_live_ids("rds", lambda: [])
+    assert container_reaper.reap_abandoned(fake_docker) == 2
+    assert fake_docker.live() == ["broken"]
+
+
+def test_persistence_keeps_state_when_a_module_fails_to_load():
+    """A service that could not import must not overwrite its persisted state.
+
+    A failed import produces a stand-in module with no state. It used to report
+    an empty dict, which save_all happily wrote over the file — so one bad boot
+    (a missing dependency, a syntax error) silently destroyed every resource the
+    service had persisted. Recovering meant recreating them from scratch.
+    """
+    import json
+    import os
+    import tempfile
+
+    from ministack.core import persistence
+
+    with tempfile.TemporaryDirectory() as tmp:
+        original_dir, original_flag = persistence.STATE_DIR, persistence.PERSIST_STATE
+        persistence.STATE_DIR, persistence.PERSIST_STATE = tmp, True
+        try:
+            path = os.path.join(tmp, "svc.json")
+            persistence.save_state("svc", {"things": {"a": 1}})
+            assert os.path.exists(path)
+
+            # A module that loaded and genuinely holds nothing still writes.
+            persistence.save_all({"svc": lambda: {"things": {}}})
+            with open(path) as f:
+                assert json.load(f)["payload"] == {"things": {}}
+
+            persistence.save_state("svc", {"things": {"a": 1}})
+            # A module that failed to load reports None, and the file survives.
+            persistence.save_all({"svc": lambda: None})
+            with open(path) as f:
+                assert json.load(f)["payload"] == {"things": {"a": 1}}, \
+                    "a failed module must not overwrite persisted state"
+        finally:
+            persistence.STATE_DIR, persistence.PERSIST_STATE = original_dir, original_flag
+
+
+def test_a_failed_service_module_reports_no_state():
+    """The stand-in for a module that would not import reports None."""
+    from ministack.app import _ErrorModule
+
+    assert _ErrorModule("appsync", "No module named 'graphql'").get_state() is None
+
+
+# Request-body framing (aws-chunked, Content-Length)
+
+@pytest.mark.parametrize(
+    ("body", "headers"),
+    [
+        (b"3", {"content-encoding": "aws-chunked"}),
+        (b"x\r\n", {"content-encoding": "aws-chunked"}),
+        (b"3\r\nab", {"content-encoding": "aws-chunked"}),
+        (b"3\r\nabc\r\n", {"content-encoding": "aws-chunked"}),
+        (b"3\r\nabc\r\n0\r\n", {"content-encoding": "aws-chunked"}),
+        (
+            b"1\r\na\r\n0\r\n\r\n",
+            {"content-encoding": "aws-chunked", "x-amz-decoded-content-length": "2"},
+        ),
+        (
+            b"1\r\na\r\n0\r\n\r\n",
+            {"content-encoding": "aws-chunked", "x-amz-trailer": "x-amz-checksum-crc32"},
+        ),
+    ],
+)
+def test_decode_aws_chunked_rejects_incomplete_or_inconsistent_body(body, headers):
+    with pytest.raises(app_module._IncompleteRequestBody):
+        app_module._decode_aws_chunked_body(body, headers)
+
+
+def test_decode_aws_chunked_accepts_complete_body_and_announced_trailer():
+    body = (
+        b"3;chunk-signature=ignored\r\nabc\r\n"
+        b"0;chunk-signature=ignored\r\n"
+        b"x-amz-checksum-crc32: value\r\n\r\n"
+    )
+    headers = {
+        "content-encoding": "aws-chunked",
+        "x-amz-decoded-content-length": "3",
+        "x-amz-trailer": "x-amz-checksum-crc32",
+    }
+
+    assert app_module._decode_aws_chunked_body(body, headers) == b"abc"
+    assert headers["x-amz-checksum-crc32"] == "value"
+
+
+def _run_asgi_request(monkeypatch, headers, body_message):
+    messages = []
+    received = iter([body_message])
+
+    async def receive():
+        return next(received)
+
+    async def send(message):
+        messages.append(message)
+
+    async def unexpected_dispatch(*_args):
+        pytest.fail("incomplete request body reached service dispatch")
+
+    monkeypatch.setattr(app_module, "_dispatch_service_request", unexpected_dispatch)
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "PUT",
+        "scheme": "http",
+        "path": "/bucket/key",
+        "raw_path": b"/bucket/key",
+        "root_path": "",
+        "query_string": b"",
+        "headers": [(b"host", b"localhost:4566"), *headers],
+        "client": ("127.0.0.1", 55555),
+        "server": ("127.0.0.1", 4566),
+    }
+
+    asyncio.run(app_module.app(scope, receive, send))
+    return messages
+
+
+@pytest.mark.parametrize(
+    ("headers", "body"),
+    [
+        ([(b"content-length", b"5")], b"abc"),
+        ([(b"content-encoding", b"aws-chunked")], b"3\r\nab"),
+    ],
+)
+def test_incomplete_s3_body_returns_incomplete_body_before_dispatch(monkeypatch, headers, body):
+    messages = _run_asgi_request(
+        monkeypatch,
+        headers,
+        {"type": "http.request", "body": body, "more_body": False},
+    )
+    response = next(message for message in messages if message["type"] == "http.response.start")
+    response_body = next(message["body"] for message in messages if message["type"] == "http.response.body")
+
+    assert response["status"] == 400
+    assert ET.fromstring(response_body).findtext("Code") == "IncompleteBody"
+    assert ET.fromstring(response_body).findtext("Message") == (
+        "You did not provide the number of bytes specified by the Content-Length HTTP header.")
+
+
+def test_s3_body_disconnect_stops_before_dispatch(monkeypatch):
+    messages = _run_asgi_request(monkeypatch, [], {"type": "http.disconnect"})
+
+    assert messages == []
+
+
+def test_incomplete_non_s3_body_is_dispatched_without_s3_error(monkeypatch):
+    dispatched = []
+
+    async def record_dispatch(*args):
+        dispatched.append(args)
+        return 200, {}, b""
+
+    monkeypatch.setattr(app_module, "_dispatch_service_request", record_dispatch)
+    sent = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"Action=ListQueues", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"}, "http_version": "1.1",
+        "method": "POST", "scheme": "http", "path": "/", "raw_path": b"/", "root_path": "",
+        "query_string": b"",
+        "headers": [(b"host", b"localhost:4566"), (b"content-length", b"99"),
+                    (b"content-type", b"application/x-www-form-urlencoded"),
+                    (b"authorization", b"AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/sqs/aws4_request, "
+                                       b"SignedHeaders=host, Signature=x")],
+        "client": ("127.0.0.1", 55555), "server": ("127.0.0.1", 4566),
+    }
+    asyncio.run(app_module.app(scope, receive, send))
+    assert all(b"IncompleteBody" not in m.get("body", b"") for m in sent)
+    assert len(dispatched) == 1 and dispatched[0][3] == b"Action=ListQueues"
+
+
+def test_drop_containers_logs_the_ids_it_could_not_remove(caplog):
+    import logging
+
+    from ministack.core import container_reaper
+
+    class _C:
+        def __init__(self, cid, fail):
+            self.id, self.fail = cid, fail
+
+        def stop(self, timeout=None):
+            if self.fail:
+                raise RuntimeError("gone")
+
+        def remove(self, v=False, force=False):
+            pass
+
+    with caplog.at_level(logging.WARNING, logger="container_reaper"):
+        removed = container_reaper.drop_containers([_C("a" * 64, False), _C("b" * 64, True)])
+    assert removed == 1
+    assert "bbbbbbbbbbbb" in caplog.text and "aaaaaaaaaaaa" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Error-envelope Content-Type fidelity + credential-scope honesty
+#
+# The expected values are real AWS observations: MiniStack responses were
+# diffed against committed real-AWS wire captures on the fields SDKs read
+# (status, parsed Error.Code, Content-Type).
+# ---------------------------------------------------------------------------
+
+from ministack.core.responses import (  # noqa: E402
+    expected_error_content_type,
+    expected_success_content_type,
+    fix_error_content_type,
+    fix_success_content_type,
+)
+from ministack.core.router import detect_service  # noqa: E402
+
+
+def _auth(scope_name):
+    return {
+        "host": "localhost:4566",
+        "authorization": (
+            "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/"
+            f"{scope_name}/aws4_request, SignedHeaders=host, Signature=x"
+        ),
+    }
+
+
+@pytest.mark.parametrize("service,emitted,expected", [
+    # json protocol: jsonVersion decides — kinesis/athena/kms answer 1.1,
+    # dynamodb/states/sqs answer 1.0.
+    ("kinesis", "application/x-amz-json-1.0", "application/x-amz-json-1.1"),
+    ("athena", "application/x-amz-json-1.0", "application/x-amz-json-1.1"),
+    ("kms", "application/x-amz-json-1.0", "application/x-amz-json-1.1"),
+    ("dynamodb", "application/x-amz-json-1.1", "application/x-amz-json-1.0"),
+    ("states", "application/x-amz-json-1.1", "application/x-amz-json-1.0"),
+    ("sqs", "application/x-amz-json-1.0", "application/x-amz-json-1.0"),
+    # rest-json answers application/json.
+    ("lambda", "application/x-amz-json-1.0", "application/json"),
+    ("appsync", "application/x-amz-json-1.0", "application/json"),
+    ("apigateway", "application/json", "application/json"),
+    # Wire quirks the model does not declare.
+    ("sesv2", "application/json", "application/x-amz-json-1.1"),
+    # query protocol answers text/xml; ec2 adds charset.
+    ("iam", "application/xml", "text/xml"),
+    ("sns", "application/xml", "text/xml"),
+    ("rds", "application/xml", "text/xml"),
+    ("cloudformation", "application/xml", "text/xml"),
+    ("elasticloadbalancing", "application/xml", "text/xml"),
+    ("ec2", "application/xml", "text/xml;charset=UTF-8"),
+    # rest-xml answers text/xml — except S3, which answers application/xml.
+    ("route53", "application/xml", "text/xml"),
+    ("route53", "text/xml", "text/xml"),
+    ("s3", "application/xml", "application/xml"),
+    ("s3", "text/xml", "application/xml"),
+])
+def test_expected_error_content_type(service, emitted, expected):
+    assert expected_error_content_type(service, emitted) == expected
+
+
+def test_family_mismatch_is_not_rewritten():
+    # A query-protocol service that emitted a JSON body stays as-is: the
+    # family guard only corrects within the emitted envelope family.
+    assert expected_error_content_type("iam", "application/json") is None
+    # Declared-cbor services ministack serves as query-compat JSON are
+    # left alone.
+    assert expected_error_content_type("monitoring", "application/x-amz-json-1.0") is None
+
+
+def test_fix_error_content_type_scopes():
+    headers = {"Content-Type": "application/x-amz-json-1.0"}
+    fix_error_content_type("kinesis", 400, headers)
+    assert headers["Content-Type"] == "application/x-amz-json-1.1"
+
+    # success responses are never rewritten by the error path
+    headers = {"Content-Type": "application/json"}
+    fix_error_content_type("s3", 200, headers)
+    assert headers["Content-Type"] == "application/json"
+
+    # non-envelope payloads and unknown services are untouched
+    headers = {"Content-Type": "image/png"}
+    fix_error_content_type("s3", 400, headers)
+    assert headers["Content-Type"] == "image/png"
+    headers = {"Content-Type": "application/xml"}
+    fix_error_content_type("not-a-service", 400, headers)
+    assert headers["Content-Type"] == "application/xml"
+
+
+@pytest.mark.parametrize("service,emitted,expected", [
+    # query successes answer text/xml; ec2 adds charset.
+    ("iam", "application/xml", "text/xml"),
+    ("sns", "application/xml", "text/xml"),
+    ("cloudformation", "application/xml", "text/xml"),
+    ("elasticloadbalancing", "application/xml", "text/xml"),
+    ("ec2", "application/xml", "text/xml;charset=UTF-8"),
+    # json successes follow the model's jsonVersion.
+    ("dynamodb", "application/json", "application/x-amz-json-1.0"),
+    ("dynamodb", "application/x-amz-json-1.1", "application/x-amz-json-1.0"),
+    ("kinesis", "application/x-amz-json-1.0", "application/x-amz-json-1.1"),
+    ("sqs", "application/json", "application/x-amz-json-1.0"),
+    # rest-json answers application/json.
+    ("lambda", "application/x-amz-json-1.0", "application/json"),
+    ("apigateway", "application/x-amz-json-1.0", "application/json"),
+    # sesv2's x-amz-json-1.1 override is error-path evidence only — its
+    # successes get the rest-json model value like any other service.
+    ("sesv2", "application/x-amz-json-1.0", "application/json"),
+    ("sesv2", "application/json", "application/json"),
+    # monitoring serves a query-compatible JSON mode AWS answers as
+    # x-amz-json-1.0 (success override); its XML query path still maps
+    # to the model's text/xml below.
+    ("monitoring", "application/json", "application/x-amz-json-1.0"),
+    ("monitoring", "application/xml", "text/xml"),
+    # rest-xml answers text/xml — except S3, which keeps application/xml.
+    ("route53", "application/xml", "text/xml"),
+    ("cloudfront", "application/xml", "text/xml"),
+    ("s3", "application/xml", "application/xml"),
+])
+def test_expected_success_content_type(service, emitted, expected):
+    assert expected_success_content_type(service, emitted) == expected
+
+
+@pytest.mark.parametrize("service,emitted", [
+    # An emitted text/xml is already wire-final: correct on API envelopes
+    # (route53/cloudfront/alb) and payload on e.g. a stored S3 object.
+    ("s3", "text/xml"),
+    ("route53", "text/xml"),
+    ("iam", "text/xml"),
+    ("ec2", "text/xml"),
+    # A stored S3 object's JSON or binary Content-Type is payload.
+    ("s3", "application/json"),
+    ("s3", "application/octet-stream"),
+    ("dynamodb", "application/octet-stream"),
+    ("iam", "text/plain"),
+    # Unknown service — nothing evidence-backed to enforce.
+    ("not-a-service", "application/xml"),
+    # An XML body from a json-protocol service has no modeled answer.
+    ("sqs", "application/xml"),
+])
+def test_expected_success_content_type_untouched(service, emitted):
+    assert expected_success_content_type(service, emitted) is None
+
+
+def test_fix_success_content_type_scopes():
+    headers = {"Content-Type": "application/xml"}
+    fix_success_content_type("iam", 200, headers)
+    assert headers["Content-Type"] == "text/xml"
+
+    # errors are never rewritten by the success path
+    headers = {"Content-Type": "application/xml"}
+    fix_success_content_type("iam", 400, headers)
+    assert headers["Content-Type"] == "application/xml"
+
+    # a stored S3 object's text/xml payload is not corrupted to the
+    # envelope value
+    headers = {"Content-Type": "text/xml"}
+    fix_success_content_type("s3", 200, headers)
+    assert headers["Content-Type"] == "text/xml"
+
+    # non-envelope payloads are untouched
+    headers = {"Content-Type": "application/octet-stream"}
+    fix_success_content_type("dynamodb", 200, headers)
+    assert headers["Content-Type"] == "application/octet-stream"
+
+
+@pytest.mark.parametrize("scope", ["glacier", "pinpoint", "route53resolver"])
+def test_unimplemented_real_service_surfaces_by_name(scope):
+    # A request signed for a real AWS service ministack does not implement
+    # must not fall through to the S3 catch-all — it routes to its own
+    # (unsupported) name so dispatch answers "Unsupported service".
+    assert detect_service("GET", "/anything", _auth(scope), {}) == scope
+
+
+def test_unknown_scope_still_falls_through_to_s3():
+    # A scope that is not a real AWS service keeps legacy path routing —
+    # e.g. unsigned/garbage credentials hitting S3 path style.
+    assert detect_service("GET", "/bucket/key", _auth("totally-fake-svc"), {}) == "s3"
+
+
+def test_implemented_scope_routes_normally():
+    assert detect_service("POST", "/", _auth("dynamodb"), {}) == "dynamodb"
+    assert detect_service("POST", "/", _auth("states"), {}) == "states"
+
+
+def test_docker_hub_mirrors_cover_hub_images_only():
+    from ministack.core.responses import docker_hub_mirrors
+
+    assert docker_hub_mirrors("postgres") == ["public.ecr.aws/docker/library/postgres", "mirror.gcr.io/library/postgres"]
+    assert docker_hub_mirrors("docker.io/library/redis") == ["public.ecr.aws/docker/library/redis", "mirror.gcr.io/library/redis"]
+    assert docker_hub_mirrors("rancher/k3s") == ["public.ecr.aws/rancher/k3s", "mirror.gcr.io/rancher/k3s"]
+    for other_registry in ("public.ecr.aws/lambda/python", "localhost:5000/app", "ghcr.io/org/app", "proxy.corp.net/postgres"):
+        assert docker_hub_mirrors(other_registry) == []
+
+
+def test_failed_docker_hub_pull_falls_back_to_a_mirror_and_keeps_the_name(monkeypatch):
+    from docker.errors import APIError
+    from docker.models.images import ImageCollection
+
+    from ministack.core.responses import install_docker_hub_fallback
+
+    pulled, tagged = [], []
+
+    class _Image:
+        def tag(self, repository, tag):
+            tagged.append(f"{repository}:{tag}")
+
+    def registry(self, repository, tag=None, all_tags=False, **kwargs):
+        pulled.append(f"{repository}:{tag}" if tag else repository)
+        if repository.startswith("mirror.gcr.io/"):
+            return _Image()
+        raise APIError("500 Server Error: registry unavailable")
+
+    monkeypatch.setattr(ImageCollection, "pull", registry)
+    install_docker_hub_fallback()
+
+    ImageCollection.pull(None, "rancher/k3s:v1.31.4-k3s1", platform="linux/amd64")
+    assert pulled == ["rancher/k3s:v1.31.4-k3s1", "public.ecr.aws/rancher/k3s:v1.31.4-k3s1",
+                      "mirror.gcr.io/rancher/k3s:v1.31.4-k3s1"]
+    assert tagged == ["rancher/k3s:v1.31.4-k3s1"]
+
+    pulled.clear()
+    with pytest.raises(APIError, match="registry unavailable"):
+        ImageCollection.pull(None, "public.ecr.aws/lambda/python:3.12")
+    assert pulled == ["public.ecr.aws/lambda/python:3.12"]
+
+
+# Wire envelopes and success Content-Types, from real-AWS captures: query errors carry
+# <Type> and no <?xml?>; ec2 keeps its declaration and charset; rest-xml carries <Type>.
+
+
+def _wire_ct(resp):
+    return resp["ResponseMetadata"]["HTTPHeaders"]["content-type"]
+
+
+def _wire_status(err):
+    return err["ResponseMetadata"]["HTTPStatusCode"]
+
+
+def test_iam_query_error_envelope(iam):
+    with pytest.raises(ClientError) as exc:
+        iam.get_user(UserName="wire-missing-user")
+    err = exc.value.response
+    assert err["Error"]["Code"] == "NoSuchEntity"
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_status(err) == 404
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_sns_query_error_envelope(sns):
+    with pytest.raises(ClientError) as exc:
+        sns.set_topic_attributes(
+            TopicArn="arn:aws:sns:us-east-1:000000000000:wire-missing",
+            AttributeName="DisplayName",
+            AttributeValue="x",
+        )
+    err = exc.value.response
+    assert err["Error"]["Code"] == "NotFound"
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_elbv2_query_error_envelope(elbv2):
+    with pytest.raises(ClientError) as exc:
+        elbv2.describe_load_balancers(Names=["wire-missing"])
+    err = exc.value.response
+    assert err["Error"]["Code"] == "LoadBalancerNotFound"
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_autoscaling_query_error_envelope(autoscaling):
+    with pytest.raises(ClientError) as exc:
+        autoscaling.update_auto_scaling_group(
+            AutoScalingGroupName="wire-missing")
+    err = exc.value.response
+    assert err["Error"]["Code"] == "ValidationError"
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_elasticache_query_error_envelope(ec):
+    with pytest.raises(ClientError) as exc:
+        ec.describe_cache_clusters(CacheClusterId="wire-missing")
+    err = exc.value.response
+    assert err["Error"]["Code"] == "CacheClusterNotFound"
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_rds_query_error_envelope(rds):
+    with pytest.raises(ClientError) as exc:
+        rds.describe_db_instances(DBInstanceIdentifier="wire-missing")
+    err = exc.value.response
+    assert err["Error"]["Code"] == "DBInstanceNotFound"
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_status(err) == 404
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_docdb_query_error_envelope(docdb):
+    with pytest.raises(ClientError) as exc:
+        docdb.describe_db_instances(DBInstanceIdentifier="wire-missing")
+    err = exc.value.response
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_cloudwatch_query_error_envelope():
+    # boto3 1.42+ speaks smithy-rpc-v2-cbor to CloudWatch: the Query path needs a raw request.
+    req = urllib.request.Request(
+        f"{ENDPOINT}/",
+        data=b"Action=GetDashboard&Version=2010-08-01&DashboardName=wire-missing",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/"
+                             "us-east-1/monitoring/aws4_request, "
+                             "SignedHeaders=host, Signature=x",
+        },
+    )
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req)
+    http_err = exc.value
+    body = http_err.read().decode()
+    assert http_err.headers["content-type"] == "text/xml"
+    assert not body.startswith("<?xml")
+    assert "<Type>Sender</Type>" in body
+    assert "ResourceNotFound" in body
+
+
+def test_ses_query_error_envelope(ses):
+    with pytest.raises(ClientError) as exc:
+        ses.describe_receipt_rule_set(RuleSetName="wire-missing")
+    err = exc.value.response
+    assert err["Error"]["Code"] == "RuleSetDoesNotExist"
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_cfn_query_error_envelope(cfn):
+    with pytest.raises(ClientError) as exc:
+        cfn.describe_stacks(StackName="wire-missing")
+    err = exc.value.response
+    assert err["Error"]["Code"] == "ValidationError"
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_ec2_error_envelope_has_no_type_and_charset(ec2):
+    with pytest.raises(ClientError) as exc:
+        ec2.describe_instances(InstanceIds=["i-0123456789abcdef0"])
+    err = exc.value.response
+    assert err["Error"]["Code"] == "InvalidInstanceID.NotFound"
+    assert err["Error"].get("Type") is None
+    assert _wire_ct(err) == "text/xml;charset=UTF-8"
+
+
+def test_route53_restxml_error_envelope(r53):
+    with pytest.raises(ClientError) as exc:
+        r53.get_hosted_zone(Id="/hostedzone/ZWIREMISSING000")
+    err = exc.value.response
+    assert err["Error"]["Type"] == "Sender"
+    assert _wire_ct(err) == "text/xml"
+
+
+def test_query_success_content_types(iam, sns, sts, ec, autoscaling,
+                                     elbv2, ses, rds, docdb, cfn):
+    calls = [
+        (iam.list_users, {}),
+        (sns.list_topics, {}),
+        (sts.get_caller_identity, {}),
+        (ec.describe_cache_clusters, {}),
+        (autoscaling.describe_auto_scaling_groups, {}),
+        (elbv2.describe_load_balancers, {}),
+        (ses.list_identities, {}),
+        (rds.describe_db_instances, {}),
+        (docdb.describe_db_instances, {}),
+        (cfn.list_stacks, {}),
+    ]
+    for call, kwargs in calls:
+        assert _wire_ct(call(**kwargs)) == "text/xml", call.__name__
+
+
+def test_cloudwatch_query_success_content_type():
+    req = urllib.request.Request(
+        f"{ENDPOINT}/",
+        data=b"Action=ListMetrics&Version=2010-08-01",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/"
+                             "us-east-1/monitoring/aws4_request, "
+                             "SignedHeaders=host, Signature=x",
+        },
+    )
+    with urllib.request.urlopen(req) as resp:
+        assert resp.headers["content-type"] == "text/xml"
+
+
+def test_json_success_content_types(ddb, sqs, kin):
+    assert _wire_ct(ddb.list_tables()) == "application/x-amz-json-1.0"
+    assert _wire_ct(sqs.list_queues()) == "application/x-amz-json-1.0"
+    assert _wire_ct(kin.list_streams()) == "application/x-amz-json-1.1"
+
+
+def test_restxml_success_content_types(s3, r53):
+    assert _wire_ct(s3.list_buckets()) == "application/xml"
+    assert _wire_ct(r53.list_hosted_zones()) == "text/xml"
+
+
+def test_restjson_success_content_type(lam):
+    assert _wire_ct(lam.list_functions()) == "application/json"
+
+
+def test_ec2_success_content_type(ec2):
+    assert _wire_ct(ec2.describe_regions()) == "text/xml;charset=UTF-8"
+
+
+def test_s3_object_payload_content_type_not_rewritten(s3):
+    # A stored object's Content-Type is payload, not an envelope.
+    bucket = "wire-ct-payload"
+    s3.create_bucket(Bucket=bucket)
+    try:
+        s3.put_object(Bucket=bucket, Key="doc.xml", Body=b"<a/>",
+                      ContentType="text/xml")
+        resp = s3.get_object(Bucket=bucket, Key="doc.xml")
+        assert _wire_ct(resp) == "text/xml"
+    finally:
+        s3.delete_object(Bucket=bucket, Key="doc.xml")
+        s3.delete_bucket(Bucket=bucket)
+@pytest.mark.auth_contract
+def test_ministack_auth_unset_is_permissive(tmp_path):
+    """Exercise a fresh HTTP server without AUTH, even in the strict CI job."""
+    import socket
+    import subprocess
+    import sys
+    import time
+    import urllib.request
+    from contextlib import closing
+    from pathlib import Path
+
+    import boto3
+    from botocore.config import Config
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    endpoint = f"http://127.0.0.1:{port}"
+    env = {**os.environ, "IOT_MTLS_ENABLED": "0", "PERSIST_STATE": "0", "S3_PERSIST": "0"}
+    env.pop("AUTH", None)
+    env.pop("LOCALSTACK_PERSISTENCE", None)
+    log_path = tmp_path / "auth-unset.log"
+    with log_path.open("w") as log:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "hypercorn", "ministack.app:app", "--bind", f"127.0.0.1:{port}"],
+            cwd=Path(__file__).resolve().parents[1], env=env, stdout=log, stderr=subprocess.STDOUT,
+        )
+        try:
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    pytest.fail(f"Default-mode server exited: {log_path.read_text()}")
+                try:
+                    with urllib.request.urlopen(f"{endpoint}/_ministack/health", timeout=1) as response:
+                        health = json.load(response)
+                    break
+                except OSError:
+                    time.sleep(0.1)
+            else:
+                pytest.fail(f"Default-mode server did not start: {log_path.read_text()}")
+            assert health["auth"] == "disabled"
+            with closing(boto3.client(
+                "s3", endpoint_url=endpoint, region_name="us-east-1",
+                aws_access_key_id="unregistered-auth-contract-key", aws_secret_access_key="dummy-secret",
+                config=Config(retries={"total_max_attempts": 1}, connect_timeout=5, read_timeout=5),
+            )) as client:
+                assert "Buckets" in client.list_buckets()
+        finally:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+
+
+def test_auth_contracts_are_excluded_from_existing_shards(tmp_path):
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    (tmp_path / "pytest.ini").write_text(
+        "[pytest]\nmarkers =\n    serial\n    data_plane\n    auth_contract\n"
+    )
+    (tmp_path / "test_lanes.py").write_text(
+        "import pytest\n"
+        "def test_parallel(): pass\n"
+        "@pytest.mark.serial\ndef test_serial(): pass\n"
+        "@pytest.mark.data_plane\ndef test_data_plane(): pass\n"
+        "@pytest.mark.auth_contract\n"
+        "@pytest.mark.parametrize('value', [1, 2])\ndef test_auth(value): pass\n"
+        "@pytest.mark.auth_contract\n@pytest.mark.serial\ndef test_auth_serial(): pass\n"
+        "@pytest.mark.auth_contract\n@pytest.mark.data_plane\ndef test_auth_data_plane(): pass\n"
+    )
+    (tmp_path / "test_auth_only.py").write_text(
+        "import pytest\n@pytest.mark.auth_contract\ndef test_only_auth(): pass\n"
+    )
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    env = {**os.environ, "PYTHONPATH": str(scripts)}
+    # Parent pytest flags must not change the nested collection's selection.
+    env.pop("PYTEST_ADDOPTS", None)
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "_collect_plan_plugin"],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    counts = json.loads((tmp_path / ".pytest_collect_plan.json").read_text())
+    assert counts == {"test_lanes.py": {"parallel": 1, "serial": 1, "data_plane": 1}}
+
+
+@pytest.mark.parametrize("bind_host, loopback", [
+    (None, False), ("0.0.0.0", False), ("127.0.0.1", True), ("localhost", True), ("::1", True), ("10.0.0.5", False),
+])
+def test_published_ports_follow_a_host_run_gateway(monkeypatch, bind_host, loopback):
+    """A host-run MiniStack publishes the containers it starts on loopback only when BIND_HOST is loopback."""
+    from ministack.core import container_reaper
+
+    monkeypatch.setattr(container_reaper.os.path, "exists", lambda p: False)
+    monkeypatch.setattr(container_reaper, "_publish_on_loopback", None)
+    if bind_host is None:
+        monkeypatch.delenv("BIND_HOST", raising=False)
+    else:
+        monkeypatch.setenv("BIND_HOST", bind_host)
+    assert container_reaper.published_port(15432) == (("127.0.0.1", 15432) if loopback else 15432)
+
+
+@pytest.mark.parametrize("bindings, loopback", [
+    ([{"HostIp": "127.0.0.1", "HostPort": "4566"}], True),
+    ([{"HostIp": "127.0.0.1", "HostPort": "4566"}, {"HostIp": "::1", "HostPort": "4566"}], True),
+    ([{"HostIp": "0.0.0.0", "HostPort": "4566"}, {"HostIp": "::", "HostPort": "4566"}], False),
+    ([], False),
+    (None, False),
+])
+def test_published_ports_follow_a_containerised_gateway(monkeypatch, bindings, loopback):
+    """In Docker, MiniStack publishes the containers it starts the way its own 4566 is published."""
+    import sys
+    import types
+
+    from ministack.core import container_reaper
+
+    me = types.SimpleNamespace(attrs={"NetworkSettings": {"Ports": {"4566/tcp": bindings}}})
+    client = types.SimpleNamespace(containers=types.SimpleNamespace(get=lambda _name: me))
+    monkeypatch.setitem(sys.modules, "docker", types.SimpleNamespace(from_env=lambda **_: client))
+    monkeypatch.setattr(container_reaper.os.path, "exists", lambda p: p == "/.dockerenv")
+    monkeypatch.setattr(container_reaper, "_publish_on_loopback", None)
+    monkeypatch.delenv("GATEWAY_PORT", raising=False)
+    monkeypatch.delenv("EDGE_PORT", raising=False)
+    assert container_reaper.published_port(None) == (("127.0.0.1", None) if loopback else None)

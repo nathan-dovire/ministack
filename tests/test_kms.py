@@ -1,13 +1,29 @@
-import io
+import base64
+import datetime as _dt
 import json
 import os
+import re
 import time
 import uuid as _uuid_mod
-import zipfile
-from urllib.parse import urlparse
 
+import boto3
 import pytest
-from botocore.exceptions import ClientError
+from botocore.config import Config
+from botocore.exceptions import ClientError, ParamValidationError
+from conftest import inprocess_iam_user, routed_request
+
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+
+
+def _regional_kms(region):
+    return boto3.client(
+        "kms",
+        endpoint_url=ENDPOINT,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region,
+        config=Config(region_name=region, retries={"mode": "standard"}),
+    )
 
 
 def test_kms_create_symmetric_key(kms_client):
@@ -69,11 +85,100 @@ def test_kms_describe_key(kms_client):
     assert resp["KeyMetadata"]["Description"] == "describe me"
     assert resp["KeyMetadata"]["KeyId"] == key_id
 
+def test_kms_update_key_description(kms_client):
+    """UpdateKeyDescription changes the description DescribeKey reports.
+
+    terraform-provider-aws calls this on any aws_kms_key description drift, so a
+    missing action fails the whole update: 'InvalidAction: Unknown action'.
+    """
+    created = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT", Description="before")
+    key_id = created["KeyMetadata"]["KeyId"]
+
+    kms_client.update_key_description(KeyId=key_id, Description="after")
+    assert kms_client.describe_key(KeyId=key_id)["KeyMetadata"]["Description"] == "after"
+
+
+def test_kms_update_key_description_by_arn_and_cleared(kms_client):
+    """The key accepts an ARN, and an empty description clears it (AWS behavior)."""
+    created = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT", Description="before")
+    arn = created["KeyMetadata"]["Arn"]
+
+    kms_client.update_key_description(KeyId=arn, Description="")
+    assert kms_client.describe_key(KeyId=arn)["KeyMetadata"]["Description"] == ""
+
+
+def test_kms_update_key_description_unknown_key(kms_client):
+    with pytest.raises(ClientError) as exc:
+        kms_client.update_key_description(
+            KeyId="00000000-0000-0000-0000-000000000000", Description="x")
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+
 def test_kms_describe_key_by_arn(kms_client):
     created = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT")
     arn = created["KeyMetadata"]["Arn"]
     resp = kms_client.describe_key(KeyId=arn)
     assert resp["KeyMetadata"]["Arn"] == arn
+
+
+def test_kms_key_arn_resolution_rejects_wrong_scope(kms_client):
+    created = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT")
+    arn = created["KeyMetadata"]["Arn"]
+    # Another account's key ARN is refused without saying whether the key exists (#2463, captured).
+    with pytest.raises(ClientError) as exc:
+        kms_client.describe_key(KeyId=arn.replace(":000000000000:", ":111111111111:"))
+    assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
+    invalid_cases = [
+        arn.replace(":us-east-1:", ":us-west-2:"),
+        arn.replace(":kms:", ":sqs:"),
+        arn.replace(":key/", ":alias/"),
+    ]
+
+    for key_id in invalid_cases:
+        with pytest.raises(ClientError) as exc:
+            kms_client.describe_key(KeyId=key_id)
+        assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+
+def test_kms_key_arn_resolution_rejects_forged_request_region(kms_client):
+    created = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT")
+    arn = created["KeyMetadata"]["Arn"]
+    west_arn = arn.replace(":us-east-1:", ":us-west-2:")
+    west_kms = _regional_kms("us-west-2")
+
+    with pytest.raises(ClientError) as exc:
+        west_kms.describe_key(KeyId=west_arn)
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+
+def test_kms_keys_are_region_scoped(kms_client):
+    created = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT")
+    key_id = created["KeyMetadata"]["KeyId"]
+    west_kms = _regional_kms("us-west-2")
+
+    west_key_ids = {k["KeyId"] for k in west_kms.list_keys()["Keys"]}
+    assert key_id not in west_key_ids
+
+    with pytest.raises(ClientError) as exc:
+        west_kms.describe_key(KeyId=key_id)
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+    assert kms_client.describe_key(KeyId=key_id)["KeyMetadata"]["KeyId"] == key_id
+
+
+def test_kms_cross_region_key_id_resolves_notfound(kms_client):
+    created = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT")
+    key_id = created["KeyMetadata"]["KeyId"]
+    west_kms = _regional_kms("us-west-2")
+
+    for call in (
+        lambda: west_kms.describe_key(KeyId=key_id),
+        lambda: west_kms.encrypt(KeyId=key_id, Plaintext=b"cross-region"),
+    ):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
 
 def test_kms_describe_nonexistent_key(kms_client):
     with pytest.raises(ClientError) as exc_info:
@@ -205,6 +310,99 @@ def test_kms_encrypt_decrypt_with_explicit_key(kms_client):
     )
     assert dec_resp["Plaintext"] == plaintext
 
+@pytest.mark.parametrize("key_spec", ["AES_128", "AES_256"])
+def test_kms_generate_data_key_material_id(kms_client, key_spec):
+    """The material identifier belongs to the wrapping key material."""
+    key_id = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT",
+        KeyUsage="ENCRYPT_DECRYPT",
+    )["KeyMetadata"]["KeyId"]
+
+    try:
+        first = kms_client.generate_data_key(
+            KeyId=key_id,
+            KeySpec=key_spec,
+            EncryptionContext={"record": "first"},
+        )
+        second = kms_client.generate_data_key(
+            KeyId=key_id,
+            KeySpec=key_spec,
+            EncryptionContext={"record": "second"},
+        )
+
+        material_id = first.get("KeyMaterialId")
+        assert isinstance(material_id, str)
+        assert re.fullmatch(r"[a-f0-9]{64}", material_id)
+        assert second.get("KeyMaterialId") == material_id
+    finally:
+        kms_client.schedule_key_deletion(
+            KeyId=key_id,
+            PendingWindowInDays=7,
+        )
+
+def test_kms_key_material_id_is_the_same_across_operations(kms_client):
+    key = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT")["KeyMetadata"]
+    try:
+        material_id = key["CurrentKeyMaterialId"]
+        assert re.fullmatch(r"[a-f0-9]{64}", material_id)
+        assert kms_client.describe_key(KeyId=key["KeyId"])["KeyMetadata"]["CurrentKeyMaterialId"] == material_id
+        generated = kms_client.generate_data_key(KeyId=key["KeyId"], KeySpec="AES_256")
+        assert generated["KeyMaterialId"] == material_id
+        without = kms_client.generate_data_key_without_plaintext(KeyId=key["KeyId"], KeySpec="AES_256")
+        assert without["KeyMaterialId"] == material_id
+        pair = kms_client.generate_data_key_pair(KeyId=key["KeyId"], KeyPairSpec="ECC_NIST_P256")
+        assert pair["KeyMaterialId"] == material_id
+        decrypted = kms_client.decrypt(CiphertextBlob=generated["CiphertextBlob"])
+        assert decrypted["KeyMaterialId"] == material_id
+    finally:
+        kms_client.schedule_key_deletion(KeyId=key["KeyId"], PendingWindowInDays=7)
+
+
+def test_kms_key_material_id_absent_for_asymmetric_keys(kms_client):
+    key = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="SIGN_VERIFY")["KeyMetadata"]
+    try:
+        assert "CurrentKeyMaterialId" not in key
+    finally:
+        kms_client.schedule_key_deletion(KeyId=key["KeyId"], PendingWindowInDays=7)
+
+
+def test_kms_generate_data_key_material_id_survives_state_roundtrip():
+    from ministack.services import kms as _kms
+
+    _kms.reset()
+    try:
+        status, _headers, body = _kms._create_key({
+            "KeySpec": "SYMMETRIC_DEFAULT",
+            "KeyUsage": "ENCRYPT_DECRYPT",
+        })
+        assert status == 200
+        key_id = json.loads(body)["KeyMetadata"]["KeyId"]
+
+        def material_id():
+            status, _headers, body = _kms._generate_data_key({
+                "KeyId": key_id,
+                "KeySpec": "AES_256",
+            })
+            assert status == 200
+            return json.loads(body)["KeyMaterialId"]
+
+        original_id = material_id()
+
+        state = _kms.get_state()
+        _kms.reset()
+        _kms.load_persisted_state(state)
+
+        assert material_id() == original_id
+
+        # Keep the key ID, but replace its material.
+        rec = _kms._keys[key_id]
+        rec["_symmetric_key"] = bytes(
+            byte ^ 0xFF for byte in rec["_symmetric_key"]
+        )
+        assert material_id() != original_id
+    finally:
+        _kms.reset()
+
 def test_kms_generate_data_key_aes_256(kms_client):
     key = kms_client.create_key(
         KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
@@ -248,6 +446,284 @@ def test_kms_generate_data_key_without_plaintext(kms_client):
     assert key_id in resp["KeyId"]
     assert resp["CiphertextBlob"]
     assert "Plaintext" not in resp
+
+def test_kms_generate_data_key_pair_ed25519(kms_client):
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    resp = kms_client.generate_data_key_pair(
+        KeyId=key_id, KeyPairSpec="ECC_NIST_EDWARDS25519"
+    )
+    assert key_id in resp["KeyId"]
+    assert resp["KeyPairSpec"] == "ECC_NIST_EDWARDS25519"
+    assert resp["PrivateKeyCiphertextBlob"]
+    # Unlike the WithoutPlaintext variant, this one does hand back the private key.
+    assert len(resp["PrivateKeyPlaintext"]) == 48
+    assert len(resp["PublicKey"]) == 44
+
+def test_kms_generate_data_key_pair_plaintext_matches_ciphertext(kms_client):
+    """PrivateKeyPlaintext must be the same key that PrivateKeyCiphertextBlob wraps."""
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    resp = kms_client.generate_data_key_pair(
+        KeyId=key_id, KeyPairSpec="ECC_NIST_EDWARDS25519"
+    )
+    dec_resp = kms_client.decrypt(
+        CiphertextBlob=resp["PrivateKeyCiphertextBlob"], KeyId=key_id
+    )
+    assert dec_resp["Plaintext"] == resp["PrivateKeyPlaintext"]
+
+def test_kms_generate_data_key_pair_rsa(kms_client):
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    resp = kms_client.generate_data_key_pair(KeyId=key_id, KeyPairSpec="RSA_2048")
+    assert resp["KeyPairSpec"] == "RSA_2048"
+    assert resp["PrivateKeyPlaintext"]
+    assert resp["PublicKey"].startswith(bytes.fromhex("3082012230"))
+
+def test_kms_generate_data_key_pair_variants_agree(kms_client):
+    """The two variants differ in exactly one field: PrivateKeyPlaintext."""
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    with_pt = kms_client.generate_data_key_pair(
+        KeyId=key_id, KeyPairSpec="ECC_NIST_EDWARDS25519"
+    )
+    without_pt = kms_client.generate_data_key_pair_without_plaintext(
+        KeyId=key_id, KeyPairSpec="ECC_NIST_EDWARDS25519"
+    )
+
+    def shape(resp):
+        return {k for k in resp if k != "ResponseMetadata"}
+
+    assert shape(with_pt) - shape(without_pt) == {"PrivateKeyPlaintext"}
+    assert shape(without_pt) - shape(with_pt) == set()
+
+def test_kms_generate_data_key_pair_usable_for_signing(kms_client):
+    """The returned plaintext private key must actually work with the public key."""
+    serialization = pytest.importorskip(
+        "cryptography.hazmat.primitives.serialization"
+    )
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    resp = kms_client.generate_data_key_pair(
+        KeyId=key_id, KeyPairSpec="ECC_NIST_EDWARDS25519"
+    )
+    private_key = serialization.load_der_private_key(
+        resp["PrivateKeyPlaintext"], password=None
+    )
+    public_key = serialization.load_der_public_key(resp["PublicKey"])
+    public_key.verify(private_key.sign(b"message"), b"message")
+
+def test_kms_generate_data_key_pair_requires_symmetric_key(kms_client):
+    key = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="SIGN_VERIFY")
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    with pytest.raises(ClientError) as exc:
+        kms_client.generate_data_key_pair(
+            KeyId=key_id, KeyPairSpec="ECC_NIST_EDWARDS25519"
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidKeyUsageException"
+    assert "GenerateDataKeyPair requires" in exc.value.response["Error"]["Message"]
+
+def test_kms_generate_data_key_pair_without_plaintext_ed25519(kms_client):
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    resp = kms_client.generate_data_key_pair_without_plaintext(
+        KeyId=key_id, KeyPairSpec="ECC_NIST_EDWARDS25519"
+    )
+    assert key_id in resp["KeyId"]
+    assert resp["KeyPairSpec"] == "ECC_NIST_EDWARDS25519"
+    assert resp["PrivateKeyCiphertextBlob"]
+    # The entire point of the WithoutPlaintext variant: the private key
+    # plaintext is never returned to the caller.
+    assert "PrivateKeyPlaintext" not in resp
+    # Ed25519 SubjectPublicKeyInfo is a fixed 44 bytes: a 12-byte header
+    # (SEQUENCE + AlgorithmIdentifier for OID 1.3.101.112) + the 32-byte key.
+    assert resp["PublicKey"].startswith(bytes.fromhex("302a300506032b6570032100"))
+    assert len(resp["PublicKey"]) == 44
+
+def test_kms_generate_data_key_pair_without_plaintext_rsa(kms_client):
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    resp = kms_client.generate_data_key_pair_without_plaintext(
+        KeyId=key_id, KeyPairSpec="RSA_2048"
+    )
+    assert resp["KeyPairSpec"] == "RSA_2048"
+    assert resp["PrivateKeyCiphertextBlob"]
+    assert "PrivateKeyPlaintext" not in resp
+    # SubjectPublicKeyInfo for RSA-2048.
+    assert resp["PublicKey"].startswith(bytes.fromhex("3082012230"))
+
+def test_kms_generate_data_key_pair_without_plaintext_decrypt_roundtrip(kms_client):
+    """The wrapped private key decrypts back to a PKCS#8 DER private key."""
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    gen_resp = kms_client.generate_data_key_pair_without_plaintext(
+        KeyId=key_id, KeyPairSpec="ECC_NIST_EDWARDS25519"
+    )
+    dec_resp = kms_client.decrypt(
+        CiphertextBlob=gen_resp["PrivateKeyCiphertextBlob"], KeyId=key_id
+    )
+    # PKCS#8 DER for an Ed25519 private key is a fixed 48 bytes.
+    assert len(dec_resp["Plaintext"]) == 48
+    assert dec_resp["Plaintext"].startswith(bytes.fromhex("302e020100300506032b657004220420"))
+
+def test_kms_generate_data_key_pair_without_plaintext_encryption_context(kms_client):
+    """EncryptionContext binds the wrapped private key: decrypt must supply the same one."""
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+    context = {"purpose": "signing", "owner": "svc-a"}
+
+    gen_resp = kms_client.generate_data_key_pair_without_plaintext(
+        KeyId=key_id,
+        KeyPairSpec="ECC_NIST_EDWARDS25519",
+        EncryptionContext=context,
+    )
+    dec_resp = kms_client.decrypt(
+        CiphertextBlob=gen_resp["PrivateKeyCiphertextBlob"],
+        KeyId=key_id,
+        EncryptionContext=context,
+    )
+    assert len(dec_resp["Plaintext"]) == 48
+
+    with pytest.raises(ClientError) as exc:
+        kms_client.decrypt(
+            CiphertextBlob=gen_resp["PrivateKeyCiphertextBlob"],
+            KeyId=key_id,
+            EncryptionContext={"purpose": "signing", "owner": "svc-b"},
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidCiphertextException"
+
+def test_kms_generate_data_key_pair_without_plaintext_keys_match(kms_client):
+    """The wrapped private key must actually pair with the returned public key.
+
+    Guards against a key pair whose metadata and material disagree — the public
+    key is useless if it does not verify what the private key signs.
+    """
+    serialization = pytest.importorskip(
+        "cryptography.hazmat.primitives.serialization"
+    )
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    gen_resp = kms_client.generate_data_key_pair_without_plaintext(
+        KeyId=key_id, KeyPairSpec="ECC_NIST_EDWARDS25519"
+    )
+    dec_resp = kms_client.decrypt(
+        CiphertextBlob=gen_resp["PrivateKeyCiphertextBlob"], KeyId=key_id
+    )
+
+    private_key = serialization.load_der_private_key(dec_resp["Plaintext"], password=None)
+    derived_public = private_key.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    assert derived_public == gen_resp["PublicKey"]
+
+    # And the pair actually works end to end.
+    signature = private_key.sign(b"message")
+    public_key = serialization.load_der_public_key(gen_resp["PublicKey"])
+    public_key.verify(signature, b"message")
+
+def test_kms_generate_data_key_pair_without_plaintext_requires_symmetric_key(kms_client):
+    """The CMK wraps the generated private key, so it must be symmetric."""
+    key = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="SIGN_VERIFY")
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    with pytest.raises(ClientError) as exc:
+        kms_client.generate_data_key_pair_without_plaintext(
+            KeyId=key_id, KeyPairSpec="ECC_NIST_EDWARDS25519"
+        )
+    assert exc.value.response["Error"]["Code"] == "InvalidKeyUsageException"
+    # Names this operation, not the GenerateDataKeyPair variant it shares a helper with.
+    assert (
+        "GenerateDataKeyPairWithoutPlaintext requires"
+        in exc.value.response["Error"]["Message"]
+    )
+
+def test_kms_generate_data_key_pair_without_plaintext_rejects_bad_spec(kms_client):
+    key = kms_client.create_key(
+        KeySpec="SYMMETRIC_DEFAULT", KeyUsage="ENCRYPT_DECRYPT"
+    )
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    with pytest.raises(ClientError) as exc:
+        kms_client.generate_data_key_pair_without_plaintext(
+            KeyId=key_id, KeyPairSpec="ECC_NIST_P224"
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+def test_kms_generate_data_key_pair_without_plaintext_nonexistent_key(kms_client):
+    with pytest.raises(ClientError) as exc:
+        kms_client.generate_data_key_pair_without_plaintext(
+            KeyId=str(_uuid_mod.uuid4()), KeyPairSpec="ECC_NIST_EDWARDS25519"
+        )
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+def test_kms_ciphertext_uses_per_blob_nonce(kms_client):
+    """Same plaintext + CMK + EncryptionContext must not yield identical
+    ciphertext. Each blob carries a random nonce mixed into key derivation, so
+    the XOR keystream never repeats across blobs. Without it the keystream would
+    recur, and a wrapped key pair's private half would be recoverable from the
+    public outputs (the DER embeds the public modulus). Both blobs must still
+    decrypt back to the same plaintext."""
+    key = kms_client.create_key()
+    key_id = key["KeyMetadata"]["KeyId"]
+    ctx = {"app": "prod"}
+    zeros = b"\x00" * 48
+    c1 = kms_client.encrypt(KeyId=key_id, Plaintext=zeros, EncryptionContext=ctx)["CiphertextBlob"]
+    c2 = kms_client.encrypt(KeyId=key_id, Plaintext=zeros, EncryptionContext=ctx)["CiphertextBlob"]
+    assert c1 != c2, "identical ciphertext means the keystream repeats (no nonce)"
+    assert kms_client.decrypt(CiphertextBlob=c1, EncryptionContext=ctx)["Plaintext"] == zeros
+    assert kms_client.decrypt(CiphertextBlob=c2, EncryptionContext=ctx)["Plaintext"] == zeros
+
+def test_kms_data_key_pair_private_key_resists_keystream_attack(kms_client):
+    """A wrapped private key must not fall out of a keystream-reuse attack.
+    The attacker grabs a keystream via a chosen-plaintext Encrypt under the same
+    CMK + EncryptionContext, then XORs it into the pair blob's data region. The
+    per-blob nonce makes the two keystreams differ, so the recovered bytes are
+    not a valid private key. Without the nonce this would reconstruct the DER."""
+    serialization = pytest.importorskip("cryptography.hazmat.primitives.serialization")
+    key = kms_client.create_key()
+    key_id = key["KeyMetadata"]["KeyId"]
+    ctx = {"app": "prod"}
+    blob = kms_client.generate_data_key_pair_without_plaintext(
+        KeyId=key_id, KeyPairSpec="ECC_NIST_EDWARDS25519", EncryptionContext=ctx
+    )["PrivateKeyCiphertextBlob"]
+    keystream_blob = kms_client.encrypt(
+        KeyId=key_id, Plaintext=b"\x00" * len(blob), EncryptionContext=ctx
+    )["CiphertextBlob"]
+    # data region starts after key_id(36) + ctx_hash(32) + nonce(16) = 84
+    guess = bytes(a ^ b for a, b in zip(blob[84:], keystream_blob[84:]))
+    with pytest.raises(Exception):
+        serialization.load_der_private_key(guess, password=None)
 
 def test_kms_get_public_key(kms_client):
     key = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="SIGN_VERIFY")
@@ -321,6 +797,203 @@ def test_kms_describe_key_by_alias(kms_client):
     resp = kms_client.describe_key(KeyId="alias/desc-alias")
     assert resp["KeyMetadata"]["KeyId"] == key_id
 
+
+def test_kms_describe_key_by_alias_arn(kms_client):
+    key = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT")
+    key_id = key["KeyMetadata"]["KeyId"]
+    kms_client.create_alias(AliasName="alias/desc-alias-arn", TargetKeyId=key_id)
+
+    resp = kms_client.describe_key(
+        KeyId="arn:aws:kms:us-east-1:000000000000:alias/desc-alias-arn",
+    )
+
+    assert resp["KeyMetadata"]["KeyId"] == key_id
+
+
+def test_kms_alias_arn_resolution_rejects_forged_request_region(kms_client):
+    key = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT")
+    key_id = key["KeyMetadata"]["KeyId"]
+    kms_client.create_alias(AliasName="alias/forged-region-alias", TargetKeyId=key_id)
+    west_kms = _regional_kms("us-west-2")
+
+    with pytest.raises(ClientError) as exc:
+        west_kms.describe_key(
+            KeyId="arn:aws:kms:us-west-2:000000000000:alias/forged-region-alias",
+        )
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+
+def test_kms_aliases_are_region_scoped(kms_client):
+    alias_name = f"alias/region-scope-{_uuid_mod.uuid4().hex[:8]}"
+    east_key_id = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT")["KeyMetadata"]["KeyId"]
+    kms_client.create_alias(AliasName=alias_name, TargetKeyId=east_key_id)
+
+    west_kms = _regional_kms("us-west-2")
+    west_key_id = west_kms.create_key(KeySpec="SYMMETRIC_DEFAULT")["KeyMetadata"]["KeyId"]
+    west_kms.create_alias(AliasName=alias_name, TargetKeyId=west_key_id)
+
+    east_aliases = {
+        alias["AliasArn"]: alias["TargetKeyId"]
+        for alias in kms_client.list_aliases()["Aliases"]
+        if alias["AliasName"] == alias_name
+    }
+    west_aliases = {
+        alias["AliasArn"]: alias["TargetKeyId"]
+        for alias in west_kms.list_aliases()["Aliases"]
+        if alias["AliasName"] == alias_name
+    }
+
+    assert east_aliases == {
+        f"arn:aws:kms:us-east-1:000000000000:{alias_name}": east_key_id,
+    }
+    assert west_aliases == {
+        f"arn:aws:kms:us-west-2:000000000000:{alias_name}": west_key_id,
+    }
+    assert kms_client.describe_key(KeyId=alias_name)["KeyMetadata"]["KeyId"] == east_key_id
+    assert west_kms.describe_key(KeyId=alias_name)["KeyMetadata"]["KeyId"] == west_key_id
+
+
+def test_kms_restore_legacy_account_scoped_state_adopts_key_arn_region():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import kms as _kms
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "000000000000"
+    key_id = str(_uuid_mod.uuid4())
+    alias_name = "alias/legacy-west"
+    alias_arn = f"arn:aws:kms:us-west-2:{account_id}:{alias_name}"
+    key_arn = f"arn:aws:kms:us-west-2:{account_id}:key/{key_id}"
+
+    legacy_keys = AccountScopedDict()
+    legacy_keys._data[(account_id, key_id)] = {
+        "KeyId": key_id,
+        "Arn": key_arn,
+        "KeyState": "Enabled",
+        "Enabled": True,
+        "KeySpec": "SYMMETRIC_DEFAULT",
+        "KeyUsage": "ENCRYPT_DECRYPT",
+        "Description": "legacy west key",
+        "CreationDate": 1700000000,
+        "Origin": "AWS_KMS",
+        "EncryptionAlgorithms": ["SYMMETRIC_DEFAULT"],
+        "SigningAlgorithms": [],
+        "_symmetric_key_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    }
+    legacy_aliases = AccountScopedDict()
+    legacy_aliases._data[(account_id, alias_arn)] = key_id
+
+    _kms.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region("us-east-1")
+        _kms.load_persisted_state({"keys": legacy_keys, "aliases": legacy_aliases})
+
+        assert _kms._keys.get_scoped(account_id, "us-east-1", key_id) is None
+        assert _kms._keys.get_scoped(account_id, "us-west-2", key_id)["Arn"] == key_arn
+        assert _kms._aliases.get_scoped(account_id, "us-west-2", alias_arn) == key_id
+
+        assert _kms._resolve_key(alias_name) is None
+        set_request_region("us-west-2")
+        assert _kms._resolve_key(alias_name)["KeyId"] == key_id
+    finally:
+        _kms.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_kms_restore_legacy_bare_alias_name_adopts_target_key_region():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import kms as _kms
+
+    original_account = get_account_id()
+    original_region = get_region()
+    account_id = "000000000000"
+    key_id = str(_uuid_mod.uuid4())
+    alias_name = "alias/legacy-bare-west"
+    alias_arn = f"arn:aws:kms:us-west-2:{account_id}:{alias_name}"
+    key_arn = f"arn:aws:kms:us-west-2:{account_id}:key/{key_id}"
+
+    legacy_keys = AccountScopedDict()
+    legacy_keys._data[(account_id, key_id)] = {
+        "KeyId": key_id,
+        "Arn": key_arn,
+        "KeyState": "Enabled",
+        "Enabled": True,
+        "KeySpec": "SYMMETRIC_DEFAULT",
+        "KeyUsage": "ENCRYPT_DECRYPT",
+        "Description": "legacy west key",
+        "CreationDate": 1700000000,
+        "Origin": "AWS_KMS",
+        "EncryptionAlgorithms": ["SYMMETRIC_DEFAULT"],
+        "SigningAlgorithms": [],
+        "_symmetric_key_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    }
+    legacy_aliases = AccountScopedDict()
+    legacy_aliases._data[(account_id, alias_name)] = key_id
+
+    _kms.reset()
+    try:
+        set_request_account_id(account_id)
+        set_request_region("us-east-1")
+        _kms.load_persisted_state({"keys": legacy_keys, "aliases": legacy_aliases})
+
+        assert _kms._aliases.get_scoped(account_id, "us-east-1", alias_arn) is None
+        assert _kms._aliases.get_scoped(account_id, "us-west-2", alias_arn) == key_id
+        assert _kms._resolve_key(alias_name) is None
+
+        set_request_region("us-west-2")
+        assert _kms._resolve_key(alias_name)["KeyId"] == key_id
+    finally:
+        _kms.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_kms_cloudformation_alias_resolves_by_name_and_arn(cfn, kms_client):
+    alias_name = f"alias/cfn-kms-alias-{_uuid_mod.uuid4().hex[:8]}"
+    template = {
+        "Resources": {
+            "Key": {"Type": "AWS::KMS::Key", "Properties": {"Description": "cfn alias key"}},
+            "Alias": {
+                "Type": "AWS::KMS::Alias",
+                "Properties": {"AliasName": alias_name, "TargetKeyId": {"Ref": "Key"}},
+            },
+        },
+    }
+    stack_name = f"kms-cfn-alias-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+
+    by_name = kms_client.describe_key(KeyId=alias_name)["KeyMetadata"]
+    alias_arn = f"arn:aws:kms:us-east-1:000000000000:{alias_name}"
+    by_arn = kms_client.describe_key(KeyId=alias_arn)["KeyMetadata"]
+    assert by_arn["KeyId"] == by_name["KeyId"]
+
+
+def test_kms_wrong_service_alias_arn_does_not_tail_match(kms_client):
+    key = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT")
+    kms_client.create_alias(AliasName="alias/wrong-service-tail", TargetKeyId=key["KeyMetadata"]["KeyId"])
+
+    with pytest.raises(ClientError) as exc:
+        kms_client.describe_key(
+            KeyId="arn:aws:sqs:us-east-1:000000000000:alias/wrong-service-tail",
+        )
+
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+
 def test_kms_update_alias(kms_client):
     key1 = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT")
     key2 = kms_client.create_key(KeySpec="SYMMETRIC_DEFAULT")
@@ -363,6 +1036,81 @@ def test_kms_get_put_key_policy(kms_client):
     assert got["Policy"] == custom
     kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
 
+
+@pytest.fixture
+def auth_key(monkeypatch):
+    """Create keys in-process, optionally with a key policy, under AUTH=true."""
+    import ministack.app as app_mod
+    from ministack.services import kms as _kms
+
+    created = []
+
+    def make(*statements):
+        data = {"KeySpec": "SYMMETRIC_DEFAULT", "KeyUsage": "ENCRYPT_DECRYPT"}
+        if statements:
+            data["Policy"] = json.dumps({"Version": "2012-10-17", "Statement": [
+                {"Effect": effect, "Principal": {"AWS": principal}, "Action": action, "Resource": "*"}
+                for effect, principal, action in statements]})
+        status, _headers, body = _kms._create_key(data)
+        assert status == 200
+        created.append(json.loads(body)["KeyMetadata"]["KeyId"])
+        return created[-1]
+
+    monkeypatch.setattr(app_mod, "AUTH", True)
+    yield make
+    for key_id in created:
+        _kms._keys.pop(key_id, None)
+
+
+def _kms_call(access_key, operation, key_id, field="__type"):
+    params = {"KeyId": key_id}
+    if operation == "Encrypt":
+        params["Plaintext"] = base64.b64encode(b"hi").decode()
+    else:
+        params["KeySpec"] = "AES_256"
+    status, _headers, body = routed_request(
+        access_key, "kms", "POST", "/", json.dumps(params).encode(),
+        {"content-type": "application/x-amz-json-1.1", "x-amz-target": f"TrentService.{operation}"})
+    return status, json.loads(body).get(field)
+
+
+_ALLOW_KMS = {"Statement": [{"Effect": "Allow", "Action": "kms:*", "Resource": "*"}]}
+_DENIED = (400, "AccessDeniedException")  # recorded on AWS: no policy allows the call
+_EXPLICITLY_DENIED = (403, "AccessDeniedException")
+
+
+def test_key_policy_naming_the_user_allows_without_identity_policy(auth_key):
+    access_key, user = inprocess_iam_user()
+    key_id = auth_key(("Allow", user, "kms:Encrypt"))
+    assert _kms_call(access_key, "Encrypt", key_id) == (200, None)
+    assert _kms_call(access_key, "GenerateDataKey", key_id) == _DENIED
+
+
+def test_key_policy_that_names_neither_user_nor_account_denies_an_identity_allow(auth_key):
+    access_key, user = inprocess_iam_user(_ALLOW_KMS)
+    key_id = auth_key(("Allow", "arn:aws:iam::000000000000:user/someone-else", "kms:*"))
+    assert _kms_call(access_key, "GenerateDataKey", key_id) == _DENIED
+
+
+def test_default_key_policy_hands_the_decision_to_identity_policies(auth_key):
+    key_id = auth_key()
+    access_key, _user = inprocess_iam_user()
+    assert _kms_call(access_key, "GenerateDataKey", key_id) == _DENIED
+    access_key, _user = inprocess_iam_user(_ALLOW_KMS)
+    assert _kms_call(access_key, "GenerateDataKey", key_id) == (200, None)
+
+
+
+def test_key_policy_deny_beats_an_identity_allow(auth_key):
+    access_key, user = inprocess_iam_user(_ALLOW_KMS)
+    key_id = auth_key(("Allow", "arn:aws:iam::000000000000:root", "kms:*"), ("Deny", user, "kms:GenerateDataKey"))
+    assert _kms_call(access_key, "GenerateDataKey", key_id) == _EXPLICITLY_DENIED
+    assert _kms_call(access_key, "GenerateDataKey", key_id, "message") == (403, (
+        f"User: {user} is not authorized to perform: kms:GenerateDataKey on resource: "
+        f"arn:aws:kms:us-east-1:000000000000:key/{key_id} with an explicit deny in a resource-based policy"))
+    assert _kms_call(access_key, "Encrypt", key_id) == (200, None)
+
+
 def test_kms_tag_untag_list_v2(kms_client):
     """TagResource / UntagResource / ListResourceTags."""
     key = kms_client.create_key()
@@ -380,6 +1128,18 @@ def test_kms_tag_untag_list_v2(kms_client):
     assert len(tags["Tags"]) == 1
     assert tags["Tags"][0]["TagKey"] == "env"
     kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+
+
+def test_kms_tag_resource_accepts_key_arn(kms_client):
+    key = kms_client.create_key()
+    arn = key["KeyMetadata"]["Arn"]
+
+    kms_client.tag_resource(KeyId=arn, Tags=[{"TagKey": "env", "TagValue": "test"}])
+
+    tags = kms_client.list_resource_tags(KeyId=arn)
+    tag_map = {t["TagKey"]: t["TagValue"] for t in tags["Tags"]}
+    assert tag_map["env"] == "test"
+    kms_client.schedule_key_deletion(KeyId=arn, PendingWindowInDays=7)
 
 def test_kms_enable_disable_key(kms_client):
     """EnableKey / DisableKey."""
@@ -491,6 +1251,117 @@ def test_kms_ecc_get_public_key(kms_client):
     assert resp["KeySpec"] == "ECC_SECG_P256K1"
     assert resp["PublicKey"]
     assert "ECDSA_SHA_256" in resp["SigningAlgorithms"]
+
+def test_kms_create_ecc_nist_edwards25519_key(kms_client):
+    resp = kms_client.create_key(
+        KeySpec="ECC_NIST_EDWARDS25519",
+        KeyUsage="SIGN_VERIFY",
+        Description="ed25519 signing key",
+    )
+    meta = resp["KeyMetadata"]
+    assert meta["KeySpec"] == "ECC_NIST_EDWARDS25519"
+    assert meta["KeyUsage"] == "SIGN_VERIFY"
+    # Real AWS lists both algorithms for this key spec — Developer Guide
+    # "Supported signing algorithms for ECC key specs".
+    assert meta["SigningAlgorithms"] == ["ED25519_SHA_512", "ED25519_PH_SHA_512"]
+    assert meta["EncryptionAlgorithms"] == []
+
+def test_kms_ecc_nist_edwards25519_sign_verify(kms_client):
+    key = kms_client.create_key(KeySpec="ECC_NIST_EDWARDS25519", KeyUsage="SIGN_VERIFY")
+    key_id = key["KeyMetadata"]["KeyId"]
+    message = b"hello ed25519"
+
+    sign_resp = kms_client.sign(
+        KeyId=key_id,
+        Message=message,
+        MessageType="RAW",
+        SigningAlgorithm="ED25519_SHA_512",
+    )
+    assert key_id in sign_resp["KeyId"]
+    assert sign_resp["SigningAlgorithm"] == "ED25519_SHA_512"
+    assert len(sign_resp["Signature"]) > 0
+
+    verify_resp = kms_client.verify(
+        KeyId=key_id,
+        Message=message,
+        MessageType="RAW",
+        Signature=sign_resp["Signature"],
+        SigningAlgorithm="ED25519_SHA_512",
+    )
+    assert verify_resp["SignatureValid"] is True
+
+def test_kms_ecc_nist_edwards25519_verify_wrong_message(kms_client):
+    key = kms_client.create_key(KeySpec="ECC_NIST_EDWARDS25519", KeyUsage="SIGN_VERIFY")
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    sign_resp = kms_client.sign(
+        KeyId=key_id,
+        Message=b"original ed25519",
+        MessageType="RAW",
+        SigningAlgorithm="ED25519_SHA_512",
+    )
+    with pytest.raises(kms_client.exceptions.KMSInvalidSignatureException):
+        kms_client.verify(
+            KeyId=key_id,
+            Message=b"tampered ed25519",
+            MessageType="RAW",
+            Signature=sign_resp["Signature"],
+            SigningAlgorithm="ED25519_SHA_512",
+        )
+
+def test_kms_ecc_nist_edwards25519_get_public_key(kms_client):
+    key = kms_client.create_key(KeySpec="ECC_NIST_EDWARDS25519", KeyUsage="SIGN_VERIFY")
+    key_id = key["KeyMetadata"]["KeyId"]
+
+    resp = kms_client.get_public_key(KeyId=key_id)
+    assert key_id in resp["KeyId"]
+    assert resp["KeySpec"] == "ECC_NIST_EDWARDS25519"
+    assert resp["PublicKey"]
+    assert resp["SigningAlgorithms"] == ["ED25519_SHA_512", "ED25519_PH_SHA_512"]
+
+def test_kms_ed25519_sha_512_rejects_non_raw_message_type(kms_client):
+    """ED25519_SHA_512 requires MessageType=RAW (AWS Developer Guide / Sign API)."""
+    key = kms_client.create_key(KeySpec="ECC_NIST_EDWARDS25519", KeyUsage="SIGN_VERIFY")
+    key_id = key["KeyMetadata"]["KeyId"]
+    with pytest.raises(Exception) as exc:
+        kms_client.sign(
+            KeyId=key_id,
+            Message=b"a" * 64,
+            MessageType="DIGEST",
+            SigningAlgorithm="ED25519_SHA_512",
+        )
+    msg = str(exc.value)
+    assert "ED25519_SHA_512" in msg and "RAW" in msg
+
+
+def test_kms_ed25519_ph_sha_512_sign_returns_unsupported(kms_client):
+    """ED25519_PH_SHA_512 (Ed25519ph) is listed in metadata but Sign is not yet implemented."""
+    key = kms_client.create_key(KeySpec="ECC_NIST_EDWARDS25519", KeyUsage="SIGN_VERIFY")
+    key_id = key["KeyMetadata"]["KeyId"]
+    with pytest.raises(Exception) as exc:
+        kms_client.sign(
+            KeyId=key_id,
+            Message=b"a" * 64,
+            MessageType="DIGEST",
+            SigningAlgorithm="ED25519_PH_SHA_512",
+        )
+    assert "ED25519_PH_SHA_512" in str(exc.value)
+
+
+def test_kms_ed25519_ph_sha_512_verify_returns_unsupported(kms_client):
+    """ED25519_PH_SHA_512 Verify is also gated until Ed25519ph lands."""
+    key = kms_client.create_key(KeySpec="ECC_NIST_EDWARDS25519", KeyUsage="SIGN_VERIFY")
+    key_id = key["KeyMetadata"]["KeyId"]
+    with pytest.raises(Exception) as exc:
+        kms_client.verify(
+            KeyId=key_id,
+            Message=b"a" * 64,
+            MessageType="DIGEST",
+            Signature=b"\x00" * 64,
+            SigningAlgorithm="ED25519_PH_SHA_512",
+        )
+    assert "ED25519_PH_SHA_512" in str(exc.value)
+
 
 def test_kms_ecc_nist_p256_sign_verify(kms_client):
     key = kms_client.create_key(KeySpec="ECC_NIST_P256", KeyUsage="SIGN_VERIFY")
@@ -638,3 +1509,1590 @@ def test_kms_disabled_key_blocks_encrypt(kms_client):
     kms_client.disable_key(KeyId=key_id)
     with pytest.raises(kms_client.exceptions.DisabledException):
         kms_client.encrypt(KeyId=key_id, Plaintext=b"test")
+
+HMAC_SPEC_ALGOS = [
+    ("HMAC_224", "HMAC_SHA_224", 28),
+    ("HMAC_256", "HMAC_SHA_256", 32),
+    ("HMAC_384", "HMAC_SHA_384", 48),
+    ("HMAC_512", "HMAC_SHA_512", 64),
+]
+
+
+def _hmac_key(kms_client, key_spec="HMAC_256"):
+    resp = kms_client.create_key(KeySpec=key_spec, KeyUsage="GENERATE_VERIFY_MAC")
+    return resp["KeyMetadata"]
+
+
+@pytest.mark.parametrize("key_spec,mac_algorithm,mac_len", HMAC_SPEC_ALGOS)
+def test_kms_create_hmac_key_metadata(kms_client, key_spec, mac_algorithm, mac_len):
+    meta = _hmac_key(kms_client, key_spec)
+    assert meta["KeySpec"] == key_spec
+    assert meta["CustomerMasterKeySpec"] == key_spec
+    assert meta["KeyUsage"] == "GENERATE_VERIFY_MAC"
+    assert meta["KeyState"] == "Enabled"
+    assert meta["Origin"] == "AWS_KMS"
+    assert meta["MacAlgorithms"] == [mac_algorithm]
+    # AWS omits these entirely for GENERATE_VERIFY_MAC keys.
+    assert "EncryptionAlgorithms" not in meta
+    assert "SigningAlgorithms" not in meta
+
+    described = kms_client.describe_key(KeyId=meta["KeyId"])["KeyMetadata"]
+    assert described["MacAlgorithms"] == [mac_algorithm]
+
+
+@pytest.mark.parametrize("key_spec,mac_algorithm,mac_len", HMAC_SPEC_ALGOS)
+def test_kms_generate_and_verify_mac_roundtrip(kms_client, key_spec, mac_algorithm, mac_len):
+    meta = _hmac_key(kms_client, key_spec)
+    message = b"ministack mac parity"
+
+    gen = kms_client.generate_mac(
+        KeyId=meta["KeyId"], Message=message, MacAlgorithm=mac_algorithm
+    )
+    assert gen["KeyId"] == meta["Arn"]
+    assert gen["MacAlgorithm"] == mac_algorithm
+    assert len(gen["Mac"]) == mac_len
+
+    verified = kms_client.verify_mac(
+        KeyId=meta["KeyId"],
+        Message=message,
+        MacAlgorithm=mac_algorithm,
+        Mac=gen["Mac"],
+    )
+    assert verified["MacValid"] is True
+    assert verified["KeyId"] == meta["Arn"]
+    assert verified["MacAlgorithm"] == mac_algorithm
+
+
+def test_kms_generate_mac_is_deterministic(kms_client):
+    meta = _hmac_key(kms_client)
+    message = b"same message"
+    first = kms_client.generate_mac(
+        KeyId=meta["KeyId"], Message=message, MacAlgorithm="HMAC_SHA_256"
+    )["Mac"]
+    second = kms_client.generate_mac(
+        KeyId=meta["KeyId"], Message=message, MacAlgorithm="HMAC_SHA_256"
+    )["Mac"]
+    assert first == second
+
+    other = kms_client.generate_mac(
+        KeyId=meta["KeyId"], Message=b"different message", MacAlgorithm="HMAC_SHA_256"
+    )["Mac"]
+    assert other != first
+
+
+def test_kms_generate_mac_accepts_key_arn_and_alias(kms_client):
+    meta = _hmac_key(kms_client)
+    alias = f"alias/mac-{_uuid_mod.uuid4().hex[:8]}"
+    kms_client.create_alias(AliasName=alias, TargetKeyId=meta["KeyId"])
+
+    by_arn = kms_client.generate_mac(
+        KeyId=meta["Arn"], Message=b"payload", MacAlgorithm="HMAC_SHA_256"
+    )
+    by_alias = kms_client.generate_mac(
+        KeyId=alias, Message=b"payload", MacAlgorithm="HMAC_SHA_256"
+    )
+    assert by_arn["Mac"] == by_alias["Mac"]
+    assert by_alias["KeyId"] == meta["Arn"]
+
+    assert kms_client.verify_mac(
+        KeyId=alias,
+        Message=b"payload",
+        MacAlgorithm="HMAC_SHA_256",
+        Mac=by_arn["Mac"],
+    )["MacValid"] is True
+
+
+def test_kms_verify_mac_tampered_message_raises_invalid_mac(kms_client):
+    meta = _hmac_key(kms_client)
+    mac = kms_client.generate_mac(
+        KeyId=meta["KeyId"], Message=b"original", MacAlgorithm="HMAC_SHA_256"
+    )["Mac"]
+    with pytest.raises(ClientError) as exc:
+        kms_client.verify_mac(
+            KeyId=meta["KeyId"],
+            Message=b"tampered",
+            MacAlgorithm="HMAC_SHA_256",
+            Mac=mac,
+        )
+    assert exc.value.response["Error"]["Code"] == "KMSInvalidMacException"
+
+
+def test_kms_verify_mac_tampered_mac_raises_invalid_mac(kms_client):
+    meta = _hmac_key(kms_client)
+    mac = bytearray(kms_client.generate_mac(
+        KeyId=meta["KeyId"], Message=b"original", MacAlgorithm="HMAC_SHA_256"
+    )["Mac"])
+    mac[0] ^= 0xFF
+    with pytest.raises(ClientError) as exc:
+        kms_client.verify_mac(
+            KeyId=meta["KeyId"],
+            Message=b"original",
+            MacAlgorithm="HMAC_SHA_256",
+            Mac=bytes(mac),
+        )
+    assert exc.value.response["Error"]["Code"] == "KMSInvalidMacException"
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda mac: mac[:16],
+    lambda mac: mac[:-1],
+    lambda mac: mac + b"\x00",
+    lambda mac: b"\x00" * len(mac),
+])
+def test_kms_verify_mac_rejects_truncated_or_extended_mac(kms_client, mutate):
+    meta = _hmac_key(kms_client)
+    mac = kms_client.generate_mac(
+        KeyId=meta["KeyId"], Message=b"original", MacAlgorithm="HMAC_SHA_256"
+    )["Mac"]
+    with pytest.raises(ClientError) as exc:
+        kms_client.verify_mac(
+            KeyId=meta["KeyId"],
+            Message=b"original",
+            MacAlgorithm="HMAC_SHA_256",
+            Mac=mutate(mac),
+        )
+    assert exc.value.response["Error"]["Code"] == "KMSInvalidMacException"
+
+
+def test_kms_verify_mac_wrong_key_raises_invalid_mac(kms_client):
+    signer = _hmac_key(kms_client)
+    other = _hmac_key(kms_client)
+    mac = kms_client.generate_mac(
+        KeyId=signer["KeyId"], Message=b"payload", MacAlgorithm="HMAC_SHA_256"
+    )["Mac"]
+    with pytest.raises(ClientError) as exc:
+        kms_client.verify_mac(
+            KeyId=other["KeyId"],
+            Message=b"payload",
+            MacAlgorithm="HMAC_SHA_256",
+            Mac=mac,
+        )
+    assert exc.value.response["Error"]["Code"] == "KMSInvalidMacException"
+
+
+def test_kms_mac_algorithm_must_match_key_spec(kms_client):
+    meta = _hmac_key(kms_client, "HMAC_256")
+    with pytest.raises(kms_client.exceptions.InvalidKeyUsageException):
+        kms_client.generate_mac(
+            KeyId=meta["KeyId"], Message=b"payload", MacAlgorithm="HMAC_SHA_512"
+        )
+
+
+def test_kms_mac_algorithm_enum_is_validated(kms_client):
+    meta = _hmac_key(kms_client)
+    with pytest.raises(ClientError) as exc:
+        kms_client.generate_mac(
+            KeyId=meta["KeyId"], Message=b"payload", MacAlgorithm="HMAC_SHA_1"
+        )
+    err = exc.value.response["Error"]
+    assert err["Code"] == "ValidationException"
+    assert "macAlgorithm" in err["Message"]
+
+
+def test_kms_generate_mac_message_size_limit(kms_client):
+    meta = _hmac_key(kms_client)
+    at_limit = kms_client.generate_mac(
+        KeyId=meta["KeyId"], Message=b"a" * 4096, MacAlgorithm="HMAC_SHA_256"
+    )
+    assert at_limit["Mac"]
+
+    with pytest.raises(ClientError) as exc:
+        kms_client.generate_mac(
+            KeyId=meta["KeyId"], Message=b"a" * 4097, MacAlgorithm="HMAC_SHA_256"
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_kms_mac_dry_run_never_succeeds(kms_client):
+    meta = _hmac_key(kms_client)
+    mac = kms_client.generate_mac(
+        KeyId=meta["KeyId"], Message=b"payload", MacAlgorithm="HMAC_SHA_256"
+    )["Mac"]
+
+    with pytest.raises(ClientError) as exc:
+        kms_client.generate_mac(
+            KeyId=meta["KeyId"],
+            Message=b"payload",
+            MacAlgorithm="HMAC_SHA_256",
+            DryRun=True,
+        )
+    assert exc.value.response["Error"]["Code"] == "DryRunOperationException"
+
+    with pytest.raises(ClientError) as exc:
+        kms_client.verify_mac(
+            KeyId=meta["KeyId"],
+            Message=b"payload",
+            MacAlgorithm="HMAC_SHA_256",
+            Mac=mac,
+            DryRun=True,
+        )
+    assert exc.value.response["Error"]["Code"] == "DryRunOperationException"
+
+
+def test_kms_mac_key_state_precedes_dry_run(kms_client):
+    meta = _hmac_key(kms_client)
+    kms_client.disable_key(KeyId=meta["KeyId"])
+    with pytest.raises(ClientError) as exc:
+        kms_client.generate_mac(
+            KeyId=meta["KeyId"],
+            Message=b"payload",
+            MacAlgorithm="HMAC_SHA_256",
+            DryRun=True,
+        )
+    assert exc.value.response["Error"]["Code"] == "DisabledException"
+
+
+def test_kms_verify_mac_comparison_precedes_dry_run(kms_client):
+    meta = _hmac_key(kms_client)
+    with pytest.raises(ClientError) as exc:
+        kms_client.verify_mac(
+            KeyId=meta["KeyId"],
+            Message=b"payload",
+            MacAlgorithm="HMAC_SHA_256",
+            Mac=b"not-the-mac",
+            DryRun=True,
+        )
+    assert exc.value.response["Error"]["Code"] == "KMSInvalidMacException"
+
+
+def test_kms_verify_mac_bounds_the_mac_blob(kms_client):
+    meta = _hmac_key(kms_client)
+    with pytest.raises(ClientError) as exc:
+        kms_client.verify_mac(
+            KeyId=meta["KeyId"],
+            Message=b"payload",
+            MacAlgorithm="HMAC_SHA_256",
+            Mac=b"a" * 6145,
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_kms_generate_mac_requires_hmac_key(kms_client):
+    symmetric = kms_client.create_key()["KeyMetadata"]
+    with pytest.raises(kms_client.exceptions.InvalidKeyUsageException):
+        kms_client.generate_mac(
+            KeyId=symmetric["KeyId"], Message=b"payload", MacAlgorithm="HMAC_SHA_256"
+        )
+
+
+def test_kms_generate_mac_rejects_empty_message(kms_client):
+    meta = _hmac_key(kms_client)
+    with pytest.raises((ClientError, ParamValidationError)) as exc:
+        kms_client.generate_mac(
+            KeyId=meta["KeyId"], Message=b"", MacAlgorithm="HMAC_SHA_256"
+        )
+    if isinstance(exc.value, ClientError):
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_kms_hmac_key_material_never_leaves_the_server(kms_client):
+    meta = _hmac_key(kms_client)
+    described = kms_client.describe_key(KeyId=meta["KeyId"])["KeyMetadata"]
+    for payload in (meta, described):
+        assert not [k for k in payload if k.startswith("_")]
+
+
+def test_kms_generate_mac_unknown_key_raises_not_found(kms_client):
+    with pytest.raises(kms_client.exceptions.NotFoundException):
+        kms_client.generate_mac(
+            KeyId=str(_uuid_mod.uuid4()), Message=b"payload", MacAlgorithm="HMAC_SHA_256"
+        )
+
+
+@pytest.mark.parametrize("state", ["Disabled", "PendingDeletion"])
+def test_kms_mac_respects_key_state(kms_client, state):
+    meta = _hmac_key(kms_client)
+    key_id = meta["KeyId"]
+    mac = kms_client.generate_mac(
+        KeyId=key_id, Message=b"payload", MacAlgorithm="HMAC_SHA_256"
+    )["Mac"]
+
+    if state == "Disabled":
+        kms_client.disable_key(KeyId=key_id)
+        expected = kms_client.exceptions.DisabledException
+    else:
+        kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+        expected = kms_client.exceptions.KMSInvalidStateException
+
+    with pytest.raises(expected):
+        kms_client.generate_mac(
+            KeyId=key_id, Message=b"payload", MacAlgorithm="HMAC_SHA_256"
+        )
+    with pytest.raises(expected):
+        kms_client.verify_mac(
+            KeyId=key_id,
+            Message=b"payload",
+            MacAlgorithm="HMAC_SHA_256",
+            Mac=mac,
+        )
+
+
+def test_kms_create_hmac_key_rejects_wrong_key_usage(kms_client):
+    with pytest.raises(ClientError) as exc:
+        kms_client.create_key(KeySpec="HMAC_256", KeyUsage="ENCRYPT_DECRYPT")
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_kms_create_key_rejects_mac_usage_on_non_hmac_spec(kms_client):
+    with pytest.raises(ClientError) as exc:
+        kms_client.create_key(
+            KeySpec="SYMMETRIC_DEFAULT", KeyUsage="GENERATE_VERIFY_MAC"
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_kms_hmac_key_rejected_by_non_mac_crypto_operations(kms_client):
+    meta = _hmac_key(kms_client)
+    key_id = meta["KeyId"]
+
+    with pytest.raises(kms_client.exceptions.InvalidKeyUsageException):
+        kms_client.encrypt(KeyId=key_id, Plaintext=b"secret")
+    with pytest.raises(kms_client.exceptions.InvalidKeyUsageException):
+        kms_client.decrypt(KeyId=key_id, CiphertextBlob=b"x" * 100)
+    with pytest.raises(kms_client.exceptions.InvalidKeyUsageException):
+        kms_client.sign(
+            KeyId=key_id, Message=b"m", SigningAlgorithm="RSASSA_PKCS1_V1_5_SHA_256"
+        )
+    with pytest.raises(kms_client.exceptions.InvalidKeyUsageException):
+        kms_client.verify(
+            KeyId=key_id,
+            Message=b"m",
+            Signature=b"sig",
+            SigningAlgorithm="RSASSA_PKCS1_V1_5_SHA_256",
+        )
+    with pytest.raises(kms_client.exceptions.InvalidKeyUsageException):
+        kms_client.generate_data_key(KeyId=key_id, KeySpec="AES_256")
+    with pytest.raises(kms_client.exceptions.InvalidKeyUsageException):
+        kms_client.generate_data_key_pair(KeyId=key_id, KeyPairSpec="RSA_2048")
+
+
+def test_kms_encrypt_key_usage_precedes_key_state(kms_client):
+    meta = _hmac_key(kms_client)
+    kms_client.disable_key(KeyId=meta["KeyId"])
+    with pytest.raises(kms_client.exceptions.InvalidKeyUsageException):
+        kms_client.encrypt(KeyId=meta["KeyId"], Plaintext=b"secret")
+
+
+def test_kms_hmac_key_has_no_public_key(kms_client):
+    meta = _hmac_key(kms_client)
+    with pytest.raises(kms_client.exceptions.InvalidKeyUsageException):
+        kms_client.get_public_key(KeyId=meta["KeyId"])
+
+
+def test_kms_symmetric_key_get_public_key_still_unsupported(kms_client):
+    key_id = kms_client.create_key()["KeyMetadata"]["KeyId"]
+    with pytest.raises(kms_client.exceptions.UnsupportedOperationException):
+        kms_client.get_public_key(KeyId=key_id)
+
+
+def test_kms_hmac_key_cannot_enable_rotation(kms_client):
+    meta = _hmac_key(kms_client)
+    with pytest.raises(kms_client.exceptions.UnsupportedOperationException):
+        kms_client.enable_key_rotation(KeyId=meta["KeyId"])
+
+
+def test_kms_hmac_key_disable_rotation_unsupported_but_status_reads_false(kms_client):
+    meta = _hmac_key(kms_client)
+    with pytest.raises(kms_client.exceptions.UnsupportedOperationException):
+        kms_client.disable_key_rotation(KeyId=meta["KeyId"])
+    status = kms_client.get_key_rotation_status(KeyId=meta["KeyId"])
+    assert status["KeyRotationEnabled"] is False
+
+
+def test_kms_hmac_key_supports_lifecycle_and_tags(kms_client):
+    meta = kms_client.create_key(
+        KeySpec="HMAC_256",
+        KeyUsage="GENERATE_VERIFY_MAC",
+        Tags=[{"TagKey": "env", "TagValue": "mac"}],
+    )["KeyMetadata"]
+    key_id = meta["KeyId"]
+
+    assert {"TagKey": "env", "TagValue": "mac"} in kms_client.list_resource_tags(
+        KeyId=key_id
+    )["Tags"]
+
+    kms_client.disable_key(KeyId=key_id)
+    assert kms_client.describe_key(KeyId=key_id)["KeyMetadata"]["KeyState"] == "Disabled"
+    kms_client.enable_key(KeyId=key_id)
+    assert kms_client.describe_key(KeyId=key_id)["KeyMetadata"]["KeyState"] == "Enabled"
+
+    policy = json.loads(kms_client.get_key_policy(KeyId=key_id, PolicyName="default")["Policy"])
+    assert policy["Statement"][0]["Action"] == "kms:*"
+
+
+def test_kms_cloudformation_hmac_key_spec(cfn, kms_client):
+    template = {
+        "Resources": {
+            "MacKey": {
+                "Type": "AWS::KMS::Key",
+                "Properties": {
+                    "Description": "cfn hmac key",
+                    "KeySpec": "HMAC_256",
+                    "KeyUsage": "GENERATE_VERIFY_MAC",
+                },
+            },
+        },
+        "Outputs": {"KeyId": {"Value": {"Ref": "MacKey"}}},
+    }
+    stack_name = f"kms-cfn-hmac-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+
+    outputs = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["Outputs"]
+    key_id = next(o["OutputValue"] for o in outputs if o["OutputKey"] == "KeyId")
+
+    meta = kms_client.describe_key(KeyId=key_id)["KeyMetadata"]
+    assert meta["KeySpec"] == "HMAC_256"
+    assert meta["KeyUsage"] == "GENERATE_VERIFY_MAC"
+    assert meta["MacAlgorithms"] == ["HMAC_SHA_256"]
+
+    mac = kms_client.generate_mac(
+        KeyId=key_id, Message=b"cfn payload", MacAlgorithm="HMAC_SHA_256"
+    )["Mac"]
+    assert kms_client.verify_mac(
+        KeyId=key_id, Message=b"cfn payload", MacAlgorithm="HMAC_SHA_256", Mac=mac
+    )["MacValid"] is True
+
+
+def test_kms_cloudformation_honours_asymmetric_key_spec(cfn, kms_client):
+    template = {
+        "Resources": {
+            "SignKey": {
+                "Type": "AWS::KMS::Key",
+                "Properties": {
+                    "KeySpec": "RSA_2048",
+                    "KeyUsage": "SIGN_VERIFY",
+                },
+            },
+        },
+        "Outputs": {"KeyId": {"Value": {"Ref": "SignKey"}}},
+    }
+    stack_name = f"kms-cfn-rsa-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack_name, TemplateBody=json.dumps(template))
+
+    outputs = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]["Outputs"]
+    key_id = next(o["OutputValue"] for o in outputs if o["OutputKey"] == "KeyId")
+
+    meta = kms_client.describe_key(KeyId=key_id)["KeyMetadata"]
+    assert meta["KeySpec"] == "RSA_2048"
+    assert meta["KeyUsage"] == "SIGN_VERIFY"
+    assert "RSASSA_PKCS1_V1_5_SHA_256" in meta["SigningAlgorithms"]
+
+    signature = kms_client.sign(
+        KeyId=key_id, Message=b"cfn signed", SigningAlgorithm="RSASSA_PKCS1_V1_5_SHA_256"
+    )["Signature"]
+    assert kms_client.verify(
+        KeyId=key_id, Message=b"cfn signed", Signature=signature,
+        SigningAlgorithm="RSASSA_PKCS1_V1_5_SHA_256",
+    )["SignatureValid"] is True
+
+
+@pytest.mark.parametrize("properties", [
+    {"KeySpec": "HMAC_256", "KeyUsage": "ENCRYPT_DECRYPT"},
+    {"KeyUsage": "GENERATE_VERIFY_MAC"},
+    {"KeySpec": "HMAC_256"},
+])
+def test_kms_cloudformation_rejects_mismatched_hmac_spec_and_usage(cfn, properties):
+    template = {
+        "Resources": {
+            "MacKey": {"Type": "AWS::KMS::Key", "Properties": properties},
+        },
+    }
+    stack_name = f"kms-cfn-hmac-bad-{_uuid_mod.uuid4().hex[:8]}"
+    cfn.create_stack(
+        StackName=stack_name,
+        TemplateBody=json.dumps(template),
+        DisableRollback=True,
+    )
+    for _ in range(50):
+        stack = cfn.describe_stacks(StackName=stack_name)["Stacks"][0]
+        if not stack["StackStatus"].endswith("_IN_PROGRESS"):
+            break
+        time.sleep(0.2)
+    assert stack["StackStatus"] in ("CREATE_FAILED", "ROLLBACK_COMPLETE")
+
+
+def test_kms_is_hmac_key_ignores_key_usage_alone():
+    from ministack.services import kms as _kms
+
+    legacy_symmetric = {
+        "KeySpec": "SYMMETRIC_DEFAULT",
+        "KeyUsage": "GENERATE_VERIFY_MAC",
+        "_symmetric_key": b"\x00" * 32,
+    }
+    assert not _kms._is_hmac_key(legacy_symmetric)
+    assert _kms._is_hmac_key({"KeySpec": "HMAC_256"})
+    assert _kms._is_hmac_key({"_hmac_key": b"\x00" * 32})
+
+
+def test_kms_generate_mac_matches_rfc2104_hmac():
+    import hmac as _hmac
+
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import kms as _kms
+
+    original_account = get_account_id()
+    original_region = get_region()
+    _kms.reset()
+    try:
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+        status, _headers, body = _kms._create_key(
+            {"KeySpec": "HMAC_384", "KeyUsage": "GENERATE_VERIFY_MAC"}
+        )
+        assert status == 200
+        key_id = json.loads(body)["KeyMetadata"]["KeyId"]
+        rec = _kms._keys[key_id]
+        assert len(rec["_hmac_key"]) == 48
+
+        message = b"rfc 2104 parity"
+        status, _headers, body = _kms._generate_mac({
+            "KeyId": key_id,
+            "Message": base64.b64encode(message).decode(),
+            "MacAlgorithm": "HMAC_SHA_384",
+        })
+        assert status == 200
+        expected = _hmac.new(rec["_hmac_key"], message, "sha384").digest()
+        assert base64.b64decode(json.loads(body)["Mac"]) == expected
+    finally:
+        _kms.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_kms_hmac_key_survives_state_roundtrip():
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import kms as _kms
+
+    original_account = get_account_id()
+    original_region = get_region()
+    _kms.reset()
+    try:
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+        status, _headers, body = _kms._create_key(
+            {"KeySpec": "HMAC_512", "KeyUsage": "GENERATE_VERIFY_MAC"}
+        )
+        assert status == 200
+        key_id = json.loads(body)["KeyMetadata"]["KeyId"]
+        message = base64.b64encode(b"persisted").decode()
+        _status, _headers, body = _kms._generate_mac({
+            "KeyId": key_id, "Message": message, "MacAlgorithm": "HMAC_SHA_512",
+        })
+        mac_before = json.loads(body)["Mac"]
+
+        state = _kms.get_state()
+        assert "_hmac_key_b64" in state["keys"][key_id]
+        assert "_hmac_key" not in state["keys"][key_id]
+        _kms.reset()
+        _kms.load_persisted_state(state)
+
+        rec = _kms._keys[key_id]
+        assert isinstance(rec["_hmac_key"], bytes)
+        assert "_hmac_key_b64" not in rec
+        assert rec["MacAlgorithms"] == ["HMAC_SHA_512"]
+
+        _status, _headers, body = _kms._generate_mac({
+            "KeyId": key_id, "Message": message, "MacAlgorithm": "HMAC_SHA_512",
+        })
+        assert json.loads(body)["Mac"] == mac_before
+
+        status, _headers, body = _kms._verify_mac({
+            "KeyId": key_id,
+            "Message": message,
+            "MacAlgorithm": "HMAC_SHA_512",
+            "Mac": mac_before,
+        })
+        assert status == 200
+        assert json.loads(body)["MacValid"] is True
+    finally:
+        _kms.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_kms_create_key_rsa_3072_signs(kms_client):
+    """RSA_3072 is in the CreateKey KeySpec enum and GenerateDataKeyPair already
+    produced RSA_3072 pairs; CreateKey used to reject it."""
+    meta = kms_client.create_key(KeySpec="RSA_3072", KeyUsage="SIGN_VERIFY")["KeyMetadata"]
+    assert meta["KeySpec"] == "RSA_3072"
+    assert "RSASSA_PSS_SHA_256" in meta["SigningAlgorithms"]
+
+    message = b"rsa-3072-message"
+    signature = kms_client.sign(
+        KeyId=meta["KeyId"],
+        Message=message,
+        MessageType="RAW",
+        SigningAlgorithm="RSASSA_PSS_SHA_256",
+    )["Signature"]
+    assert kms_client.verify(
+        KeyId=meta["KeyId"],
+        Message=message,
+        MessageType="RAW",
+        Signature=signature,
+        SigningAlgorithm="RSASSA_PSS_SHA_256",
+    )["SignatureValid"]
+
+
+def test_kms_generate_random_returns_requested_bytes(kms_client):
+    """GenerateRandom is keyless; the response Plaintext is exactly the
+    requested number of bytes, and two calls do not repeat."""
+    first = kms_client.generate_random(NumberOfBytes=32)["Plaintext"]
+    second = kms_client.generate_random(NumberOfBytes=32)["Plaintext"]
+    assert len(first) == 32
+    assert len(second) == 32
+    assert first != second
+    assert len(kms_client.generate_random(NumberOfBytes=1)["Plaintext"]) == 1
+    assert len(kms_client.generate_random(NumberOfBytes=1024)["Plaintext"]) == 1024
+
+
+def test_kms_generate_random_validation(kms_client):
+    """An omitted or out-of-range NumberOfBytes is a ValidationException, a
+    CustomKeyStoreId a CustomKeyStoreNotFoundException — botocore validates the
+    range client-side, so the raw-request path is exercised via the wire."""
+    import requests as _requests
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+
+    def _raw(payload):
+        # Signed with the client's credentials, so it also passes authentication under AUTH=true.
+        request = AWSRequest("POST", ENDPOINT, data=json.dumps(payload), headers={
+            "x-amz-target": "TrentService.GenerateRandom",
+            "content-type": "application/x-amz-json-1.1",
+        })
+        SigV4Auth(kms_client._get_credentials(), "kms", kms_client.meta.region_name).add_auth(request)
+        return _requests.post(ENDPOINT, data=request.body, headers=dict(request.headers), timeout=10)
+
+    resp = _raw({})
+    assert resp.status_code == 400
+    assert "ValidationException" in resp.json().get("__type", "")
+    assert resp.json().get("message") == "NumberOfBytes is required."
+
+    resp = _raw({"NumberOfBytes": 0})
+    assert resp.status_code == 400
+    assert "ValidationException" in resp.json().get("__type", "")
+    assert resp.json().get("message") == (
+        "1 validation error detected: Value '0' at 'numberOfBytes' failed to "
+        "satisfy constraint: Member must have value greater than or equal to 1"
+    )
+
+    resp = _raw({"NumberOfBytes": 2000})
+    assert resp.status_code == 400
+    assert "ValidationException" in resp.json().get("__type", "")
+
+    resp = _raw({"NumberOfBytes": 16, "CustomKeyStoreId": "cks-does-not-exist"})
+    assert resp.status_code == 400
+    assert "CustomKeyStoreNotFoundException" in resp.json().get("__type", "")
+
+
+def test_kms_generate_random_refuses_a_recipient(kms_client):
+    """The Nitro-enclave Recipient parameter is refused, not silently ignored.
+
+    A caller sending Recipient expects CiphertextForRecipient and a null
+    Plaintext; MiniStack cannot encrypt to an enclave attestation key, and
+    answering Plaintext anyway is a response shape the request never gets from
+    the real service.
+    """
+    with pytest.raises(ClientError) as e:
+        kms_client.generate_random(
+            NumberOfBytes=32,
+            Recipient={
+                "KeyEncryptionAlgorithm": "RSAES_OAEP_SHA_256",
+                "AttestationDocument": b"not-a-real-attestation-document",
+            },
+        )
+    assert e.value.response["Error"]["Code"] == "UnsupportedOperationException"
+
+
+# ---------------------------------------------------------------------------
+# Multi-Region keys and ReplicateKey
+# ---------------------------------------------------------------------------
+
+def test_kms_multi_region_key_metadata(kms_client):
+    """A MultiRegion key carries the mrk- id prefix and reports its
+    MultiRegionConfiguration; a plain key reports MultiRegion false."""
+    plain = kms_client.create_key()["KeyMetadata"]
+    assert plain["MultiRegion"] is False
+    assert "MultiRegionConfiguration" not in plain
+
+    meta = kms_client.create_key(MultiRegion=True)["KeyMetadata"]
+    assert meta["KeyId"].startswith("mrk-")
+    assert meta["MultiRegion"] is True
+    cfg = meta["MultiRegionConfiguration"]
+    assert cfg["MultiRegionKeyType"] == "PRIMARY"
+    assert cfg["PrimaryKey"]["Region"] == "us-east-1"
+    assert cfg["PrimaryKey"]["Arn"].endswith(f":key/{meta['KeyId']}")
+    assert cfg["ReplicaKeys"] == []
+
+
+def test_kms_replicate_key_cross_region_decrypt():
+    """ReplicateKey creates a same-id replica in the target region sharing the
+    key material, so a ciphertext produced against the primary decrypts
+    against the replica — the S3 SSE-KMS cross-region case."""
+    east, west = _regional_kms("us-east-1"), _regional_kms("us-west-2")
+    key_id = east.create_key(MultiRegion=True)["KeyMetadata"]["KeyId"]
+
+    resp = east.replicate_key(KeyId=key_id, ReplicaRegion="us-west-2",
+                              Description="the west copy")
+    replica = resp["ReplicaKeyMetadata"]
+    assert replica["KeyId"] == key_id
+    assert replica["Arn"] == f"arn:aws:kms:us-west-2:000000000000:key/{key_id}"
+    assert replica["MultiRegionConfiguration"]["MultiRegionKeyType"] == "REPLICA"
+    assert replica["Description"] == "the west copy"
+    assert resp["ReplicaPolicy"]
+    assert resp["ReplicaTags"] == []
+
+    # Both members report the full topology.
+    for client, kind in ((east, "PRIMARY"), (west, "REPLICA")):
+        cfg = client.describe_key(KeyId=key_id)["KeyMetadata"]["MultiRegionConfiguration"]
+        assert cfg["MultiRegionKeyType"] == kind
+        assert cfg["PrimaryKey"]["Region"] == "us-east-1"
+        assert [r["Region"] for r in cfg["ReplicaKeys"]] == ["us-west-2"]
+
+    # Shared key material: encrypt east, decrypt west.
+    blob = east.encrypt(KeyId=key_id, Plaintext=b"cross-region")["CiphertextBlob"]
+    out = west.decrypt(CiphertextBlob=blob)
+    assert out["Plaintext"] == b"cross-region"
+    assert out["KeyId"].endswith(f":key/{key_id}")
+
+    # The same region twice is a conflict.
+    with pytest.raises(ClientError) as ei:
+        east.replicate_key(KeyId=key_id, ReplicaRegion="us-west-2")
+    assert ei.value.response["Error"]["Code"] == "AlreadyExistsException"
+
+
+def test_kms_replicate_key_refusals(kms_client):
+    """A plain key cannot be replicated, and a replica cannot be the source."""
+    east, west = _regional_kms("us-east-1"), _regional_kms("us-west-2")
+
+    plain = kms_client.create_key()["KeyMetadata"]["KeyId"]
+    with pytest.raises(ClientError) as ei:
+        kms_client.replicate_key(KeyId=plain, ReplicaRegion="us-west-2")
+    assert ei.value.response["Error"]["Code"] == "UnsupportedOperationException"
+
+    key_id = east.create_key(MultiRegion=True)["KeyMetadata"]["KeyId"]
+    east.replicate_key(KeyId=key_id, ReplicaRegion="us-west-2")
+    with pytest.raises(ClientError) as ei:
+        west.replicate_key(KeyId=key_id, ReplicaRegion="eu-west-1")
+    assert ei.value.response["Error"]["Code"] == "UnsupportedOperationException"
+
+
+def test_kms_primary_with_replicas_waits_on_deletion():
+    """Scheduling deletion on a primary with a live replica lands
+    PendingReplicaDeletion; once the replica is scheduled away, the primary
+    moves on to PendingDeletion."""
+    east, west = _regional_kms("us-east-1"), _regional_kms("us-west-2")
+    key_id = east.create_key(MultiRegion=True)["KeyMetadata"]["KeyId"]
+    east.replicate_key(KeyId=key_id, ReplicaRegion="us-west-2")
+
+    resp = east.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+    assert resp["KeyState"] == "PendingReplicaDeletion"
+    meta = east.describe_key(KeyId=key_id)["KeyMetadata"]
+    assert meta["KeyState"] == "PendingReplicaDeletion"
+    assert meta["PendingDeletionWindowInDays"] == 7
+
+    west.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+    assert east.describe_key(KeyId=key_id)["KeyMetadata"]["KeyState"] == "PendingDeletion"
+
+
+# ---------------------------------------------------------------------------
+# Imported key material (BYOK): Origin EXTERNAL, GetParametersForImport,
+# ImportKeyMaterial, DeleteImportedKeyMaterial.
+# ---------------------------------------------------------------------------
+
+_BYOK_MATERIAL = bytes(range(32))
+_NO_EXPIRY = "KEY_MATERIAL_DOES_NOT_EXPIRE"
+
+
+def _wrap_material(public_key_der, algorithm, material=_BYOK_MATERIAL):
+    """Wrap key material the way a caller does, per WrappingAlgorithm."""
+    keywrap = pytest.importorskip("cryptography.hazmat.primitives.keywrap")
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    public_key = serialization.load_der_public_key(public_key_der)
+    if algorithm == "RSAES_PKCS1_V1_5":
+        return public_key.encrypt(material, padding.PKCS1v15())
+    digest = hashes.SHA1() if algorithm.endswith("SHA_1") else hashes.SHA256()
+    oaep = padding.OAEP(mgf=padding.MGF1(algorithm=digest), algorithm=digest, label=None)
+    if algorithm.startswith("RSAES_OAEP"):
+        return public_key.encrypt(material, oaep)
+    ephemeral = os.urandom(32)
+    return (public_key.encrypt(ephemeral, oaep)
+            + keywrap.aes_key_wrap_with_padding(ephemeral, material))
+
+
+def _import_external_key(kms, algorithm="RSAES_OAEP_SHA_256", material=_BYOK_MATERIAL,
+                         expiration=_NO_EXPIRY, valid_to=None, **create_kwargs):
+    key_id = kms.create_key(Origin="EXTERNAL", **create_kwargs)["KeyMetadata"]["KeyId"]
+    params = kms.get_parameters_for_import(
+        KeyId=key_id, WrappingAlgorithm=algorithm, WrappingKeySpec="RSA_2048")
+    kwargs = {"ExpirationModel": expiration}
+    if valid_to is not None:
+        kwargs["ValidTo"] = valid_to
+    kms.import_key_material(
+        KeyId=key_id, ImportToken=params["ImportToken"],
+        EncryptedKeyMaterial=_wrap_material(params["PublicKey"], algorithm, material),
+        **kwargs)
+    return key_id, params
+
+
+def test_kms_external_key_starts_pending_import_and_refuses_use():
+    """An EXTERNAL key has no material until it is imported, so it starts
+    PendingImport and every cryptographic operation is refused."""
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    metadata = kms.create_key(Origin="EXTERNAL")["KeyMetadata"]
+    assert metadata["Origin"] == "EXTERNAL"
+    assert metadata["KeyState"] == "PendingImport"
+    assert metadata["Enabled"] is False
+    with pytest.raises(ClientError) as exc:
+        kms.encrypt(KeyId=metadata["KeyId"], Plaintext=b"x")
+    assert exc.value.response["Error"]["Code"] == "KMSInvalidStateException"
+
+
+@pytest.mark.parametrize("algorithm", [
+    "RSAES_PKCS1_V1_5", "RSAES_OAEP_SHA_1", "RSAES_OAEP_SHA_256",
+    "RSA_AES_KEY_WRAP_SHA_1", "RSA_AES_KEY_WRAP_SHA_256",
+])
+def test_kms_import_key_material_every_wrapping_algorithm(algorithm):
+    """Each WrappingAlgorithm in the enum unwraps, and the key then encrypts
+    and decrypts with the caller's own material."""
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    key_id, params = _import_external_key(kms, algorithm)
+    assert params["KeyId"].endswith(key_id)
+    assert params["ParametersValidTo"]
+    metadata = kms.describe_key(KeyId=key_id)["KeyMetadata"]
+    assert metadata["KeyState"] == "Enabled"
+    assert metadata["Enabled"] is True
+    assert metadata["ExpirationModel"] == _NO_EXPIRY
+    assert "ValidTo" not in metadata
+    ciphertext = kms.encrypt(KeyId=key_id, Plaintext=b"hello byok")["CiphertextBlob"]
+    assert kms.decrypt(CiphertextBlob=ciphertext)["Plaintext"] == b"hello byok"
+
+
+def test_kms_imported_material_is_the_callers_own_bytes():
+    """The point of BYOK: two keys given the same material are interchangeable,
+    so a fixture can pin the key bytes a test depends on."""
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    first, _ = _import_external_key(kms)
+    second, _ = _import_external_key(kms)
+    ciphertext = kms.encrypt(KeyId=first, Plaintext=b"same material")["CiphertextBlob"]
+    assert kms.decrypt(CiphertextBlob=ciphertext, KeyId=second)["Plaintext"] \
+        == b"same material"
+
+
+def test_kms_import_expiring_material_reports_valid_to():
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    valid_to = _dt.datetime(2030, 1, 1, tzinfo=_dt.timezone.utc)
+    key_id, _ = _import_external_key(
+        kms, expiration="KEY_MATERIAL_EXPIRES", valid_to=valid_to)
+    metadata = kms.describe_key(KeyId=key_id)["KeyMetadata"]
+    assert metadata["ExpirationModel"] == "KEY_MATERIAL_EXPIRES"
+    assert metadata["ValidTo"] == valid_to
+
+
+def test_kms_delete_imported_key_material_returns_the_key_to_pending_import():
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    key_id, _ = _import_external_key(kms)
+    kms.delete_imported_key_material(KeyId=key_id)
+    metadata = kms.describe_key(KeyId=key_id)["KeyMetadata"]
+    assert metadata["KeyState"] == "PendingImport"
+    assert metadata["Enabled"] is False
+    assert "ValidTo" not in metadata
+    with pytest.raises(ClientError) as exc:
+        kms.encrypt(KeyId=key_id, Plaintext=b"x")
+    assert exc.value.response["Error"]["Code"] == "KMSInvalidStateException"
+
+
+def test_kms_import_rejects_a_bad_token_wrong_material_and_reuse():
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    key_id = kms.create_key(Origin="EXTERNAL")["KeyMetadata"]["KeyId"]
+    params = kms.get_parameters_for_import(
+        KeyId=key_id, WrappingAlgorithm="RSAES_OAEP_SHA_256",
+        WrappingKeySpec="RSA_2048")
+    wrapped = _wrap_material(params["PublicKey"], "RSAES_OAEP_SHA_256")
+
+    def fails_with(code, **kwargs):
+        with pytest.raises(ClientError) as exc:
+            kms.import_key_material(KeyId=key_id, ExpirationModel=_NO_EXPIRY, **kwargs)
+        assert exc.value.response["Error"]["Code"] == code
+
+    fails_with("InvalidImportTokenException",
+               ImportToken=b"nope", EncryptedKeyMaterial=wrapped)
+    fails_with("InvalidCiphertextException",
+               ImportToken=params["ImportToken"], EncryptedKeyMaterial=b"x" * 256)
+    fails_with("IncorrectKeyMaterialException",
+               ImportToken=params["ImportToken"],
+               EncryptedKeyMaterial=_wrap_material(
+                   params["PublicKey"], "RSAES_OAEP_SHA_256", b"tooshort"))
+    # ValidTo is required when the material expires.
+    with pytest.raises(ClientError) as exc:
+        kms.import_key_material(
+            KeyId=key_id, ImportToken=params["ImportToken"],
+            EncryptedKeyMaterial=wrapped, ExpirationModel="KEY_MATERIAL_EXPIRES")
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+    kms.import_key_material(
+        KeyId=key_id, ImportToken=params["ImportToken"],
+        EncryptedKeyMaterial=wrapped, ExpirationModel=_NO_EXPIRY)
+    # The token is single-use.
+    fails_with("InvalidImportTokenException",
+               ImportToken=params["ImportToken"], EncryptedKeyMaterial=wrapped)
+
+
+def test_kms_import_flow_refuses_a_non_external_key():
+    """GetParametersForImport, ImportKeyMaterial and DeleteImportedKeyMaterial
+    all require Origin EXTERNAL."""
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    key_id = kms.create_key()["KeyMetadata"]["KeyId"]
+    with pytest.raises(ClientError) as exc:
+        kms.get_parameters_for_import(
+            KeyId=key_id, WrappingAlgorithm="RSAES_OAEP_SHA_256",
+            WrappingKeySpec="RSA_2048")
+    assert exc.value.response["Error"]["Code"] == "UnsupportedOperationException"
+    with pytest.raises(ClientError) as exc:
+        kms.delete_imported_key_material(KeyId=key_id)
+    assert exc.value.response["Error"]["Code"] == "UnsupportedOperationException"
+
+
+def test_kms_external_origin_wrapping_key_specs_are_validated():
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    key_id = kms.create_key(Origin="EXTERNAL")["KeyMetadata"]["KeyId"]
+    with pytest.raises(ClientError) as exc:
+        kms.get_parameters_for_import(
+            KeyId=key_id, WrappingAlgorithm="RSAES_OAEP_SHA_256",
+            WrappingKeySpec="SM2")
+    assert exc.value.response["Error"]["Code"] == "UnsupportedOperationException"
+
+
+def _pkcs8_der(private_key):
+    """The private key alone, DER-encoded PKCS#8, which is the form AWS imports."""
+    from cryptography.hazmat.primitives import serialization
+    return private_key.private_bytes(
+        serialization.Encoding.DER,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+
+
+def test_kms_external_hmac_key_imports_its_own_material():
+    """AWS supports imported key material for HMAC keys, and the imported bytes
+    are the ones the MAC is computed with."""
+    pytest.importorskip("cryptography")
+    import hashlib
+    import hmac
+    kms = _regional_kms("us-east-1")
+    material = bytes(range(32))
+    key_id, _ = _import_external_key(
+        kms, algorithm="RSAES_OAEP_SHA_256", material=material,
+        KeySpec="HMAC_256", KeyUsage="GENERATE_VERIFY_MAC")
+    metadata = kms.describe_key(KeyId=key_id)["KeyMetadata"]
+    assert metadata["KeyState"] == "Enabled"
+    assert metadata["Origin"] == "EXTERNAL"
+    mac = kms.generate_mac(KeyId=key_id, Message=b"hmac byok",
+                           MacAlgorithm="HMAC_SHA_256")["Mac"]
+    assert hmac.new(material, b"hmac byok", hashlib.sha256).digest() == mac
+
+
+@pytest.mark.parametrize("key_spec", [
+    "RSA_2048", "ECC_NIST_P256", "ECC_NIST_EDWARDS25519",
+])
+def test_kms_external_asymmetric_key_imports_its_own_private_key(key_spec):
+    """AWS imports the private key alone and derives the public key from it, so
+    GetPublicKey returns the pair of the material the caller supplied."""
+    pytest.importorskip("cryptography")
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa
+    kms = _regional_kms("us-east-1")
+    if key_spec == "RSA_2048":
+        private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    elif key_spec == "ECC_NIST_P256":
+        private_key = ec.generate_private_key(ec.SECP256R1())
+    else:
+        private_key = ed25519.Ed25519PrivateKey.generate()
+    # A private key is far larger than RSAES_OAEP can wrap directly, so
+    # asymmetric material travels under the AES key-wrap algorithms.
+    key_id, _ = _import_external_key(
+        kms, algorithm="RSA_AES_KEY_WRAP_SHA_256", material=_pkcs8_der(private_key),
+        KeySpec=key_spec, KeyUsage="SIGN_VERIFY")
+    assert kms.describe_key(KeyId=key_id)["KeyMetadata"]["KeyState"] == "Enabled"
+    assert kms.get_public_key(KeyId=key_id)["PublicKey"] == \
+        private_key.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo)
+
+
+def test_kms_imported_asymmetric_key_signs_with_the_imported_material():
+    pytest.importorskip("cryptography")
+    from cryptography.hazmat.primitives.asymmetric import ec
+    kms = _regional_kms("us-east-1")
+    private_key = ec.generate_private_key(ec.SECP256R1())
+    key_id, _ = _import_external_key(
+        kms, algorithm="RSA_AES_KEY_WRAP_SHA_256", material=_pkcs8_der(private_key),
+        KeySpec="ECC_NIST_P256", KeyUsage="SIGN_VERIFY")
+    signature = kms.sign(KeyId=key_id, Message=b"sign byok",
+                         SigningAlgorithm="ECDSA_SHA_256")["Signature"]
+    assert kms.verify(KeyId=key_id, Message=b"sign byok", Signature=signature,
+                      SigningAlgorithm="ECDSA_SHA_256")["SignatureValid"] is True
+
+
+@pytest.mark.parametrize("key_spec,key_usage,material", [
+    ("HMAC_256", "GENERATE_VERIFY_MAC", bytes(16)),
+    ("ECC_NIST_P256", "SIGN_VERIFY", b"not a der private key"),
+])
+def test_kms_import_rejects_material_that_does_not_fit_the_key_spec(
+        key_spec, key_usage, material):
+    pytest.importorskip("cryptography")
+    kms = _regional_kms("us-east-1")
+    with pytest.raises(ClientError) as exc:
+        _import_external_key(
+            kms, algorithm="RSA_AES_KEY_WRAP_SHA_256", material=material,
+            KeySpec=key_spec, KeyUsage=key_usage)
+    assert exc.value.response["Error"]["Code"] == "IncorrectKeyMaterialException"
+
+
+def test_kms_import_rejects_a_private_key_of_the_wrong_curve():
+    """The material must be the key the KeySpec declares, not merely parseable."""
+    pytest.importorskip("cryptography")
+    from cryptography.hazmat.primitives.asymmetric import ec
+    kms = _regional_kms("us-east-1")
+    with pytest.raises(ClientError) as exc:
+        _import_external_key(
+            kms, algorithm="RSA_AES_KEY_WRAP_SHA_256",
+            material=_pkcs8_der(ec.generate_private_key(ec.SECP384R1())),
+            KeySpec="ECC_NIST_P256", KeyUsage="SIGN_VERIFY")
+    assert exc.value.response["Error"]["Code"] == "IncorrectKeyMaterialException"
+
+
+def test_kms_delete_imported_material_clears_the_asymmetric_key():
+    pytest.importorskip("cryptography")
+    from cryptography.hazmat.primitives.asymmetric import ec
+    kms = _regional_kms("us-east-1")
+    key_id, _ = _import_external_key(
+        kms, algorithm="RSA_AES_KEY_WRAP_SHA_256",
+        material=_pkcs8_der(ec.generate_private_key(ec.SECP256R1())),
+        KeySpec="ECC_NIST_P256", KeyUsage="SIGN_VERIFY")
+    kms.delete_imported_key_material(KeyId=key_id)
+    assert kms.describe_key(KeyId=key_id)["KeyMetadata"]["KeyState"] == "PendingImport"
+    with pytest.raises(ClientError) as exc:
+        kms.get_public_key(KeyId=key_id)
+    assert exc.value.response["Error"]["Code"] == "KMSInvalidStateException"
+
+
+def test_kms_alias_carries_creation_and_last_updated_dates(kms_client):
+    first = kms_client.create_key()["KeyMetadata"]["KeyId"]
+    second = kms_client.create_key()["KeyMetadata"]["KeyId"]
+    alias = f"alias/dates-{_uuid_mod.uuid4().hex[:8]}"
+    kms_client.create_alias(AliasName=alias, TargetKeyId=first)
+    try:
+        entry = next(a for a in kms_client.list_aliases()["Aliases"] if a["AliasName"] == alias)
+        assert isinstance(entry["CreationDate"], _dt.datetime)
+        assert entry["LastUpdatedDate"] == entry["CreationDate"]
+        time.sleep(1.1)
+        kms_client.update_alias(AliasName=alias, TargetKeyId=second)
+        updated = next(a for a in kms_client.list_aliases()["Aliases"] if a["AliasName"] == alias)
+        assert updated["CreationDate"] == entry["CreationDate"]
+        assert updated["LastUpdatedDate"] > entry["LastUpdatedDate"]
+    finally:
+        kms_client.delete_alias(AliasName=alias)
+
+
+def test_kms_list_grants(kms_client):
+    meta = kms_client.create_key()["KeyMetadata"]
+    for key_ref in (meta["KeyId"], meta["Arn"]):
+        resp = kms_client.list_grants(KeyId=key_ref)
+        assert resp["Grants"] == [] and resp["Truncated"] is False
+    for missing, code in (("00000000-0000-0000-0000-000000000000", "NotFoundException"),
+                          ("alias/does-not-matter", "InvalidArnException")):
+        with pytest.raises(ClientError) as exc:
+            kms_client.list_grants(KeyId=missing)
+        assert exc.value.response["Error"]["Code"] == code
+
+
+def _new_grant_key(kms_client, **kwargs):
+    return kms_client.create_key(**kwargs)["KeyMetadata"]
+
+
+def test_kms_create_grant_is_listed(kms_client):
+    meta = _new_grant_key(kms_client)
+    grantee = "arn:aws:iam::000000000000:role/grant-reader"
+    resp = kms_client.create_grant(
+        KeyId=meta["KeyId"],
+        GranteePrincipal=grantee,
+        RetiringPrincipal="arn:aws:iam::000000000000:role/grant-retirer",
+        Operations=["Encrypt", "Decrypt"],
+        Constraints={"EncryptionContextSubset": {"app": "billing"}},
+    )
+    assert resp["GrantId"] and resp["GrantToken"]
+
+    for key_ref in (meta["KeyId"], meta["Arn"]):
+        grants = kms_client.list_grants(KeyId=key_ref)["Grants"]
+        assert len(grants) == 1
+        grant = grants[0]
+        assert grant["GrantId"] == resp["GrantId"]
+        assert grant["KeyId"] == meta["Arn"]
+        assert grant["GranteePrincipal"] == grantee
+        assert grant["RetiringPrincipal"] == "arn:aws:iam::000000000000:role/grant-retirer"
+        assert grant["Operations"] == ["Encrypt", "Decrypt"]
+        assert grant["Constraints"] == {"EncryptionContextSubset": {"app": "billing"}}
+        assert grant["IssuingAccount"].startswith("arn:aws:iam::")
+        assert isinstance(grant["CreationDate"], _dt.datetime)
+        assert "GrantToken" not in grant
+
+
+def test_kms_list_grants_filters(kms_client):
+    meta = _new_grant_key(kms_client)
+    first = kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/a", Operations=["Encrypt"])
+    kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/b", Operations=["Decrypt"])
+    other = _new_grant_key(kms_client)
+    kms_client.create_grant(KeyId=other["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/a", Operations=["Encrypt"])
+
+    assert len(kms_client.list_grants(KeyId=meta["KeyId"])["Grants"]) == 2
+    by_id = kms_client.list_grants(KeyId=meta["KeyId"], GrantId=first["GrantId"])["Grants"]
+    assert [g["GrantId"] for g in by_id] == [first["GrantId"]]
+    by_grantee = kms_client.list_grants(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/b")["Grants"]
+    assert [g["GranteePrincipal"] for g in by_grantee] == ["arn:aws:iam::000000000000:role/b"]
+
+
+def test_kms_list_grants_paginates(kms_client):
+    meta = _new_grant_key(kms_client)
+    created = {
+        kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal=f"arn:aws:iam::000000000000:role/p{i}", Operations=["Encrypt"])["GrantId"]
+        for i in range(5)
+    }
+    seen, marker = [], None
+    while True:
+        kwargs = {"KeyId": meta["KeyId"], "Limit": 2}
+        if marker:
+            kwargs["Marker"] = marker
+        page = kms_client.list_grants(**kwargs)
+        assert len(page["Grants"]) <= 2
+        seen += [g["GrantId"] for g in page["Grants"]]
+        if not page["Truncated"]:
+            assert "NextMarker" not in page
+            break
+        marker = page["NextMarker"]
+    assert len(seen) == len(set(seen)) == 5
+    assert set(seen) == created
+
+    with pytest.raises(ClientError) as exc:
+        kms_client.list_grants(KeyId=meta["KeyId"], Marker="not-a-marker")
+    assert exc.value.response["Error"]["Code"] == "InvalidMarkerException"
+
+
+def test_kms_create_grant_with_name_is_idempotent(kms_client):
+    meta = _new_grant_key(kms_client)
+    params = {"KeyId": meta["KeyId"], "GranteePrincipal": "arn:aws:iam::000000000000:role/n", "Operations": ["Encrypt"], "Name": "retry-safe"}
+    first = kms_client.create_grant(**params)
+    again = kms_client.create_grant(**params)
+    assert again["GrantId"] == first["GrantId"]
+    assert again["GrantToken"] != first["GrantToken"]
+    assert len(kms_client.list_grants(KeyId=meta["KeyId"])["Grants"]) == 1
+
+    changed = kms_client.create_grant(**{**params, "Operations": ["Decrypt"]})
+    assert changed["GrantId"] != first["GrantId"]
+
+    unnamed = {k: v for k, v in params.items() if k != "Name"}
+    assert kms_client.create_grant(**unnamed)["GrantId"] != kms_client.create_grant(**unnamed)["GrantId"]
+
+
+def test_kms_revoke_grant(kms_client):
+    meta = _new_grant_key(kms_client)
+    grant_id = kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/r", Operations=["Encrypt"])["GrantId"]
+    kms_client.revoke_grant(KeyId=meta["Arn"], GrantId=grant_id)
+    assert kms_client.list_grants(KeyId=meta["KeyId"])["Grants"] == []
+
+    with pytest.raises(ClientError) as exc:
+        kms_client.revoke_grant(KeyId=meta["KeyId"], GrantId=grant_id)
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+
+def test_kms_revoke_grant_checks_the_key(kms_client):
+    meta = _new_grant_key(kms_client)
+    other = _new_grant_key(kms_client)
+    grant_id = kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/r", Operations=["Encrypt"])["GrantId"]
+    with pytest.raises(ClientError) as exc:
+        kms_client.revoke_grant(KeyId=other["KeyId"], GrantId=grant_id)
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+    assert len(kms_client.list_grants(KeyId=meta["KeyId"])["Grants"]) == 1
+
+
+def test_kms_retire_grant_by_token_and_by_id(kms_client):
+    meta = _new_grant_key(kms_client)
+    by_token = kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/t", Operations=["Encrypt"])
+    by_id = kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/i", Operations=["Encrypt"])
+
+    kms_client.retire_grant(GrantToken=by_token["GrantToken"])
+    kms_client.retire_grant(KeyId=meta["Arn"], GrantId=by_id["GrantId"])
+    assert kms_client.list_grants(KeyId=meta["KeyId"])["Grants"] == []
+
+    with pytest.raises(ClientError) as exc:
+        kms_client.retire_grant(GrantToken=by_token["GrantToken"])
+    assert exc.value.response["Error"]["Code"] == "InvalidGrantTokenException"
+    with pytest.raises(ClientError) as exc:
+        kms_client.retire_grant(GrantId=by_id["GrantId"])
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+
+
+def test_kms_create_grant_rejects_operations_the_key_cannot_do(kms_client):
+    symmetric = _new_grant_key(kms_client)
+    signing = _new_grant_key(kms_client, KeySpec="RSA_2048", KeyUsage="SIGN_VERIFY")
+    for key, operation in ((symmetric, "Sign"), (symmetric, "GenerateMac"), (signing, "GenerateDataKey")):
+        with pytest.raises(ClientError) as exc:
+            kms_client.create_grant(KeyId=key["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/v", Operations=[operation])
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert kms_client.create_grant(KeyId=signing["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/v", Operations=["Sign", "Verify"])["GrantId"]
+
+
+def test_kms_create_grant_key_states(kms_client):
+    disabled = _new_grant_key(kms_client)
+    kms_client.disable_key(KeyId=disabled["KeyId"])
+    pending = _new_grant_key(kms_client)
+    kms_client.schedule_key_deletion(KeyId=pending["KeyId"], PendingWindowInDays=7)
+    for meta, code in ((disabled, "DisabledException"), (pending, "KMSInvalidStateException")):
+        with pytest.raises(ClientError) as exc:
+            kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/s", Operations=["Encrypt"])
+        assert exc.value.response["Error"]["Code"] == code
+        assert kms_client.list_grants(KeyId=meta["KeyId"])["Grants"] == []
+
+
+def test_kms_grant_operations_reject_unknown_key_and_alias(kms_client):
+    meta = _new_grant_key(kms_client)
+    alias = f"alias/grant-{_uuid_mod.uuid4().hex[:8]}"
+    kms_client.create_alias(AliasName=alias, TargetKeyId=meta["KeyId"])
+    try:
+        # Recorded on AWS (us-east-1): grant operations refuse an alias even when it exists.
+        for key_ref, code in (("00000000-0000-0000-0000-000000000000", "NotFoundException"),
+                              (alias, "InvalidArnException")):
+            with pytest.raises(ClientError) as exc:
+                kms_client.create_grant(KeyId=key_ref, GranteePrincipal="arn:aws:iam::000000000000:role/x", Operations=["Encrypt"])
+            assert exc.value.response["Error"]["Code"] == code
+            with pytest.raises(ClientError) as exc:
+                kms_client.revoke_grant(KeyId=key_ref, GrantId="0" * 64)
+            assert exc.value.response["Error"]["Code"] == code
+    finally:
+        kms_client.delete_alias(AliasName=alias)
+
+
+def test_kms_grant_dry_run_changes_nothing(kms_client):
+    meta = _new_grant_key(kms_client)
+    with pytest.raises(ClientError) as exc:
+        kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/d", Operations=["Encrypt"], DryRun=True)
+    assert exc.value.response["Error"]["Code"] == "DryRunOperationException"
+    assert kms_client.list_grants(KeyId=meta["KeyId"])["Grants"] == []
+
+    grant = kms_client.create_grant(KeyId=meta["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/d", Operations=["Encrypt"])
+    for call in (
+        lambda: kms_client.revoke_grant(KeyId=meta["KeyId"], GrantId=grant["GrantId"], DryRun=True),
+        lambda: kms_client.retire_grant(GrantToken=grant["GrantToken"], DryRun=True),
+    ):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert exc.value.response["Error"]["Code"] == "DryRunOperationException"
+    assert len(kms_client.list_grants(KeyId=meta["KeyId"])["Grants"]) == 1
+
+
+def test_kms_grants_survive_persistence(monkeypatch, tmp_path):
+    from ministack.core import persistence
+    from ministack.core.responses import (
+        get_account_id,
+        get_region,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import kms as _kms
+
+    monkeypatch.setattr(persistence, "PERSIST_STATE", True)
+    monkeypatch.setattr(persistence, "STATE_DIR", str(tmp_path))
+    original_account = get_account_id()
+    original_region = get_region()
+    _kms.reset()
+    try:
+        set_request_account_id("000000000000")
+        set_request_region("us-east-1")
+        _status, _headers, body = _kms._create_key({})
+        key_id = json.loads(body)["KeyMetadata"]["KeyId"]
+        _status, _headers, body = _kms._create_grant({
+            "KeyId": key_id,
+            "GranteePrincipal": "arn:aws:iam::000000000000:role/persisted",
+            "Operations": ["Encrypt"],
+            "Name": "persisted",
+        })
+        created = json.loads(body)
+
+        persistence.save_state("kms", _kms.get_state())
+        _kms.reset()
+        _kms.load_persisted_state(persistence.load_state("kms"))
+
+        _status, _headers, body = _kms._list_grants({"KeyId": key_id})
+        assert [g["GrantId"] for g in json.loads(body)["Grants"]] == [created["GrantId"]]
+        status, _headers, _body = _kms._retire_grant({"GrantToken": created["GrantToken"]})
+        assert status == 200
+        _status, _headers, body = _kms._list_grants({"KeyId": key_id})
+        assert json.loads(body)["Grants"] == []
+    finally:
+        _kms.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def test_kms_create_grant_on_hmac_key_allows_only_mac_operations(kms_client):
+    hmac_key = _new_grant_key(kms_client, KeySpec="HMAC_256", KeyUsage="GENERATE_VERIFY_MAC")
+    for operations in (["Encrypt"], ["Sign"], ["GenerateDataKey"], ["GetPublicKey"], ["GenerateMac", "Decrypt"]):
+        with pytest.raises(ClientError) as exc:
+            kms_client.create_grant(KeyId=hmac_key["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/h", Operations=operations)
+        assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert kms_client.list_grants(KeyId=hmac_key["KeyId"])["Grants"] == []
+
+    allowed = ["GenerateMac", "VerifyMac", "DescribeKey", "CreateGrant", "RetireGrant"]
+    kms_client.create_grant(KeyId=hmac_key["KeyId"], GranteePrincipal="arn:aws:iam::000000000000:role/h", Operations=allowed)
+    assert kms_client.list_grants(KeyId=hmac_key["KeyId"])["Grants"][0]["Operations"] == allowed
+
+
+def test_kms_create_grant_rejects_primary_pending_replica_deletion():
+    east, west = _regional_kms("us-east-1"), _regional_kms("us-west-2")
+    key_id = east.create_key(MultiRegion=True)["KeyMetadata"]["KeyId"]
+    east.replicate_key(KeyId=key_id, ReplicaRegion="us-west-2")
+    try:
+        assert east.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)["KeyState"] == "PendingReplicaDeletion"
+        with pytest.raises(ClientError) as exc:
+            east.create_grant(KeyId=key_id, GranteePrincipal="arn:aws:iam::000000000000:role/m", Operations=["Encrypt"])
+        assert exc.value.response["Error"]["Code"] == "KMSInvalidStateException"
+        assert east.list_grants(KeyId=key_id)["Grants"] == []
+    finally:
+        west.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=7)
+
+
+@pytest.mark.parametrize("days,accepted", [(6, False), (7, True), (30, True), (31, False)])
+def test_kms_schedule_key_deletion_window_is_7_to_30_days(kms_client, days, accepted):
+    key_id = kms_client.create_key()["KeyMetadata"]["KeyId"]
+    if accepted:
+        assert kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=days)["KeyState"] == "PendingDeletion"
+    else:
+        with pytest.raises(ClientError) as exc:
+            kms_client.schedule_key_deletion(KeyId=key_id, PendingWindowInDays=days)
+        assert exc.value.response["Error"] == {"Code": "ValidationException",
+                                               "Message": "PendingWindowInDays must be between 7 and 30"}
+        assert kms_client.describe_key(KeyId=key_id)["KeyMetadata"]["KeyState"] == "Enabled"
+
+
+def test_kms_rsassa_pss_uses_a_digest_length_salt(kms_client):
+    import hashlib
+
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding, utils
+
+    key_id = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="SIGN_VERIFY")["KeyMetadata"]["KeyId"]
+    digest = hashlib.sha256(b"payload").digest()
+    signature = kms_client.sign(KeyId=key_id, Message=digest, MessageType="DIGEST",
+                         SigningAlgorithm="RSASSA_PSS_SHA_256")["Signature"]
+    public_key = serialization.load_der_public_key(kms_client.get_public_key(KeyId=key_id)["PublicKey"])
+    public_key.verify(signature, digest, padding.PSS(mgf=padding.MGF1(hashes.SHA256()),
+                                                     salt_length=padding.PSS.DIGEST_LENGTH),
+                      utils.Prehashed(hashes.SHA256()))
+
+
+def test_kms_rsa_encryption_honours_the_named_algorithm(kms_client):
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    key_id = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="ENCRYPT_DECRYPT")["KeyMetadata"]["KeyId"]
+    public_key = serialization.load_der_public_key(kms_client.get_public_key(KeyId=key_id)["PublicKey"])
+    sha256 = padding.OAEP(mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)
+    blob = public_key.encrypt(b"secret", sha256)
+    with pytest.raises(ClientError) as exc:
+        kms_client.decrypt(KeyId=key_id, CiphertextBlob=blob, EncryptionAlgorithm="RSAES_OAEP_SHA_1")
+    assert exc.value.response["Error"]["Code"] == "InvalidCiphertextException"
+    assert kms_client.decrypt(KeyId=key_id, CiphertextBlob=blob,
+                       EncryptionAlgorithm="RSAES_OAEP_SHA_256")["Plaintext"] == b"secret"
+    sha1_blob = kms_client.encrypt(KeyId=key_id, Plaintext=b"secret", EncryptionAlgorithm="RSAES_OAEP_SHA_1")["CiphertextBlob"]
+    assert kms_client.decrypt(KeyId=key_id, CiphertextBlob=sha1_blob,
+                       EncryptionAlgorithm="RSAES_OAEP_SHA_1")["Plaintext"] == b"secret"
+
+
+def test_kms_sign_refuses_a_wrong_digest_length_or_algorithm(kms_client):
+    ec_key = kms_client.create_key(KeySpec="ECC_NIST_P256", KeyUsage="SIGN_VERIFY")["KeyMetadata"]["KeyId"]
+    with pytest.raises(ClientError) as exc:
+        kms_client.sign(KeyId=ec_key, Message=b"x" * 20, MessageType="DIGEST", SigningAlgorithm="ECDSA_SHA_256")
+    err = exc.value.response
+    assert (err["Error"]["Code"], err["ResponseMetadata"]["HTTPStatusCode"]) == ("ValidationException", 400)
+    with pytest.raises(ClientError) as exc:
+        kms_client.sign(KeyId=ec_key, Message=b"x" * 32, MessageType="DIGEST", SigningAlgorithm="RSASSA_PSS_SHA_256")
+    assert exc.value.response["Error"]["Code"] == "InvalidKeyUsageException"
+
+
+def test_kms_sign_unknown_algorithm_is_an_enum_validation_error(kms_client):
+    key_id = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="SIGN_VERIFY")["KeyMetadata"]["KeyId"]
+    with pytest.raises(ClientError) as exc:
+        kms_client.sign(KeyId=key_id, Message=b"x" * 32, MessageType="DIGEST", SigningAlgorithm="NOT_A_SIGNING_ALGORITHM")
+    error = exc.value.response["Error"]
+    assert error["Code"] == "ValidationException"
+    assert error["Message"].startswith(
+        "1 validation error detected: Value 'NOT_A_SIGNING_ALGORITHM' at 'signingAlgorithm' failed to satisfy "
+        "constraint: Member must satisfy enum value set: [RSASSA_PSS_SHA_256, ")
+
+
+def test_kms_rsa_decrypt_without_algorithm_is_invalid_ciphertext(kms_client):
+    key_id = kms_client.create_key(KeySpec="RSA_2048", KeyUsage="ENCRYPT_DECRYPT")["KeyMetadata"]["KeyId"]
+    blob = kms_client.encrypt(KeyId=key_id, Plaintext=b"secret", EncryptionAlgorithm="RSAES_OAEP_SHA_256")["CiphertextBlob"]
+    with pytest.raises(ClientError) as exc:
+        kms_client.decrypt(KeyId=key_id, CiphertextBlob=blob)
+    assert exc.value.response["Error"]["Code"] == "InvalidCiphertextException"
+    with pytest.raises(ClientError) as exc:
+        kms_client.encrypt(KeyId=key_id, Plaintext=b"secret")
+    assert exc.value.response["Error"] == {
+        "Code": "InvalidKeyUsageException", "Message": "Algorithm SYMMETRIC_DEFAULT is incompatible with key spec RSA_2048."}
+
+
+
+def test_kms_missing_key_errors_match_aws(kms_client):
+    """Recorded on AWS (us-east-1): admin operations refuse an alias outright, Decrypt reads the
+    ciphertext before it looks up KeyId, and RetireGrant wants a key ARN and hides an unknown grant."""
+    missing, alias = "00000000-0000-0000-0000-000000000000", f"alias/nope-{_uuid_mod.uuid4().hex[:8]}"
+    with pytest.raises(ClientError) as exc:
+        kms_client.get_key_policy(KeyId=alias, PolicyName="default")
+    assert exc.value.response["Error"] == {
+        "Code": "InvalidArnException", "Message": "Key Aliases are not supported for this operation."}
+    with pytest.raises(ClientError) as exc:
+        kms_client.decrypt(KeyId=missing, CiphertextBlob=b"x" * 100)
+    assert exc.value.response["Error"]["Code"] == "InvalidCiphertextException"
+    with pytest.raises(ClientError) as exc:
+        kms_client.retire_grant(KeyId=missing, GrantId="a" * 64)
+    assert exc.value.response["Error"] == {"Code": "NotFoundException", "Message": f"Invalid arn {missing}"}
+    with pytest.raises(ClientError) as exc:
+        kms_client.encrypt(KeyId=alias, Plaintext=b"x")
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+    key = kms_client.create_key()["KeyMetadata"]
+    with pytest.raises(ClientError) as exc:
+        kms_client.retire_grant(KeyId=key["Arn"], GrantId="a" * 64)
+    assert exc.value.response["Error"]["Code"] == "AccessDeniedException"
+    assert "because the resource does not exist in this Region" in exc.value.response["Error"]["Message"]
+    kms_client.create_alias(AliasName=alias, TargetKeyId=key["KeyId"])
+    try:
+        with pytest.raises(ClientError) as exc:
+            kms_client.disable_key(KeyId=alias)
+        assert exc.value.response["Error"]["Code"] == "InvalidArnException"
+    finally:
+        kms_client.delete_alias(AliasName=alias)
+
+
+
+def test_kms_shapes_match_aws(kms_client):
+    """Recorded on AWS (us-east-1): not-found wording, rotation status, DescribeKey and the default policy."""
+    meta = kms_client.create_key()["KeyMetadata"]
+    account = meta["Arn"].split(":")[4]
+    assert kms_client.describe_key(KeyId=meta["KeyId"])["KeyMetadata"]["AWSAccountId"] == account
+    status = kms_client.get_key_rotation_status(KeyId=meta["KeyId"])
+    assert (status["KeyId"], status["KeyRotationEnabled"], "RotationPeriodInDays" in status) == (meta["Arn"], False, False)
+    kms_client.enable_key_rotation(KeyId=meta["KeyId"])
+    assert kms_client.get_key_rotation_status(KeyId=meta["KeyId"])["RotationPeriodInDays"] == 365
+    policy = kms_client.get_key_policy(KeyId=meta["KeyId"], PolicyName="default")["Policy"]
+    assert policy.startswith('{\n  "Version" : "2012-10-17",\n  "Id" : "key-default-1",\n  "Statement" : [ {\n')
+    missing = "00000000-0000-0000-0000-000000000000"
+    with pytest.raises(ClientError) as exc:
+        kms_client.encrypt(KeyId=missing, Plaintext=b"x")
+    assert exc.value.response["Error"]["Message"] == f"Key 'arn:aws:kms:us-east-1:{account}:key/{missing}' does not exist"
+    with pytest.raises(ClientError) as exc:
+        kms_client.encrypt(KeyId="alias/never-made", Plaintext=b"x")
+    assert exc.value.response["Error"]["Message"] == f"Alias arn:aws:kms:us-east-1:{account}:alias/never-made is not found."
+
+
+@pytest.mark.auth_contract
+def test_kms_identity_denial_names_the_key(auth_enabled, iam_user, kms_client):
+    """Recorded on AWS (us-east-1): a user without an identity policy is refused with HTTP 400, naming the key."""
+    key = kms_client.create_key()["KeyMetadata"]
+    user = iam_user()
+    client = user.client("kms")
+    if not auth_enabled:
+        assert "CiphertextBlob" in client.generate_data_key(KeyId=key["KeyId"], KeySpec="AES_256")
+        return
+    with pytest.raises(ClientError) as exc:
+        client.generate_data_key(KeyId=key["KeyId"], KeySpec="AES_256")
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert exc.value.response["Error"] == {"Code": "AccessDeniedException", "Message": (
+        f"User: {user.arn} is not authorized to perform: kms:GenerateDataKey on resource: {key['Arn']} "
+        "because no identity-based policy allows the kms:GenerateDataKey action")}
+
+@pytest.mark.auth_contract
+def test_kms_key_arn_from_another_account(auth_enabled):
+    """#2463, recorded on AWS with two accounts (us-east-1): a key ARN or alias ARN of another account
+    resolves in the owner's account and its key policy decides, in both auth modes. A key that exists is
+    named in the refusal; one that does not is not."""
+    def kms(account):
+        return boto3.client("kms", endpoint_url=ENDPOINT, region_name="us-east-1",
+                            aws_access_key_id=account, aws_secret_access_key="test")
+
+    owner, other = kms("111122223333"), kms("444455556666")
+    closed = owner.create_key()["KeyMetadata"]
+    shared = owner.create_key(Policy=json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::111122223333:root"}, "Action": "kms:*", "Resource": "*"},
+        {"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::444455556666:root"},
+         "Action": ["kms:Encrypt", "kms:Decrypt", "kms:DescribeKey", "kms:DisableKey"], "Resource": "*"}]}))["KeyMetadata"]
+    alias = f"alias/xacct-{_uuid_mod.uuid4().hex[:8]}"
+    owner.create_alias(AliasName=alias, TargetKeyId=shared["KeyId"])
+    caller = "arn:aws:iam::444455556666:root"
+
+    def refused(call, message):
+        with pytest.raises(ClientError) as exc:
+            call()
+        err = exc.value.response
+        assert (err["ResponseMetadata"]["HTTPStatusCode"], err["Error"]["Code"], err["Error"]["Message"]) == (
+            400, "AccessDeniedException", message)
+
+    def named(action, key):
+        return (f"User: {caller} is not authorized to perform: kms:{action} on resource: {key['Arn']} "
+                f"because no resource-based policy allows the kms:{action} action")
+
+    blob = other.encrypt(KeyId=shared["Arn"], Plaintext=b"x")["CiphertextBlob"]
+    assert other.decrypt(CiphertextBlob=blob)["Plaintext"] == b"x"
+    assert other.encrypt(KeyId=f"arn:aws:kms:us-east-1:111122223333:{alias}", Plaintext=b"x")["KeyId"] == shared["Arn"]
+    assert other.describe_key(KeyId=shared["Arn"])["KeyMetadata"]["AWSAccountId"] == "111122223333"
+    refused(lambda: other.encrypt(KeyId=closed["Arn"], Plaintext=b"x"), named("Encrypt", closed))
+    refused(lambda: other.generate_data_key(KeyId=shared["Arn"], KeySpec="AES_256"), named("GenerateDataKey", shared))
+    refused(lambda: other.disable_key(KeyId=shared["Arn"]), "This operation cannot be called cross account")
+    refused(lambda: other.encrypt(KeyId=closed["Arn"][:-4] + "0000", Plaintext=b"x"), (
+        f"User: {caller} is not authorized to perform: kms:Encrypt on this resource because the resource does not "
+        "exist in this Region, no resource-based policies allow access, or a resource-based policy explicitly "
+        "denies access"))
+    with pytest.raises(ClientError) as exc:
+        other.encrypt(KeyId=closed["KeyId"], Plaintext=b"x")
+    assert exc.value.response["Error"] == {
+        "Code": "NotFoundException",
+        "Message": f"Key 'arn:aws:kms:us-east-1:444455556666:key/{closed['KeyId']}' does not exist"}
+    with pytest.raises(ClientError) as exc:
+        other.encrypt(KeyId=closed["Arn"].replace(":us-east-1:", ":us-west-2:"), Plaintext=b"x")
+    assert exc.value.response["Error"] == {"Code": "NotFoundException", "Message": "Invalid arn us-west-2"}
+
+
+def test_kms_aws_s3_alias_is_listed_before_its_key_and_describe_key_creates_it():
+    """Recorded on AWS (sa-east-1, us-west-1, us-west-2): ListAliases names alias/aws/s3 without a target
+    before the key exists; DescribeKey of alias/aws/s3 creates the AWS managed key and the alias then targets it."""
+    import random
+    account = "".join(random.choices("123456789", k=12))
+    kms = boto3.client("kms", endpoint_url=ENDPOINT, region_name="sa-east-1", aws_access_key_id=account,
+                       aws_secret_access_key="test")
+    listed = [a for a in kms.list_aliases()["Aliases"] if a["AliasName"] == "alias/aws/s3"]
+    assert listed == [{"AliasName": "alias/aws/s3", "AliasArn": f"arn:aws:kms:sa-east-1:{account}:alias/aws/s3"}]
+    meta = kms.describe_key(KeyId="alias/aws/s3")["KeyMetadata"]
+    assert meta["KeyManager"] == "AWS"
+    assert meta["Description"] == "Default key that protects my S3 objects when no other key is defined"
+    listed = [a for a in kms.list_aliases()["Aliases"] if a["AliasName"] == "alias/aws/s3"]
+    assert [a["TargetKeyId"] for a in listed] == [meta["KeyId"]]
+    assert kms.describe_key(KeyId="alias/aws/s3")["KeyMetadata"]["KeyId"] == meta["KeyId"]

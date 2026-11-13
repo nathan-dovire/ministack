@@ -1,8 +1,10 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """
-SES (Simple Email Service) Emulator — v1 Query API + v2 REST/JSON API.
+SES (Simple Email Service) Emulator — v1 Query API.
 
 v1 Query API (Action=...) via POST form body.
-v2 JSON API detected via path prefix /v2/ or X-Amz-Target containing "sesv2".
+SES v2 requests are delegated to :mod:`ses_v2`.
 
 v1 actions: SendEmail, SendRawEmail, SendTemplatedEmail, SendBulkTemplatedEmail,
             VerifyEmailIdentity, VerifyEmailAddress, VerifyDomainIdentity,
@@ -12,11 +14,11 @@ v1 actions: SendEmail, SendRawEmail, SendTemplatedEmail, SendBulkTemplatedEmail,
             DeleteConfigurationSet, DescribeConfigurationSet,
             ListConfigurationSets, CreateTemplate, GetTemplate, DeleteTemplate,
             ListTemplates, UpdateTemplate, GetIdentityDkimAttributes,
-            SetIdentityNotificationTopic, SetIdentityFeedbackForwardingEnabled.
-
-v2 REST endpoints under /v2/email/:
-            outbound-emails, outbound-bulk-emails, identities, configuration-sets,
-            templates, account.
+            SetIdentityNotificationTopic, SetIdentityFeedbackForwardingEnabled,
+            CreateReceiptRuleSet, ListReceiptRuleSets, DescribeReceiptRuleSet,
+            DeleteReceiptRuleSet, SetActiveReceiptRuleSet,
+            DescribeActiveReceiptRuleSet, CreateReceiptRule, DescribeReceiptRule,
+            DeleteReceiptRule.
 
 All emails stored in-memory for test inspection.
 Send statistics aggregated into 15-minute buckets per AWS spec.
@@ -36,21 +38,33 @@ from email import message_from_bytes
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.policy import default as default_policy
-from urllib.parse import parse_qs, unquote
+from email.utils import parseaddr
+from urllib.parse import parse_qs
 
-from ministack.core.persistence import PERSIST_STATE, load_state
-from ministack.core.responses import AccountScopedDict, get_account_id, get_region, new_uuid
+from ministack.core.concurrency import spawn_background
+from ministack.core.responses import (
+    AccountRegionScopedDict,
+    AccountScopedDict,
+    get_account_id,
+    get_region,
+    new_uuid,
+)
 
 logger = logging.getLogger("ses")
 
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-_identities = AccountScopedDict()
-# Per-account sent-mail record. AccountScopedDict under "entries" so the list
-# manipulation stays simple but GetSendStatistics / inspection is scoped.
-_sent_emails = AccountScopedDict()
-_templates = AccountScopedDict()
-_configuration_sets = AccountScopedDict()
+_identities = AccountRegionScopedDict()
+# Per-account-and-region sent-mail record. The scoped dict stays under
+# "entries" so list manipulation remains simple while statistics stay regional.
+_sent_emails = AccountRegionScopedDict()
+_templates = AccountRegionScopedDict()
+_configuration_sets = AccountRegionScopedDict()
+# SESv2 PutAccountDetails, under "account": ProductionAccessEnabled and the details.
+_account_details = AccountRegionScopedDict()
+_receipt_rule_sets = AccountRegionScopedDict()
+_active_receipt_rule_set = AccountRegionScopedDict()
+_SIMULATOR_DOMAIN = "simulator.amazonses.com"
 
 
 def _sent_emails_list() -> list:
@@ -70,24 +84,43 @@ def get_state() -> dict:
         "_identities": _identities,
         "_templates": _templates,
         "_configuration_sets": _configuration_sets,
+        "_account_details": _account_details,
+        "_receipt_rule_sets": _receipt_rule_sets,
+        "_active_receipt_rule_set": _active_receipt_rule_set,
     })
 
 
-def restore_state(data: dict):
-    _identities.update(data.get("_identities", {}))
-    _templates.update(data.get("_templates", {}))
-    _configuration_sets.update(data.get("_configuration_sets", {}))
+def load_persisted_state(data):
+    return _restore_state(data)
 
 
-try:
-    _restored = load_state("ses")
-    if _restored:
-        restore_state(_restored)
-except Exception:
-    import logging
-    logging.getLogger(__name__).exception(
-        "Failed to restore persisted state; continuing with fresh store"
+def _restore_state(data: dict):
+    _restore_regional_store(_identities, data.get("_identities", {}))
+    _restore_regional_store(_templates, data.get("_templates", {}))
+    _restore_regional_store(
+        _configuration_sets, data.get("_configuration_sets", {})
     )
+    _restore_regional_store(_account_details, data.get("_account_details", {}))
+    _restore_regional_store(_receipt_rule_sets, data.get("_receipt_rule_sets", {}))
+    _restore_regional_store(
+        _active_receipt_rule_set, data.get("_active_receipt_rule_set", {})
+    )
+
+
+def _restore_regional_store(store, restored):
+    """Map legacy SES state to the boot region without inspecting content ARNs."""
+    if isinstance(restored, AccountRegionScopedDict):
+        store.update(restored)
+        return
+    if isinstance(restored, AccountScopedDict):
+        region = get_region()
+        for (account_id, key), value in restored._data.items():
+            store.set_scoped(account_id, region, key, value)
+        return
+    for key, value in restored.items():
+        store[key] = value
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -99,17 +132,28 @@ async def handle_request(method, path, headers, body, query_params):
     is_v2 = path.startswith("/v2/") or "sesv2" in target.lower()
 
     if is_v2:
-        return _handle_v2(method, path, headers, body)
+        from ministack.services import ses_v2
+
+        return await ses_v2.handle_request(method, path, headers, body, query_params)
 
     params = dict(query_params)
     if method == "POST" and body:
-        form_params = parse_qs(body.decode("utf-8", errors="replace"))
+        form_params = parse_qs(body.decode("utf-8", errors="replace"), keep_blank_values=True)
         for k, v in form_params.items():
             params[k] = v
 
     action = _p(params, "Action")
 
     handlers = {
+        "CreateReceiptRuleSet": _create_receipt_rule_set,
+        "ListReceiptRuleSets": _list_receipt_rule_sets,
+        "DescribeReceiptRuleSet": _describe_receipt_rule_set,
+        "DeleteReceiptRuleSet": _delete_receipt_rule_set,
+        "SetActiveReceiptRuleSet": _set_active_receipt_rule_set,
+        "DescribeActiveReceiptRuleSet": _describe_active_receipt_rule_set,
+        "CreateReceiptRule": _create_receipt_rule,
+        "DescribeReceiptRule": _describe_receipt_rule,
+        "DeleteReceiptRule": _delete_receipt_rule,
         "SendEmail": _send_email,
         "SendRawEmail": _send_raw_email,
         "SendTemplatedEmail": _send_templated_email,
@@ -145,6 +189,282 @@ async def handle_request(method, path, headers, body, query_params):
 
 
 # ---------------------------------------------------------------------------
+# v1 — Receipt-rule metadata (AddHeader/Stop only; no receiving execution)
+# ---------------------------------------------------------------------------
+
+_RECEIPT_ACTION_FIELDS = {
+    "S3Action": ("TopicArn", "BucketName", "ObjectKeyPrefix", "KmsKeyArn", "IamRoleArn"),
+    "BounceAction": ("TopicArn", "SmtpReplyCode", "StatusCode", "Message", "Sender"),
+    "WorkmailAction": ("TopicArn", "OrganizationArn"),
+    "LambdaAction": ("TopicArn", "FunctionArn", "InvocationType"),
+    "StopAction": ("Scope", "TopicArn"),
+    "AddHeaderAction": ("HeaderName", "HeaderValue"),
+    "SNSAction": ("TopicArn", "Encoding"),
+    "ConnectAction": ("InstanceARN", "IAMRoleARN"),
+}
+
+
+def _receipt_error(code, message):
+    return _error(code, message, 400, "Sender")
+
+
+def _receipt_result(action, data=None):
+    inner = _receipt_element(f"{action}Result", data or {})
+    # AWS stores headers containing NUL but returns InternalFailure when the
+    # metadata cannot be serialized as XML. Do not emit malformed success XML.
+    if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]", inner):
+        return _error("InternalFailure", None, 500, "Receiver")
+    return _xml(200, f"{action}Response", inner)
+
+
+def _receipt_element(name, value):
+    if isinstance(value, dict):
+        inner = "".join(_receipt_element(k, v) for k, v in value.items())
+    elif isinstance(value, list):
+        inner = "".join(_receipt_element("member", v) for v in value)
+    elif isinstance(value, bool):
+        inner = str(value).lower()
+    else:
+        inner = _esc(str(value))
+    return f"<{name}>{inner}</{name}>"
+
+
+def _receipt_name_error(params, key, field, business_field=None):
+    if key not in params:
+        return _receipt_error("ValidationError", (
+            f"1 validation error detected: Value at '{field}' failed to satisfy "
+            "constraint: Member must not be null"))
+    name = _p(params, key)
+    if not name:
+        return _receipt_error("ValidationError", (
+            f"2 validation errors detected: Value at '{field}' failed to satisfy "
+            "constraint: Member must have length greater than or equal to 1; "
+            f"Value at '{field}' failed to satisfy constraint: Member must satisfy "
+            "regular expression pattern: ^[a-zA-Z0-9_.-]+$"))
+    if not re.fullmatch(r"[a-zA-Z0-9_.-]+", name):
+        return _receipt_error("ValidationError", (
+            f"1 validation error detected: Value at '{field}' failed to satisfy "
+            "constraint: Member must satisfy regular expression pattern: ^[a-zA-Z0-9_.-]+$"))
+    if business_field and (len(name) > 64 or not re.fullmatch(
+            r"[a-zA-Z0-9](?:[a-zA-Z0-9_.-]*[a-zA-Z0-9])?", name)):
+        return _receipt_error("InvalidParameterValue", f"Not a valid {business_field}: {name}")
+    return None
+
+
+def _receipt_missing_set(name):
+    return _receipt_error("RuleSetDoesNotExist", f"Rule set does not exist: {name}")
+
+
+def _create_receipt_rule_set(params):
+    error = _receipt_name_error(params, "RuleSetName", "ruleSetName", "ruleSetName")
+    if error:
+        return error
+    name = _p(params, "RuleSetName")
+    if name in _receipt_rule_sets:
+        return _receipt_error("AlreadyExists", f"Rule set already exists: {name}")
+    _receipt_rule_sets[name] = {
+        "Metadata": {"Name": name, "CreatedTimestamp": datetime.now(timezone.utc).isoformat()},
+        "Rules": [],
+    }
+    return _receipt_result("CreateReceiptRuleSet")
+
+
+def _list_receipt_rule_sets(params):
+    names = sorted(_receipt_rule_sets)
+    token = _p(params, "NextToken")
+    if token:
+        try:
+            last = base64.b64decode(token, validate=True).decode("utf-8")
+            start = names.index(last) + 1
+        except (ValueError, UnicodeError):
+            return _receipt_error("InvalidParameterValue", f"Invalid token: {token}")
+    else:
+        start = 0
+    page = names[start:start + 100]
+    result = {"RuleSets": [_receipt_rule_sets[n]["Metadata"] for n in page]}
+    if start + len(page) < len(names):
+        result["NextToken"] = base64.b64encode(page[-1].encode()).decode()
+    return _receipt_result("ListReceiptRuleSets", result)
+
+
+def _describe_receipt_rule_set(params):
+    name = _p(params, "RuleSetName")
+    error = _receipt_name_error(params, "RuleSetName", "ruleSetName", "ruleSetName")
+    if error:
+        return error
+    if name not in _receipt_rule_sets:
+        return _receipt_missing_set(name)
+    return _receipt_result("DescribeReceiptRuleSet", _receipt_rule_sets[name])
+
+
+def _delete_receipt_rule_set(params):
+    name = _p(params, "RuleSetName")
+    error = _receipt_name_error(params, "RuleSetName", "ruleSetName", "ruleSetName")
+    if error:
+        return error
+    if _active_receipt_rule_set.get("name") == name:
+        return _receipt_error("CannotDelete", f"Cannot delete active rule set: {name}")
+    _receipt_rule_sets.pop(name, None)
+    return _receipt_result("DeleteReceiptRuleSet")
+
+
+def _set_active_receipt_rule_set(params):
+    if "RuleSetName" not in params:
+        _active_receipt_rule_set.pop("name", None)
+    else:
+        error = _receipt_name_error(params, "RuleSetName", "ruleSetName", "ruleSetName")
+        if error:
+            return error
+        name = _p(params, "RuleSetName")
+        if name not in _receipt_rule_sets:
+            return _receipt_missing_set(name)
+        _active_receipt_rule_set["name"] = name
+    return _receipt_result("SetActiveReceiptRuleSet")
+
+
+def _describe_active_receipt_rule_set(params):
+    name = _active_receipt_rule_set.get("name")
+    return _receipt_result("DescribeActiveReceiptRuleSet", _receipt_rule_sets.get(name, {}))
+
+
+def _receipt_rule_from_params(params):
+    rule = {
+        "Name": _p(params, "Rule.Name"),
+        "Enabled": _p(params, "Rule.Enabled").lower() == "true",
+        "TlsPolicy": _p(params, "Rule.TlsPolicy", "Optional"),
+        "Actions": [],
+        "ScanEnabled": _p(params, "Rule.ScanEnabled").lower() == "true",
+    }
+    if any(k == "Rule.Recipients" or k.startswith("Rule.Recipients.member.") for k in params):
+        recipients = []
+        i = 1
+        while f"Rule.Recipients.member.{i}" in params:
+            recipients.append(_p(params, f"Rule.Recipients.member.{i}"))
+            i += 1
+        rule["Recipients"] = recipients
+    indexes = sorted({int(k.split(".")[3]) for k in params
+                      if re.match(r"^Rule\.Actions\.member\.\d+\.", k)})
+    for i in indexes:
+        action = {}
+        for name, fields in _RECEIPT_ACTION_FIELDS.items():
+            prefix = f"Rule.Actions.member.{i}.{name}."
+            values = {f: _p(params, prefix + f) for f in fields if prefix + f in params}
+            if values:
+                action[name] = values
+        rule["Actions"].append(action)
+    return rule
+
+
+def _receipt_rule_error(rule):
+    tls = rule["TlsPolicy"]
+    if tls not in ("Optional", "Require"):
+        return _receipt_error("ValidationError", (
+            "1 validation error detected: Value at 'rule.tlsPolicy' failed to satisfy "
+            "constraint: Member must satisfy enum value set: [Optional, Require]"))
+    for i, action in enumerate(rule["Actions"], 1):
+        if len(action) != 1:
+            return _receipt_error("InvalidParameterValue", (
+                "Exactly one action type must be specified for each ReceiptAction"))
+        if "StopAction" in action:
+            if action["StopAction"].get("Scope") != "RuleSet":
+                return _receipt_error("ValidationError", (
+                    f"1 validation error detected: Value at 'rule.actions.{i}.member.stopAction.scope' "
+                    "failed to satisfy constraint: Member must satisfy enum value set: [RuleSet]"))
+            if i != len(rule["Actions"]):
+                return _receipt_error("InvalidParameterValue", (
+                    "Stop action, if any, must be placed at the end of the actions list"))
+        header = action.get("AddHeaderAction")
+        if header is not None:
+            for field in ("HeaderName", "HeaderValue"):
+                if field not in header:
+                    return _receipt_error("ValidationError", (
+                        f"1 validation error detected: Value at 'rule.actions.{i}.member."
+                        f"addHeaderAction.{field[0].lower() + field[1:]}' failed to satisfy "
+                        "constraint: Member must not be null"))
+            name, value = header["HeaderName"], header["HeaderValue"]
+            if not re.fullmatch(r"[a-zA-Z0-9-]{1,50}", name):
+                return _receipt_error("InvalidParameterValue", f"Invalid header name: {name}")
+            if len(value) > 2048 or "\n" in value or "\r" in value:
+                printable = value.replace("\n", "0x000a").replace("\r", "0x000d")
+                return _receipt_error("InvalidParameterValue", f"Invalid header value: {printable}")
+    recipients = rule.get("Recipients", [])
+    for i, recipient in enumerate(recipients):
+        parts = recipient.rsplit("@", 1)
+        domain = parts[-1]
+        if (len(parts) == 2 and not parts[0]) or not re.fullmatch(
+                r"\.?[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?"
+                r"(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)+", domain) or (
+                    len(parts) == 2 and ("@" in parts[0] or re.search(r"\s", parts[0]))):
+            return _receipt_error("InvalidParameterValue", f"Invalid recipient: {recipient}")
+        recipients[i] = recipient.lower()
+    if "Recipients" in rule:
+        rule["Recipients"] = sorted(set(recipients))
+    return None
+
+
+def _create_receipt_rule(params):
+    if not any(key.startswith("Rule.") for key in params):
+        return _receipt_error("ValidationError", (
+            "1 validation error detected: Value at 'rule' failed to satisfy "
+            "constraint: Member must not be null"))
+    error = _receipt_name_error(params, "Rule.Name", "rule.name", "ruleName")
+    if error:
+        return error
+    error = _receipt_name_error(params, "RuleSetName", "ruleSetName", "ruleSetName")
+    if error:
+        return error
+    if "After" in params:
+        error = _receipt_name_error(params, "After", "after")
+        if error:
+            return error
+    rule = _receipt_rule_from_params(params)
+    error = _receipt_rule_error(rule)
+    if error:
+        return error
+    name = _p(params, "RuleSetName")
+    if name not in _receipt_rule_sets:
+        return _receipt_missing_set(name)
+    rules = _receipt_rule_sets[name]["Rules"]
+    if any(r["Name"] == rule["Name"] for r in rules):
+        return _receipt_error("AlreadyExists", f"Rule already exists: {rule['Name']}")
+    after = _p(params, "After")
+    position = 0
+    if after:
+        position = next((i + 1 for i, r in enumerate(rules) if r["Name"] == after), None)
+        if position is None:
+            return _receipt_error("RuleDoesNotExist", f"Rule does not exist: {after}")
+    rules.insert(position, rule)
+    return _receipt_result("CreateReceiptRule")
+
+
+def _describe_receipt_rule(params):
+    for key, field in (("RuleSetName", "ruleSetName"), ("RuleName", "ruleName")):
+        error = _receipt_name_error(params, key, field, field)
+        if error:
+            return error
+    name, rule_name = _p(params, "RuleSetName"), _p(params, "RuleName")
+    if name not in _receipt_rule_sets:
+        return _receipt_missing_set(name)
+    rule = next((r for r in _receipt_rule_sets[name]["Rules"] if r["Name"] == rule_name), None)
+    if rule is None:
+        return _receipt_error("RuleDoesNotExist", f"Rule does not exist: {rule_name}")
+    return _receipt_result("DescribeReceiptRule", {"Rule": rule})
+
+
+def _delete_receipt_rule(params):
+    for key, field in (("RuleSetName", "ruleSetName"), ("RuleName", "ruleName")):
+        error = _receipt_name_error(params, key, field, field)
+        if error:
+            return error
+    name, rule_name = _p(params, "RuleSetName"), _p(params, "RuleName")
+    if name not in _receipt_rule_sets:
+        return _receipt_missing_set(name)
+    rules = _receipt_rule_sets[name]["Rules"]
+    rules[:] = [r for r in rules if r["Name"] != rule_name]
+    return _receipt_result("DeleteReceiptRule")
+
+
+# ---------------------------------------------------------------------------
 # v1 — Send operations
 # ---------------------------------------------------------------------------
 
@@ -158,6 +478,14 @@ def _send_email(params):
     to_addrs = _collect_list(params, "Destination.ToAddresses.member")
     cc_addrs = _collect_list(params, "Destination.CcAddresses.member")
     bcc_addrs = _collect_list(params, "Destination.BccAddresses.member")
+    recipients = to_addrs + cc_addrs + bcc_addrs
+    if any(_missing_domain(address) for address in [source, *recipients] if address):
+        return _error("InvalidParameterValue", "Missing final '@domain'", 400)
+    if config_set and not _configuration_set_exists(config_set):
+        return _config_set_missing(config_set)
+    rejected = _message_rejection(source, recipients)
+    if rejected:
+        return _error("MessageRejected", rejected, 400)
 
     msg_id = _record_send(
         source=source,
@@ -172,6 +500,27 @@ def _send_email(params):
     )
     return _xml(200, "SendEmailResponse",
                 f"<SendEmailResult><MessageId>{msg_id}</MessageId></SendEmailResult>")
+
+
+def _missing_domain(value: str) -> bool:
+    """SES answers "Missing final '@domain'" for an address without a domain
+    and for one with non-ASCII characters ("must be 7-bit ASCII")."""
+    if not value.isascii():
+        return True
+    _, separator, domain = parseaddr(value)[1].rpartition("@")
+    return not separator or not domain
+
+
+def _config_set_missing(name):
+    return _error("ConfigurationSetDoesNotExist", f"Configuration set {name} does not exist", 400,
+                  "Sender", fields={"ConfigurationSetName": name})
+
+
+def _configuration_set_exists(name):
+    """A set created through either API; on AWS v1 and v2 share them."""
+    from ministack.services import ses_v2
+
+    return name in _configuration_sets or name in ses_v2._config_sets
 
 
 def _record_send(source, to_addrs, cc_addrs=None, bcc_addrs=None,
@@ -209,6 +558,9 @@ def _record_send(source, to_addrs, cc_addrs=None, bcc_addrs=None,
         mime_str = _build_mime_message(source, to_addrs, cc_addrs, bcc_addrs,
                                        subject, body_text, body_html, msg_id)
         _smtp_relay(source, all_addrs, mime_str)
+    _send_notifications(msg_id, source, all_addrs)
+    _publish_send_events(msg_id, source, to_addrs, cc_addrs, bcc_addrs, subject,
+                         operation=type_name, config_set=config_set, body_html=body_html)
     return msg_id
 
 
@@ -233,9 +585,16 @@ def send_internal_email(source, to_addrs, subject, body_text="", body_html="",
 def _send_raw_email(params):
     raw_b64 = _p(params, "RawMessage.Data")
     source = _p(params, "Source")
+    config_set = _p(params, "ConfigurationSetName")
     msg_id = f"{new_uuid()}@email.amazonses.com"
 
     parsed = _parse_raw_mime(raw_b64)
+    rejected = _message_rejection(
+        source or parsed.get("From", ""),
+        _collect_list(params, "Destinations.member")
+        or [a.strip() for h in ("To", "Cc", "Bcc") for a in parsed.get(h, "").split(",") if a.strip()])
+    if rejected:
+        return _error("MessageRejected", rejected, 400)
 
     # Extract from body parts if available
     subject = ""
@@ -265,6 +624,8 @@ def _send_raw_email(params):
         "Timestamp": time.time(),
         "Type": "SendRawEmail",
     }
+    if config_set:
+        record["ConfigurationSetName"] = config_set
     _sent_emails_list().append(record)
     logger.info("SES SendRawEmail: %s", msg_id)
     # Relay raw message via SMTP
@@ -281,10 +642,14 @@ def _send_raw_email(params):
                 decoded = base64.b64decode(raw_bytes)
             except Exception:
                 decoded = raw_bytes
-            raw_str = f'Message-ID: <{msg_id}>\r\n' + decoded.decode('utf-8', errors='replace')
+            raw_str = f'Message-ID: <{msg_id}>\r\n' + _strip_message_id_header(
+                decoded.decode('utf-8', errors='replace'))
             _smtp_relay(actual_source, relay_addrs, raw_str)
         except Exception:
             logger.warning('SMTP relay failed for SendRawEmail: %s', msg_id, exc_info=True)
+    _send_notifications(msg_id, actual_source, relay_addrs)
+    _publish_send_events(msg_id, actual_source, relay_addrs, operation="SendRawEmail",
+                         config_set=config_set, raw_headers=parsed.get("Headers", []))
     return _xml(200, "SendRawEmailResponse",
                 f"<SendRawEmailResult><MessageId>{msg_id}</MessageId></SendRawEmailResult>")
 
@@ -302,6 +667,9 @@ def _send_templated_email(params):
     if template_name not in _templates:
         return _error("TemplateDoesNotExist",
                        f"Template {template_name} does not exist", 400)
+    rejected = _message_rejection(source, to_addrs + cc_addrs + bcc_addrs)
+    if rejected:
+        return _error("MessageRejected", rejected, 400)
 
     rendered = _render_template(_templates[template_name], template_data)
     msg_id = f"{new_uuid()}@email.amazonses.com"
@@ -330,6 +698,10 @@ def _send_templated_email(params):
                                        rendered.get("Text", ""),
                                        rendered.get("Html", ""), msg_id)
         _smtp_relay(source, all_addrs, mime_str)
+    _send_notifications(msg_id, source, all_addrs)
+    _publish_send_events(msg_id, source, to_addrs, cc_addrs, bcc_addrs, rendered.get("Subject", ""),
+                         operation="SendTemplatedEmail", config_set=config_set,
+                         body_html=rendered.get("Html", ""))
     return _xml(200, "SendTemplatedEmailResponse",
                 f"<SendTemplatedEmailResult><MessageId>{msg_id}</MessageId></SendTemplatedEmailResult>")
 
@@ -355,8 +727,16 @@ def _send_bulk_templated_email(params):
         destinations.append({"To": to_addrs, "TemplateData": replacement})
         i += 1
 
+    rejected = _message_rejection(source)
+    if rejected:
+        return _error("MessageRejected", rejected, 400)
     statuses = []
     for dest in destinations:
+        rejected = _message_rejection(None, dest["To"])
+        if rejected:
+            statuses.append(f"<member><Status>MessageRejected</Status>"
+                            f"<Error>{_esc(rejected)}</Error></member>")
+            continue
         msg_id = f"{new_uuid()}@email.amazonses.com"
         rendered = _render_template(template, dest["TemplateData"])
         record = {
@@ -378,6 +758,10 @@ def _send_bulk_templated_email(params):
                                            rendered.get("Text", ""),
                                            rendered.get("Html", ""), msg_id)
             _smtp_relay(source, dest["To"], mime_str)
+        _send_notifications(msg_id, source, dest["To"])
+        _publish_send_events(msg_id, source, dest["To"], subject=rendered.get("Subject", ""),
+                             operation="SendBulkTemplatedEmail", config_set=config_set,
+                             body_html=rendered.get("Html", ""))
         statuses.append(
             f"<member><Status>Success</Status>"
             f"<MessageId>{msg_id}</MessageId></member>")
@@ -411,15 +795,17 @@ def _verify_domain_identity(params):
                 f"</VerifyDomainIdentityResult>")
 
 
+def _dkim_tokens(domain):
+    """The three Easy DKIM tokens for a domain identity, stable per domain."""
+    return [hashlib.md5(f"{domain}-dkim-{i}".encode()).hexdigest()[:32] for i in range(3)]
+
+
 def _verify_domain_dkim(params):
     domain = _p(params, "Domain")
     if domain not in _identities:
         _identities[domain] = _make_identity(domain, "Domain")
 
-    tokens = [
-        hashlib.md5(f"{domain}-dkim-{i}".encode()).hexdigest()[:32]
-        for i in range(3)
-    ]
+    tokens = _dkim_tokens(domain)
     _identities[domain]["DkimEnabled"] = True
     _identities[domain]["DkimTokens"] = tokens
     _identities[domain]["DkimVerificationStatus"] = "Success"
@@ -431,15 +817,34 @@ def _verify_domain_dkim(params):
                 f"</VerifyDomainDkimResult>")
 
 
+def _token_page(params, items, default=None, cap=None):
+    """MaxItems / NextToken over a list. Returns ``(page, next_token_xml)``."""
+    try:
+        start = max(int(base64.urlsafe_b64decode(_p(params, "NextToken").encode()).decode()), 0)
+    except (ValueError, UnicodeDecodeError):
+        start = 0
+    try:
+        limit = max(int(_p(params, "MaxItems")), 1)
+    except (TypeError, ValueError):
+        limit = default or len(items)
+    if cap:
+        limit = min(limit, cap)
+    end = start + limit
+    if end < len(items):
+        token = base64.urlsafe_b64encode(str(end).encode()).decode()
+        return items[start:end], f"<NextToken>{token}</NextToken>"
+    return items[start:end], ""
+
+
 def _list_identities(params):
     identity_type = _p(params, "IdentityType")
-    members = ""
-    for identity, info in _identities.items():
-        if not identity_type or info["Type"] == identity_type:
-            members += f"<member>{identity}</member>"
+    names = [identity for identity, info in _identities.items()
+             if not identity_type or info["Type"] == identity_type]
+    names, token_xml = _token_page(params, names)
+    members = "".join(f"<member>{identity}</member>" for identity in names)
     return _xml(200, "ListIdentitiesResponse",
                 f"<ListIdentitiesResult>"
-                f"<Identities>{members}</Identities>"
+                f"<Identities>{members}</Identities>{token_xml}"
                 f"</ListIdentitiesResult>")
 
 
@@ -458,8 +863,25 @@ def _get_identity_verification_attributes(params):
                 f"</GetIdentityVerificationAttributesResult>")
 
 
+def _tenant_delete_block(kind, name):
+    """Refuse v1 deletes of resources with SESv2 tenant associations, as AWS does."""
+    from ministack.services import ses_v2
+
+    arn = f"arn:aws:ses:{get_region()}:{get_account_id()}:{kind}/{name}"
+    if any(arn in resources for resources in ses_v2._tenant_resources.values()):
+        return _error(
+            "InvalidParameterValue",
+            f"Cannot delete <{arn}> because it has tenant associations. Remove all tenant associations and try again.",
+            400,
+        )
+    return None
+
+
 def _delete_identity(params):
     identity = _p(params, "Identity")
+    blocked = _tenant_delete_block("identity", identity)
+    if blocked:
+        return blocked
     _identities.pop(identity, None)
     return _xml(200, "DeleteIdentityResponse", "<DeleteIdentityResult/>")
 
@@ -569,9 +991,11 @@ def _create_configuration_set(params):
 
 def _delete_configuration_set(params):
     name = _p(params, "ConfigurationSetName")
+    blocked = _tenant_delete_block("configuration-set", name)
+    if blocked:
+        return blocked
     if name not in _configuration_sets:
-        return _error("ConfigurationSetDoesNotExist",
-                       f"Configuration set {name} does not exist", 400)
+        return _config_set_missing(name)
     del _configuration_sets[name]
     return _xml(200, "DeleteConfigurationSetResponse", "<DeleteConfigurationSetResult/>")
 
@@ -580,8 +1004,7 @@ def _describe_configuration_set(params):
     name = _p(params, "ConfigurationSetName")
     cs = _configuration_sets.get(name)
     if not cs:
-        return _error("ConfigurationSetDoesNotExist",
-                       f"Configuration set {name} does not exist", 400)
+        return _config_set_missing(name)
     return _xml(200, "DescribeConfigurationSetResponse",
                 f"<DescribeConfigurationSetResult>"
                 f"<ConfigurationSet><Name>{cs['Name']}</Name></ConfigurationSet>"
@@ -589,13 +1012,14 @@ def _describe_configuration_set(params):
 
 
 def _list_configuration_sets(params):
+    sets, token_xml = _token_page(params, list(_configuration_sets.values()))
     members = "".join(
         f"<member><Name>{cs['Name']}</Name></member>"
-        for cs in _configuration_sets.values()
+        for cs in sets
     )
     return _xml(200, "ListConfigurationSetsResponse",
                 f"<ListConfigurationSetsResult>"
-                f"<ConfigurationSets>{members}</ConfigurationSets>"
+                f"<ConfigurationSets>{members}</ConfigurationSets>{token_xml}"
                 f"</ListConfigurationSetsResult>")
 
 
@@ -638,19 +1062,23 @@ def _get_template(params):
 
 def _delete_template(params):
     name = _p(params, "TemplateName")
+    blocked = _tenant_delete_block("template", name)
+    if blocked:
+        return blocked
     _templates.pop(name, None)
     return _xml(200, "DeleteTemplateResponse", "<DeleteTemplateResult/>")
 
 
 def _list_templates(params):
+    templates, token_xml = _token_page(params, list(_templates.values()), default=10, cap=100)
     members = "".join(
         f"<member><Name>{_esc(t['TemplateName'])}</Name>"
         f"<CreatedTimestamp>{t['CreatedTimestamp']}</CreatedTimestamp></member>"
-        for t in _templates.values()
+        for t in templates
     )
     return _xml(200, "ListTemplatesResponse",
                 f"<ListTemplatesResult>"
-                f"<TemplatesMetadata>{members}</TemplatesMetadata>"
+                f"<TemplatesMetadata>{members}</TemplatesMetadata>{token_xml}"
                 f"</ListTemplatesResult>")
 
 
@@ -670,337 +1098,322 @@ def _update_template(params):
 
 
 # ---------------------------------------------------------------------------
-# v2 — REST / JSON dispatcher
-# ---------------------------------------------------------------------------
-
-def _handle_v2(method, path, headers, body):
-    try:
-        raw = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else (body or "")
-        data = json.loads(raw) if raw else {}
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        data = {}
-
-    route = path.rstrip("/")
-    if route.startswith("/v2/email"):
-        route = route[len("/v2/email"):]
-
-    if method == "POST" and route == "/outbound-emails":
-        return _v2_send_email(data)
-    if method == "POST" and route == "/outbound-bulk-emails":
-        return _v2_send_bulk_email(data)
-    if method == "POST" and route == "/identities":
-        return _v2_create_identity(data)
-    if method == "GET" and route == "/identities":
-        return _v2_list_identities()
-    if method == "POST" and route == "/configuration-sets":
-        return _v2_create_configuration_set(data)
-    if method == "GET" and route == "/configuration-sets":
-        return _v2_list_configuration_sets()
-    if method == "POST" and route == "/templates":
-        return _v2_create_template(data)
-    if method == "GET" and route == "/templates":
-        return _v2_list_templates()
-    if method == "GET" and route == "/account":
-        return _v2_get_account()
-
-    parts = route.split("/")
-
-    if len(parts) == 3 and parts[1] == "identities":
-        identity = unquote(parts[2])
-        if method == "GET":
-            return _v2_get_identity(identity)
-        if method == "DELETE":
-            return _v2_delete_identity(identity)
-
-    if len(parts) == 3 and parts[1] == "configuration-sets":
-        name = unquote(parts[2])
-        if method == "GET":
-            return _v2_get_configuration_set(name)
-        if method == "DELETE":
-            return _v2_delete_configuration_set(name)
-
-    if len(parts) == 3 and parts[1] == "templates":
-        name = unquote(parts[2])
-        if method == "GET":
-            return _v2_get_template(name)
-        if method == "PUT":
-            return _v2_update_template(name, data)
-        if method == "DELETE":
-            return _v2_delete_template(name)
-
-    return _json_error("NotFoundException", f"Route not found: {method} {path}", 404)
-
-
-# ---------------------------------------------------------------------------
-# v2 — Send
-# ---------------------------------------------------------------------------
-
-def _v2_send_email(data):
-    from_addr = data.get("FromEmailAddress", "")
-    dest = data.get("Destination", {})
-    to_addrs = dest.get("ToAddresses", [])
-    cc_addrs = dest.get("CcAddresses", [])
-    bcc_addrs = dest.get("BccAddresses", [])
-    content = data.get("Content", {})
-    config_set = data.get("ConfigurationSetName", "")
-
-    subject = ""
-    body_text = ""
-    body_html = ""
-    template_name = ""
-    template_data = ""
-
-    simple = content.get("Simple", {})
-    if simple:
-        subject = simple.get("Subject", {}).get("Data", "")
-        body_obj = simple.get("Body", {})
-        body_text = body_obj.get("Text", {}).get("Data", "")
-        body_html = body_obj.get("Html", {}).get("Data", "")
-
-    tpl = content.get("Template", {})
-    if tpl:
-        template_name = tpl.get("TemplateName", "")
-        template_data = tpl.get("TemplateData", "")
-
-    raw = content.get("Raw", {})
-    parsed = {}
-    if raw:
-        parsed = _parse_raw_mime(raw.get("Data", ""))
-
-    msg_id = f"{new_uuid()}@email.amazonses.com"
-    record = {
-        "MessageId": msg_id,
-        "Source": from_addr,
-        "To": to_addrs,
-        "CC": cc_addrs,
-        "BCC": bcc_addrs,
-        "Subject": subject,
-        "BodyText": body_text,
-        "BodyHtml": body_html,
-        "Timestamp": time.time(),
-        "Type": "v2.SendEmail",
-    }
-    if template_name:
-        record["Template"] = template_name
-        record["TemplateData"] = template_data
-    if parsed:
-        record["Parsed"] = parsed
-    if config_set:
-        record["ConfigurationSetName"] = config_set
-    _sent_emails_list().append(record)
-    logger.info("SES v2 SendEmail: %s -> %s", from_addr, to_addrs)
-    return _json_response(200, {"MessageId": msg_id})
-
-
-def _v2_send_bulk_email(data):
-    from_addr = data.get("FromEmailAddress", "")
-    default_content = data.get("DefaultContent", {})
-    tpl = default_content.get("Template", {})
-    template_name = tpl.get("TemplateName", "")
-    default_data = tpl.get("TemplateData", "")
-    entries = data.get("BulkEmailEntries", [])
-    config_set = data.get("ConfigurationSetName", "")
-
-    results = []
-    for entry in entries:
-        dest = entry.get("Destination", {})
-        to_addrs = dest.get("ToAddresses", [])
-        replacement = (
-            entry.get("ReplacementEmailContent", {})
-                 .get("ReplacementTemplate", {})
-                 .get("ReplacementTemplateData", default_data)
-        )
-        msg_id = f"{new_uuid()}@email.amazonses.com"
-        record = {
-            "MessageId": msg_id,
-            "Source": from_addr,
-            "To": to_addrs,
-            "Template": template_name,
-            "TemplateData": replacement,
-            "Timestamp": time.time(),
-            "Type": "v2.SendBulkEmail",
-        }
-        if config_set:
-            record["ConfigurationSetName"] = config_set
-        _sent_emails_list().append(record)
-        results.append({"Status": "SUCCESS", "MessageId": msg_id})
-
-    logger.info("SES v2 SendBulkEmail: %s | template=%s | %s entries",
-                from_addr, template_name, len(entries))
-    return _json_response(200, {"BulkEmailEntryResults": results})
-
-
-# ---------------------------------------------------------------------------
-# v2 — Identity
-# ---------------------------------------------------------------------------
-
-def _v2_create_identity(data):
-    identity = data.get("EmailIdentity", "")
-    id_type = "Domain" if ("." in identity and "@" not in identity) else "EmailAddress"
-    _identities[identity] = _make_identity(identity, id_type)
-    return _json_response(200, {
-        "IdentityType": "DOMAIN" if id_type == "Domain" else "EMAIL_ADDRESS",
-        "VerifiedForSendingStatus": True,
-    })
-
-
-def _v2_list_identities():
-    items = []
-    for identity, info in _identities.items():
-        items.append({
-            "IdentityType": "DOMAIN" if info["Type"] == "Domain" else "EMAIL_ADDRESS",
-            "IdentityName": identity,
-            "SendingEnabled": info["VerificationStatus"] == "Success",
-        })
-    return _json_response(200, {"EmailIdentities": items})
-
-
-def _v2_get_identity(identity):
-    info = _identities.get(identity)
-    if not info:
-        return _json_error("NotFoundException",
-                           f"Identity {identity} not found", 404)
-    return _json_response(200, {
-        "IdentityType": "DOMAIN" if info["Type"] == "Domain" else "EMAIL_ADDRESS",
-        "VerifiedForSendingStatus": info["VerificationStatus"] == "Success",
-        "FeedbackForwardingStatus": info.get("FeedbackForwardingEnabled", True),
-        "DkimAttributes": {
-            "SigningEnabled": info.get("DkimEnabled", False),
-            "Status": info.get("DkimVerificationStatus", "NOT_STARTED"),
-            "Tokens": info.get("DkimTokens", []),
-        },
-    })
-
-
-def _v2_delete_identity(identity):
-    _identities.pop(identity, None)
-    return _json_response(200, {})
-
-
-# ---------------------------------------------------------------------------
-# v2 — Configuration sets
-# ---------------------------------------------------------------------------
-
-def _v2_create_configuration_set(data):
-    name = data.get("ConfigurationSetName", "")
-    if not name:
-        return _json_error("BadRequestException",
-                           "ConfigurationSetName is required", 400)
-    if name in _configuration_sets:
-        return _json_error("AlreadyExistsException",
-                           f"Configuration set {name} already exists", 409)
-    _configuration_sets[name] = {"Name": name, "CreatedTimestamp": _iso_now()}
-    return _json_response(200, {})
-
-
-def _v2_list_configuration_sets():
-    items = [{"Name": cs["Name"]} for cs in _configuration_sets.values()]
-    return _json_response(200, {"ConfigurationSets": items})
-
-
-def _v2_get_configuration_set(name):
-    cs = _configuration_sets.get(name)
-    if not cs:
-        return _json_error("NotFoundException",
-                           f"Configuration set {name} not found", 404)
-    return _json_response(200, {"ConfigurationSetName": cs["Name"]})
-
-
-def _v2_delete_configuration_set(name):
-    if name not in _configuration_sets:
-        return _json_error("NotFoundException",
-                           f"Configuration set {name} not found", 404)
-    del _configuration_sets[name]
-    return _json_response(200, {})
-
-
-# ---------------------------------------------------------------------------
-# v2 — Templates
-# ---------------------------------------------------------------------------
-
-def _v2_create_template(data):
-    name = data.get("TemplateName", "")
-    content = data.get("TemplateContent", {})
-    if not name:
-        return _json_error("BadRequestException",
-                           "TemplateName is required", 400)
-    if name in _templates:
-        return _json_error("AlreadyExistsException",
-                           f"Template {name} already exists", 409)
-    _templates[name] = {
-        "TemplateName": name,
-        "SubjectPart": content.get("Subject", ""),
-        "TextPart": content.get("Text", ""),
-        "HtmlPart": content.get("Html", ""),
-        "CreatedTimestamp": _iso_now(),
-    }
-    return _json_response(200, {})
-
-
-def _v2_list_templates():
-    items = [
-        {"TemplateName": t["TemplateName"],
-         "CreatedTimestamp": t["CreatedTimestamp"]}
-        for t in _templates.values()
-    ]
-    return _json_response(200, {"TemplatesMetadata": items})
-
-
-def _v2_get_template(name):
-    tpl = _templates.get(name)
-    if not tpl:
-        return _json_error("NotFoundException",
-                           f"Template {name} not found", 404)
-    return _json_response(200, {
-        "TemplateName": tpl["TemplateName"],
-        "TemplateContent": {
-            "Subject": tpl["SubjectPart"],
-            "Text": tpl["TextPart"],
-            "Html": tpl["HtmlPart"],
-        },
-    })
-
-
-def _v2_update_template(name, data):
-    if name not in _templates:
-        return _json_error("NotFoundException",
-                           f"Template {name} not found", 404)
-    content = data.get("TemplateContent", {})
-    tpl = _templates[name]
-    if "Subject" in content:
-        tpl["SubjectPart"] = content["Subject"]
-    if "Text" in content:
-        tpl["TextPart"] = content["Text"]
-    if "Html" in content:
-        tpl["HtmlPart"] = content["Html"]
-    return _json_response(200, {})
-
-
-def _v2_delete_template(name):
-    _templates.pop(name, None)
-    return _json_response(200, {})
-
-
-# ---------------------------------------------------------------------------
-# v2 — Account
-# ---------------------------------------------------------------------------
-
-def _v2_get_account():
-    cutoff = time.time() - 86400
-    sent_24h = sum(1 for e in _sent_emails_list() if e["Timestamp"] >= cutoff)
-    return _json_response(200, {
-        "SendQuota": {
-            "Max24HourSend": 50000.0,
-            "MaxSendRate": 14.0,
-            "SentLast24Hours": float(sent_24h),
-        },
-        "SendingEnabled": True,
-    })
-
-
-# ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Sandbox (SESv2 PutAccountDetails ProductionAccessEnabled=false)
+# ---------------------------------------------------------------------------
+
+def _production_access_enabled() -> bool:
+    return (_account_details.get("account") or {}).get("ProductionAccessEnabled", True)
+
+
+def _domain_and_parents(domain: str):
+    """`a.b.com` -> `a.b.com`, `b.com` (the bare TLD is never an identity)."""
+    labels = domain.split(".")
+    return (".".join(labels[i:]) for i in range(len(labels) - 1))
+
+
+def _identity_verified(address: str, *, simulator: bool = False) -> bool:
+    """A verified address identity (case-sensitive) or a verified domain identity
+    for the address's domain or any parent domain (case-insensitive), in v1 or v2."""
+    from ministack.services import ses_v2
+
+    addr = parseaddr(address)[1]
+    if not addr:
+        return False
+    domain = addr.rpartition("@")[2].lower()
+    if simulator and domain == _SIMULATOR_DOMAIN:
+        return True
+
+    def ok(v1_rec, v2_rec):
+        return ((v1_rec or {}).get("VerificationStatus") == "Success"
+                or bool((v2_rec or {}).get("VerifiedForSendingStatus")))
+
+    if ok(_identities.get(addr), ses_v2._identities.get(addr)):
+        return True
+    v1 = {k.lower(): r for k, r in _identities.items() if "@" not in k}
+    v2 = {k.lower(): r for k, r in ses_v2._identities.items() if "@" not in k}
+    return any(ok(v1.get(d), v2.get(d)) for d in _domain_and_parents(domain))
+
+
+def _message_rejection(sender, recipients=()) -> str | None:
+    """The MessageRejected message for an unverified sender, or, in the sandbox,
+    unverified recipients."""
+    failed = [sender] if sender and not _identity_verified(sender) else []
+    if not _production_access_enabled():
+        failed += [r for r in recipients if r and not _identity_verified(r, simulator=True)]
+    if not failed:
+        return None
+    return ("Email address is not verified. The following identities failed the check "
+            f"in region {get_region().upper()}: {', '.join(failed)}")
+
+
+# Mailbox simulator local part -> (notificationType, bounceSubType) it produces;
+# any other address (success@, ooto@) is delivered.
+_SIMULATOR_OUTCOMES = {
+    "bounce": (("Bounce", "General"),),
+    "suppressionlist": (("Bounce", "Suppressed"),),
+    # Accepted and delivered, then marked as spam.
+    "complaint": (("Delivery", None), ("Complaint", None)),
+}
+
+
+def _notification_identity(source: str) -> tuple[str, dict] | None:
+    """The (name, record) of the identity whose notification topics apply to a
+    sender: the address identity if verified, else the nearest verified parent domain."""
+    addr = parseaddr(source or "")[1]
+    if not addr:
+        return None
+    if addr in _identities:
+        return addr, _identities[addr]
+    domains = {k.lower(): (k, r) for k, r in _identities.items() if "@" not in k}
+    for d in _domain_and_parents(addr.rpartition("@")[2].lower()):
+        if d in domains:
+            return domains[d]
+    return None
+
+
+def _publish_notification(topic_arn: str, payload: dict) -> None:
+    from ministack.services import sns
+
+    try:
+        sns.publish_internal(topic_arn, json.dumps(payload),
+                             "Amazon SES Email Event Notification")
+    except Exception:
+        logger.warning("SES notification publish to %s failed", topic_arn, exc_info=True)
+
+
+def _notification_detail(kind: str, rcpt: str, ts: str, bounce_subtype: str | None = None) -> dict:
+    if kind == "Delivery":
+        return {"delivery": {
+            "timestamp": ts, "processingTimeMillis": 0, "recipients": [rcpt],
+            "smtpResponse": "250 2.6.0 Message received",
+            "reportingMTA": "a0-0.smtp-out.amazonses.com"}}
+    if kind == "Bounce" and bounce_subtype == "Suppressed":
+        # SES suppressed the send, so no remote MTA returned a DSN.
+        return {"bounce": {
+            "bounceType": "Permanent", "bounceSubType": "Suppressed",
+            "bouncedRecipients": [{"emailAddress": rcpt}],
+            "timestamp": ts, "feedbackId": new_uuid()}}
+    if kind == "Bounce":
+        return {"bounce": {
+            "bounceType": "Permanent", "bounceSubType": "General",
+            "bouncedRecipients": [{
+                "emailAddress": rcpt, "action": "failed", "status": "5.1.1",
+                "diagnosticCode": "smtp; 550 5.1.1 user unknown"}],
+            "timestamp": ts, "feedbackId": new_uuid(),
+            "reportingMTA": "dsn; a0-0.smtp-out.amazonses.com"}}
+    return {"complaint": {
+        "complainedRecipients": [{"emailAddress": rcpt}],
+        "timestamp": ts, "feedbackId": new_uuid(),
+        "userAgent": "Amazon SES Mailbox Simulator",
+        "complaintFeedbackType": "abuse", "arrivalDate": ts}}
+
+
+def _send_notifications(msg_id, source, recipients):
+    """Publish the Delivery / Bounce / Complaint notification of each recipient
+    to the SNS topic set on the sender's identity (SetIdentityNotificationTopic)."""
+    found = _notification_identity(source)
+    if not found:
+        return
+    identity_name, identity = found
+    topics = identity.get("NotificationTopics", {})
+    if not any(topics.values()):
+        return
+    recipients = [a for a in (parseaddr(r)[1] for r in recipients) if a]
+    now = datetime.now(timezone.utc)
+    ts = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+    mail = {
+        "timestamp": ts,
+        # The envelope MAIL FROM address and the identity used to send.
+        "source": parseaddr(source)[1],
+        "sourceArn": f"arn:aws:ses:{get_region()}:{get_account_id()}:identity/{identity_name}",
+        "sendingAccountId": get_account_id(),
+        "messageId": msg_id,
+        "destination": recipients,
+    }
+    for rcpt in recipients:
+        local, _, domain = rcpt.partition("@")
+        outcomes = (("Delivery", None),)
+        if domain.lower() == _SIMULATOR_DOMAIN:
+            outcomes = _SIMULATOR_OUTCOMES.get(local.lower().split("+")[0], outcomes)
+        for kind, bounce_subtype in outcomes:
+            topic = topics.get(kind)
+            if not topic:
+                continue
+            detail = _notification_detail(kind, rcpt, ts, bounce_subtype)
+            _publish_notification(topic, {"notificationType": kind, "mail": mail, **detail})
+
+
+# ---------------------------------------------------------------------------
+# Sending events: configuration set event destinations -> EventBridge
+# ---------------------------------------------------------------------------
+
+# What SES publishes for a mailbox simulator recipient after the Send event, as
+# (eventType, bounceType, bounceSubType). Captured on AWS (us-west-2,
+# 2026-11-08). Any other recipient is delivered.
+_DELIVERED = (("Delivery", None, None),)
+_SIMULATOR_EVENTS = {
+    "bounce": (("Bounce", "Permanent", "General"),),
+    "suppressionlist": (("Bounce", "Permanent", "EmailValidationSuppressed"),),
+    "ooto": (("Delivery", None, None), ("Bounce", "Transient", "General")),
+    "complaint": (("Delivery", None, None), ("Complaint", None, None)),
+}
+_EVENT_DETAIL_TYPES = {
+    "Send": "Email Sent",
+    "Delivery": "Email Delivered",
+    "Bounce": "Email Bounced",
+    "Complaint": "Email Complaint Received",
+}
+_SEND_OPERATIONS = {"SendEmail", "SendRawEmail", "SendTemplatedEmail", "SendBulkTemplatedEmail", "SendBulkEmail"}
+_SUPPRESSED_DIAGNOSTIC = (
+    "Amazon SES has suppressed sending to this address due to email validation. The address quality "
+    "confidence level is below your configured threshold. For details on validation checks and threshold "
+    "configuration, see https://docs.aws.amazon.com/ses/latest/dg/email-validation.html")
+
+
+def _sending_identity(source: str) -> tuple[str, str] | None:
+    """The (name, default configuration set) of the identity a sender sends as:
+    its address identity, else its nearest parent domain identity, in v2 or v1.
+    The most specific identity wins even when it has no default."""
+    from ministack.services import ses_v2
+
+    addr = parseaddr(source or "")[1]
+    if not addr:
+        return None
+    if addr in ses_v2._identities:
+        return addr, ses_v2._identities[addr].get("ConfigurationSetName", "")
+    if addr in _identities:
+        return addr, ""
+    domains = {k.lower(): (k, "") for k in _identities if "@" not in k}
+    domains.update({k.lower(): (k, r.get("ConfigurationSetName", ""))
+                    for k, r in ses_v2._identities.items() if "@" not in k})
+    for d in _domain_and_parents(addr.rpartition("@")[2].lower()):
+        if d in domains:
+            return domains[d]
+    return None
+
+
+def _event_headers(source, to_addrs, cc_addrs, subject, body_html="", raw_headers=None):
+    """The ``mail.headers`` list: a raw message's own headers, else the ones SES writes."""
+    if raw_headers is not None:
+        return [{"name": k, "value": str(v)} for k, v in raw_headers if k.lower() != "message-id"]
+    headers = [{"name": "From", "value": source}]
+    if to_addrs:
+        headers.append({"name": "To", "value": ", ".join(to_addrs)})
+    if cc_addrs:
+        headers.append({"name": "Cc", "value": ", ".join(cc_addrs)})
+    content_type = "text/html" if body_html else "text/plain"
+    return headers + [{"name": "Subject", "value": subject or ""},
+                      {"name": "MIME-Version", "value": "1.0"},
+                      {"name": "Content-Type", "value": f"{content_type}; charset=UTF-8"},
+                      {"name": "Content-Transfer-Encoding", "value": "7bit"}]
+
+
+def _common_headers(headers, msg_id):
+    found = {h["name"].lower(): h["value"] for h in headers}
+    out = {key: [a.strip() for a in found[key].split(",") if a.strip()]
+           for key in ("from", "to", "cc") if key in found}
+    out["messageId"] = msg_id
+    if "subject" in found:
+        out["subject"] = found["subject"]
+    return out
+
+
+def _feedback_id():
+    return f"{new_uuid().replace('-', '')[:16]}-{new_uuid()}-000000"
+
+
+def _event_body(kind, rcpt, ts, bounce_type=None, bounce_subtype=None):
+    """The ``delivery`` / ``bounce`` / ``complaint`` member of an outcome event, as captured on AWS."""
+    simulator = rcpt.rpartition("@")[2].lower() == _SIMULATOR_DOMAIN
+    mta = f"a0-0.smtp-out.{get_region()}.amazonses.com"
+    if kind == "Delivery":
+        return {"delivery": {
+            "timestamp": ts, "processingTimeMillis": 0, "recipients": [rcpt],
+            "smtpResponse": "250 Ok" if simulator else "250 2.0.0 OK", "reportingMTA": mta}}
+    if kind == "Complaint":
+        return {"complaint": {
+            "feedbackId": _feedback_id(), "complaintSubType": None,
+            "complainedRecipients": [{"emailAddress": rcpt}], "timestamp": ts,
+            "userAgent": "Amazon SES Mailbox Simulator", "complaintFeedbackType": "abuse",
+            "arrivalDate": ts}}
+    recipient = {"emailAddress": rcpt}
+    bounce = {"feedbackId": _feedback_id(), "bounceType": bounce_type, "bounceSubType": bounce_subtype,
+              "bouncedRecipients": [recipient], "timestamp": ts}
+    if bounce_subtype == "EmailValidationSuppressed":
+        recipient.update(action="failed", status="5.1.1", diagnosticCode=_SUPPRESSED_DIAGNOSTIC)
+        bounce["reportingMTA"] = "dns; amazonses.com"
+    elif bounce_type == "Permanent":
+        recipient.update(action="failed", status="5.1.1",
+                         diagnosticCode=f"smtp; 550 5.1.1 As requested: user unknown <{rcpt}>")
+        bounce["reportingMTA"] = f"dns; {mta}"
+    return {"bounce": bounce}
+
+
+def _publish_send_events(msg_id, source, to_addrs, cc_addrs=(), bcc_addrs=(), subject="", *,
+                         operation, config_set="", body_html="", raw_headers=None):
+    """Publish a send's events to the EventBridge event destinations of its
+    configuration set: the one named on the send, else the sending identity's
+    default. One Send event, then each recipient's outcome events, filtered by
+    each destination's MatchingEventTypes. Failures never fail the send."""
+    from ministack.services import eventbridge, ses_v2
+
+    try:
+        identity = _sending_identity(source)
+        if identity is None:
+            return
+        identity_name, default_set = identity
+        set_name = config_set or default_set
+        destinations = [d for d in ((ses_v2._config_sets.get(set_name) or {}).get("EventDestinations") or {}).values()
+                        if d.get("Enabled") and d.get("EventBridgeDestination")]
+        if not destinations:
+            return
+        recipients = [a for a in (parseaddr(r)[1] for r in [*to_addrs, *cc_addrs, *bcc_addrs]) if a]
+        now = datetime.now(timezone.utc)
+        ts = now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+        headers = _event_headers(source, list(to_addrs), list(cc_addrs), subject, body_html, raw_headers)
+        sender = parseaddr(source)[1]
+        mail = {
+            "timestamp": ts,
+            "source": sender,
+            "sourceArn": f"arn:aws:ses:{get_region()}:{get_account_id()}:identity/{identity_name}",
+            "sendingAccountId": get_account_id(),
+            "messageId": msg_id,
+            "destination": recipients,
+            "headersTruncated": False,
+            "headers": headers,
+            "commonHeaders": _common_headers(headers, msg_id),
+            "tags": {
+                "ses:operation": [operation if operation in _SEND_OPERATIONS else "SendEmail"],
+                "ses:configuration-set": [set_name],
+                "ses:from-domain": [sender.rpartition("@")[2]],
+                "ses:sender-identity": [identity_name],
+            },
+        }
+        events = [("Send", {"send": {}})]
+        for rcpt in recipients:
+            local, _, domain = rcpt.partition("@")
+            outcomes = _DELIVERED
+            if domain.lower() == _SIMULATOR_DOMAIN:
+                outcomes = _SIMULATOR_EVENTS.get(local.lower().split("+")[0], _DELIVERED)
+            events += [(kind, _event_body(kind, rcpt, ts, bounce_type, bounce_subtype))
+                       for kind, bounce_type, bounce_subtype in outcomes]
+        set_arn = f"arn:aws:ses:{get_region()}:{get_account_id()}:configuration-set/{set_name}"
+        for destination in destinations:
+            wanted = set(destination.get("MatchingEventTypes") or [])
+            bus = destination["EventBridgeDestination"].get("EventBusArn") or "default"
+            entries = [{"Source": "aws.ses", "DetailType": _EVENT_DETAIL_TYPES[kind],
+                        "Detail": json.dumps({"eventType": kind, "mail": mail, **body}),
+                        "Resources": [set_arn], "EventBusName": bus}
+                       for kind, body in events if kind.upper() in wanted]
+            for i in range(0, len(entries), 10):
+                eventbridge._put_events({"Entries": entries[i:i + 10]}, allow_aws_source=True)
+    except Exception:
+        logger.warning("SES event publishing for %s failed", msg_id, exc_info=True)
+
 
 def _make_identity(identity, identity_type):
     return {
@@ -1089,14 +1502,42 @@ def _build_mime_message(source, to_addrs, cc_addrs, bcc_addrs,
     return msg.as_string()
 
 
+_SMTP_TIMEOUT_SECONDS = 10
+
+
+def _strip_message_id_header(raw_str):
+    """Drop client-supplied Message-ID headers (incl. folded lines); real SES replaces it."""
+    lines = raw_str.splitlines(keepends=True)
+    out = []
+    in_headers = True
+    skipping = False
+    for line in lines:
+        if in_headers:
+            if line in ('\r\n', '\n', '\r'):
+                in_headers = False
+            elif line[0] in ' \t':
+                if skipping:
+                    continue
+            else:
+                skipping = line.lower().startswith('message-id:')
+                if skipping:
+                    continue
+        out.append(line)
+    return ''.join(out)
+
+
 def _smtp_relay(source, to_addrs, message_str):
-    """Relay email via external SMTP if SMTP_HOST is set. Best-effort."""
+    """Relay email via external SMTP if SMTP_HOST is set. Best-effort, off the event loop."""
     endpoint = _parse_smtp_host()
     if not endpoint:
         return
-    host, port = endpoint
+    spawn_background(_smtp_send, source, to_addrs, message_str, *endpoint,
+                     thread_name="ministack-ses-smtp")
+
+
+def _smtp_send(source, to_addrs, message_str, host, port):
     try:
-        with smtplib.SMTP(host, port) as conn:
+        with smtplib.SMTP(host, port, timeout=_SMTP_TIMEOUT_SECONDS) as conn:
             conn.sendmail(source, to_addrs, message_str)
         logger.info('SMTP relay: %s -> %s via %s:%d', source, to_addrs, host, port)
     except Exception:
@@ -1119,6 +1560,7 @@ def _parse_raw_mime(raw_b64):
         parsed["To"] = mime_msg.get("To", "")
         parsed["Subject"] = mime_msg.get("Subject", "")
         parsed["ContentType"] = mime_msg.get_content_type()
+        parsed["Headers"] = [(name, str(value)) for name, value in mime_msg.items()]
 
         body_parts = []
         if mime_msg.is_multipart():
@@ -1179,21 +1621,16 @@ def _xml(status, root_tag, inner):
     return status, {"Content-Type": "application/xml"}, body
 
 
-def _error(code, message, status):
-    body = (f'<?xml version="1.0" encoding="UTF-8"?>'
-            f'<ErrorResponse xmlns="http://ses.amazonaws.com/doc/2010-12-01/">'
-            f'<Error><Code>{code}</Code><Message>{_esc(message)}</Message></Error>'
+def _error(code, message, status, error_type="", fields=None):
+    # Query error envelope: <Type> in <Error>, no <?xml?> (AWS captures).
+    error_type = error_type or ("Sender" if status < 500 else "Receiver")
+    message_xml = f"<Message>{_esc(message)}</Message>" if message is not None else ""
+    message_xml += "".join(f"<{k}>{_esc(v)}</{k}>" for k, v in (fields or {}).items())
+    body = (f'<ErrorResponse xmlns="http://ses.amazonaws.com/doc/2010-12-01/">'
+            f'<Error><Type>{error_type}</Type><Code>{code}</Code>{message_xml}</Error>'
             f'<RequestId>{new_uuid()}</RequestId>'
             f'</ErrorResponse>').encode("utf-8")
     return status, {"Content-Type": "application/xml"}, body
-
-
-def _json_response(status, data):
-    return status, {"Content-Type": "application/json"}, json.dumps(data).encode("utf-8")
-
-
-def _json_error(code, message, status):
-    return status, {"Content-Type": "application/json", "x-amzn-errortype": code}, json.dumps({"__type": code, "message": message}).encode("utf-8")
 
 
 def reset():
@@ -1201,3 +1638,6 @@ def reset():
     _sent_emails.clear()
     _templates.clear()
     _configuration_sets.clear()
+    _account_details.clear()
+    _receipt_rule_sets.clear()
+    _active_receipt_rule_set.clear()

@@ -1,22 +1,51 @@
 """API Gateway v2 tests — HTTP API + WebSocket + common lifecycle."""
 
+import asyncio
 import base64
 import io
 import json
 import os
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid as _uuid_mod
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
+import boto3
 import pytest
 from botocore.exceptions import ClientError
+from conftest import (
+    CONCURRENCY_N,
+    ENDPOINT,
+    LoopProbe,
+    concurrent_burst,
+    make_probe_lambda,
+    second_access_key,
+)
+
+from ministack.core.responses import get_account_id, get_region, set_request_account_id, set_request_region
+from ministack.services import apigateway as _apigw
 
 _endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 
 _EXECUTE_PORT = urlparse(_endpoint).port or 4566
+
+def _regional_client(service: str, region: str):
+    import boto3
+    from botocore.config import Config
+
+    return boto3.client(
+        service,
+        endpoint_url=_endpoint,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region,
+        config=Config(region_name=region),
+    )
 
 def _make_zip(code: str) -> bytes:
     buf = io.BytesIO()
@@ -63,17 +92,19 @@ def _start_echo_server():
 def _make_signed_token(claims: dict) -> str:
     from ministack.services import cognito as _cognito
 
-    if _cognito._RSA_PRIVATE_KEY is None:
+    pool_id = str(claims.get("iss", "")).rsplit("/", 1)[-1]
+    key, jwk = _cognito._pool_signing_key(pool_id, "id" if claims.get("token_use") == "id" else "access")
+    if key is None:
         pytest.skip("cryptography-backed Cognito signing key unavailable")
 
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import padding
 
-    header = {"alg": "RS256", "kid": "ministack-key-1"}
+    header = {"alg": "RS256", "kid": jwk["kid"]}
     h = base64.urlsafe_b64encode(json.dumps(header).encode()).rstrip(b"=").decode()
     p = base64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b"=").decode()
     signed = f"{h}.{p}".encode()
-    sig = _cognito._RSA_PRIVATE_KEY.sign(signed, padding.PKCS1v15(), hashes.SHA256())
+    sig = key.sign(signed, padding.PKCS1v15(), hashes.SHA256())
     s = base64.urlsafe_b64encode(sig).rstrip(b"=").decode()
     return f"{h}.{p}.{s}"
 
@@ -98,6 +129,190 @@ def test_apigw_get_apis(apigw):
     assert "list-api-a" in names
     assert "list-api-b" in names
 
+
+def test_apigw_apis_are_region_isolated():
+    """apigw-v2 APIs are region-specific: GetApi/GetApis must not surface an API
+    owned by another region (the execute path already enforces this)."""
+    import boto3
+    from botocore.config import Config
+
+    def cli(r):
+        return boto3.client(
+            "apigatewayv2", endpoint_url=_endpoint,
+            aws_access_key_id="test", aws_secret_access_key="test",
+            region_name=r, config=Config(region_name=r),
+        )
+
+    east, west = cli("us-east-1"), cli("us-west-2")
+    name = f"region-iso-{_uuid_mod.uuid4().hex[:8]}"
+    api_id = east.create_api(Name=name, ProtocolType="HTTP")["ApiId"]
+    assert any(a["ApiId"] == api_id for a in east.get_apis()["Items"])
+    assert all(a["ApiId"] != api_id for a in west.get_apis()["Items"])
+    with pytest.raises(ClientError) as e:
+        west.get_api(ApiId=api_id)
+    assert e.value.response["Error"]["Code"] == "NotFoundException"
+
+
+def test_apigw_control_plane_child_crud_is_region_isolated():
+    import boto3
+    from botocore.config import Config
+
+    def cli(r):
+        return boto3.client(
+            "apigatewayv2", endpoint_url=_endpoint,
+            aws_access_key_id="test", aws_secret_access_key="test",
+            region_name=r, config=Config(region_name=r),
+        )
+
+    east, west = cli("us-east-1"), cli("us-west-2")
+
+    http_api_id = east.create_api(
+        Name=f"child-iso-http-{_uuid_mod.uuid4().hex[:8]}",
+        ProtocolType="HTTP",
+    )["ApiId"]
+    route_id = east.create_route(ApiId=http_api_id, RouteKey="GET /items")["RouteId"]
+    integration_id = east.create_integration(
+        ApiId=http_api_id,
+        IntegrationType="HTTP_PROXY",
+        IntegrationUri="https://example.com",
+        IntegrationMethod="GET",
+    )["IntegrationId"]
+    east.create_stage(ApiId=http_api_id, StageName="prod")
+    deployment_id = east.create_deployment(ApiId=http_api_id)["DeploymentId"]
+    authorizer_id = east.create_authorizer(
+        ApiId=http_api_id,
+        AuthorizerType="JWT",
+        Name="jwt",
+        IdentitySource=["$request.header.Authorization"],
+        JwtConfiguration={
+            "Audience": ["client"],
+            "Issuer": "https://issuer.example.test",
+        },
+    )["AuthorizerId"]
+
+    ws_api_id = east.create_api(
+        Name=f"child-iso-ws-{_uuid_mod.uuid4().hex[:8]}",
+        ProtocolType="WEBSOCKET",
+    )["ApiId"]
+    ws_integration_id = east.create_integration(
+        ApiId=ws_api_id,
+        IntegrationType="MOCK",
+    )["IntegrationId"]
+    ws_route_id = east.create_route(
+        ApiId=ws_api_id,
+        RouteKey="sendMessage",
+        Target=f"integrations/{ws_integration_id}",
+    )["RouteId"]
+    route_response_id = east.create_route_response(
+        ApiId=ws_api_id,
+        RouteId=ws_route_id,
+        RouteResponseKey="$default",
+    )["RouteResponseId"]
+    integration_response_id = east.create_integration_response(
+        ApiId=ws_api_id,
+        IntegrationId=ws_integration_id,
+        IntegrationResponseKey="/200/",
+    )["IntegrationResponseId"]
+
+    calls = [
+        lambda: west.update_api(ApiId=http_api_id, Name="wrong-region"),
+        lambda: west.delete_api(ApiId=http_api_id),
+        lambda: west.get_routes(ApiId=http_api_id),
+        lambda: west.create_route(ApiId=http_api_id, RouteKey="GET /wrong"),
+        lambda: west.get_route(ApiId=http_api_id, RouteId=route_id),
+        lambda: west.update_route(ApiId=http_api_id, RouteId=route_id, RouteKey="GET /wrong"),
+        lambda: west.delete_route(ApiId=http_api_id, RouteId=route_id),
+        lambda: west.get_integrations(ApiId=http_api_id),
+        lambda: west.create_integration(
+            ApiId=http_api_id,
+            IntegrationType="HTTP_PROXY",
+            IntegrationUri="https://wrong.example",
+        ),
+        lambda: west.get_integration(ApiId=http_api_id, IntegrationId=integration_id),
+        lambda: west.update_integration(
+            ApiId=http_api_id,
+            IntegrationId=integration_id,
+            Description="wrong-region",
+        ),
+        lambda: west.delete_integration(ApiId=http_api_id, IntegrationId=integration_id),
+        lambda: west.get_stages(ApiId=http_api_id),
+        lambda: west.create_stage(ApiId=http_api_id, StageName="wrong"),
+        lambda: west.get_stage(ApiId=http_api_id, StageName="prod"),
+        lambda: west.update_stage(ApiId=http_api_id, StageName="prod", Description="wrong"),
+        lambda: west.delete_stage(ApiId=http_api_id, StageName="prod"),
+        lambda: west.get_deployments(ApiId=http_api_id),
+        lambda: west.create_deployment(ApiId=http_api_id),
+        lambda: west.get_deployment(ApiId=http_api_id, DeploymentId=deployment_id),
+        lambda: west.delete_deployment(ApiId=http_api_id, DeploymentId=deployment_id),
+        lambda: west.get_authorizers(ApiId=http_api_id),
+        lambda: west.create_authorizer(
+            ApiId=http_api_id,
+            AuthorizerType="JWT",
+            Name="wrong",
+            IdentitySource=["$request.header.Authorization"],
+        ),
+        lambda: west.get_authorizer(ApiId=http_api_id, AuthorizerId=authorizer_id),
+        lambda: west.update_authorizer(
+            ApiId=http_api_id,
+            AuthorizerId=authorizer_id,
+            Name="wrong",
+        ),
+        lambda: west.delete_authorizer(ApiId=http_api_id, AuthorizerId=authorizer_id),
+        lambda: west.get_route_responses(ApiId=ws_api_id, RouteId=ws_route_id),
+        lambda: west.create_route_response(
+            ApiId=ws_api_id,
+            RouteId=ws_route_id,
+            RouteResponseKey="$default",
+        ),
+        lambda: west.get_route_response(
+            ApiId=ws_api_id,
+            RouteId=ws_route_id,
+            RouteResponseId=route_response_id,
+        ),
+        lambda: west.update_route_response(
+            ApiId=ws_api_id,
+            RouteId=ws_route_id,
+            RouteResponseId=route_response_id,
+            RouteResponseKey="$default",
+        ),
+        lambda: west.delete_route_response(
+            ApiId=ws_api_id,
+            RouteId=ws_route_id,
+            RouteResponseId=route_response_id,
+        ),
+        lambda: west.get_integration_responses(
+            ApiId=ws_api_id,
+            IntegrationId=ws_integration_id,
+        ),
+        lambda: west.create_integration_response(
+            ApiId=ws_api_id,
+            IntegrationId=ws_integration_id,
+            IntegrationResponseKey="/200/",
+        ),
+        lambda: west.get_integration_response(
+            ApiId=ws_api_id,
+            IntegrationId=ws_integration_id,
+            IntegrationResponseId=integration_response_id,
+        ),
+        lambda: west.update_integration_response(
+            ApiId=ws_api_id,
+            IntegrationId=ws_integration_id,
+            IntegrationResponseId=integration_response_id,
+            IntegrationResponseKey="/200/",
+        ),
+        lambda: west.delete_integration_response(
+            ApiId=ws_api_id,
+            IntegrationId=ws_integration_id,
+            IntegrationResponseId=integration_response_id,
+        ),
+    ]
+
+    for call in calls:
+        with pytest.raises(ClientError) as exc_info:
+            call()
+        assert exc_info.value.response["Error"]["Code"] == "NotFoundException"
+
+
 def test_apigw_update_api(apigw):
     api_id = apigw.create_api(Name="update-api-before", ProtocolType="HTTP")["ApiId"]
     apigw.update_api(ApiId=api_id, Name="update-api-after")
@@ -112,6 +327,32 @@ def test_apigw_delete_api(apigw):
     with pytest.raises(ClientError) as exc:
         apigw.get_api(ApiId=api_id)
     assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+def test_apigw_cfn_api_tracks_owner_region():
+    from ministack.core.responses import get_account_id, get_region, set_request_region
+    from ministack.services import apigateway as _apigw
+    from ministack.services.cloudformation import provisioners as _provisioners
+
+    account_id = get_account_id()
+    original_region = get_region()
+    api_id = None
+    try:
+        set_request_region("us-west-2")
+        api_id, _attrs = _provisioners._apigw_v2_api_create(
+            "HttpApi",
+            {"Name": "cfn-apigwv2-region-owner", "ProtocolType": "HTTP"},
+            "cfn-apigwv2-region",
+        )
+
+        assert _apigw._apis.get_scoped(account_id, "us-west-2", api_id)["apiId"] == api_id
+
+        _provisioners._apigw_v2_api_delete(api_id, {})
+        assert _apigw._apis.get_scoped(account_id, "us-west-2", api_id) is None
+        api_id = None
+    finally:
+        if api_id is not None:
+            _provisioners._apigw_v2_api_delete(api_id, {})
+        set_request_region(original_region)
 
 def test_apigw_create_route(apigw):
     api_id = apigw.create_api(Name="route-api", ProtocolType="HTTP")["ApiId"]
@@ -148,6 +389,85 @@ def test_apigw_delete_route(apigw):
     apigw.delete_route(ApiId=api_id, RouteId=route_id)
     resp = apigw.get_routes(ApiId=api_id)
     assert not any(r["RouteId"] == route_id for r in resp["Items"])
+
+def _make_api_with_routes(apigw_mod, route_keys):
+    """Register an in-process HTTP API with the given route keys, in order.
+
+    Uses the real ``_create_route`` path so the routes are built and inserted
+    exactly as a live request would, letting the tests exercise creation order.
+    """
+    api_id = apigw_mod.new_uuid()[:8]
+    apigw_mod._apis[api_id] = {"apiId": api_id, "protocolType": "HTTP"}
+    for route_key in route_keys:
+        apigw_mod._create_route(api_id, {"routeKey": route_key})
+    return api_id
+
+
+@pytest.mark.parametrize("proxy_first", [False, True])
+def test_apigw_match_route_prefers_specific_over_proxy(proxy_first):
+    """The exact route wins over an ``ANY /{proxy+}`` catch-all in either order.
+
+    Real API Gateway dispatches to the most specific matching route regardless
+    of creation order; ministack must not fall back to first-match-wins.
+    """
+    from ministack.services import apigateway as apigw_mod
+
+    exact = "POST /api/v1/sql/execute"
+    proxy = "ANY /{proxy+}"
+    keys = [proxy, exact] if proxy_first else [exact, proxy]
+    api_id = _make_api_with_routes(apigw_mod, keys)
+
+    route = apigw_mod._match_route(api_id, "POST", "/api/v1/sql/execute")
+    assert route is not None
+    assert route["routeKey"] == exact
+
+
+@pytest.mark.parametrize("proxy_first", [False, True])
+def test_apigw_match_route_falls_through_to_proxy(proxy_first):
+    """A path only the catch-all matches still resolves to ``ANY /{proxy+}``."""
+    from ministack.services import apigateway as apigw_mod
+
+    exact = "POST /api/v1/sql/execute"
+    proxy = "ANY /{proxy+}"
+    keys = [proxy, exact] if proxy_first else [exact, proxy]
+    api_id = _make_api_with_routes(apigw_mod, keys)
+
+    route = apigw_mod._match_route(api_id, "GET", "/something/else")
+    assert route is not None
+    assert route["routeKey"] == proxy
+
+
+def test_apigw_match_route_default_fallback():
+    """When no specific route matches, the $default route is the fallback."""
+    from ministack.services import apigateway as apigw_mod
+
+    api_id = _make_api_with_routes(
+        apigw_mod, ["POST /api/v1/sql/execute", "$default"]
+    )
+
+    route = apigw_mod._match_route(api_id, "GET", "/unmatched/path")
+    assert route is not None
+    assert route["routeKey"] == "$default"
+
+
+@pytest.mark.parametrize("greedy_first", [False, True])
+def test_apigw_match_route_full_match_beats_greedy_with_more_literals(greedy_first):
+    """AWS priority is full-match-beats-greedy, independent of literal count: a
+    fully-parameterized route (`GET /{x}/{y}/{z}`) is a full match and must win
+    over a greedy route with more literal segments (`GET /a/b/{proxy+}`), which
+    is only a tier-2 greedy match, for the request `/a/b/c`.
+    """
+    from ministack.services import apigateway as apigw_mod
+
+    full = "GET /{x}/{y}/{z}"
+    greedy = "GET /a/b/{proxy+}"
+    keys = [greedy, full] if greedy_first else [full, greedy]
+    api_id = _make_api_with_routes(apigw_mod, keys)
+
+    route = apigw_mod._match_route(api_id, "GET", "/a/b/c")
+    assert route is not None
+    assert route["routeKey"] == full
+
 
 def test_apigw_create_integration(apigw):
     api_id = apigw.create_api(Name="integ-api", ProtocolType="HTTP")["ApiId"]
@@ -296,7 +616,6 @@ def test_apigw_http_protocol_type(apigw):
 
 def test_apigw_execute_lambda_proxy(apigw, lam):
     """API Gateway execute-api routes a request through Lambda proxy integration."""
-    import urllib.error as _urlerr
     import urllib.request as _urlreq
     import uuid as _uuid
 
@@ -349,8 +668,353 @@ def test_apigw_execute_lambda_proxy(apigw, lam):
     apigw.delete_api(ApiId=api_id)
     lam.delete_function(FunctionName=fname)
 
+def test_apigw_execute_lambda_proxy_cookies(apigw, lam):
+    """Payload format 2.0 `cookies` array yields one Set-Cookie header per entry.
+
+    Real APIGW v2 emits each `cookies` entry as a separate Set-Cookie response
+    header (RFC 6265 §3 forbids comma-folding them). A regular header returned
+    alongside must still pass through.
+    """
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-apigw-cookie-{_uuid.uuid4().hex[:8]}"
+    code = (
+        b"def handler(event, context):\n"
+        b"    return {\n"
+        b"        'statusCode': 200,\n"
+        b"        'headers': {'X-App': 'yes'},\n"
+        b"        'cookies': ['session=abc123; Path=/; HttpOnly', 'flag=on; Path=/; SameSite=Lax'],\n"
+        b"        'body': 'ok',\n"
+        b"    }\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+
+    api_id = apigw.create_api(Name=f"cookie-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    route_id = apigw.create_route(
+        ApiId=api_id,
+        RouteKey="GET /cookie",
+        Target=f"integrations/{int_id}",
+    )["RouteId"]
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/cookie"
+    req = _urlreq.Request(url, method="GET")
+    req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+    resp = _urlreq.urlopen(req)
+    assert resp.status == 200
+    set_cookies = resp.headers.get_all("Set-Cookie") or []
+    assert set_cookies == [
+        "session=abc123; Path=/; HttpOnly",
+        "flag=on; Path=/; SameSite=Lax",
+    ]
+    # A normal header returned alongside the cookies still passes through.
+    assert resp.headers.get("X-App") == "yes"
+
+    # Cleanup
+    apigw.delete_route(ApiId=api_id, RouteId=route_id)
+    apigw.delete_integration(ApiId=api_id, IntegrationId=int_id)
+    apigw.delete_api(ApiId=api_id)
+    lam.delete_function(FunctionName=fname)
+
+def test_apigw_execute_lambda_proxy_empty_cookies(apigw, lam):
+    """An empty `cookies` array emits zero Set-Cookie headers (no empty header)."""
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-apigw-nocookie-{_uuid.uuid4().hex[:8]}"
+    code = (
+        b"def handler(event, context):\n"
+        b"    return {'statusCode': 200, 'cookies': [], 'body': 'ok'}\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+
+    api_id = apigw.create_api(Name=f"nocookie-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    route_id = apigw.create_route(
+        ApiId=api_id,
+        RouteKey="GET /nocookie",
+        Target=f"integrations/{int_id}",
+    )["RouteId"]
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/nocookie"
+    req = _urlreq.Request(url, method="GET")
+    req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+    resp = _urlreq.urlopen(req)
+    assert resp.status == 200
+    assert (resp.headers.get_all("Set-Cookie") or []) == []
+
+    # Cleanup
+    apigw.delete_route(ApiId=api_id, RouteId=route_id)
+    apigw.delete_integration(ApiId=api_id, IntegrationId=int_id)
+    apigw.delete_api(ApiId=api_id)
+    lam.delete_function(FunctionName=fname)
+
+def test_apigw_execute_lambda_proxy_cookies_and_header_set_cookie_both_ship(apigw, lam):
+    """Both the `cookies` array AND a `Set-Cookie` in `headers` ship.
+
+    Observed real-AWS behavior for HTTP API (v2) Lambda-proxy: when both are
+    returned, AWS emits the array entries first, followed by the header
+    `Set-Cookie`. Case-insensitive on the header key.
+    """
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-apigw-bothcookie-{_uuid.uuid4().hex[:8]}"
+    code = (
+        b"def handler(event, context):\n"
+        b"    return {\n"
+        b"        'statusCode': 200,\n"
+        b"        'headers': {'set-cookie': 'h=1; Path=/'},\n"
+        b"        'cookies': ['a=1; Path=/', 'b=2; Path=/'],\n"
+        b"        'body': 'x',\n"
+        b"    }\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler", Code={"ZipFile": buf.getvalue()},
+    )
+
+    api_id = apigw.create_api(Name=f"bothcookie-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id, IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    route_id = apigw.create_route(
+        ApiId=api_id, RouteKey="GET /bothcookie", Target=f"integrations/{int_id}",
+    )["RouteId"]
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/bothcookie"
+    req = _urlreq.Request(url, method="GET")
+    req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+    resp = _urlreq.urlopen(req)
+    assert resp.status == 200
+    set_cookies = resp.headers.get_all("Set-Cookie") or []
+    # Array entries first, header `Set-Cookie` last.
+    assert set_cookies == ["a=1; Path=/", "b=2; Path=/", "h=1; Path=/"]
+
+    apigw.delete_route(ApiId=api_id, RouteId=route_id)
+    apigw.delete_integration(ApiId=api_id, IntegrationId=int_id)
+    apigw.delete_api(ApiId=api_id)
+    lam.delete_function(FunctionName=fname)
+
+def test_apigw_execute_lambda_proxy_header_case_override(apigw, lam):
+    """A lowercase `content-type` overrides the default, not duplicates it.
+
+    Follow-up to #750: HTTP field names are case-insensitive (RFC 9110 §5.1),
+    so a Lambda's `content-type` must replace MiniStack's seeded default
+    `Content-Type` rather than ship as a second header.
+    """
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-apigw-ctcase-{_uuid.uuid4().hex[:8]}"
+    code = (
+        b"def handler(event, context):\n"
+        b"    return {\n"
+        b"        'statusCode': 200,\n"
+        b"        'headers': {'content-type': 'text/plain'},\n"
+        b"        'body': 'x',\n"
+        b"    }\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler", Code={"ZipFile": buf.getvalue()},
+    )
+
+    api_id = apigw.create_api(Name=f"ctcase-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id, IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    route_id = apigw.create_route(
+        ApiId=api_id, RouteKey="GET /ct", Target=f"integrations/{int_id}",
+    )["RouteId"]
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/ct"
+    req = _urlreq.Request(url, method="GET")
+    req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+    resp = _urlreq.urlopen(req)
+    assert resp.status == 200
+    # Exactly one Content-Type, and it's the Lambda's value (not the default).
+    assert (resp.headers.get_all("Content-Type") or []) == ["text/plain"]
+
+    apigw.delete_route(ApiId=api_id, RouteId=route_id)
+    apigw.delete_integration(ApiId=api_id, IntegrationId=int_id)
+    apigw.delete_api(ApiId=api_id)
+    lam.delete_function(FunctionName=fname)
+
+def test_apigw_execute_lambda_proxy_base64_body(apigw, lam):
+    """A base64 response body (isBase64Encoded) is decoded to raw bytes.
+
+    HTTP API (v2) honors isBase64Encoded unconditionally. The response must
+    carry the decoded binary, not the literal base64 string.
+    """
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-apigw-b64-{_uuid.uuid4().hex[:8]}"
+    # All 256 byte values — definitely not valid UTF-8, so a literal-base64
+    # regression would not compare equal.
+    code = (
+        b"import base64\n"
+        b"def handler(event, context):\n"
+        b"    raw = bytes(range(256))\n"
+        b"    return {\n"
+        b"        'statusCode': 200,\n"
+        b"        'headers': {'Content-Type': 'application/octet-stream'},\n"
+        b"        'isBase64Encoded': True,\n"
+        b"        'body': base64.b64encode(raw).decode('ascii'),\n"
+        b"    }\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler", Code={"ZipFile": buf.getvalue()},
+    )
+
+    api_id = apigw.create_api(Name=f"b64-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id, IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    route_id = apigw.create_route(
+        ApiId=api_id, RouteKey="GET /bin", Target=f"integrations/{int_id}",
+    )["RouteId"]
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/bin"
+    req = _urlreq.Request(url, method="GET")
+    req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+    resp = _urlreq.urlopen(req)
+    assert resp.status == 200
+    assert resp.read() == bytes(range(256))
+
+    apigw.delete_route(ApiId=api_id, RouteId=route_id)
+    apigw.delete_integration(ApiId=api_id, IntegrationId=int_id)
+    apigw.delete_api(ApiId=api_id)
+    lam.delete_function(FunctionName=fname)
+
+def test_apigw_execute_lambda_proxy_binary_request_body(apigw, lam):
+    """A binary request body is base64-encoded into the event.
+
+    Verified against real AWS (HTTP API v2): the inbound body is delivered as
+    base64 with isBase64Encoded=true for non-text content types (e.g.
+    application/octet-stream), and as a UTF-8 string for text types (e.g.
+    application/json).
+    """
+    import hashlib
+    import json as _json
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-apigw-binreq-{_uuid.uuid4().hex[:8]}"
+    # Echo back what the function actually received in the event.
+    code = (
+        b"import json, base64, hashlib\n"
+        b"def handler(event, context):\n"
+        b"    b = event.get('body'); isb = bool(event.get('isBase64Encoded'))\n"
+        b"    if b is None: raw = b''\n"
+        b"    elif isb: raw = base64.b64decode(b)\n"
+        b"    else: raw = b.encode('utf-8', 'surrogateescape')\n"
+        b"    return {'statusCode': 200, 'headers': {'content-type': 'application/json'},\n"
+        b"            'body': json.dumps({'isB64': isb, 'sha': hashlib.sha256(raw).hexdigest()})}\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler", Code={"ZipFile": buf.getvalue()},
+    )
+
+    api_id = apigw.create_api(Name=f"binreq-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id, IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    route_id = apigw.create_route(
+        ApiId=api_id, RouteKey="POST /echo", Target=f"integrations/{int_id}",
+    )["RouteId"]
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/echo"
+    host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+
+    # Binary content type -> base64-encoded body, round-tripping the raw bytes.
+    payload = bytes(range(256))
+    expected_sha = hashlib.sha256(payload).hexdigest()
+    req = _urlreq.Request(url, data=payload, method="POST")
+    req.add_header("Host", host)
+    req.add_header("Content-Type", "application/octet-stream")
+    got = _json.loads(_urlreq.urlopen(req).read())
+    assert got["isB64"] is True
+    assert got["sha"] == expected_sha
+
+    # Text content type (application/json) -> passed through as a UTF-8 string.
+    req2 = _urlreq.Request(url, data=b'{"x":1}', method="POST")
+    req2.add_header("Host", host)
+    req2.add_header("Content-Type", "application/json")
+    got2 = _json.loads(_urlreq.urlopen(req2).read())
+    assert got2["isB64"] is False
+    assert got2["sha"] == hashlib.sha256(b'{"x":1}').hexdigest()
+
+    apigw.delete_route(ApiId=api_id, RouteId=route_id)
+    apigw.delete_integration(ApiId=api_id, IntegrationId=int_id)
+    apigw.delete_api(ApiId=api_id)
+    lam.delete_function(FunctionName=fname)
+
 def test_apigw_execute_no_route(apigw):
-    """execute-api returns 404 when no matching route exists."""
+    """execute-api returns 404 when no matching route exists, with AWS's
+    exact compact-JSON body (no space after the colon)."""
     import urllib.error as _urlerr
     import urllib.request as _urlreq
 
@@ -364,6 +1028,19 @@ def test_apigw_execute_no_route(apigw):
         assert False, "Expected 404"
     except _urlerr.HTTPError as e:
         assert e.code == 404
+        assert e.read() == b'{"message":"Not Found"}'
+    # No stage matches and there is no $default stage: the same body.
+    staged = apigw.create_api(Name="no-stage-api", ProtocolType="HTTP")["ApiId"]
+    apigw.create_stage(ApiId=staged, StageName="prod")
+    req = _urlreq.Request(f"http://{staged}.execute-api.localhost:{_EXECUTE_PORT}/dev/x", method="GET")
+    req.add_header("Host", f"{staged}.execute-api.localhost:{_EXECUTE_PORT}")
+    try:
+        _urlreq.urlopen(req)
+        assert False, "Expected 404"
+    except _urlerr.HTTPError as e:
+        assert e.code == 404
+        assert e.read() == b'{"message":"Not Found"}'
+    apigw.delete_api(ApiId=staged)
     apigw.delete_api(ApiId=api_id)
 
 def test_apigw_execute_default_route(apigw, lam):
@@ -440,6 +1117,44 @@ def test_apigw_path_param_route(apigw, lam):
     assert resp.status == 200
     body = json.loads(resp.read())
     assert body["rawPath"] == "/items/abc123"
+
+    apigw.delete_api(ApiId=api_id)
+    lam.delete_function(FunctionName=fname)
+
+def test_apigw_execute_leading_double_slash_selects_route(apigw, lam):
+    """A doubled leading slash still selects the route, as on AWS."""
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-dbl-slash-{_uuid.uuid4().hex[:8]}"
+    code = (
+        b"import json\n"
+        b"def handler(event, context):\n"
+        b"    return {'statusCode': 200, 'body': json.dumps(event.get('pathParameters'))}\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler",
+        Code={"ZipFile": buf.getvalue()},
+    )
+    api_id = apigw.create_api(Name=f"dbl-slash-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    apigw.create_route(ApiId=api_id, RouteKey="ANY /items/{proxy+}", Target=f"integrations/{int_id}")
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    resp = _urlreq.urlopen(f"http://localhost:{_EXECUTE_PORT}/_aws/execute-api/{api_id}/$default//items/abc123")
+    assert resp.status == 200
+    assert json.loads(resp.read()) == {"proxy": "abc123"}
 
     apigw.delete_api(ApiId=api_id)
     lam.delete_function(FunctionName=fname)
@@ -573,6 +1288,181 @@ def test_apigw_query_params_and_headers_in_event(apigw, lam):
         assert "tag=a" in body["rawQs"]
         assert "tag=b" in body["rawQs"]
         assert body["customHeader"] == "test-value"
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        lam.delete_function(FunctionName=fname)
+
+
+def test_apigw_v2_event_omits_null_fields_when_absent(apigw, lam):
+    """Real AWS omits queryStringParameters/body from the v2 proxy event
+    entirely when there is no query string / no request body, rather than
+    including the key with a null value. Strict event-shape validators (e.g.
+    AWS Lambda Powertools' isAPIGatewayProxyEventV2) accept `undefined`
+    (Python: key absent) or a proper value, but reject `null` — a
+    present-but-null key broke every bodyless/querystring-less request
+    against such a validator, even though the invocation itself succeeded.
+
+    dict.get() can't distinguish an absent key from one explicitly set to
+    None, so this checks for key presence via `in` rather than the value.
+    """
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-nullfields-{_uuid.uuid4().hex[:8]}"
+    code = (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    return {'statusCode': 200, 'body': json.dumps({\n"
+        "        'hasQs': 'queryStringParameters' in event,\n"
+        "        'hasBody': 'body' in event,\n"
+        "    })}\n"
+    )
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(code)},
+    )
+    api_id = apigw.create_api(Name=f"nullfields-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    apigw.create_route(ApiId=api_id, RouteKey="GET /nofields", Target=f"integrations/{int_id}")
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+
+    try:
+        url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/nofields"
+        req = _urlreq.Request(url, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        resp = _urlreq.urlopen(req)
+        assert resp.status == 200
+        body = json.loads(resp.read())
+        assert body["hasQs"] is False
+        assert body["hasBody"] is False
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        lam.delete_function(FunctionName=fname)
+
+
+def test_http_api_response_request_id_header(apigw, lam):
+    """AWS: observed 2026-09-07, us-east-1, an HTTP API's integration responses: apigw-requestid
+    (e.g. Ct26qjlpoAMEbVg=) and no x-amzn-requestid or x-amz-request-id. AWS Knowledge Center
+    "collect-api-gateway-extended-request-ids": HTTP API apigw-requestid, REST API x-amz-apigw-id."""
+    import re
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-reqid-{_uuid.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip("def handler(event, context):\n    return {'statusCode': 200, 'body': 'ok'}\n")},
+    )
+    api_id = apigw.create_api(Name=f"reqid-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    apigw.create_route(ApiId=api_id, RouteKey="GET /reqid", Target=f"integrations/{int_id}")
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+    try:
+        req = _urlreq.Request(f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/reqid")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        resp = _urlreq.urlopen(req)
+        assert resp.status == 200
+        assert re.fullmatch(r"[A-Za-z0-9+/]{15}=", resp.headers["apigw-requestid"])
+        assert resp.headers["x-amzn-requestid"] is None
+        assert resp.headers["x-amz-request-id"] is None
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        lam.delete_function(FunctionName=fname)
+
+
+def test_apigw_raw_query_string_percent_encoded(apigw, lam):
+    """rawQueryString is the query string as the client sent it: a space in a value stays
+    %20, not a literal space (which breaks lambda_http / http::Uri) — #1035 — and a bare key
+    gains no "="."""
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-rawqs-{_uuid.uuid4().hex[:8]}"
+    code = (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    return {'statusCode': 200, 'body': json.dumps({'rawQs': event.get('rawQueryString')})}\n"
+    )
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _make_zip(code)},
+    )
+    api_id = apigw.create_api(Name=f"rawqs-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id, IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    apigw.create_route(ApiId=api_id, RouteKey="GET /authorize", Target=f"integrations/{int_id}")
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+    try:
+        url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/authorize?scope=openid%20profile"
+        req = _urlreq.Request(url, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        resp = _urlreq.urlopen(req)
+        body = json.loads(resp.read())
+        assert "openid%20profile" in body["rawQs"]
+        assert "openid profile" not in body["rawQs"]  # no literal space
+        req = _urlreq.Request(url.split("?")[0] + "?flag&a=1", method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        assert json.loads(_urlreq.urlopen(req).read())["rawQs"] == "flag&a=1"
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        lam.delete_function(FunctionName=fname)
+
+
+def test_apigw_raw_path_keeps_percent25_escape(apigw, lam):
+    """rawPath decodes escapes but never %25, so a%252Eb is not turned into a%2Eb."""
+    import urllib.request as _urlreq
+    import uuid as _uuid
+
+    fname = f"intg-rawpath-{_uuid.uuid4().hex[:8]}"
+    code = (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    return {'statusCode': 200, 'body': json.dumps({'rawPath': event.get('rawPath')})}\n"
+    )
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _make_zip(code)},
+    )
+    api_id = apigw.create_api(Name=f"rawpath-api-{fname}", ProtocolType="HTTP")["ApiId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id, IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fname}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    apigw.create_route(ApiId=api_id, RouteKey="GET /items/{proxy+}", Target=f"integrations/{int_id}")
+    apigw.create_stage(ApiId=api_id, StageName="$default")
+    host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+
+    def raw_path(segment):
+        req = _urlreq.Request(f"http://{host}/$default/items/{segment}", method="GET")
+        req.add_header("Host", host)
+        return json.loads(_urlreq.urlopen(req).read())["rawPath"]
+
+    try:
+        assert raw_path("a%252Eb") == "/items/a%252Eb"
+        assert raw_path("a%2Eb") == "/items/a.b"
+        req = _urlreq.Request(f"http://{host}/items/a%252Eb", method="GET")
+        req.add_header("Host", host)
+        assert json.loads(_urlreq.urlopen(req).read())["rawPath"] == "/items/a%252Eb"
     finally:
         apigw.delete_api(ApiId=api_id)
         lam.delete_function(FunctionName=fname)
@@ -840,12 +1730,14 @@ def test_apigw_integration_without_request_parameters_optional_map(apigw):
     apigw.delete_api(ApiId=api_id)
 
 
-def test_apigw_jwt_authorizer_enforced_in_data_plane(apigw):
+def test_apigw_jwt_authorizer_enforced_in_data_plane(apigw, cognito_idp):
     import urllib.error as _urlerr
     import urllib.request as _urlreq
 
     from ministack.services import cognito as _cognito
 
+    pool_id = cognito_idp.create_user_pool(PoolName=f"jwt-enforce-{_uuid_mod.uuid4().hex[:8]}")["UserPool"]["Id"]
+    issuer = f"https://cognito-idp.us-east-1.amazonaws.com/{pool_id}"
     api_id = apigw.create_api(Name=f"jwt-enforce-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="HTTP")["ApiId"]
     server, _thread, _captured = _start_echo_server()
     try:
@@ -860,7 +1752,7 @@ def test_apigw_jwt_authorizer_enforced_in_data_plane(apigw):
             AuthorizerType="JWT",
             Name="jwt-auth",
             IdentitySource=["$request.header.Authorization"],
-            JwtConfiguration={"Audience": ["ms-client"], "Issuer": "https://cognito-idp.us-east-1.amazonaws.com/test-pool"},
+            JwtConfiguration={"Audience": ["ms-client"], "Issuer": issuer},
         )["AuthorizerId"]
         apigw.create_route(
             ApiId=api_id,
@@ -878,7 +1770,7 @@ def test_apigw_jwt_authorizer_enforced_in_data_plane(apigw):
             _urlreq.urlopen(req_missing)
         assert exc.value.code == 401
 
-        token = _cognito._fake_token("user-1", "test-pool", "ms-client", token_type="access")
+        token = _cognito._fake_token("user-1", pool_id, "ms-client", token_type="access")
         req_ok = _urlreq.Request(url, method="GET")
         req_ok.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
         req_ok.add_header("Authorization", f"Bearer {token}")
@@ -888,11 +1780,281 @@ def test_apigw_jwt_authorizer_enforced_in_data_plane(apigw):
         server.shutdown()
         server.server_close()
         apigw.delete_api(ApiId=api_id)
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
 
 
-def test_apigw_request_mapping_claims_to_headers(apigw):
+def test_apigw_request_authorizer_simple_response_enforced_in_data_plane(apigw, lam):
+    """A CUSTOM route backed by a REQUEST (Lambda) authorizer using the 2.0
+    simple response format (`enableSimpleResponses`) is actually invoked and
+    enforced on the data path. (#1345)
+
+    Before this fix, `_handle_execute_in_scope` only branched on
+    `auth_type == "JWT"`; a CUSTOM route (the AuthorizationType a route gets
+    when it references a REQUEST authorizer) fell through unauthenticated —
+    the authorizer Lambda was never invoked at all, regardless of whether the
+    request carried a valid, invalid, or missing token.
+
+    - isAuthorized: false -> 403.
+    - isAuthorized: true  -> 200, with the returned context surfaced to the
+      integration Lambda under requestContext.authorizer.lambda (mirrors
+      REST/v1's requestContext.authorizer for a CUSTOM authorizer, just keyed
+      under `.lambda` instead of flat, matching real HTTP API behavior).
+    """
+    import urllib.error as _urlerr
     import urllib.request as _urlreq
 
+    suffix = _uuid_mod.uuid4().hex[:8]
+    auth_fn = f"intg-v2-authfn-simple-{suffix}"
+    int_fn = f"intg-v2-intfn-simple-{suffix}"
+
+    auth_code = (
+        b"def handler(event, context):\n"
+        b"    tok = event.get('headers', {}).get('authorization', '')\n"
+        b"    if tok == 'allow-me':\n"
+        b"        return {'isAuthorized': True, 'context': {'user': 'alice', 'admin': True,\n"
+        b"                                                  'rawQueryString': event.get('rawQueryString')}}\n"
+        b"    return {'isAuthorized': False}\n"
+    )
+    int_code = (
+        b"import json\n"
+        b"def handler(event, context):\n"
+        b"    auth = event.get('requestContext', {}).get('authorizer')\n"
+        b"    return {'statusCode': 200, 'body': json.dumps(auth)}\n"
+    )
+    lam.create_function(
+        FunctionName=auth_fn, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _make_zip(auth_code)},
+    )
+    lam.create_function(
+        FunctionName=int_fn, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _make_zip(int_code)},
+    )
+
+    api_id = apigw.create_api(Name=f"v2-authz-simple-{suffix}", ProtocolType="HTTP")["ApiId"]
+    try:
+        auth_id = apigw.create_authorizer(
+            ApiId=api_id,
+            AuthorizerType="REQUEST",
+            Name="req-auth-simple",
+            AuthorizerUri=f"arn:aws:lambda:us-east-1:000000000000:function:{auth_fn}",
+            AuthorizerPayloadFormatVersion="2.0",
+            EnableSimpleResponses=True,
+            IdentitySource=["$request.header.Authorization"],
+            AuthorizerResultTtlInSeconds=0,
+        )["AuthorizerId"]
+        int_id = apigw.create_integration(
+            ApiId=api_id,
+            IntegrationType="AWS_PROXY",
+            IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{int_fn}",
+            PayloadFormatVersion="2.0",
+        )["IntegrationId"]
+        apigw.create_route(
+            ApiId=api_id,
+            RouteKey="GET /private",
+            Target=f"integrations/{int_id}",
+            AuthorizationType="CUSTOM",
+            AuthorizerId=auth_id,
+        )
+        apigw.create_stage(ApiId=api_id, StageName="$default")
+
+        host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+        url = f"http://{host}/$default/private"
+
+        def _call(token, query=""):
+            req = _urlreq.Request(url + query, method="GET")
+            req.add_header("Host", host)
+            if token is not None:
+                req.add_header("Authorization", token)
+            try:
+                r = _urlreq.urlopen(req)
+                return r.status, r.read()
+            except _urlerr.HTTPError as e:
+                return e.code, e.read()
+
+        # No/invalid token -> isAuthorized: false -> 403, not a silent pass-through.
+        status, _ = _call("deny-me")
+        assert status == 403
+
+        # Valid token -> isAuthorized: true -> 200, context reaches the
+        # integration under requestContext.authorizer.lambda.
+        status, body = _call("allow-me", "?flag&a=1")
+        assert status == 200
+        auth = json.loads(body)
+        assert auth == {"lambda": {"user": "alice", "admin": True, "rawQueryString": "flag&a=1"}}
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        lam.delete_function(FunctionName=auth_fn)
+        lam.delete_function(FunctionName=int_fn)
+
+
+def test_apigw_request_authorizer_iam_policy_response_enforced_in_data_plane(apigw, lam):
+    """A CUSTOM route backed by a REQUEST (Lambda) authorizer using the IAM
+    policy response format (the default when `enableSimpleResponses` is not
+    set, and the only format for `authorizerPayloadFormatVersion: 1.0`) is
+    invoked and enforced, with the policy evaluated against the route ARN.
+    (#1345)
+    """
+    import urllib.error as _urlerr
+    import urllib.request as _urlreq
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    auth_fn = f"intg-v2-authfn-iam-{suffix}"
+    int_fn = f"intg-v2-intfn-iam-{suffix}"
+
+    auth_code = (
+        b"def handler(event, context):\n"
+        b"    tok = event.get('headers', {}).get('authorization', '')\n"
+        b"    arn = event['routeArn']\n"
+        b"    effect = 'Allow' if tok == 'allow-me' else 'Deny'\n"
+        b"    return {\n"
+        b"        'principalId': 'alice',\n"
+        b"        'context': {'user': 'alice'},\n"
+        b"        'policyDocument': {\n"
+        b"            'Version': '2012-10-17',\n"
+        b"            'Statement': [{'Action': 'execute-api:Invoke', 'Effect': effect, 'Resource': arn}],\n"
+        b"        },\n"
+        b"    }\n"
+    )
+    int_code = (
+        b"import json\n"
+        b"def handler(event, context):\n"
+        b"    auth = event.get('requestContext', {}).get('authorizer')\n"
+        b"    return {'statusCode': 200, 'body': json.dumps(auth)}\n"
+    )
+    lam.create_function(
+        FunctionName=auth_fn, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _make_zip(auth_code)},
+    )
+    lam.create_function(
+        FunctionName=int_fn, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _make_zip(int_code)},
+    )
+
+    api_id = apigw.create_api(Name=f"v2-authz-iam-{suffix}", ProtocolType="HTTP")["ApiId"]
+    try:
+        auth_id = apigw.create_authorizer(
+            ApiId=api_id,
+            AuthorizerType="REQUEST",
+            Name="req-auth-iam",
+            AuthorizerUri=f"arn:aws:lambda:us-east-1:000000000000:function:{auth_fn}",
+            AuthorizerPayloadFormatVersion="2.0",
+            EnableSimpleResponses=False,
+            IdentitySource=["$request.header.Authorization"],
+            AuthorizerResultTtlInSeconds=0,
+        )["AuthorizerId"]
+        int_id = apigw.create_integration(
+            ApiId=api_id,
+            IntegrationType="AWS_PROXY",
+            IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{int_fn}",
+            PayloadFormatVersion="2.0",
+        )["IntegrationId"]
+        apigw.create_route(
+            ApiId=api_id,
+            RouteKey="GET /private",
+            Target=f"integrations/{int_id}",
+            AuthorizationType="CUSTOM",
+            AuthorizerId=auth_id,
+        )
+        apigw.create_stage(ApiId=api_id, StageName="$default")
+
+        host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+        url = f"http://{host}/$default/private"
+
+        def _call(token):
+            req = _urlreq.Request(url, method="GET")
+            req.add_header("Host", host)
+            if token is not None:
+                req.add_header("Authorization", token)
+            try:
+                r = _urlreq.urlopen(req)
+                return r.status, r.read()
+            except _urlerr.HTTPError as e:
+                return e.code, e.read()
+
+        # Deny policy -> 403, not a silent pass-through.
+        status, _ = _call("deny-me")
+        assert status == 403
+
+        # Allow policy -> 200; context (incl. principalId) reaches the
+        # integration under requestContext.authorizer.lambda.
+        status, body = _call("allow-me")
+        assert status == 200
+        auth = json.loads(body)
+        assert auth == {"lambda": {"user": "alice", "principalId": "alice"}}
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        lam.delete_function(FunctionName=auth_fn)
+        lam.delete_function(FunctionName=int_fn)
+
+
+def test_apigw_jwt_claims_delivered_to_lambda_as_strings(apigw, lam, cognito_idp):
+    """Every JWT claim value reaches the Lambda event as a string, as on AWS."""
+    import urllib.request as _urlreq
+
+    suffix = _uuid_mod.uuid4().hex[:8]
+    fn = f"jwt-claims-str-{suffix}"
+    code = (
+        b"import json\n"
+        b"def handler(event, context):\n"
+        b"    claims = event['requestContext']['authorizer']['jwt']['claims']\n"
+        b"    return {'statusCode': 200, 'body': json.dumps(claims)}\n"
+    )
+    lam.create_function(
+        FunctionName=fn, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _make_zip(code)},
+    )
+    pool_id = cognito_idp.create_user_pool(PoolName=f"jwt-str-{suffix}")["UserPool"]["Id"]
+    issuer = f"https://cognito-idp.us-east-1.amazonaws.com/{pool_id}"
+    api_id = apigw.create_api(Name=f"jwt-str-{suffix}", ProtocolType="HTTP")["ApiId"]
+    try:
+        integ_id = apigw.create_integration(
+            ApiId=api_id,
+            IntegrationType="AWS_PROXY",
+            IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{fn}",
+            PayloadFormatVersion="2.0",
+        )["IntegrationId"]
+        auth_id = apigw.create_authorizer(
+            ApiId=api_id,
+            AuthorizerType="JWT",
+            Name="jwt-str-auth",
+            IdentitySource=["$request.header.Authorization"],
+            JwtConfiguration={"Audience": ["ms-client"], "Issuer": issuer},
+        )["AuthorizerId"]
+        apigw.create_route(
+            ApiId=api_id,
+            RouteKey="GET /secure",
+            Target=f"integrations/{integ_id}",
+            AuthorizationType="JWT",
+            AuthorizerId=auth_id,
+        )
+        apigw.create_stage(ApiId=api_id, StageName="$default")
+
+        now = int(time.time())
+        token = _make_signed_token(
+            {"sub": "u1", "iss": issuer, "aud": "ms-client", "iat": now, "exp": now + 3600,
+             "email_verified": True, "cognito:groups": ["admin", "dev"]}
+        )
+        url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/$default/secure"
+        req = _urlreq.Request(url, method="GET")
+        req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+        req.add_header("Authorization", f"Bearer {token}")
+        claims = json.loads(_urlreq.urlopen(req).read())
+        assert claims["iat"] == str(now)
+        assert claims["exp"] == str(now + 3600)
+        assert claims["email_verified"] == "true"
+        assert claims["cognito:groups"] == "[admin dev]"
+        assert all(isinstance(v, str) for v in claims.values())
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+        lam.delete_function(FunctionName=fn)
+
+
+def test_apigw_request_mapping_claims_to_headers(apigw, cognito_idp):
+    import urllib.request as _urlreq
+
+    pool_id = cognito_idp.create_user_pool(PoolName=f"jwt-map-{_uuid_mod.uuid4().hex[:8]}")["UserPool"]["Id"]
+    issuer = f"https://cognito-idp.us-east-1.amazonaws.com/{pool_id}"
     api_id = apigw.create_api(Name=f"jwt-map-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="HTTP")["ApiId"]
     server, _thread, _captured = _start_echo_server()
     try:
@@ -913,7 +2075,7 @@ def test_apigw_request_mapping_claims_to_headers(apigw):
             AuthorizerType="JWT",
             Name="jwt-map-auth",
             IdentitySource=["$request.header.Authorization"],
-            JwtConfiguration={"Audience": ["ms-client"], "Issuer": "https://cognito-idp.us-east-1.amazonaws.com/test-pool"},
+            JwtConfiguration={"Audience": ["ms-client"], "Issuer": issuer},
         )["AuthorizerId"]
         apigw.create_route(
             ApiId=api_id,
@@ -928,7 +2090,7 @@ def test_apigw_request_mapping_claims_to_headers(apigw):
         token = _make_signed_token(
             {
                 "sub": "auth0|abc123",
-                "iss": "https://cognito-idp.us-east-1.amazonaws.com/test-pool",
+                "iss": issuer,
                 "aud": "ms-client",
                 "iat": now,
                 "nbf": now - 1,
@@ -953,6 +2115,129 @@ def test_apigw_request_mapping_claims_to_headers(apigw):
         server.shutdown()
         server.server_close()
         apigw.delete_api(ApiId=api_id)
+        cognito_idp.delete_user_pool(UserPoolId=pool_id)
+
+
+def test_apigw_resolve_jwks_url_uses_oidc_discovery(monkeypatch):
+    """Non-Cognito issuers: jwks_uri is read from OIDC discovery, not hardcoded.
+
+    Regression test for issuers like Salesforce that publish their keys at a path
+    other than {issuer}/.well-known/jwks.json (e.g. /id/keys).
+    """
+    import asyncio
+
+    from ministack.services import apigateway as apigw_mod
+
+    issuer = "https://example-idp.test"
+    discovery_url = f"{issuer}/.well-known/openid-configuration"
+    real_jwks_uri = f"{issuer}/id/keys"
+    calls = {"urls": []}
+
+    async def _fake_urlopen(request_or_url, _timeout_seconds):
+        calls["urls"].append(request_or_url)
+        body = json.dumps({"jwks_uri": real_jwks_uri}).encode("utf-8")
+        return 200, {"Content-Type": "application/json"}, body
+
+    monkeypatch.setattr(apigw_mod, "_urlopen_async", _fake_urlopen)
+    monkeypatch.setattr(apigw_mod, "_oidc_config_cache", apigw_mod.AccountScopedDict())
+
+    authorizer = {"jwtConfiguration": {"Issuer": issuer, "Audience": ["ms-client"]}}
+    resolved = asyncio.run(apigw_mod._resolve_jwks_url(authorizer))
+
+    assert resolved == real_jwks_uri
+    assert calls["urls"] == [discovery_url]
+
+
+def test_apigw_resolve_jwks_url_falls_back_when_discovery_unavailable(monkeypatch):
+    """If OIDC discovery fails, fall back to the conventional jwks.json path."""
+    import asyncio
+
+    from ministack.services import apigateway as apigw_mod
+
+    issuer = "https://unreachable-idp.test"
+
+    async def _failing_urlopen(_request_or_url, _timeout_seconds):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(apigw_mod, "_urlopen_async", _failing_urlopen)
+    monkeypatch.setattr(apigw_mod, "_oidc_config_cache", apigw_mod.AccountScopedDict())
+
+    authorizer = {"jwtConfiguration": {"Issuer": issuer, "Audience": ["ms-client"]}}
+    resolved = asyncio.run(apigw_mod._resolve_jwks_url(authorizer))
+
+    assert resolved == f"{issuer}/.well-known/jwks.json"
+
+
+def test_apigw_oidc_discovery_failure_is_negative_cached(monkeypatch):
+    """A failed discovery must not poison the cache for the full 7200s TTL.
+
+    Regression test: a transient discovery failure used to be cached for
+    7200s, making every JWT validation for that issuer fail closed for up to
+    2 hours even after the underlying network issue cleared. It should
+    instead be negative-cached briefly (60s) so a flood of requests during
+    the outage doesn't each trigger their own discovery call, but recovery
+    happens quickly once the issuer is reachable again.
+    """
+    import asyncio
+
+    from ministack.services import apigateway as apigw_mod
+
+    issuer = "https://flaky-idp.test"
+    real_jwks_uri = f"{issuer}/id/keys"
+    calls = {"count": 0}
+
+    async def _flaky_then_ok_urlopen(_request_or_url, _timeout_seconds):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise OSError("connection refused")
+        body = json.dumps({"jwks_uri": real_jwks_uri}).encode("utf-8")
+        return 200, {"Content-Type": "application/json"}, body
+
+    fake_now = {"value": 1_000_000.0}
+    monkeypatch.setattr(apigw_mod, "_urlopen_async", _flaky_then_ok_urlopen)
+    monkeypatch.setattr(apigw_mod, "_oidc_config_cache", apigw_mod.AccountScopedDict())
+    monkeypatch.setattr(apigw_mod.time, "time", lambda: fake_now["value"])
+
+    authorizer = {"jwtConfiguration": {"Issuer": issuer, "Audience": ["ms-client"]}}
+
+    first = asyncio.run(apigw_mod._resolve_jwks_url(authorizer))
+    assert first == f"{issuer}/.well-known/jwks.json"
+
+    # Within the 60s negative-cache window, a retry must not re-trigger
+    # discovery — it should reuse the cached failure.
+    second = asyncio.run(apigw_mod._resolve_jwks_url(authorizer))
+    assert second == f"{issuer}/.well-known/jwks.json"
+    assert calls["count"] == 1
+
+    # Once the negative-cache TTL has elapsed, discovery is retried and
+    # the now-healthy issuer resolves successfully.
+    fake_now["value"] += 61
+    third = asyncio.run(apigw_mod._resolve_jwks_url(authorizer))
+    assert third == real_jwks_uri
+    assert calls["count"] == 2
+
+
+def test_apigw_resolve_jwks_url_cognito_skips_discovery(monkeypatch):
+    """Cognito issuers keep using the local pool JWKS — no discovery call."""
+    import asyncio
+
+    from ministack.services import apigateway as apigw_mod
+
+    issuer = "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_pool123"
+    called = {"hit": False}
+
+    async def _should_not_be_called(_request_or_url, _timeout_seconds):
+        called["hit"] = True
+        return 200, {}, b"{}"
+
+    monkeypatch.setattr(apigw_mod, "_urlopen_async", _should_not_be_called)
+    monkeypatch.setattr(apigw_mod, "_oidc_config_cache", apigw_mod.AccountScopedDict())
+
+    authorizer = {"jwtConfiguration": {"Issuer": issuer, "Audience": ["ms-client"]}}
+    resolved = asyncio.run(apigw_mod._resolve_jwks_url(authorizer))
+
+    assert resolved.endswith("/us-east-1_pool123/.well-known/jwks.json")
+    assert called["hit"] is False
 
 
 def test_apigw_http_proxy_does_not_block_parallel_ddb(monkeypatch):
@@ -1081,6 +2366,74 @@ def test_apigw_integration_content_handling_strategy_roundtrip(apigw):
     integ = apigw.get_integration(ApiId=api_id, IntegrationId=integ_id)
     assert integ.get("ContentHandlingStrategy") == "CONVERT_TO_BINARY"
 
+
+def test_apigw_websocket_lambda_worker_uses_function_region(monkeypatch):
+    import asyncio
+
+    from ministack.core import lambda_runtime
+    from ministack.core.responses import get_region, set_request_region
+    from ministack.services import apigateway as apigw_mod
+    from ministack.services import lambda_svc
+
+    api_id = f"ws-scope-{_uuid_mod.uuid4().hex[:8]}"
+    integration_id = f"int-{_uuid_mod.uuid4().hex[:8]}"
+    func_name = f"ws-scope-fn-{_uuid_mod.uuid4().hex[:8]}"
+    func_arn = f"arn:aws:lambda:us-west-2:000000000000:function:{func_name}"
+    func_config = {
+        "FunctionName": func_name,
+        "FunctionArn": func_arn,
+        "Runtime": "python3.12",
+    }
+    func_record = {"config": func_config, "code_zip": b"fake-zip"}
+    seen_regions = []
+
+    def fake_get_func_record_for_ref(function_ref):
+        assert function_ref == func_arn
+        return func_record, func_config, func_name
+
+    class FakeWorker:
+        def invoke(self, event, message_id):
+            seen_regions.append(("invoke", get_region()))
+            return {"status": "ok", "result": {"statusCode": 200, "body": "ok"}}
+
+    def fake_get_or_create_worker(name, config, code_zip, *, qualifier):
+        seen_regions.append(("spawn", get_region(), name, qualifier))
+        return FakeWorker()
+
+    monkeypatch.setattr(lambda_svc, "_get_func_record_for_ref", fake_get_func_record_for_ref)
+    monkeypatch.setattr(lambda_runtime, "get_or_create_worker", fake_get_or_create_worker)
+
+    apigw_mod._integrations[api_id] = {
+        integration_id: {"integrationType": "AWS_PROXY", "integrationUri": func_arn}
+    }
+    route = {"routeKey": "$default", "target": f"integrations/{integration_id}"}
+    set_request_region("us-east-1")
+    try:
+        result = asyncio.run(apigw_mod._invoke_ws_lambda(
+            api_id,
+            "000000000000",
+            "us-east-1",
+            route,
+            "$default",
+            "conn-1",
+            "MESSAGE",
+            "msg-1",
+            "{}",
+            "127.0.0.1",
+            {},
+            {},
+        ))
+    finally:
+        apigw_mod._integrations.pop(api_id, None)
+        set_request_region("us-east-1")
+
+    assert result == {"statusCode": 200, "body": "ok"}
+    assert seen_regions == [
+        ("spawn", "us-west-2", func_name, "$LATEST"),
+        ("invoke", "us-west-2"),
+    ]
+
+
 def test_apigw_delete_route_v2(apigw):
     """DeleteRoute removes the route from GetRoutes."""
     api_id = apigw.create_api(Name="qa-apigw-del-route", ProtocolType="HTTP")["ApiId"]
@@ -1123,6 +2476,30 @@ def test_apigwv2_created_date_is_unix_timestamp(apigw):
         f"CreatedDate should be datetime (parsed from Unix int), got {type(created)}"
     )
     apigw.delete_api(ApiId=resp["ApiId"])
+
+
+@pytest.mark.parametrize("use_ssl, http_scheme, ws_scheme", [("1", "https", "wss"), ("", "http", "http")])
+def test_apigwv2_endpoint_scheme_follows_tls(monkeypatch, use_ssl, http_scheme, ws_scheme):
+    """Under USE_SSL=1 the gateway serves only HTTPS, so apiEndpoint is https:// (wss:// for a WebSocket API), as on
+    AWS; without it both keep http://."""
+    monkeypatch.setenv("USE_SSL", use_ssl)
+    for protocol, scheme in (("HTTP", http_scheme), ("WEBSOCKET", ws_scheme)):
+        status, body = _payload(_apigw._create_api({"name": f"scheme-{protocol}", "protocolType": protocol}))
+        assert status == 201
+        assert body["apiEndpoint"].startswith(f"{scheme}://"), body["apiEndpoint"]
+        _apigw._delete_api(body["apiId"])
+
+
+def test_apigwv2_cfn_api_endpoint_follows_tls(monkeypatch):
+    """The AWS::ApiGatewayV2::Api provisioner builds the same apiEndpoint as CreateApi."""
+    from ministack.services.cloudformation import provisioners
+
+    monkeypatch.setenv("USE_SSL", "1")
+    api_id, attrs = provisioners._apigw_v2_api_create("Api", {"Name": "cfn-tls", "ProtocolType": "WEBSOCKET"}, "stack")
+    try:
+        assert attrs["ApiEndpoint"].startswith("wss://"), attrs["ApiEndpoint"]
+    finally:
+        _apigw._delete_api(api_id)
 
 
 # ========== from test_apigwv2_websocket.py ==========
@@ -1237,6 +2614,17 @@ class _WSClient:
         except socket.timeout:
             return None
 
+    def recv_frame(self, timeout: float = 15.0) -> tuple[int, bytes] | None:
+        """Return the next data or close frame as (opcode, payload), skipping ping/pong."""
+        self._sock.settimeout(timeout)
+        try:
+            while True:
+                frame = self._recv_frame()
+                if frame is None or frame[0] in (0x1, 0x2, 0x8):
+                    return frame
+        except socket.timeout:
+            return None
+
     def _recv_all(self, n: int) -> bytes:
         while len(self._buf) < n:
             chunk = self._sock.recv(max(4096, n - len(self._buf)))
@@ -1305,7 +2693,7 @@ def handler(event, context):
 """
 
 
-def _make_fn(lam, name: str, code: str) -> str:
+def _make_fn(lam, name: str, code: str, *, region: str = "us-east-1") -> str:
     try:
         lam.delete_function(FunctionName=name)
     except Exception:
@@ -1333,13 +2721,14 @@ def _make_fn(lam, name: str, code: str) -> str:
         )
     except Exception:
         pass
-    return f"arn:aws:lambda:us-east-1:000000000000:function:{name}"
+    return f"arn:aws:lambda:{region}:000000000000:function:{name}"
 
 
 def _wire_ws_api(apigw, lam, *, name_suffix: str,
                  connect_code: str | None = None,
                  default_code: str = _ECHO_CODE,
-                 disconnect_code: str | None = None) -> tuple[str, dict]:
+                 disconnect_code: str | None = None,
+                 function_region: str = "us-east-1") -> tuple[str, dict]:
     """Create a WS API + routes + integrations and return (apiId, metadata)."""
     api = apigw.create_api(Name=f"ws-{name_suffix}", ProtocolType="WEBSOCKET")
     api_id = api["ApiId"]
@@ -1348,7 +2737,7 @@ def _wire_ws_api(apigw, lam, *, name_suffix: str,
 
     def _route(route_key: str, code: str):
         fn_name = f"ws-{name_suffix}-{route_key.lstrip('$')}-{uuid.uuid4().hex[:6]}"
-        arn = _make_fn(lam, fn_name, code)
+        arn = _make_fn(lam, fn_name, code, region=function_region)
         meta["created_functions"].append(fn_name)
         integ = apigw.create_integration(
             ApiId=api_id,
@@ -1494,6 +2883,107 @@ def test_ws_post_to_connection_from_management_api(apigw, lam):
         ws.close()
 
 
+def test_ws_post_to_connection_sends_text_frames(apigw, lam):
+    """PostToConnection data arrives as a text frame, with bytes that aren't UTF-8 replaced by U+FFFD, as on AWS."""
+    import urllib.request
+
+    api_id, _ = _wire_ws_api(apigw, lam, name_suffix="p2c-text")
+    host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+    ws = _WSClient("localhost", _EXECUTE_PORT, "/prod", headers={"Host": host})
+    try:
+        ws.send(json.dumps({"action": "sendMessage"}))
+        conn_id = json.loads(ws.recv())["connectionId"]
+
+        for data, delivered in (
+            (b'{"kind":"changes"}', b'{"kind":"changes"}'),
+            (b"\xff\xfe\x00\x01", b"\xef\xbf\xbd\xef\xbf\xbd\x00\x01"),
+            (b"\xed\xa0\x80A", b"\xef\xbf\xbdA"),
+        ):
+            req = urllib.request.Request(
+                f"http://{host}/prod/@connections/{conn_id}", data=data, method="POST", headers={"Host": host},
+            )
+            assert urllib.request.urlopen(req, timeout=30).status == 200
+            assert ws.recv_frame(timeout=3) == (0x1, delivered)
+    finally:
+        ws.close()
+
+
+@pytest.mark.parametrize("posted, delivered", [
+    ("fffe0001", "efbfbdefbfbd0001"),  # lone-invalid
+    ("80", "efbfbd"),  # lone-continuation
+    ("e282", "efbfbd"),  # truncated-3byte
+    ("e28241", "efbfbd41"),  # truncated-3byte-then-ascii
+    ("f09f98", "efbfbd"),  # truncated-4byte
+    ("f09f9841", "efbfbd41"),  # truncated-4byte-then-ascii
+    ("c0af", "efbfbdefbfbd"),  # overlong-2byte
+    ("e080af", "efbfbdefbfbdefbfbd"),  # overlong-3byte
+    ("f0808080", "efbfbdefbfbdefbfbdefbfbd"),  # overlong-4byte
+    ("f4908080", "efbfbdefbfbdefbfbdefbfbd"),  # above-max-codepoint
+    ("f5808080", "efbfbdefbfbdefbfbdefbfbd"),  # invalid-lead-f5
+    ("f09f9880", "f09f9880"),  # valid-emoji
+    ("41e282f09f98804280", "41efbfbdf09f988042efbfbd"),  # mixed
+    ("eda080", "efbfbd"),  # high-surrogate
+    ("edb080", "efbfbd"),  # low-surrogate
+    ("edbfbf", "efbfbd"),  # max-surrogate
+    ("eda0bdedb880", "efbfbdefbfbd"),  # surrogate-pair-cesu8
+    ("eda0", "efbfbd"),  # truncated-surrogate-at-end
+    ("eda041", "efbfbd41"),  # truncated-surrogate-then-ascii
+    ("eda08041", "efbfbd41"),  # surrogate-then-ascii
+    ("41eda0", "41efbfbd"),  # ascii-then-truncated-surrogate
+    ("ed41", "efbfbd41"),  # lead-ed-then-ascii
+    ("ed", "efbfbd"),  # lead-ed-at-end
+    ("ed9fbf", "ed9fbf"),  # below-surrogates-valid
+    ("ee8080", "ee8080"),  # after-surrogates-valid
+])
+def test_ws_post_to_connection_text_replaces_invalid_utf8_like_aws(posted, delivered):
+    """Each pair is what API Gateway delivered (eu-west-1, 2026-10-22) for data posted with PostToConnection."""
+    assert _apigw._post_to_connection_text(bytes.fromhex(posted)).encode().hex() == delivered
+
+
+def test_ws_non_boot_region_routes_and_management_api():
+    """A WebSocket API owned by a non-boot region routes frames and @connections
+    operations through the API owner's region, not the server boot region."""
+    import urllib.request
+
+    apigw_west = _regional_client("apigatewayv2", "us-west-2")
+    apigw_east = _regional_client("apigatewayv2", "us-east-1")
+    lam_west = _regional_client("lambda", "us-west-2")
+    api_id, _ = _wire_ws_api(
+        apigw_west,
+        lam_west,
+        name_suffix=f"west-{_uuid_mod.uuid4().hex[:6]}",
+        function_region="us-west-2",
+    )
+    with pytest.raises(ClientError) as exc_info:
+        apigw_east.get_stages(ApiId=api_id)
+    assert exc_info.value.response["Error"]["Code"] == "NotFoundException"
+    ws = _WSClient(
+        "localhost",
+        _EXECUTE_PORT,
+        "/prod",
+        headers={"Host": f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"},
+    )
+    try:
+        ws.send(json.dumps({"action": "sendMessage", "payload": "west"}))
+        reply = ws.recv()
+        parsed = json.loads(reply)
+        conn_id = parsed["connectionId"]
+        assert parsed["eventType"] == "MESSAGE"
+        assert parsed["body"]["payload"] == "west"
+
+        url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/prod/@connections/{conn_id}"
+        req = urllib.request.Request(
+            url,
+            data=b"west-push",
+            method="POST",
+            headers={"Host": f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"},
+        )
+        assert urllib.request.urlopen(req, timeout=30).status == 200
+        assert ws.recv(timeout=3) == "west-push"
+    finally:
+        ws.close()
+
+
 def test_ws_get_connection_returns_metadata(apigw, lam):
     """@connections GetConnection returns connected-at / identity."""
     import urllib.request
@@ -1521,31 +3011,57 @@ def test_ws_get_connection_returns_metadata(apigw, lam):
         ws.close()
 
 
-def test_ws_delete_connection_closes_socket(apigw, lam):
-    """@connections DeleteConnection terminates the WS session."""
+def test_ws_delete_connection_closes_socket(apigw, lam, sqs):
+    """DeleteConnection sends the client a close frame, forgets the connection and runs $disconnect."""
+    import urllib.error
     import urllib.request
 
-    api_id, _ = _wire_ws_api(apigw, lam, name_suffix="delc")
-    ws = _WSClient("localhost", _EXECUTE_PORT, "/prod",
-                   headers={"Host": f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"})
+    qname = _v2_auth_counter_queue(sqs)
+    disconnect = (_V2_AUTH_MARK_PRELUDE + (
+        f"def handler(event, context):\n    _mark('{qname}')\n    return {{'statusCode': 200}}\n").encode()).decode()
+    api_id, _ = _wire_ws_api(apigw, lam, name_suffix="delc", disconnect_code=disconnect)
+    host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+    warmed = _v2_auth_count(sqs, qname)  # _make_fn's warm-up call
+    ws = _WSClient("localhost", _EXECUTE_PORT, "/prod", headers={"Host": host})
     try:
         ws.send(json.dumps({"action": "x"}))
-        reply = ws.recv()
-        conn_id = json.loads(reply)["connectionId"]
+        conn_id = json.loads(ws.recv())["connectionId"]
+        url = f"http://{host}/prod/@connections/{conn_id}"
+        r = urllib.request.urlopen(urllib.request.Request(url, method="DELETE", headers={"Host": host}), timeout=30)
+        assert r.status == 204
 
-        url = f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/prod/@connections/{conn_id}"
-        req = urllib.request.Request(
-            url, method="DELETE",
-            headers={"Host": f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"},
-        )
-        r = urllib.request.urlopen(req, timeout=30)
-        assert r.status in (200, 204)
-
-        # Give the server a moment to close, then subsequent recv returns None.
-        time.sleep(0.5)
-        assert ws.recv(timeout=1.5) is None
+        ws._sock.settimeout(5)
+        assert ws._recv_frame()[0] == 0x8
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(urllib.request.Request(url, method="GET", headers={"Host": host}), timeout=30)
+        assert exc_info.value.code == 410
+        assert exc_info.value.headers["x-amzn-ErrorType"] == "GoneException"
+        deadline = time.time() + 30
+        while _v2_auth_count(sqs, qname) < warmed + 1 and time.time() < deadline:
+            time.sleep(0.5)
+        assert _v2_auth_count(sqs, qname) == warmed + 1
     finally:
         ws.close()
+        _v2_auth_delete_queue(sqs, qname)
+
+
+def test_ws_route_and_stage_keep_their_optional_fields(apigw):
+    api_id = apigw.create_api(Name="ws-fields", ProtocolType="WEBSOCKET")["ApiId"]
+    route = apigw.create_route(ApiId=api_id, RouteKey="send", RouteResponseSelectionExpression="$default",
+                               ModelSelectionExpression="$request.body.type")
+    got = apigw.get_route(ApiId=api_id, RouteId=route["RouteId"])
+    for answer in (route, got):
+        assert answer["RouteResponseSelectionExpression"] == "$default"
+        assert answer["ModelSelectionExpression"] == "$request.body.type"
+    updated = apigw.update_route(ApiId=api_id, RouteId=route["RouteId"], RouteResponseSelectionExpression="")
+    assert "RouteResponseSelectionExpression" not in updated
+
+    logs = {"DestinationArn": "arn:aws:logs:us-east-1:000000000000:log-group:ws", "Format": "$context.requestId"}
+    stage = apigw.create_stage(ApiId=api_id, StageName="prod", AccessLogSettings=logs)
+    assert stage["AccessLogSettings"] == logs
+    assert apigw.get_stage(ApiId=api_id, StageName="prod")["AccessLogSettings"] == logs
+    changed = {**logs, "Format": "$context.requestId $context.status"}
+    assert apigw.update_stage(ApiId=api_id, StageName="prod", AccessLogSettings=changed)["AccessLogSettings"] == changed
 
 
 def test_ws_post_to_unknown_connection_returns_410(apigw, lam):
@@ -1742,6 +3258,305 @@ def test_apigwv2_path_based_websocket(apigw, lam):
         ws.close()
 
 
+_WS_CONTEXT_CODE = """
+import json
+def handler(event, context):
+    rc = event['requestContext']
+    return {'statusCode': 200, 'body': json.dumps({'stage': rc['stage'], 'authorizer': rc.get('authorizer')})}
+"""
+
+
+@pytest.mark.parametrize("path_based", [False, True], ids=["host", "path"])
+def test_ws_request_context_names_the_stage(apigw, lam, path_based):
+    """requestContext.stage is the stage named in the connection URL."""
+    api_id, _ = _wire_ws_api(apigw, lam, name_suffix=f"stage-{uuid.uuid4().hex[:6]}",
+                             default_code=_WS_CONTEXT_CODE)
+    if path_based:
+        path, host = f"/_aws/execute-api/{api_id}/prod", f"localhost:{_EXECUTE_PORT}"
+    else:
+        path, host = "/prod", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+    ws = _WSClient("localhost", _EXECUTE_PORT, path, headers={"Host": host})
+    try:
+        ws.send(json.dumps({"action": "x"}))
+        assert json.loads(ws.recv())["stage"] == "prod"
+    finally:
+        ws.close()
+
+
+_WS_AUTHORIZER_CODE = """
+def handler(event, context):
+    tok = {k.lower(): v for k, v in event['headers'].items()}.get('auth', '')
+    if tok == 'error':
+        raise Exception('authorizer failed')
+    arn = event['methodArn']
+    return {
+        'principalId': 'alice',
+        'policyDocument': {'Version': '2012-10-17', 'Statement': [{
+            'Action': 'execute-api:Invoke', 'Resource': arn.replace('/prod/', '/other/') if tok == 'other' else arn,
+            'Effect': 'Allow' if tok in ('allow', 'other') else 'Deny'}]},
+        'context': {'user': 'alice', 'n': 7, 'ok': True, 'methodArn': arn, 'type': event['type'],
+                    'eventType': event['requestContext']['eventType'],
+                    'requestId': event['requestContext']['requestId']},
+    }
+"""
+
+_WS_CONNECT_NEEDS_AUTHORIZER_CODE = """
+def handler(event, context):
+    rc = event['requestContext']
+    authorizer = rc.get('authorizer') or {}
+    same_request = authorizer.get('requestId') == rc['requestId']
+    return {'statusCode': 200 if authorizer.get('user') == 'alice' and same_request else 403}
+"""
+
+
+def _wire_ws_request_authorizer_api(apigw, lam,
+                                    identity_source=("route.request.header.Auth", "route.request.querystring.tok")):
+    """WS API whose $connect route uses a REQUEST authorizer, by default on header Auth + querystring tok."""
+    api_id, _ = _wire_ws_api(apigw, lam, name_suffix=f"reqauth-{uuid.uuid4().hex[:6]}",
+                             connect_code=_WS_CONNECT_NEEDS_AUTHORIZER_CODE, default_code=_WS_CONTEXT_CODE)
+    fn_arn = _make_fn(lam, f"ws-reqauth-authorizer-{uuid.uuid4().hex[:6]}", _WS_AUTHORIZER_CODE)
+    auth_id = apigw.create_authorizer(
+        ApiId=api_id, AuthorizerType="REQUEST", Name="ws-request",
+        AuthorizerUri=f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/{fn_arn}/invocations",
+        IdentitySource=list(identity_source),
+    )["AuthorizerId"]
+    connect = next(r for r in apigw.get_routes(ApiId=api_id)["Items"] if r["RouteKey"] == "$connect")
+    apigw.update_route(ApiId=api_id, RouteId=connect["RouteId"], AuthorizationType="CUSTOM", AuthorizerId=auth_id)
+    return api_id
+
+
+def _ws_handshake(api_id: str, path: str, headers: dict | None = None) -> tuple[int, dict]:
+    """Status and JSON body of a WebSocket upgrade request."""
+    import http.client
+
+    conn = http.client.HTTPConnection("localhost", _EXECUTE_PORT, timeout=30)
+    try:
+        conn.request("GET", path, headers={
+            "Host": f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}", "Upgrade": "websocket",
+            "Connection": "Upgrade", "Sec-WebSocket-Key": base64.b64encode(os.urandom(16)).decode(),
+            "Sec-WebSocket-Version": "13", **(headers or {}),
+        })
+        resp = conn.getresponse()
+        return resp.status, json.loads(resp.read() or b"{}")
+    finally:
+        conn.close()
+
+
+def test_ws_connect_request_authorizer_refuses_the_handshake(apigw, lam):
+    """A $connect REQUEST authorizer refuses with 401 (identity source missing), 403 (denied) or 500."""
+    api_id = _wire_ws_request_authorizer_api(apigw, lam)
+    cases = [
+        ("/prod", {}, 401, "Unauthorized"),
+        ("/prod", {"Auth": "allow"}, 401, "Unauthorized"),
+        ("/prod?tok=1", {"Auth": "deny"}, 403,
+         "User is not authorized to access this resource with an explicit deny in an identity-based policy"),
+        ("/prod?tok=1", {"Auth": "other"}, 403,
+         "User is not authorized to access this resource because no identity-based policy allows "
+         "the execute-api:Invoke action"),
+        ("/prod?tok=1", {"Auth": "error"}, 500, ""),
+    ]
+    for path, headers, status, message in cases:
+        got_status, body = _ws_handshake(api_id, path, headers)
+        assert (got_status, body.get("message")) == (status, message), (path, headers)
+        assert body["connectionId"] and body["requestId"]
+
+
+def test_ws_connect_request_authorizer_reads_stage_variables(apigw, lam):
+    """A stageVariables.* identity source is present once the stage defines that variable."""
+    api_id = _wire_ws_request_authorizer_api(apigw, lam, identity_source=("route.request.header.Auth",
+                                                                          "stageVariables.tier"))
+    assert _ws_handshake(api_id, "/prod", {"Auth": "deny"})[0] == 401
+    apigw.update_stage(ApiId=api_id, StageName="prod", StageVariables={"tier": "gold"})
+    assert _ws_handshake(api_id, "/prod", {"Auth": "deny"})[0] == 403
+
+
+def test_ws_connect_request_authorizer_context_reaches_the_routes(apigw, lam):
+    """An allowed $connect passes principalId and the stringified context to $connect and later messages."""
+    api_id = _wire_ws_request_authorizer_api(apigw, lam)
+    ws = _WSClient("localhost", _EXECUTE_PORT, "/prod?tok=1",
+                   headers={"Host": f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}", "Auth": "allow"})
+    try:
+        ws.send(json.dumps({"action": "x"}))
+        reply = json.loads(ws.recv())
+    finally:
+        ws.close()
+    authorizer = reply["authorizer"]
+    assert authorizer.pop("requestId")
+    assert authorizer == {
+        "principalId": "alice", "user": "alice", "n": "7", "ok": "true", "type": "REQUEST", "eventType": "CONNECT",
+        "methodArn": f"arn:aws:execute-api:us-east-1:000000000000:{api_id}/prod/$connect",
+    }
+
+
+def test_ws_connect_aws_iam_needs_a_signed_request(apigw, lam):
+    """An AWS_IAM $connect refuses an unsigned handshake with 403 and accepts a SigV4-signed one."""
+    api_id, _ = _wire_ws_api(apigw, lam, name_suffix=f"iam-{uuid.uuid4().hex[:6]}", connect_code=_ECHO_CODE)
+    connect = next(r for r in apigw.get_routes(ApiId=api_id)["Items"] if r["RouteKey"] == "$connect")
+    apigw.update_route(ApiId=api_id, RouteId=connect["RouteId"], AuthorizationType="AWS_IAM")
+
+    status, body = _ws_handshake(api_id, "/prod")
+    assert (status, body["message"]) == (403, "Missing Authentication Token")
+    signed = {"Authorization": "AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/execute-api/aws4_request, "
+                               "SignedHeaders=host;x-amz-date, Signature=0"}
+    assert _ws_handshake(api_id, "/prod", signed)[0] == 101
+    presigned = "/prod?X-Amz-Credential=test%2F20260101%2Fus-east-1%2Fexecute-api%2Faws4_request&X-Amz-Signature=0"
+    assert _ws_handshake(api_id, presigned)[0] == 101
+
+
+_WS_IAM_POLICY = {"Version": "2012-10-17", "Statement": [
+    {"Effect": "Allow", "Action": ["execute-api:Invoke", "sts:GetSessionToken"], "Resource": "*"}]}
+
+
+def _signed_ws_connect(host, key, secret, *, session=False, token=None, token_after=False, header=False,
+                       expires=3600, skew=0, drop=""):
+    """Path and headers of a GET /prod handshake signed by botocore for execute-api."""
+    import datetime as dt
+    from unittest import mock
+    from urllib.parse import quote
+
+    import botocore.auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    if session or token == "session":
+        credentials = boto3.client("sts", endpoint_url=ENDPOINT, aws_access_key_id=key, aws_secret_access_key=secret,
+                                   region_name="us-east-1").get_session_token()["Credentials"]
+        token = credentials["SessionToken"] if token == "session" else token
+        if session:
+            key, secret = credentials["AccessKeyId"], credentials["SecretAccessKey"]
+    request = AWSRequest(method="GET", url=f"http://{host}/prod")
+    signing = Credentials(key, secret, None if token_after else token)
+    signer = botocore.auth.SigV4Auth(signing, "execute-api", "us-east-1") if header else (
+        botocore.auth.SigV4QueryAuth(signing, "execute-api", "us-east-1", expires=expires))
+    now = botocore.auth.get_current_datetime() + dt.timedelta(seconds=skew)
+    with mock.patch.object(botocore.auth, "get_current_datetime", return_value=now):
+        signer.add_auth(request)
+    query = "&".join(p for p in urlparse(request.url).query.split("&") if not drop or not p.startswith(drop + "="))
+    if token_after and token:
+        query += "&X-Amz-Security-Token=" + quote(token, safe="")
+    return f"/prod?{query}" if query else "/prod", {k: v for k, v in request.headers.items() if k.lower() != "host"}
+
+
+_MISMATCH = (
+    "The request signature we calculated does not match the signature you provided. Check your AWS Secret Access Key "
+    "and signing method. Consult the service documentation for details.\n\nThe Canonical String for this request "
+    "should have been\n'GET\n/prod\n"
+)
+_INVALID_TOKEN = "The security token included in the request is invalid"
+_WS_CONNECT_CASES = {  # case: (signing arguments, AWS's 403 message under AUTH=true, or None for 101)
+    "signed": ({}, None),
+    "wrong-secret": ({"secret": "wrong"}, _MISMATCH),
+    "signed-2-min-ago-expires-60": ({"skew": -120, "expires": 60}, None),
+    "signed-6-min-ago-expires-86400": ({"skew": -360, "expires": 86400}, "Signature expired: "),
+    "signed-16-min-ahead": ({"skew": 960}, "Signature not yet current: "),
+    "no-signature": ({"drop": "X-Amz-Signature"}, "AWS query-string parameters must include 'X-Amz-Signature'. "
+                                                  "Re-examine the query-string parameters."),
+    "no-date": ({"drop": "X-Amz-Date"}, "AWS query-string parameters must include 'X-Amz-Date'. "
+                                        "Re-examine the query-string parameters."),
+    "header-signed": ({"header": True}, None),
+    "header-wrong-secret": ({"header": True, "secret": "wrong"}, _MISMATCH),
+    "unknown-key": ({"key": "AKIAUNKNOWNKEY000001"}, _INVALID_TOKEN + "."),
+    "session-token-signed": ({"session": True, "token": "session"}, None),
+    "session-token-appended": ({"session": True, "token": "session", "token_after": True}, _MISMATCH),
+    "session-no-token": ({"session": True}, _INVALID_TOKEN + "."),
+    "session-other-token": ({"session": True, "token": "other"}, _INVALID_TOKEN),
+    "user-key-with-token": ({"token": "session"}, _INVALID_TOKEN),
+}
+
+
+@pytest.mark.auth_contract
+@pytest.mark.parametrize("case", list(_WS_CONNECT_CASES))
+def test_ws_connect_aws_iam_handshake_signature_contract(auth_enabled, iam_user, apigw, case):
+    """Under AUTH=true an AWS_IAM $connect verifies the handshake's signature before its policy."""
+    api_id = apigw.create_api(Name=f"ws-iam-sig-{uuid.uuid4().hex[:6]}", ProtocolType="WEBSOCKET",
+                              RouteSelectionExpression="$request.body.action")["ApiId"]
+    try:
+        integration = apigw.create_integration(ApiId=api_id, IntegrationType="MOCK")["IntegrationId"]
+        apigw.create_route(ApiId=api_id, RouteKey="$connect", AuthorizationType="AWS_IAM",
+                           Target=f"integrations/{integration}")
+        apigw.create_stage(ApiId=api_id, StageName="prod")
+        args, message = _WS_CONNECT_CASES[case]
+        host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+        with second_access_key(iam_user(policy=_WS_IAM_POLICY)) as (key, secret):
+            args = {"key": key, "secret": secret, **args}
+            path, headers = _signed_ws_connect(host, args.pop("key"), args.pop("secret"), **args)
+            status, body = _ws_handshake(api_id, path, headers)
+    finally:
+        apigw.delete_api(ApiId=api_id)
+    if auth_enabled and message:
+        assert status == 403
+        assert body["message"].startswith(message) if message.endswith((" ", "\n")) else body["message"] == message
+        assert body["connectionId"] and body["requestId"]
+    else:
+        assert status == 101
+
+
+@pytest.mark.parametrize("resource, message", [
+    ({"Type": "AWS::ApiGatewayV2::Authorizer", "Properties": {
+        "AuthorizerType": "JWT", "Name": "jwt", "IdentitySource": ["route.request.querystring.token"],
+        "JwtConfiguration": {"Audience": ["client"], "Issuer": "https://issuer.example.com"}}},
+     "Invalid authorizer type. Only REQUEST authorizer type is supported on WEBSOCKET protocol Apis."),
+    ({"Type": "AWS::ApiGatewayV2::Route", "Properties": {"RouteKey": "$connect", "AuthorizationType": "JWT"}},
+     "Currently, JWT authorization type is restricted to APIs with a protocol type of HTTP"),
+    ({"Type": "AWS::ApiGatewayV2::Route", "Properties": {"RouteKey": "send", "AuthorizationType": "CUSTOM"}},
+     "Currently, authorization is restricted to the $connect route only"),
+], ids=["jwt-authorizer", "jwt-route", "custom-on-send"])
+def test_ws_cfn_refuses_route_authorization_a_websocket_api_does_not_support(cfn, resource, message):
+    """A template fails the stack where CreateAuthorizer or CreateRoute would answer BadRequestException."""
+    stack = f"ws-cfnauth-{uuid.uuid4().hex[:8]}"
+    cfn.create_stack(StackName=stack, TemplateBody=json.dumps({"Resources": {
+        "Api": {"Type": "AWS::ApiGatewayV2::Api", "Properties": {
+            "Name": stack, "ProtocolType": "WEBSOCKET", "RouteSelectionExpression": "$request.body.action"}},
+        "Refused": {"Type": resource["Type"], "Properties": {"ApiId": {"Ref": "Api"}, **resource["Properties"]}},
+    }}))
+    try:
+        for _ in range(60):
+            status = cfn.describe_stacks(StackName=stack)["Stacks"][0]["StackStatus"]
+            if not status.endswith("_IN_PROGRESS"):
+                break
+            time.sleep(1)
+        assert status == "ROLLBACK_COMPLETE"
+        reasons = [e.get("ResourceStatusReason", "") for e in cfn.describe_stack_events(StackName=stack)["StackEvents"]
+                   if e["LogicalResourceId"] == "Refused"]
+        assert any(message in r for r in reasons), reasons
+    finally:
+        cfn.delete_stack(StackName=stack)
+
+
+def test_ws_route_authorization_limited_to_connect_and_request_authorizers(apigw):
+    """A WebSocket API takes REQUEST authorizers only, and route authorization on $connect only, never JWT."""
+    api_id = apigw.create_api(Name=f"ws-auth-rules-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="WEBSOCKET")["ApiId"]
+
+    def refused(message, call, **kwargs):
+        with pytest.raises(ClientError) as exc:
+            call(ApiId=api_id, **kwargs)
+        assert exc.value.response["Error"]["Code"] == "BadRequestException"
+        assert exc.value.response["Error"]["Message"] == message
+
+    refused("Invalid authorizer type. Only REQUEST authorizer type is supported on WEBSOCKET protocol Apis.",
+            apigw.create_authorizer, AuthorizerType="JWT", Name="jwt",
+            IdentitySource=["route.request.header.Auth"],
+            JwtConfiguration={"Audience": ["client"], "Issuer": "https://issuer.example.com"})
+    auth_id = apigw.create_authorizer(
+        ApiId=api_id, AuthorizerType="REQUEST", Name="request", IdentitySource=["route.request.header.Auth"],
+        AuthorizerUri="arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/"
+                      "arn:aws:lambda:us-east-1:000000000000:function:auth/invocations",
+    )["AuthorizerId"]
+    jwt_refused = "Currently, JWT authorization type is restricted to APIs with a protocol type of HTTP"
+    refused(jwt_refused, apigw.create_route, RouteKey="$connect", AuthorizationType="JWT", AuthorizerId=auth_id)
+    connect_id = apigw.create_route(ApiId=api_id, RouteKey="$connect")["RouteId"]
+    refused(jwt_refused, apigw.update_route, RouteId=connect_id, AuthorizationType="JWT", AuthorizerId=auth_id)
+    assert apigw.update_route(
+        ApiId=api_id, RouteId=connect_id, AuthorizationType="CUSTOM", AuthorizerId=auth_id,
+    )["AuthorizationType"] == "CUSTOM"
+
+    connect_only = "Currently, authorization is restricted to the $connect route only"
+    refused(connect_only, apigw.create_route, RouteKey="sendMessage", AuthorizationType="CUSTOM", AuthorizerId=auth_id)
+    refused(connect_only, apigw.create_route, RouteKey="sendMessage", AuthorizationType="AWS_IAM")
+    message_id = apigw.create_route(ApiId=api_id, RouteKey="sendMessage")["RouteId"]
+    refused(connect_only, apigw.update_route, RouteId=message_id, AuthorizationType="CUSTOM", AuthorizerId=auth_id)
+
+
 def test_apigwv1_path_based_restapi_legacy_user_request(apigw_v1, lam):
     """REST API v1 reachable via /restapis/{apiId}/{stage}/_user_request_/{path} (LocalStack legacy)."""
     import urllib.request
@@ -1804,6 +3619,40 @@ def test_apigwv2_custom_id_duplicate_rejected(apigw):
         )
     assert exc_info.value.response["Error"]["Code"] == "ConflictException"
     assert exc_info.value.response["ResponseMetadata"]["HTTPStatusCode"] == 409
+
+
+def test_apigwv2_custom_id_duplicate_rejected_across_regions():
+    """ms-custom-id values are account-wide unique, not region-local."""
+    from ministack.core.responses import get_region, set_request_region
+    from ministack.services import apigateway as apigw_mod
+
+    original_region = get_region()
+    api_id = f"v2regionaldup{_uuid_mod.uuid4().hex[:6]}"
+    try:
+        set_request_region("us-west-2")
+        status, _headers, body = apigw_mod._create_api(
+            {
+                "name": "dup-west",
+                "protocolType": "HTTP",
+                "tags": {"ms-custom-id": api_id},
+            }
+        )
+        assert status == 201
+        assert json.loads(body)["apiId"] == api_id
+
+        set_request_region("us-east-1")
+        status, _headers, body = apigw_mod._create_api(
+            {
+                "name": "dup-east",
+                "protocolType": "HTTP",
+                "tags": {"ms-custom-id": api_id},
+            }
+        )
+        assert status == 409
+        assert json.loads(body)["__type"] == "ConflictException"
+        assert apigw_mod.find_api_scope(api_id) == ("000000000000", "us-west-2")
+    finally:
+        set_request_region(original_region)
 
 
 def test_apigwv2_custom_id_absent_uses_random(apigw):
@@ -1869,6 +3718,38 @@ def _create_cors_api(apigw, *, name: str, cors: dict | None):
     # Default stage so execute_path parsing works at the root.
     apigw.create_stage(ApiId=api_id, StageName="$default", AutoDeploy=True)
     return api_id
+
+
+def test_apigwv2_update_api_replaces_cors_and_delete_removes_it(apigw):
+    """UpdateApi replaces a CORS configuration; it cannot clear one. The API
+    has DeleteCorsConfiguration for that, so an UpdateApi that carries no
+    usable configuration leaves the existing one alone."""
+    import urllib.request
+
+    api_id = _create_cors_api(apigw, name="cors-update", cors={
+        "AllowOrigins": ["https://a.example"], "AllowMethods": ["GET"],
+    })
+    assert apigw.get_api(ApiId=api_id)["CorsConfiguration"]["AllowOrigins"] == [
+        "https://a.example"]
+
+    # A configuration on the call replaces the stored one.
+    apigw.update_api(ApiId=api_id, CorsConfiguration={
+        "AllowOrigins": ["https://b.example"], "AllowMethods": ["GET", "POST"]})
+    cors = apigw.get_api(ApiId=api_id)["CorsConfiguration"]
+    assert cors["AllowOrigins"] == ["https://b.example"]
+
+    # Another property on its own does not disturb it.
+    apigw.update_api(ApiId=api_id, Description="unrelated")
+    assert apigw.get_api(ApiId=api_id)["CorsConfiguration"]["AllowOrigins"] == [
+        "https://b.example"]
+
+    # DeleteCorsConfiguration is what removes it (boto3 models it; the call
+    # goes out as DELETE /v2/apis/{apiId}/cors).
+    req = urllib.request.Request(
+        f"{ENDPOINT}/v2/apis/{api_id}/cors", method="DELETE")
+    with urllib.request.urlopen(req) as r:
+        assert r.status == 204
+    assert "CorsConfiguration" not in apigw.get_api(ApiId=api_id)
 
 
 def test_apigwv2_cors_preflight_echoes_configured_origin(apigw):
@@ -1991,6 +3872,172 @@ def test_apigwv2_named_stage_still_requires_prefix(apigw, lam):
 def _wrapped_uri(fn_arn: str) -> str:
     """Build the APIGW integration URI Terraform/AWS actually send."""
     return f"arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/{fn_arn}/invocations"
+
+
+def _lambda_client(region: str):
+    import boto3
+
+    return boto3.client(
+        "lambda",
+        endpoint_url=_endpoint,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name=region,
+    )
+
+
+def _regional_marker_code(marker: str) -> str:
+    return f"""
+def handler(event, context):
+    return {{
+        'statusCode': 200,
+        'body': '{marker}:' + context.invoked_function_arn,
+    }}
+"""
+
+
+def _make_regional_fn(lam, name: str, marker: str) -> str:
+    created = lam.create_function(
+        FunctionName=name,
+        Runtime="python3.12",
+        Role=_LAMBDA_ROLE,
+        Handler="index.handler",
+        Code={"ZipFile": _make_zip(_regional_marker_code(marker))},
+    )
+    lam.invoke(
+        FunctionName=name,
+        InvocationType="RequestResponse",
+        Payload=b'{"_ministack_warmup": true}',
+    )
+    return created["FunctionArn"]
+
+
+def test_apigwv2_lambda_integration_uses_function_arn_region(apigw, lam):
+    import urllib.request
+
+    west_lam = _lambda_client("us-west-2")
+    fn_name = f"apigw-region-{uuid.uuid4().hex[:6]}"
+    _make_regional_fn(lam, fn_name, "east")
+    west_arn = _make_regional_fn(west_lam, fn_name, "west")
+
+    api_id = apigw.create_api(Name="regional-lambda-api", ProtocolType="HTTP")["ApiId"]
+    integ = apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=_wrapped_uri(west_arn),
+        IntegrationMethod="POST",
+    )
+    apigw.create_route(ApiId=api_id, RouteKey="GET /hello", Target=f"integrations/{integ['IntegrationId']}")
+    apigw.create_stage(ApiId=api_id, StageName="$default", AutoDeploy=True)
+
+    req = urllib.request.Request(f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/hello")
+    req.add_header("Host", f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}")
+    resp = urllib.request.urlopen(req, timeout=30)
+
+    assert resp.status == 200
+    body = resp.read().decode()
+    assert body.startswith("west:")
+    assert ":us-west-2:" in body
+
+
+def test_apigwv2_unsigned_execute_resolves_non_boot_region_api():
+    import urllib.error
+    import urllib.request
+
+    import boto3
+    from botocore.config import Config
+
+    west_apigw = boto3.client(
+        "apigatewayv2",
+        endpoint_url=_endpoint,
+        aws_access_key_id="test",
+        aws_secret_access_key="test",
+        region_name="us-west-2",
+        config=Config(region_name="us-west-2"),
+    )
+    west_lam = _lambda_client("us-west-2")
+    fn_name = f"apigw-west-owner-{uuid.uuid4().hex[:6]}"
+    west_arn = _make_regional_fn(west_lam, fn_name, "west-owner")
+
+    api_id = west_apigw.create_api(
+        Name=f"west-owner-api-{uuid.uuid4().hex[:6]}",
+        ProtocolType="HTTP",
+    )["ApiId"]
+    integ = west_apigw.create_integration(
+        ApiId=api_id,
+        IntegrationType="AWS_PROXY",
+        IntegrationUri=_wrapped_uri(west_arn),
+        IntegrationMethod="POST",
+    )
+    west_apigw.create_route(
+        ApiId=api_id,
+        RouteKey="GET /hello",
+        Target=f"integrations/{integ['IntegrationId']}",
+    )
+    west_apigw.create_stage(ApiId=api_id, StageName="prod", AutoDeploy=True)
+
+    requests = [
+        (
+            f"http://{api_id}.execute-api.localhost:{_EXECUTE_PORT}/prod/hello",
+            f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}",
+        ),
+        (
+            f"http://localhost:{_EXECUTE_PORT}/_aws/execute-api/{api_id}/prod/hello",
+            f"localhost:{_EXECUTE_PORT}",
+        ),
+    ]
+    for url, host in requests:
+        req = urllib.request.Request(url)
+        req.add_header("Host", host)
+        resp = urllib.request.urlopen(req, timeout=30)
+        assert resp.status == 200
+        body = resp.read().decode()
+        assert body.startswith("west-owner:")
+        assert ":us-west-2:" in body
+
+    missing = urllib.request.Request(
+        f"http://missing-api.execute-api.localhost:{_EXECUTE_PORT}/prod/hello"
+    )
+    missing.add_header("Host", f"missing-api.execute-api.localhost:{_EXECUTE_PORT}")
+    with pytest.raises(urllib.error.HTTPError) as exc_info:
+        urllib.request.urlopen(missing, timeout=30)
+    assert exc_info.value.code == 404
+
+
+def test_apigwv1_lambda_integration_uses_function_arn_region(apigw_v1, lam):
+    import urllib.request
+
+    west_lam = _lambda_client("us-west-2")
+    fn_name = f"apigwv1-region-{uuid.uuid4().hex[:6]}"
+    _make_regional_fn(lam, fn_name, "east")
+    west_arn = _make_regional_fn(west_lam, fn_name, "west")
+
+    api_id = apigw_v1.create_rest_api(name="regional-v1-api")["id"]
+    root = apigw_v1.get_resources(restApiId=api_id)["items"][0]["id"]
+    res_id = apigw_v1.create_resource(restApiId=api_id, parentId=root, pathPart="hello")["id"]
+    apigw_v1.put_method(
+        restApiId=api_id,
+        resourceId=res_id,
+        httpMethod="GET",
+        authorizationType="NONE",
+    )
+    apigw_v1.put_integration(
+        restApiId=api_id,
+        resourceId=res_id,
+        httpMethod="GET",
+        type="AWS_PROXY",
+        integrationHttpMethod="POST",
+        uri=_wrapped_uri(west_arn),
+    )
+    apigw_v1.create_deployment(restApiId=api_id, stageName="prod")
+
+    url = f"http://localhost:{_EXECUTE_PORT}/restapis/{api_id}/prod/_user_request_/hello"
+    resp = urllib.request.urlopen(url, timeout=30)
+
+    assert resp.status == 200
+    body = resp.read().decode()
+    assert body.startswith("west:")
+    assert ":us-west-2:" in body
 
 
 def test_apigwv2_integration_wrapped_function_arn(apigw, lam):
@@ -2260,3 +4307,1004 @@ def test_apigateway_get_state_returns_independent_copy(mod_name):
 
     if hasattr(mod, "reset"):
         mod.reset()
+
+
+# ---- Data plane: REQUEST (Lambda) authorizer result caching ----
+
+_V2_AUTH_ECHO_BACKEND = (
+    b"import json\n"
+    b"def handler(event, context):\n"
+    b"    return {'statusCode': 200,\n"
+    b"            'body': json.dumps(event['requestContext'].get('authorizer'))}\n"
+)
+
+# Prelude for authorizer sources: counts invocations by pushing one SQS message
+# per call. The counter has to live INSIDE the emulator — writing to a
+# ``tmp_path`` file only works while the server runs in-process, and silently
+# breaks (FileNotFoundError on every counted test) under the documented
+# ``docker compose up`` workflow where the Lambda runs in its own container.
+_V2_AUTH_MARK_PRELUDE = (
+    b"import os, boto3\n"
+    b"def _mark(qname):\n"
+    b"    sqs = boto3.client('sqs', endpoint_url=os.environ['AWS_ENDPOINT_URL'])\n"
+    b"    url = sqs.get_queue_url(QueueName=qname)['QueueUrl']\n"
+    b"    sqs.send_message(QueueUrl=url, MessageBody='1')\n"
+)
+
+
+def _v2_auth_counter_queue(sqs):
+    """Create the SQS queue an authorizer marks on every invocation."""
+    qname = f"v2-auth-count-{_uuid_mod.uuid4().hex[:8]}"
+    sqs.create_queue(QueueName=qname)
+    return qname
+
+
+def _v2_auth_count(sqs, qname):
+    """How many times the authorizer behind ``qname`` has run."""
+    url = sqs.get_queue_url(QueueName=qname)["QueueUrl"]
+    attrs = sqs.get_queue_attributes(
+        QueueUrl=url, AttributeNames=["ApproximateNumberOfMessages"]
+    )["Attributes"]
+    return int(attrs["ApproximateNumberOfMessages"])
+
+
+def _v2_auth_delete_queue(sqs, qname):
+    try:
+        sqs.delete_queue(QueueUrl=sqs.get_queue_url(QueueName=qname)["QueueUrl"])
+    except ClientError:
+        pass
+
+
+def _v2_auth_make_lambda(lam, label, code):
+    fname = f"v2-auth-{label}-{_uuid_mod.uuid4().hex[:8]}"
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Timeout=30, Code={"ZipFile": _make_zip(code)},
+    )
+    return fname
+
+
+def _v2_auth_drop_lambda(lam, fname):
+    try:
+        lam.delete_function(FunctionName=fname)
+    except ClientError:
+        pass
+
+
+def _v2_auth_drop_api(apigw, api_id):
+    try:
+        apigw.delete_api(ApiId=api_id)
+    except ClientError:
+        pass
+
+
+def _v2_auth_policy_authorizer_code(qname):
+    """IAM-policy authorizer: Allow for `allow*` tokens, Deny otherwise.
+
+    The policy's ``Resource`` is the canonical ``event['routeArn']`` — the shape
+    every AWS sample emits, and the one whose per-request evaluation keeps a
+    cached policy from granting another route or stage. The routeArn is echoed
+    through ``context`` so a test can see which one was issued.
+    """
+    return (
+        _V2_AUTH_MARK_PRELUDE
+        + b"def handler(event, context):\n"
+        + f"    _mark({qname!r})\n".encode()
+        + b"    token = event['headers'].get('authorization', '')\n"
+        b"    effect = 'Allow' if token.startswith('allow') else 'Deny'\n"
+        b"    return {\n"
+        b"        'principalId': 'user|' + token,\n"
+        b"        'policyDocument': {'Version': '2012-10-17', 'Statement': [\n"
+        b"            {'Action': 'execute-api:Invoke', 'Effect': effect,\n"
+        b"             'Resource': event['routeArn']}]},\n"
+        b"        'context': {'arn': event['routeArn']},\n"
+        b"    }\n"
+    )
+
+
+def _v2_auth_http(url, method="GET", headers=None, timeout=30):
+    """(status, body_bytes) without raising on 4xx/5xx.
+
+    An explicit timeout keeps a wedged request from hanging the whole session.
+    """
+    import urllib.error as _urlerr
+    import urllib.request as _urlreq
+
+    req = _urlreq.Request(url, method=method)
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
+    try:
+        resp = _urlreq.urlopen(req, timeout=timeout)
+        return resp.status, resp.read()
+    except _urlerr.HTTPError as e:
+        return e.code, e.read()
+
+
+def _v2_auth_execute_url(api_id, stage, path):
+    # Path-based execute form: no *.execute-api.localhost DNS needed.
+    return f"http://localhost:{_EXECUTE_PORT}/_aws/execute-api/{api_id}/{stage}/{path}"
+
+
+def _v2_auth_build_api(apigw, auth_fn, int_fn, authorizer_kwargs,
+                       route_paths=("secure",), stages=("test",)):
+    """HTTP API with a CUSTOM-guarded `GET /{path}` per entry in ``route_paths``."""
+    api_id = apigw.create_api(
+        Name=f"v2-auth-{_uuid_mod.uuid4().hex[:6]}", ProtocolType="HTTP"
+    )["ApiId"]
+    auth_id = apigw.create_authorizer(
+        ApiId=api_id, AuthorizerType="REQUEST",
+        AuthorizerUri=f"arn:aws:lambda:us-east-1:000000000000:function:{auth_fn}",
+        **authorizer_kwargs,
+    )["AuthorizerId"]
+    int_id = apigw.create_integration(
+        ApiId=api_id, IntegrationType="AWS_PROXY",
+        IntegrationUri=f"arn:aws:lambda:us-east-1:000000000000:function:{int_fn}",
+        PayloadFormatVersion="2.0",
+    )["IntegrationId"]
+    for path in route_paths:
+        apigw.create_route(
+            ApiId=api_id, RouteKey=f"GET /{path}", Target=f"integrations/{int_id}",
+            AuthorizationType="CUSTOM", AuthorizerId=auth_id,
+        )
+    for stage in stages:
+        apigw.create_stage(ApiId=api_id, StageName=stage)
+    return api_id, auth_id
+
+
+def test_apigwv2_authorizer_cache_is_scoped_per_route_arn(apigw, lam, sqs):
+    """A cached Allow grants only the route it was issued for.
+
+    HTTP API caches the authorizer *response* — "By default, API Gateway uses
+    the cached authorizer response for all routes of an API that use the
+    authorizer" — and evaluates it per request. The canonical
+    `Resource: event['routeArn']` policy therefore still covers exactly one
+    route: reusing the *response* on /beta re-evaluates the /alpha policy and
+    denies. Caching the allow/deny *verdict* instead replays the Allow on every
+    other route the same token touches.
+    """
+    qname = _v2_auth_counter_queue(sqs)
+    backend = _v2_auth_make_lambda(lam, "be", _V2_AUTH_ECHO_BACKEND)
+    authz = _v2_auth_make_lambda(lam, "pol", _v2_auth_policy_authorizer_code(qname))
+    api_id, _ = _v2_auth_build_api(
+        apigw, authz, backend,
+        dict(Name="pol", AuthorizerPayloadFormatVersion="2.0",
+             IdentitySource=["$request.header.Authorization"],
+             AuthorizerResultTtlInSeconds=300),
+        route_paths=("alpha", "beta"),
+    )
+    try:
+        status, _ = _v2_auth_http(
+            _v2_auth_execute_url(api_id, "test", "alpha"),
+            headers={"Authorization": "allow-abc"},
+        )
+        assert status == 200
+        assert _v2_auth_count(sqs, qname) == 1
+
+        status, _ = _v2_auth_http(
+            _v2_auth_execute_url(api_id, "test", "beta"),
+            headers={"Authorization": "allow-abc"},
+        )
+        assert status == 403, "an Allow issued for /alpha must not carry over to /beta"
+        assert _v2_auth_count(sqs, qname) == 1, "the cached policy is what gets re-evaluated"
+    finally:
+        _v2_auth_drop_api(apigw, api_id)
+        _v2_auth_drop_lambda(lam, backend)
+        _v2_auth_drop_lambda(lam, authz)
+        _v2_auth_delete_queue(sqs, qname)
+
+
+def test_apigwv2_authorizer_cache_is_scoped_per_stage(apigw, lam, sqs):
+    """A result computed on one stage never answers the same token on another.
+
+    Stages are independent deployments of the API and the route ARN carries the
+    stage, so a cached entry shared across stages could only ever deny the
+    second one — the authorizer never gets to see the stage it was asked about.
+    """
+    qname = _v2_auth_counter_queue(sqs)
+    backend = _v2_auth_make_lambda(lam, "be", _V2_AUTH_ECHO_BACKEND)
+    authz = _v2_auth_make_lambda(lam, "pol", _v2_auth_policy_authorizer_code(qname))
+    api_id, _ = _v2_auth_build_api(
+        apigw, authz, backend,
+        dict(Name="pol", AuthorizerPayloadFormatVersion="2.0",
+             IdentitySource=["$request.header.Authorization"],
+             AuthorizerResultTtlInSeconds=300),
+        stages=("test", "prod"),
+    )
+    try:
+        status, body = _v2_auth_http(
+            _v2_auth_execute_url(api_id, "test", "secure"),
+            headers={"Authorization": "allow-abc"},
+        )
+        assert status == 200, body
+        assert "/test/GET/secure" in json.loads(body)["lambda"]["arn"]
+        assert _v2_auth_count(sqs, qname) == 1
+
+        status, body = _v2_auth_http(
+            _v2_auth_execute_url(api_id, "prod", "secure"),
+            headers={"Authorization": "allow-abc"},
+        )
+        assert status == 200, body
+        assert _v2_auth_count(sqs, qname) == 2, "the test-stage entry must not serve prod"
+        assert "/prod/GET/secure" in json.loads(body)["lambda"]["arn"]
+
+        # The per-stage entries are independent: both now answer from cache.
+        for stage in ("test", "prod"):
+            status, _ = _v2_auth_http(
+                _v2_auth_execute_url(api_id, stage, "secure"),
+                headers={"Authorization": "allow-abc"},
+            )
+            assert status == 200
+        assert _v2_auth_count(sqs, qname) == 2
+    finally:
+        _v2_auth_drop_api(apigw, api_id)
+        _v2_auth_drop_lambda(lam, backend)
+        _v2_auth_drop_lambda(lam, authz)
+        _v2_auth_delete_queue(sqs, qname)
+
+
+def test_apigwv2_authorizer_simple_response_cache_covers_routes(apigw, lam, sqs):
+    """A simple response has no resource dimension, so its cached verdict does
+    cover every route — "the authorizer's response fully allows or denies all
+    API requests that match the cached identity source values".
+
+    This is the deliberate asymmetry with the IAM policy format above: there the
+    cached *policy* is re-evaluated per route, here there is no policy to
+    re-evaluate and the verdict itself is what gets cached.
+    """
+    qname = _v2_auth_counter_queue(sqs)
+    backend = _v2_auth_make_lambda(lam, "be", _V2_AUTH_ECHO_BACKEND)
+    authz = _v2_auth_make_lambda(
+        lam, "simple",
+        _V2_AUTH_MARK_PRELUDE
+        + b"def handler(event, context):\n"
+        + f"    _mark({qname!r})\n".encode()
+        + b"    token = event['headers'].get('authorization', '')\n"
+        b"    return {'isAuthorized': token.startswith('allow'),\n"
+        b"            'context': {'user': token}}\n",
+    )
+    api_id, _ = _v2_auth_build_api(
+        apigw, authz, backend,
+        dict(Name="simple", AuthorizerPayloadFormatVersion="2.0",
+             EnableSimpleResponses=True,
+             IdentitySource=["$request.header.Authorization"],
+             AuthorizerResultTtlInSeconds=300),
+        route_paths=("alpha", "beta"),
+    )
+    try:
+        for path in ("alpha", "beta"):
+            status, body = _v2_auth_http(
+                _v2_auth_execute_url(api_id, "test", path),
+                headers={"Authorization": "allow-abc"},
+            )
+            assert status == 200, body
+            assert json.loads(body) == {"lambda": {"user": "allow-abc"}}
+        assert _v2_auth_count(sqs, qname) == 1
+
+        # A denied verdict is cached for the TTL too, exactly like an Allow.
+        for _ in range(2):
+            status, _ = _v2_auth_http(
+                _v2_auth_execute_url(api_id, "test", "alpha"),
+                headers={"Authorization": "nope"},
+            )
+            assert status == 403
+        assert _v2_auth_count(sqs, qname) == 2
+    finally:
+        _v2_auth_drop_api(apigw, api_id)
+        _v2_auth_drop_lambda(lam, backend)
+        _v2_auth_drop_lambda(lam, authz)
+        _v2_auth_delete_queue(sqs, qname)
+
+
+def test_apigwv2_authorizer_without_policy_document_is_500_and_not_cached(apigw, lam, sqs):
+    """A response with no policyDocument is an invalid response format: "clients
+    receive a 500 Internal Server Error", not an implicit deny — and an invalid
+    response is never cached."""
+    qname = _v2_auth_counter_queue(sqs)
+    backend = _v2_auth_make_lambda(lam, "be", _V2_AUTH_ECHO_BACKEND)
+    authz = _v2_auth_make_lambda(
+        lam, "nopolicy",
+        _V2_AUTH_MARK_PRELUDE
+        + b"def handler(event, context):\n"
+        + f"    _mark({qname!r})\n".encode()
+        + b"    return {'principalId': 'user|abc'}\n",
+    )
+    api_id, _ = _v2_auth_build_api(
+        apigw, authz, backend,
+        dict(Name="nopolicy", AuthorizerPayloadFormatVersion="2.0",
+             IdentitySource=["$request.header.Authorization"],
+             AuthorizerResultTtlInSeconds=300),
+    )
+    try:
+        url = _v2_auth_execute_url(api_id, "test", "secure")
+        for _ in range(2):
+            status, body = _v2_auth_http(url, headers={"Authorization": "allow-abc"})
+            assert status == 500
+            assert json.loads(body) == {"message": "Internal Server Error"}
+        assert _v2_auth_count(sqs, qname) == 2, "an invalid response must not be cached"
+    finally:
+        _v2_auth_drop_api(apigw, api_id)
+        _v2_auth_drop_lambda(lam, backend)
+        _v2_auth_drop_lambda(lam, authz)
+        _v2_auth_delete_queue(sqs, qname)
+
+
+def test_apigwv2_authorizer_simple_response_non_boolean_is_500(apigw, lam, sqs):
+    """The simple format is `{"isAuthorized": true/false}`; anything else is an
+    invalid response format -> 500, uncached.
+
+    Truthiness is not a safe stand-in: `"false"` is a truthy string, so an
+    authorizer that plainly denies would otherwise be read as an Allow.
+    """
+    qname = _v2_auth_counter_queue(sqs)
+    backend = _v2_auth_make_lambda(lam, "be", _V2_AUTH_ECHO_BACKEND)
+    authz = _v2_auth_make_lambda(
+        lam, "strbool",
+        _V2_AUTH_MARK_PRELUDE
+        + b"def handler(event, context):\n"
+        + f"    _mark({qname!r})\n".encode()
+        + b"    return {'isAuthorized': 'false', 'context': {'user': 'mallory'}}\n",
+    )
+    api_id, _ = _v2_auth_build_api(
+        apigw, authz, backend,
+        dict(Name="strbool", AuthorizerPayloadFormatVersion="2.0",
+             EnableSimpleResponses=True,
+             IdentitySource=["$request.header.Authorization"],
+             AuthorizerResultTtlInSeconds=300),
+    )
+    try:
+        url = _v2_auth_execute_url(api_id, "test", "secure")
+        for _ in range(2):
+            status, body = _v2_auth_http(url, headers={"Authorization": "allow-abc"})
+            assert status == 500, "a truthy 'false' string must not authorize the request"
+            assert json.loads(body) == {"message": "Internal Server Error"}
+        assert _v2_auth_count(sqs, qname) == 2, "an invalid response must not be cached"
+    finally:
+        _v2_auth_drop_api(apigw, api_id)
+        _v2_auth_drop_lambda(lam, backend)
+        _v2_auth_drop_lambda(lam, authz)
+        _v2_auth_delete_queue(sqs, qname)
+
+
+def test_apigwv2_authorizer_unparsable_ttl_falls_back_to_the_default(apigw, lam, sqs):
+    """UpdateAuthorizer copies the request body verbatim, so the TTL can be any
+    JSON value by the time the data plane reads it. An unparsable value falls
+    back to the same default an absent one does (and does not raise).
+
+    The update goes over raw HTTP: botocore models the field as an integer and
+    would reject the string client-side — which is exactly why the server has to
+    cope with what other clients can still store.
+    """
+    import urllib.request as _urlreq
+
+    qname = _v2_auth_counter_queue(sqs)
+    backend = _v2_auth_make_lambda(lam, "be", _V2_AUTH_ECHO_BACKEND)
+    authz = _v2_auth_make_lambda(lam, "pol", _v2_auth_policy_authorizer_code(qname))
+    api_id, auth_id = _v2_auth_build_api(
+        apigw, authz, backend,
+        dict(Name="pol", AuthorizerPayloadFormatVersion="2.0",
+             IdentitySource=["$request.header.Authorization"],
+             AuthorizerResultTtlInSeconds=300),
+    )
+    try:
+        patch = _urlreq.Request(
+            f"{_endpoint}/v2/apis/{api_id}/authorizers/{auth_id}",
+            data=json.dumps({"authorizerResultTtlInSeconds": "not-a-number"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="PATCH",
+        )
+        patched = json.loads(_urlreq.urlopen(patch, timeout=30).read())
+        assert patched["authorizerResultTtlInSeconds"] == "not-a-number"
+
+        url = _v2_auth_execute_url(api_id, "test", "secure")
+        for _ in range(2):
+            status, body = _v2_auth_http(url, headers={"Authorization": "allow-abc"})
+            assert status == 200, body
+        assert _v2_auth_count(sqs, qname) == 1, "caching stays on at the default TTL"
+    finally:
+        _v2_auth_drop_api(apigw, api_id)
+        _v2_auth_drop_lambda(lam, backend)
+        _v2_auth_drop_lambda(lam, authz)
+        _v2_auth_delete_queue(sqs, qname)
+
+
+def test_apigwv2_authorizer_without_identity_source_does_not_cache(apigw, lam, sqs):
+    """"To enable caching, your authorizer must have at least one identity
+    source" — the identity values are the cache key.
+
+    An authorizer that reads the header itself and declares no identity source
+    is a supported setup (it is how you return your own 401), and it is created
+    with the default 300s TTL. Keying that on the empty identity list would
+    serve the first caller's verdict to every other caller.
+    """
+    qname = _v2_auth_counter_queue(sqs)
+    backend = _v2_auth_make_lambda(lam, "be", _V2_AUTH_ECHO_BACKEND)
+    authz = _v2_auth_make_lambda(lam, "pol", _v2_auth_policy_authorizer_code(qname))
+    api_id, _ = _v2_auth_build_api(
+        apigw, authz, backend,
+        dict(Name="pol", AuthorizerPayloadFormatVersion="2.0", IdentitySource=[]),
+    )
+    try:
+        url = _v2_auth_execute_url(api_id, "test", "secure")
+        status, body = _v2_auth_http(url, headers={"Authorization": "allow-abc"})
+        assert status == 200, body
+
+        status, _ = _v2_auth_http(url, headers={"Authorization": "deny-me"})
+        assert status == 403, "the first caller's Allow must not answer a second token"
+        assert _v2_auth_count(sqs, qname) == 2
+    finally:
+        _v2_auth_drop_api(apigw, api_id)
+        _v2_auth_drop_lambda(lam, backend)
+        _v2_auth_drop_lambda(lam, authz)
+        _v2_auth_delete_queue(sqs, qname)
+
+
+def test_apigwv2_authorizer_missing_identity_source_401s_without_invoking(apigw, lam, sqs):
+    """A declared identity source missing from the request is a 401 without
+    invoking the Lambda, even with caching disabled (``AuthorizerResultTtlInSeconds=0``).
+
+    AWS applies this identity-source short circuit independent of caching;
+    it is not only a caching optimization. The body matches AWS's own
+    compact-JSON gateway response exactly (no space after the colon).
+    """
+    qname = _v2_auth_counter_queue(sqs)
+    backend = _v2_auth_make_lambda(lam, "be", _V2_AUTH_ECHO_BACKEND)
+    authz = _v2_auth_make_lambda(lam, "pol", _v2_auth_policy_authorizer_code(qname))
+    api_id, _ = _v2_auth_build_api(
+        apigw, authz, backend,
+        dict(Name="pol", AuthorizerPayloadFormatVersion="2.0",
+             IdentitySource=["$request.header.Authorization"],
+             AuthorizerResultTtlInSeconds=0),
+    )
+    try:
+        url = _v2_auth_execute_url(api_id, "test", "secure")
+        status, body = _v2_auth_http(url)  # no Authorization header sent
+        assert status == 401
+        assert body == b'{"message":"Unauthorized"}'
+        assert _v2_auth_count(sqs, qname) == 0, "the authorizer Lambda must not be invoked"
+    finally:
+        _v2_auth_drop_api(apigw, api_id)
+        _v2_auth_drop_lambda(lam, backend)
+        _v2_auth_drop_lambda(lam, authz)
+        _v2_auth_delete_queue(sqs, qname)
+
+
+@pytest.mark.parametrize("source,ttl,calls,invocations", [
+    ("$context.identity.sourceIp", 0, 1, 1),
+    # "To cache responses per route, add $context.routeKey to your authorizer's identity sources."
+    ("$context.routeKey", 300, 2, 1),
+])
+def test_apigwv2_authorizer_context_identity_source_still_invokes(apigw, lam, sqs, source, ttl,
+                                                                  calls, invocations):
+    """A $context.* identity source is resolved from the request, so it is never missing and,
+    cached, keys the authorizer cache."""
+    qname = _v2_auth_counter_queue(sqs)
+    backend = _v2_auth_make_lambda(lam, "be", _V2_AUTH_ECHO_BACKEND)
+    authz = _v2_auth_make_lambda(lam, "pol", _v2_auth_policy_authorizer_code(qname))
+    api_id, _ = _v2_auth_build_api(
+        apigw, authz, backend,
+        dict(Name="pol", AuthorizerPayloadFormatVersion="2.0",
+             IdentitySource=[source], AuthorizerResultTtlInSeconds=ttl),
+    )
+    try:
+        for _ in range(calls):
+            status, _body = _v2_auth_http(_v2_auth_execute_url(api_id, "test", "secure"))
+            assert status != 401
+        assert _v2_auth_count(sqs, qname) == invocations
+    finally:
+        _v2_auth_drop_api(apigw, api_id)
+        _v2_auth_drop_lambda(lam, backend)
+        _v2_auth_drop_lambda(lam, authz)
+        _v2_auth_delete_queue(sqs, qname)
+
+
+def test_apigwv2_authorizer_cache_is_bounded():
+    """The result cache is keyed on caller-supplied identity values, so it is
+    capped rather than left to grow for the life of the process. Expired entries
+    go first; beyond that the oldest insertions are evicted."""
+    from ministack.services import apigateway as _apigw_svc
+
+    cache = _apigw_svc._authorizer_cache
+    cap = _apigw_svc._AUTHORIZER_CACHE_MAX
+    saved = dict(cache)
+    cache.clear()
+    try:
+        expired_at = time.time() - 1
+        for i in range(cap):
+            _apigw_svc._cache_authorizer_result(("stale", i), expired_at, {}, {})
+        assert len(cache) == cap
+
+        # The next write is over the cap and prunes the expired entries first.
+        _apigw_svc._cache_authorizer_result(("live", 0), time.time() + 300, {}, {})
+        assert len(cache) == 1
+        assert ("live", 0) in cache
+
+        # With nothing expired to reclaim, the oldest insertions are evicted.
+        for i in range(cap + 50):
+            _apigw_svc._cache_authorizer_result(("live", i), time.time() + 300, {}, {})
+        assert len(cache) <= cap
+        assert ("live", cap + 49) in cache
+    finally:
+        cache.clear()
+        cache.update(saved)
+
+
+# ---------------------------------------------------------------------------
+# Re-entrancy under concurrency — the rest of the suite issues one request at
+# a time, so a service whose blocking work is misclassified passes serially
+# and only wedges under load. These fire N callers at once and assert both
+# that every caller completes and that the event loop keeps serving.
+# ---------------------------------------------------------------------------
+@pytest.mark.serial
+def test_concurrent_apigw_lambda_proxy_requests(apigw, lam):
+    """N simultaneous HTTP-API requests, each executing a Lambda, must all serve."""
+    fn = make_probe_lambda(lam, (
+        "import time\n"
+        "def handler(event, context):\n"
+        "    time.sleep(0.4)\n"
+        "    return {'statusCode': 200, 'body': 'ok'}\n"
+    ))
+    api = apigw.create_api(Name=f"conc-{uuid.uuid4().hex[:8]}", ProtocolType="HTTP",
+                           Target=f"arn:aws:lambda:us-east-1:000000000000:function:{fn}")
+    api_id = api["ApiId"]
+
+    def call(_):
+        try:
+            r = urllib.request.urlopen(f"{ENDPOINT}/_apigw/{api_id}/", timeout=30)
+            return r.status
+        except urllib.error.HTTPError as e:
+            return e.code
+        except Exception:
+            return None
+
+    with LoopProbe() as probe:
+        codes = concurrent_burst(call)
+    probe.assert_responsive("apigw proxy burst")
+
+    # The route wiring differs by MiniStack version; what this test guards is
+    # that the server answered every caller rather than wedging.
+    assert all(c is not None for c in codes), (
+        f"{codes.count(None)}/{CONCURRENCY_N} API Gateway requests got no response at all — "
+        f"the Lambda dispatch wedged"
+    )
+
+
+def test_apigwv2_aws_iam_route_fills_authorizer_iam(apigw, lam, cognito_identity):
+    """An AWS_IAM route reports the resolved caller under
+    requestContext.authorizer.iam (payload 2.0 shape: accessKey/accountId/
+    callerId/userArn/userId, plus cognitoIdentity for identity-pool sessions),
+    and a request with no Authorization header is 403."""
+    import http.client as _http
+
+    from botocore.auth import SigV4Auth
+    from botocore.awsrequest import AWSRequest
+    from botocore.credentials import Credentials
+
+    fname = f"v2-iam-ident-{_uuid_mod.uuid4().hex[:8]}"
+    code = (b"import json\n"
+            b"def handler(event, context):\n"
+            b"    return {'statusCode': 200,\n"
+            b"            'body': json.dumps(event['requestContext'].get('authorizer'))}\n")
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("index.py", code)
+    lam.create_function(
+        FunctionName=fname, Runtime="python3.12",
+        Role="arn:aws:iam::000000000000:role/test-role",
+        Handler="index.handler", Code={"ZipFile": buf.getvalue()},
+    )
+    fn_arn = f"arn:aws:lambda:us-east-1:000000000000:function:{fname}"
+
+    api_id = apigw.create_api(Name=f"iam-ident-{fname}", ProtocolType="HTTP")["ApiId"]
+    try:
+        integ_id = apigw.create_integration(
+            ApiId=api_id, IntegrationType="AWS_PROXY",
+            IntegrationUri=fn_arn, PayloadFormatVersion="2.0",
+        )["IntegrationId"]
+        apigw.create_route(
+            ApiId=api_id, RouteKey="GET /whoami",
+            AuthorizationType="AWS_IAM", Target=f"integrations/{integ_id}",
+        )
+        apigw.create_stage(ApiId=api_id, StageName="$default", AutoDeploy=True)
+
+        host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+
+        # No Authorization header: 403 Forbidden.
+        conn = _http.HTTPConnection("127.0.0.1", _EXECUTE_PORT)
+        conn.request("GET", "/whoami", headers={"Host": host})
+        assert conn.getresponse().status == 403
+
+        def signed_call(creds):
+            req = AWSRequest(method="GET", url=f"http://{host}/whoami", headers={"Host": host})
+            SigV4Auth(creds, "execute-api", "us-east-1").add_auth(req)
+            c2 = _http.HTTPConnection("127.0.0.1", _EXECUTE_PORT)
+            c2.request("GET", "/whoami", headers=dict(req.headers))
+            resp = c2.getresponse()
+            return resp.status, json.loads(resp.read().decode())
+
+        import boto3 as _boto3
+        orgs = _boto3.client(
+            "organizations", endpoint_url=_endpoint, region_name="us-east-1",
+            aws_access_key_id="test", aws_secret_access_key="test")
+        org_id = orgs.describe_organization()["Organization"]["Id"]
+
+        status, authorizer = signed_call(Credentials("test", "test"))
+        assert status == 200
+        iam = authorizer["iam"]
+        assert iam["accessKey"] == "test"
+        assert iam["accountId"] == "000000000000"
+        assert iam["userArn"] == "arn:aws:iam::000000000000:root"
+        assert iam["principalOrgId"] == org_id
+        assert "cognitoIdentity" not in iam
+
+        idpool = cognito_identity.create_identity_pool(
+            IdentityPoolName=f"ip-{fname}", AllowUnauthenticatedIdentities=True,
+        )["IdentityPoolId"]
+        cognito_identity.set_identity_pool_roles(
+            IdentityPoolId=idpool,
+            Roles={"unauthenticated": "arn:aws:iam::000000000000:role/UnauthPoolRole"})
+        identity_id = cognito_identity.get_id(IdentityPoolId=idpool)["IdentityId"]
+        c = cognito_identity.get_credentials_for_identity(
+            IdentityId=identity_id)["Credentials"]
+
+        status, authorizer = signed_call(
+            Credentials(c["AccessKeyId"], c["SecretKey"], c["SessionToken"]))
+        assert status == 200
+        iam = authorizer["iam"]
+        assert iam["userArn"] == (
+            "arn:aws:sts::000000000000:assumed-role/UnauthPoolRole/CognitoIdentityCredentials")
+        assert iam["cognitoIdentity"]["identityId"] == identity_id
+        assert iam["cognitoIdentity"]["identityPoolId"] == idpool
+        assert iam["cognitoIdentity"]["amr"] == ["unauthenticated"]
+    finally:
+        apigw.delete_api(ApiId=api_id)
+        lam.delete_function(FunctionName=fname)
+
+
+@pytest.fixture
+def _reset_apigateway_state():
+    original_account = get_account_id()
+    original_region = get_region()
+    set_request_account_id("000000000000")
+    set_request_region("us-east-1")
+    _apigw.reset()
+    try:
+        yield
+    finally:
+        _apigw.reset()
+        set_request_account_id(original_account)
+        set_request_region(original_region)
+
+
+def _payload(response):
+    status, _headers, body = response
+    return status, json.loads(body or b"{}")
+
+
+def _post_tags_path(resource_arn, tags):
+    encoded_arn = urllib.parse.quote(resource_arn, safe="")
+    body = json.dumps({"tags": tags}).encode("utf-8")
+    return asyncio.run(_apigw.handle_request("POST", f"/v2/tags/{encoded_arn}", {}, body, {}))
+
+
+def _create_api(name="tag-arn-api"):
+    status, body = _payload(_apigw._create_api({"name": name, "protocolType": "HTTP"}))
+    assert status == 201
+    return body["apiId"]
+
+
+@pytest.mark.usefixtures("_reset_apigateway_state")
+def test_apigwv2_tag_api_arn_decodes_and_uses_canonical_key():
+    api_id = _create_api()
+    api_arn = _apigw._api_arn(api_id)
+
+    status, _headers, _body = _post_tags_path(api_arn, {"env": "test"})
+
+    assert status == 201
+    assert _apigw._api_tags.get(api_arn) == {"env": "test"}
+
+    status, body = _payload(_apigw._get_tags(api_arn))
+    assert status == 200
+    assert body["tags"] == {"env": "test"}
+
+
+@pytest.mark.usefixtures("_reset_apigateway_state")
+def test_apigwv2_tag_arns_accept_existing_local_api_and_stage_resources():
+    api_id = _create_api("tag-stage-api")
+
+    stage_status, _stage_body = _payload(
+        _apigw._create_stage(api_id, {"stageName": "$default", "tags": {"created": "stage"}})
+    )
+    assert stage_status == 201
+
+    stage_arn = _apigw._api_resource_arn(api_id, "stages", "$default")
+    status, _headers, _body = _apigw._tag_resource(stage_arn, {"tags": {"owner": "team-a"}})
+    assert status == 201
+
+    stage_status, stage_body = _payload(_apigw._get_tags(stage_arn))
+    assert stage_status == 200
+    assert stage_body["tags"] == {"created": "stage", "owner": "team-a"}
+
+
+@pytest.mark.usefixtures("_reset_apigateway_state")
+def test_apigwv2_tag_arns_reject_invalid_or_nonlocal_resources_before_touching_tags():
+    api_id = _create_api("tag-reject-api")
+    route_status, route = _payload(_apigw._create_route(api_id, {"routeKey": "GET /items"}))
+    assert route_status == 201
+    integration_status, integration = _payload(
+        _apigw._create_integration(
+            api_id,
+            {
+                "integrationType": "HTTP_PROXY",
+                "integrationUri": "https://example.com",
+                "integrationMethod": "GET",
+            },
+        )
+    )
+    assert integration_status == 201
+    deployment_status, deployment = _payload(_apigw._create_deployment(api_id, {}))
+    assert deployment_status == 201
+    authorizer_status, authorizer = _payload(
+        _apigw._create_authorizer(
+            api_id,
+            {
+                "name": "request-auth",
+                "authorizerType": "REQUEST",
+                "authorizerUri": "not-an-arn",
+                "authorizerCredentialsArn": "also-not-an-arn",
+            },
+        )
+    )
+    assert authorizer_status == 201
+
+    bad_arns = [
+        ("not-an-arn", "BadRequestException"),
+        (f"arn:aws-us-gov:apigateway:us-east-1::/apis/{api_id}", "BadRequestException"),
+        (f"arn:aws:execute-api:us-east-1::/apis/{api_id}", "BadRequestException"),
+        (f"arn:aws:apigateway:us-west-2::/apis/{api_id}", "BadRequestException"),
+        (f"arn:aws:apigateway:us-east-1:000000000000:/apis/{api_id}", "BadRequestException"),
+        ("arn:aws:apigateway:us-east-1::/domainnames/example.com", "NotFoundException"),
+        (f"arn:aws:apigateway:us-east-1::/apis/{api_id}/routes", "BadRequestException"),
+        (f"arn:aws:apigateway:us-east-1::/apis/{api_id}/routes/{route['routeId']}", "BadRequestException"),
+        (
+            f"arn:aws:apigateway:us-east-1::/apis/{api_id}/integrations/{integration['integrationId']}",
+            "BadRequestException",
+        ),
+        (
+            f"arn:aws:apigateway:us-east-1::/apis/{api_id}/deployments/{deployment['deploymentId']}",
+            "BadRequestException",
+        ),
+        (
+            f"arn:aws:apigateway:us-east-1::/apis/{api_id}/authorizers/{authorizer['authorizerId']}",
+            "BadRequestException",
+        ),
+        ("arn:aws:apigateway:us-east-1::/apis/missing", "NotFoundException"),
+        (f"arn:aws:apigateway:us-east-1::/apis/{api_id}/stages/missing", "NotFoundException"),
+    ]
+
+    for resource_arn, expected_code in bad_arns:
+        before = dict(_apigw._api_tags.items())
+        status, body = _payload(_apigw._tag_resource(resource_arn, {"tags": {"bad": "tag"}}))
+        assert status in (400, 404)
+        assert body["__type"] == expected_code
+        assert dict(_apigw._api_tags.items()) == before
+        assert _apigw._api_tags.get(resource_arn) is None
+
+    stage_status, _stage = _payload(_apigw._create_stage(api_id, {"stageName": "prod"}))
+    assert stage_status == 201
+    stage_arn = _apigw._api_resource_arn(api_id, "stages", "prod")
+    assert _apigw._tag_resource(stage_arn, {"tags": {"ok": "yes"}})[0] == 201
+    assert _apigw._api_tags.get(stage_arn) == {"ok": "yes"}
+    assert _apigw._delete_stage(api_id, "prod")[0] == 204
+    status, body = _payload(_apigw._get_tags(stage_arn))
+    assert status == 404
+    assert body["__type"] == "NotFoundException"
+    assert _apigw._api_tags.get(stage_arn) is None
+
+
+# ---------------------------------------------------------------------------
+# Custom domain names and API mappings
+# ---------------------------------------------------------------------------
+
+_CERT_ARN = "arn:aws:acm:us-east-1:000000000000:certificate/11111111-2222-3333-4444-555555555555"
+
+
+def _domain(apigw, name, **kwargs):
+    return apigw.create_domain_name(
+        DomainName=name,
+        DomainNameConfigurations=[{"CertificateArn": _CERT_ARN, "EndpointType": "REGIONAL",
+                                   "SecurityPolicy": "TLS_1_2"}],
+        **kwargs,
+    )
+
+
+def test_apigwv2_domain_name_crud_shared_with_v1(apigw, apigw_v1):
+    name = f"api-{_uuid_mod.uuid4().hex[:8]}.example.com"
+    created = _domain(apigw, name, Tags={"team": "a"})
+    try:
+        assert created["DomainName"] == name
+        assert created["DomainNameArn"] == f"arn:aws:apigateway:us-east-1::/domainnames/{name}"
+        assert created["ApiMappingSelectionExpression"] == "$request.basepath"
+        assert created["RoutingMode"] == "API_MAPPING_ONLY"
+        assert created["Tags"] == {"team": "a"}
+        [config] = created["DomainNameConfigurations"]
+        assert config["CertificateArn"] == _CERT_ARN
+        assert config["EndpointType"] == "REGIONAL"
+        assert config["DomainNameStatus"] == "AVAILABLE"
+        assert config["ApiGatewayDomainName"].startswith("d-")
+
+        assert apigw.get_domain_name(DomainName=name)["DomainNameConfigurations"] == [config]
+        assert name in [d["DomainName"] for d in apigw.get_domain_names()["Items"]]
+        # One resource with API Gateway v1, as on AWS.
+        v1 = apigw_v1.get_domain_name(domainName=name)
+        assert v1["regionalCertificateArn"] == _CERT_ARN
+        assert v1["regionalDomainName"] == config["ApiGatewayDomainName"]
+
+        updated = apigw.update_domain_name(
+            DomainName=name,
+            DomainNameConfigurations=[{"CertificateArn": _CERT_ARN.replace("1111", "9999"),
+                                       "EndpointType": "REGIONAL"}],
+        )
+        assert updated["DomainNameConfigurations"][0]["CertificateArn"].endswith("99999999-2222-3333-4444-555555555555")
+
+        with pytest.raises(ClientError) as exc:
+            _domain(apigw, name)
+        assert exc.value.response["Error"]["Code"] == "ConflictException"
+    finally:
+        apigw.delete_domain_name(DomainName=name)
+    with pytest.raises(ClientError) as exc:
+        apigw.get_domain_name(DomainName=name)
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+    with pytest.raises(ClientError) as exc:
+        apigw_v1.get_domain_name(domainName=name)
+    assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+
+def test_apigwv2_domain_name_tags(apigw):
+    name = f"tags-{_uuid_mod.uuid4().hex[:8]}.example.com"
+    arn = _domain(apigw, name)["DomainNameArn"]
+    try:
+        apigw.tag_resource(ResourceArn=arn, Tags={"env": "dev"})
+        assert apigw.get_tags(ResourceArn=arn)["Tags"] == {"env": "dev"}
+        assert apigw.get_domain_name(DomainName=name)["Tags"] == {"env": "dev"}
+        apigw.untag_resource(ResourceArn=arn, TagKeys=["env"])
+        assert apigw.get_tags(ResourceArn=arn)["Tags"] == {}
+    finally:
+        apigw.delete_domain_name(DomainName=name)
+
+
+def test_apigwv2_api_mapping_crud(apigw, apigw_v1):
+    name = f"map-{_uuid_mod.uuid4().hex[:8]}.example.com"
+    api_id = apigw.create_api(Name=f"map-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="HTTP")["ApiId"]
+    apigw.create_stage(ApiId=api_id, StageName="prod")
+    _domain(apigw, name)
+    try:
+        mapping = apigw.create_api_mapping(DomainName=name, ApiId=api_id, Stage="prod", ApiMappingKey="orders")
+        mapping_id = mapping["ApiMappingId"]
+        assert (mapping["ApiId"], mapping["Stage"], mapping["ApiMappingKey"]) == (api_id, "prod", "orders")
+        assert apigw.get_api_mapping(DomainName=name, ApiMappingId=mapping_id)["ApiMappingKey"] == "orders"
+        assert [m["ApiMappingId"] for m in apigw.get_api_mappings(DomainName=name)["Items"]] == [mapping_id]
+        # The v1 view of the same mapping, without the v2 id.
+        v1 = apigw_v1.get_base_path_mapping(domainName=name, basePath="orders")
+        assert {k: v for k, v in v1.items() if k != "ResponseMetadata"} == {
+            "basePath": "orders", "restApiId": api_id, "stage": "prod"}
+
+        with pytest.raises(ClientError) as exc:
+            apigw.create_api_mapping(DomainName=name, ApiId=api_id, Stage="prod", ApiMappingKey="orders")
+        assert exc.value.response["Error"]["Code"] == "ConflictException"
+        assert exc.value.response["Error"]["Message"] == "ApiMapping key already exists for this domain name"
+        with pytest.raises(ClientError) as exc:
+            apigw.create_api_mapping(DomainName=name, ApiId="nope123", Stage="prod")
+        assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+        updated = apigw.update_api_mapping(DomainName=name, ApiMappingId=mapping_id, ApiId=api_id,
+                                           ApiMappingKey="v2/orders")
+        assert updated["ApiMappingKey"] == "v2/orders"
+        assert updated["ApiMappingId"] == mapping_id
+
+        apigw.delete_api_mapping(DomainName=name, ApiMappingId=mapping_id)
+        assert apigw.get_api_mappings(DomainName=name)["Items"] == []
+        with pytest.raises(ClientError) as exc:
+            apigw.get_api_mapping(DomainName=name, ApiMappingId=mapping_id)
+        assert exc.value.response["Error"]["Code"] == "NotFoundException"
+    finally:
+        apigw.delete_domain_name(DomainName=name)
+        apigw.delete_api(ApiId=api_id)
+
+
+def test_apigwv2_custom_domain_routes_to_http_api(apigw):
+    server, _thread, captured = _start_echo_server()
+    port = server.server_address[1]
+    name = f"route-{_uuid_mod.uuid4().hex[:8]}.example.com"
+    api_id = apigw.create_api(Name=f"route-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="HTTP")["ApiId"]
+    integration_id = apigw.create_integration(
+        ApiId=api_id, IntegrationType="HTTP_PROXY", IntegrationMethod="GET",
+        IntegrationUri=f"http://127.0.0.1:{port}/backend", PayloadFormatVersion="1.0",
+    )["IntegrationId"]
+    apigw.create_route(ApiId=api_id, RouteKey="GET /hello", Target=f"integrations/{integration_id}")
+    apigw.create_stage(ApiId=api_id, StageName="$default", AutoDeploy=True)
+    _domain(apigw, name)
+    try:
+        apigw.create_api_mapping(DomainName=name, ApiId=api_id, Stage="$default", ApiMappingKey="v1")
+        req = urllib.request.Request(f"http://localhost:{_EXECUTE_PORT}/v1/hello", method="GET")
+        req.add_header("Host", name)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            assert resp.status == 200
+        # The mapping key is stripped; the API sees /hello.
+        assert captured["path"].endswith("/hello") and "/v1" not in captured["path"]
+    finally:
+        apigw.delete_domain_name(DomainName=name)
+        apigw.delete_api(ApiId=api_id)
+        server.shutdown()
+
+
+def test_apigwv2_api_mapping_requires_an_existing_stage(apigw):
+    name = f"stage-{_uuid_mod.uuid4().hex[:8]}.example.com"
+    api_id = apigw.create_api(Name=f"stage-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="HTTP")["ApiId"]
+    _domain(apigw, name)
+    try:
+        with pytest.raises(ClientError) as exc:
+            apigw.create_api_mapping(DomainName=name, ApiId=api_id, Stage="missing")
+        assert exc.value.response["Error"]["Code"] == "BadRequestException"
+        assert exc.value.response["Error"]["Message"] == "Invalid stage identifier specified"
+    finally:
+        apigw.delete_domain_name(DomainName=name)
+        apigw.delete_api(ApiId=api_id)
+
+
+def test_apigwv2_domain_names_and_api_mappings_paginate(apigw):
+    names = [f"page{i}-{_uuid_mod.uuid4().hex[:8]}.example.com" for i in range(3)]
+    api_id = apigw.create_api(Name=f"page-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="HTTP")["ApiId"]
+    apigw.create_stage(ApiId=api_id, StageName="prod")
+    for name in names:
+        _domain(apigw, name)
+    try:
+        seen, token = [], None
+        while True:
+            page = apigw.get_domain_names(MaxResults="1", **({"NextToken": token} if token else {}))
+            assert len(page["Items"]) <= 1
+            seen += [d["DomainName"] for d in page["Items"]]
+            token = page.get("NextToken")
+            if not token:
+                break
+        assert set(names) <= set(seen)
+
+        for key in ("a", "b"):
+            apigw.create_api_mapping(DomainName=names[0], ApiId=api_id, Stage="prod", ApiMappingKey=key)
+        first = apigw.get_api_mappings(DomainName=names[0], MaxResults="1")
+        second = apigw.get_api_mappings(DomainName=names[0], MaxResults="1", NextToken=first["NextToken"])
+        assert [m["ApiMappingKey"] for m in first["Items"] + second["Items"]] == ["a", "b"]
+        assert "NextToken" not in second
+    finally:
+        for name in names:
+            apigw.delete_domain_name(DomainName=name)
+        apigw.delete_api(ApiId=api_id)
+
+
+@pytest.mark.auth_contract
+def test_apigwv2_route_without_authorization_answers_any_caller_account_contract(auth_enabled):
+    """An HTTP API in another account answers an unsigned call and one carrying another account's
+    Authorization header, as a REST API does: an execute-api URL reaches its API from any caller."""
+    owner = boto3.client("apigatewayv2", endpoint_url=_endpoint, aws_access_key_id="111122223333",
+                         aws_secret_access_key="test", region_name="us-east-1")
+    server, _thread, captured = _start_echo_server()
+    api_id = owner.create_api(Name=f"any-caller-{_uuid_mod.uuid4().hex[:8]}", ProtocolType="HTTP")["ApiId"]
+    other_account = ("AWS4-HMAC-SHA256 Credential=444455556666/20260101/us-east-1/execute-api/aws4_request, "
+                     "SignedHeaders=host, Signature=0")
+    try:
+        integration_id = owner.create_integration(
+            ApiId=api_id, IntegrationType="HTTP_PROXY", IntegrationMethod="GET",
+            IntegrationUri=f"http://127.0.0.1:{server.server_address[1]}", PayloadFormatVersion="1.0",
+        )["IntegrationId"]
+        owner.create_route(ApiId=api_id, RouteKey="GET /ping", Target=f"integrations/{integration_id}")
+        owner.create_stage(ApiId=api_id, StageName="$default", AutoDeploy=True)
+
+        host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+        for headers in ({}, {"Authorization": other_account}):
+            captured["path"] = None
+            request = urllib.request.Request(f"http://{host}/ping", headers={"Host": host, **headers})
+            with urllib.request.urlopen(request, timeout=10) as response:
+                assert response.status == 200, headers
+            assert captured["path"] is not None, headers  # reached the integration
+    finally:
+        owner.delete_api(ApiId=api_id)
+        server.shutdown()

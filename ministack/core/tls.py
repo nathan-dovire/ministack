@@ -1,9 +1,11 @@
+# Copyright (c) 2026 MiniStack Contributors. SPDX-License-Identifier: MIT
+# Copies or substantial portions, including AI-assisted ports or rewrites, must retain this notice (see LICENSE).
 """TLS material helpers — env-driven cert/key resolution for the gateway.
 
 `USE_SSL=1` enables HTTPS (LocalStack-compatible). Self-signed cert
 generation shells out to the `openssl` CLI present in both base images
-(alpine adds it via `apk add openssl`; debian/slim already ships it),
-so this module has no Python crypto dep.
+(alpine adds it via `apk add openssl`; debian/slim already ships it). Only the
+Java truststore needs a Python crypto dep, and degrades to None without one.
 """
 
 import os
@@ -12,8 +14,140 @@ import sys
 import tempfile
 
 
+def _write_atomic(path: str, data: bytes) -> "str | None":
+    """Write `data` to `path` via an atomic rename; None on failure."""
+    try:
+        handle, staging = tempfile.mkstemp(dir=os.path.dirname(path))
+        with os.fdopen(handle, "wb") as out:
+            out.write(data)
+        os.replace(staging, path)
+    except OSError:
+        return None
+    return path
+
+
 def use_ssl_enabled() -> bool:
     return os.environ.get("USE_SSL", "").strip().lower() in ("1", "true", "yes")
+
+
+def cognito_idp_host() -> str:
+    """The host a Cognito token's `iss` names, which clients fetch keys from."""
+    region = os.environ.get("MINISTACK_REGION", "us-east-1")
+    return f"cognito-idp.{region}.amazonaws.com"
+
+
+def cognito_idp_hosts() -> "list[str]":
+    """Every region's Cognito issuer host, so a pool in any region validates."""
+    from ministack.services.account import _REGIONS_LIST
+
+    hosts = [cognito_idp_host()] + [f"cognito-idp.{r}.amazonaws.com" for r in _REGIONS_LIST]
+    return list(dict.fromkeys(hosts))
+
+
+def iot_endpoint_hosts() -> "list[str]":
+    """Every region's IoT DescribeEndpoint hosts, which SDKs dial as https://<address>."""
+    import ipaddress
+
+    from ministack.services.account import _REGIONS_LIST
+
+    host = os.environ.get("MINISTACK_HOST", "localhost").strip().lower()
+    try:
+        ipaddress.ip_address(host)
+        return []  # An address under an IP literal is not a DNS name a cert can carry.
+    except ValueError:
+        pass
+    if not host or ":" in host:
+        return []
+    regions = [os.environ.get("MINISTACK_REGION", "us-east-1")] + _REGIONS_LIST
+    hosts = [name for r in regions for name in (f"*.iot.{r}.{host}", f"*.credentials.iot.{r}.{host}")]
+    return list(dict.fromkeys(hosts))
+
+
+def _generated_cert_names() -> "list[str]":
+    # Docker Lambda containers reach the gateway as host.docker.internal.
+    return ["host.docker.internal"] + cognito_idp_hosts() + iot_endpoint_hosts()
+
+
+def ca_bundle_path(cert_path: str) -> "str | None":
+    """System roots plus `cert_path` (the *_CA_BUNDLE vars replace the store), or None."""
+    import ssl
+
+    paths = ssl.get_default_verify_paths()
+    system = paths.cafile or paths.openssl_cafile
+    if not system or not os.path.exists(system):
+        return None
+    try:
+        blob = b"\n".join(open(source, "rb").read() for source in (system, cert_path))
+    except OSError:
+        return None
+    return _write_atomic(os.path.join(os.path.dirname(cert_path), "ca-bundle.pem"), blob)
+
+
+JAVA_TRUSTSTORE_PASSWORD = "changeit"
+
+
+def java_truststore_path(cert_path: str) -> "str | None":
+    """The same trust as a PKCS12 truststore for the JVM, or None."""
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives.serialization import (
+            BestAvailableEncryption,
+            pkcs12,
+        )
+    except ImportError:
+        return None
+    import ssl
+    import warnings
+
+    paths = ssl.get_default_verify_paths()
+    system = paths.cafile or paths.openssl_cafile
+    if not system or not os.path.exists(system):
+        return None
+    try:
+        with warnings.catch_warnings():
+            # Non-positive serials in the shipped roots: warns now, raises later.
+            warnings.simplefilter("ignore")
+            roots = x509.load_pem_x509_certificates(open(system, "rb").read())
+            roots.extend(x509.load_pem_x509_certificates(open(cert_path, "rb").read()))
+            blob = pkcs12.serialize_key_and_certificates(
+                name=b"ministack", key=None, cert=None, cas=roots,
+                encryption_algorithm=BestAvailableEncryption(
+                    JAVA_TRUSTSTORE_PASSWORD.encode()),
+            )
+    except Exception:
+        return None
+    return _write_atomic(os.path.join(os.path.dirname(cert_path), "truststore.p12"), blob)
+
+
+def _cert_names(cert_path: str, names: "list[str]") -> bool:
+    """Whether the certificate at `cert_path` carries every name in `names` as a SAN and is no CA.
+
+    webpki (rustls) refuses a CA certificate served as the leaf (CaUsedAsEndEntity).
+    """
+    try:
+        out = subprocess.run(
+            ["openssl", "x509", "-in", cert_path, "-noout", "-ext", "subjectAltName,basicConstraints"],
+            capture_output=True, text=True, check=False,
+        )
+    except OSError:
+        return True  # No openssl to check with; leave the cached cert alone.
+    text = out.stdout or ""
+    return all(f"DNS:{name}" in text for name in names) and "CA:TRUE" not in text
+
+
+def trust_gateway_cert(env: dict) -> None:
+    """Have a host process trust the gateway's certificate, unless env already names a CA."""
+    try:
+        cert_path, _key_path = resolve_tls_material()
+    except SystemExit:
+        return
+    if not os.path.exists(cert_path):
+        return
+    env.setdefault("NODE_EXTRA_CA_CERTS", cert_path)
+    bundle = ca_bundle_path(cert_path)
+    if bundle:
+        for var in ("AWS_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE"):
+            env.setdefault(var, bundle)
 
 
 def resolve_tls_material() -> "tuple[str, str]":
@@ -40,13 +174,24 @@ def resolve_tls_material() -> "tuple[str, str]":
     os.makedirs(tls_dir, exist_ok=True)
     cert_path = os.path.join(tls_dir, "server.crt")
     key_path = os.path.join(tls_dir, "server.key")
+    if (os.path.exists(cert_path) and os.path.exists(key_path)
+            and not _cert_names(cert_path, _generated_cert_names())):
+        # Cached by an older build or another MINISTACK_HOST: regenerate so every name is covered.
+        os.remove(cert_path)
+        os.remove(key_path)
     if not (os.path.exists(cert_path) and os.path.exists(key_path)):
         subprocess.run([
             "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
             "-keyout", key_path, "-out", cert_path,
             "-days", "825",
             "-subj", "/CN=ministack-local/O=MiniStack",
-            "-addext", "subjectAltName=DNS:localhost,DNS:ministack,IP:127.0.0.1,IP:0:0:0:0:0:0:0:1",
+            "-addext", "basicConstraints=critical,CA:FALSE",
+            "-addext", "keyUsage=critical,digitalSignature,keyEncipherment",
+            "-addext", "extendedKeyUsage=serverAuth",
+            "-addext",
+            "subjectAltName=DNS:localhost,DNS:ministack,"
+            + "".join(f"DNS:{host}," for host in _generated_cert_names())
+            + "IP:127.0.0.1,IP:0:0:0:0:0:0:0:1",
         ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         os.chmod(cert_path, 0o600)
         os.chmod(key_path, 0o600)

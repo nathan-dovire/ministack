@@ -6,6 +6,7 @@ exercised — they aren't reachable through the AWS CLI or Terraform.
 """
 
 import json
+import os
 import uuid
 
 import boto3
@@ -13,16 +14,15 @@ import pytest
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-
-ENDPOINT = "http://localhost:4566"
+ENDPOINT = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
 REGION = "us-east-1"
 
 
-def _client(account="test"):
+def _client(account="test", region=REGION):
     return boto3.client(
         "resource-groups",
         endpoint_url=ENDPOINT,
-        region_name=REGION,
+        region_name=region,
         aws_access_key_id=account,
         aws_secret_access_key="test",
         config=Config(retries={"mode": "standard"}),
@@ -86,6 +86,41 @@ def test_get_group_by_name_and_by_arn(rg):
         by_arn = rg.get_group(Group=arn)
         assert by_name["Group"]["Name"] == name
         assert by_arn["Group"]["Name"] == name
+    finally:
+        rg.delete_group(Group=name)
+
+
+def test_group_arn_region_and_account_must_match_request(rg):
+    name = f"g-{_uid()}"
+    arn = rg.create_group(Name=name, ResourceQuery=_tag_query())["Group"]["GroupArn"]
+    foreign_region = arn.replace(":us-east-1:", ":us-west-2:")
+    foreign_account = arn.replace(":000000000000:", ":111111111111:")
+    try:
+        for group_arn in (foreign_region, foreign_account):
+            with pytest.raises(ClientError) as exc:
+                rg.get_group(Group=group_arn)
+            assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+            with pytest.raises(ClientError) as exc:
+                rg.tag(Arn=group_arn, Tags={"env": "foreign"})
+            assert exc.value.response["Error"]["Code"] == "NotFoundException"
+
+        assert rg.get_group(Group=arn)["Group"]["Name"] == name
+    finally:
+        rg.delete_group(Group=name)
+
+
+def test_malformed_group_arn_does_not_resolve_as_group_name(rg):
+    name = f"g-{_uid()}"
+    rg.create_group(Name=name, ResourceQuery=_tag_query())
+    try:
+        malformed = f"arn:aws:resource-groups:us-east-1:000000000000:group/{name}:extra"
+        invalid_partition = f"arn:notaws:resource-groups:us-east-1:000000000000:group/{name}"
+        wrong_service = f"arn:aws:sns:us-east-1:000000000000:group/{name}"
+        for group_arn in (malformed, invalid_partition, wrong_service):
+            with pytest.raises(ClientError) as exc:
+                rg.get_group(Group=group_arn)
+            assert exc.value.response["Error"]["Code"] == "BadRequestException"
     finally:
         rg.delete_group(Group=name)
 
@@ -215,6 +250,60 @@ def test_group_and_ungroup_and_list_resources(rg):
         rg.delete_group(Group=name)
 
 
+def test_group_resources_rejects_malformed_resource_arn(rg):
+    name = f"g-{_uid()}"
+    rg.create_group(Name=name, ResourceQuery=_tag_query())
+    try:
+        valid = "arn:aws:ec2:us-east-1:000000000000:instance/i-aaa"
+        malformed = "arn:aws:ec2:us-east-1:000000000000"
+        invalid_partition = "arn:notaws:ec2:us-east-1:000000000000:instance/i-aaa"
+        for resource_arn in (malformed, invalid_partition):
+            with pytest.raises(ClientError) as exc:
+                rg.group_resources(Group=name, ResourceArns=[valid, resource_arn])
+            assert exc.value.response["Error"]["Code"] == "BadRequestException"
+            assert rg.list_group_resources(GroupName=name)["ResourceIdentifiers"] == []
+    finally:
+        rg.delete_group(Group=name)
+
+
+def test_group_resources_failed_request_does_not_partially_mutate_existing_members(rg):
+    name = f"g-{_uid()}"
+    rg.create_group(Name=name, ResourceQuery=_tag_query())
+    try:
+        existing = "arn:aws:ec2:us-east-1:000000000000:instance/i-existing"
+        valid = "arn:aws:ec2:us-east-1:000000000000:instance/i-new"
+        malformed = "arn:aws:ec2:us-east-1:000000000000"
+        rg.group_resources(Group=name, ResourceArns=[existing])
+
+        with pytest.raises(ClientError) as exc:
+            rg.group_resources(Group=name, ResourceArns=[valid, malformed])
+
+        assert exc.value.response["Error"]["Code"] == "BadRequestException"
+        listed = rg.list_group_resources(GroupName=name)["ResourceIdentifiers"]
+        assert [resource["ResourceArn"] for resource in listed] == [existing]
+    finally:
+        rg.delete_group(Group=name)
+
+
+def test_ungroup_resources_failed_request_does_not_partially_mutate_existing_members(rg):
+    name = f"g-{_uid()}"
+    rg.create_group(Name=name, ResourceQuery=_tag_query())
+    try:
+        keep = "arn:aws:ec2:us-east-1:000000000000:instance/i-keep"
+        remove = "arn:aws:ec2:us-east-1:000000000000:instance/i-remove"
+        malformed = "arn:aws:ec2:us-east-1:000000000000"
+        rg.group_resources(Group=name, ResourceArns=[keep, remove])
+
+        with pytest.raises(ClientError) as exc:
+            rg.ungroup_resources(Group=name, ResourceArns=[remove, malformed])
+
+        assert exc.value.response["Error"]["Code"] == "BadRequestException"
+        listed = rg.list_group_resources(GroupName=name)["ResourceIdentifiers"]
+        assert [resource["ResourceArn"] for resource in listed] == [keep, remove]
+    finally:
+        rg.delete_group(Group=name)
+
+
 def test_list_grouping_statuses(rg):
     name = f"g-{_uid()}"
     rg.create_group(Name=name, ResourceQuery=_tag_query())
@@ -305,3 +394,87 @@ def test_account_isolation_for_groups():
         assert exc.value.response["Error"]["Code"] == "NotFoundException"
     finally:
         a.delete_group(Group=name)
+
+
+def test_region_isolation_for_groups_and_account_settings():
+    east = _client(region="us-east-1")
+    west = _client(region="us-west-2")
+    name = f"region-{_uid()}"
+
+    east.create_group(
+        Name=name,
+        Description="east",
+        ResourceQuery=_tag_query("region", "east"),
+    )
+    west.create_group(
+        Name=name,
+        Description="west",
+        ResourceQuery=_tag_query("region", "west"),
+    )
+    try:
+        east_group = east.get_group(GroupName=name)["Group"]
+        west_group = west.get_group(GroupName=name)["Group"]
+        assert east_group["Description"] == "east"
+        assert west_group["Description"] == "west"
+        assert ":us-east-1:" in east_group["GroupArn"]
+        assert ":us-west-2:" in west_group["GroupArn"]
+
+        east.update_account_settings(GroupLifecycleEventsDesiredStatus="ACTIVE")
+        assert (
+            east.get_account_settings()["AccountSettings"][
+                "GroupLifecycleEventsDesiredStatus"
+            ]
+            == "ACTIVE"
+        )
+        assert (
+            west.get_account_settings()["AccountSettings"][
+                "GroupLifecycleEventsDesiredStatus"
+            ]
+            == "INACTIVE"
+        )
+    finally:
+        east.update_account_settings(GroupLifecycleEventsDesiredStatus="INACTIVE")
+        east.delete_group(Group=name)
+        west.delete_group(Group=name)
+
+
+def test_restore_legacy_child_state_uses_parent_group_region():
+    from ministack.core.responses import (
+        AccountScopedDict,
+        set_request_account_id,
+        set_request_region,
+    )
+    from ministack.services import resource_groups as service
+
+    account_id = "111111111111"
+    group_name = "legacy-group"
+    resource_region = "us-west-2"
+    boot_region = "us-east-1"
+    groups = AccountScopedDict()
+    queries = AccountScopedDict()
+
+    set_request_account_id(account_id)
+    set_request_region(boot_region)
+    groups[group_name] = {
+        "GroupArn": (
+            f"arn:aws:resource-groups:{resource_region}:{account_id}:"
+            f"group/{group_name}"
+        ),
+        "Name": group_name,
+    }
+    queries[group_name] = _tag_query("region", "legacy")
+
+    service.reset()
+    try:
+        service.load_persisted_state({"groups": groups, "group_queries": queries})
+        assert service._groups.get_scoped(
+            account_id, resource_region, group_name
+        )["Name"] == group_name
+        assert service._group_queries.get_scoped(
+            account_id, resource_region, group_name
+        ) == _tag_query("region", "legacy")
+        assert service._group_queries.get_scoped(
+            account_id, boot_region, group_name
+        ) is None
+    finally:
+        service.reset()
