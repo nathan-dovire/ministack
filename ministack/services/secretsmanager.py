@@ -669,9 +669,26 @@ def _create_secret(data):
     return json_response(result)
 
 
+def _names_another_account(secret_id):
+    """An ARN for another account in the request's region; a name always means the caller's own account."""
+    scope = _secret_scope_from_arn(secret_id) if isinstance(secret_id, str) else None
+    if not scope:
+        return False
+    spec, _ = scope
+    return spec.account_id != get_account_id() and spec.region == get_region()
+
+
 def _get_secret_value(data):
     secret_id = data.get("SecretId")
     _, secret = _resolve(secret_id)
+    if not secret and _names_another_account(secret_id):
+        _, secret = _resolve(secret_id, use_arn_scope=True, cross_account=True)
+        if secret and not foreign_secret_readable(secret_id):
+            from ministack.core.iam_actions import access_denied_response
+            from ministack.core.iam_evaluator import caller_arn
+
+            return access_denied_response("secretsmanager", "secretsmanager:GetSecretValue", caller_arn(),
+                                          new_uuid(), resource_arn=secret["ARN"])
     if not secret:
         return error_response_json(
             "ResourceNotFoundException",
