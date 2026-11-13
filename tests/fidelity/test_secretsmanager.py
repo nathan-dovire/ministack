@@ -1,7 +1,7 @@
-"""Fidelity: reading a Secrets Manager secret that another account owns.
+"""Fidelity: Secrets Manager.
 
 Each test checks one documented AWS behaviour, quoted in its docstring, and that the response on the
-wire fits the GetSecretValue model.
+wire fits the operation's model.
 """
 import json
 import os
@@ -10,7 +10,8 @@ import uuid
 import boto3
 import pytest
 from botocore.exceptions import ClientError
-from fidelity_model import WireRecorder
+
+from fidelity.fidelity_model import WireRecorder
 
 OWNER, CALLER = "111122223333", "000000000000"
 GET_SECRET_VALUE = "https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_GetSecretValue.html"
@@ -62,6 +63,14 @@ def test_name_does_not_reach_another_account(owned_secret):
     (GET_SECRET_VALUE). A name is looked up in the caller's account only."""
     name, _arn = owned_secret
     assert _read(name) == "ResourceNotFoundException"
+
+
+def test_secret_in_another_account_scheduled_for_deletion_is_refused(owned_secret):
+    """GetSecretValue errors, InvalidRequestException: "A parameter value is not valid for the current
+    state of the resource. Possible causes: The secret is scheduled for deletion." (GET_SECRET_VALUE)"""
+    name, arn = owned_secret
+    _client("secretsmanager", OWNER).delete_secret(SecretId=name, RecoveryWindowInDays=7)
+    assert _read(arn) == "InvalidRequestException"
 
 
 @pytest.mark.auth_contract
